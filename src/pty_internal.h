@@ -29,10 +29,9 @@ void  local_write_impl(void *impl, const uint8_t *buf, size_t n);
 void  local_resize_impl(void *impl, int cols, int rows);
 bool  local_cwd_impl(void *impl, char *out, size_t cap);
 
-/* SSH backend (src/pty_ssh.c, cross-platform via libssh).
- * `target` is "user@host" or "user@host:port". On failure, returns NULL
- * and writes a human-readable reason into `err` if non-NULL. */
-void *ssh_open_impl(const char *target, int cols, int rows,
+/* SSH backend (src/pty_ssh.c, cross-platform via libssh). See pty.h. */
+void *ssh_open_impl(const char *user, const char *host, int port,
+                    const char *keyfile, int cols, int rows,
                     char *err, size_t errsz);
 void  ssh_close_impl(void *impl);
 bool  ssh_alive_impl(void *impl);

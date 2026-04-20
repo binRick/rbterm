@@ -1,13 +1,14 @@
 /* SSH backend for rbterm via libssh. Cross-platform.
  *
- * Connect + auth + channel setup happen in blocking mode on the calling
- * thread (opening a tab may stall for a second or two); the session is
- * then flipped into non-blocking mode so ssh_channel_read_nonblocking()
- * can drive the main-loop drain like our local Pty does.
+ * Connect + auth + channel setup run in blocking mode on the caller's
+ * thread (SSH handshake stalls ~1-2 s), then the session flips to
+ * non-blocking so pty_read can drain ssh_channel_read_nonblocking the
+ * same way local PTYs drain read() + EAGAIN.
  *
- * Auth is key-based only for now: ssh_userauth_publickey_auto tries
- * the ssh-agent first, then ~/.ssh/id_ed25519 / id_rsa / id_ecdsa. No
- * interactive password prompt yet. Host-key check is trust-on-first-use. */
+ * Auth is key-based: explicit private key if the form supplies one,
+ * otherwise ssh_userauth_publickey_auto (ssh-agent + ~/.ssh/id_*).
+ * Host keys are trust-on-first-use: unknown keys go into
+ * ~/.ssh/known_hosts; a changed key aborts with an error. */
 
 #include "pty_internal.h"
 
@@ -32,66 +33,40 @@ static void set_err(char *err, size_t errsz, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* Parse "[user@]host[:port]" into pieces. Trims whitespace. */
-static bool parse_target(const char *in,
-                         char *user, size_t user_sz,
-                         char *host, size_t host_sz,
-                         int  *port) {
-    /* Skip leading whitespace. */
-    while (*in == ' ' || *in == '\t') in++;
-
-    /* Trim trailing whitespace by working on a local copy. */
-    char tmp[512];
-    strncpy(tmp, in, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = 0;
-    size_t L = strlen(tmp);
-    while (L > 0 && (tmp[L - 1] == ' ' || tmp[L - 1] == '\t' ||
-                     tmp[L - 1] == '\n' || tmp[L - 1] == '\r'))
-        tmp[--L] = 0;
-    if (L == 0) return false;
-
-    *port = 22;
-    char *p = tmp;
-    char *at = strchr(p, '@');
-    if (at) {
-        size_t ul = (size_t)(at - p);
-        if (ul == 0 || ul >= user_sz) return false;
-        memcpy(user, p, ul);
-        user[ul] = 0;
-        p = at + 1;
-    } else {
-        const char *env_user = getenv("USER");
+/* Replace leading "~/" with $HOME (or %USERPROFILE% on Windows). */
+static void expand_tilde(const char *in, char *out, size_t cap) {
+    if (cap == 0) return;
+    out[0] = 0;
+    if (!in) return;
+    if (in[0] == '~' && (in[1] == '/' || in[1] == 0 || in[1] == '\\')) {
+        const char *home = getenv("HOME");
 #ifdef _WIN32
-        if (!env_user) env_user = getenv("USERNAME");
+        if (!home || !*home) home = getenv("USERPROFILE");
 #endif
-        if (!env_user || !*env_user) env_user = "user";
-        strncpy(user, env_user, user_sz - 1);
-        user[user_sz - 1] = 0;
+        if (home && *home) {
+            snprintf(out, cap, "%s%s", home, in + 1);
+            return;
+        }
     }
-
-    char *colon = strrchr(p, ':');
-    if (colon) {
-        size_t hl = (size_t)(colon - p);
-        if (hl == 0 || hl >= host_sz) return false;
-        memcpy(host, p, hl);
-        host[hl] = 0;
-        int n = atoi(colon + 1);
-        if (n > 0 && n < 65536) *port = n;
-    } else {
-        strncpy(host, p, host_sz - 1);
-        host[host_sz - 1] = 0;
-    }
-    return host[0] != 0;
+    strncpy(out, in, cap - 1);
+    out[cap - 1] = 0;
 }
 
-void *ssh_open_impl(const char *target, int cols, int rows,
+void *ssh_open_impl(const char *user, const char *host, int port,
+                    const char *keyfile, int cols, int rows,
                     char *err, size_t errsz) {
-    char user[96], host[256];
-    int port = 22;
-    if (!parse_target(target, user, sizeof(user), host, sizeof(host), &port)) {
-        set_err(err, errsz, "Can't parse '%s' (expected user@host[:port])", target);
+    if (!host || !*host) {
+        set_err(err, errsz, "Host is required");
         return NULL;
     }
+    if (!user || !*user) {
+        user = getenv("USER");
+#ifdef _WIN32
+        if (!user || !*user) user = getenv("USERNAME");
+#endif
+        if (!user || !*user) user = "user";
+    }
+    if (port <= 0) port = 22;
 
     SshPty *p = calloc(1, sizeof(*p));
     if (!p) { set_err(err, errsz, "out of memory"); return NULL; }
@@ -116,8 +91,6 @@ void *ssh_open_impl(const char *target, int cols, int rows,
         return NULL;
     }
 
-    /* Host-key check — trust-on-first-use. Unknown or missing entries are
-       added to ~/.ssh/known_hosts; a *changed* key aborts with a warning. */
     enum ssh_known_hosts_e khs = ssh_session_is_known_server(p->session);
     if (khs == SSH_KNOWN_HOSTS_CHANGED) {
         set_err(err, errsz,
@@ -128,8 +101,24 @@ void *ssh_open_impl(const char *target, int cols, int rows,
         ssh_session_update_known_hosts(p->session);
     }
 
-    /* Key-based auth: agent first, then ~/.ssh/id_*. */
-    int auth = ssh_userauth_publickey_auto(p->session, NULL, NULL);
+    int auth = SSH_AUTH_ERROR;
+    if (keyfile && *keyfile) {
+        char expanded[1024];
+        expand_tilde(keyfile, expanded, sizeof(expanded));
+        ssh_key priv = NULL;
+        int r = ssh_pki_import_privkey_file(expanded, NULL, NULL, NULL, &priv);
+        if (r != SSH_OK || !priv) {
+            set_err(err, errsz, "can't load key %s%s%s",
+                    expanded,
+                    r == SSH_EOF ? " (passphrase-protected?)" : "",
+                    ssh_get_error(p->session));
+            goto fail;
+        }
+        auth = ssh_userauth_publickey(p->session, NULL, priv);
+        ssh_key_free(priv);
+    } else {
+        auth = ssh_userauth_publickey_auto(p->session, NULL, NULL);
+    }
     if (auth != SSH_AUTH_SUCCESS) {
         const char *msg = ssh_get_error(p->session);
         set_err(err, errsz, "authentication failed%s%s",
@@ -155,7 +144,6 @@ void *ssh_open_impl(const char *target, int cols, int rows,
         goto fail;
     }
 
-    /* Flip the whole session into non-blocking mode for the read loop. */
     ssh_set_blocking(p->session, 0);
     p->alive = true;
     return p;
@@ -203,7 +191,6 @@ int ssh_read_impl(void *impl, uint8_t *buf, size_t cap) {
     if (n > 0) return n;
     if (n == SSH_EOF) { p->alive = false; return -1; }
     if (n == SSH_ERROR) { p->alive = false; return -1; }
-    /* SSH_AGAIN and 0 both mean "no data yet". */
     if (ssh_channel_is_closed(p->channel)) { p->alive = false; return -1; }
     return 0;
 }

@@ -16,13 +16,17 @@ typedef struct Pty Pty;
    Returns NULL on failure. */
 Pty *pty_open(int cols, int rows);
 
-/* Connect a PTY to a remote shell over SSH. `target` is "user@host" or
-   "user@host:port"; if `user@` is omitted, $USER is used. On failure,
-   returns NULL and writes a human-readable reason into `err` (if
-   non-NULL and `errsz > 0`). Uses libssh with publickey auth
-   (ssh-agent + ~/.ssh/id_*). Auto-adds unknown host keys to
-   ~/.ssh/known_hosts (MVP trust-on-first-use). */
-Pty *pty_open_ssh(const char *target, int cols, int rows,
+/* Connect a PTY to a remote shell over SSH.
+ *   user:    NULL/"" → $USER / $USERNAME.
+ *   host:    required, e.g. "myserver.example.com".
+ *   port:    <= 0 → 22.
+ *   keyfile: NULL/"" → ssh_userauth_publickey_auto (agent + ~/.ssh/id_*);
+ *            otherwise the explicit private-key path to use.
+ * On failure, returns NULL and writes a human-readable reason into `err`
+ * (if non-NULL). Host keys are trust-on-first-use: unknown keys are
+ * added to ~/.ssh/known_hosts; a *changed* key aborts. */
+Pty *pty_open_ssh(const char *user, const char *host, int port,
+                  const char *keyfile, int cols, int rows,
                   char *err, size_t errsz);
 
 /* Kill (SIGHUP or TerminateProcess) + wait for child, release all
