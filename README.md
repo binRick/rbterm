@@ -25,6 +25,10 @@ how the OS, the shell, and a graphics library all meet.
   wide-char support via `ATTR_WIDE`/`ATTR_WIDE_CONT`.
 - **Tabs** — up to 16 concurrent shells, each with its own PTY,
   scrollback, selection and title. Background tabs stay live.
+- **Embedded SSH** — Cmd+Shift+T opens a modal, type `user@host[:port]`,
+  Enter and a new tab is an SSH session via libssh (no local shell in
+  the middle). Key auth via ssh-agent or `~/.ssh/id_*`; host keys
+  trust-on-first-use into `~/.ssh/known_hosts`.
 - **Tab label tracks `cd`** via `proc_pidinfo` (macOS) /
   `/proc/<pid>/cwd` (Linux). `$HOME` shortens to `~`.
 - **Reflow on resize** — widen the window and wrapped prompts
@@ -49,7 +53,8 @@ how the OS, the shell, and a graphics library all meet.
 
 | Shortcut | Action |
 |----------|--------|
-| Cmd+T | New tab |
+| Cmd+T | New tab (local shell) |
+| Cmd+Shift+T | New tab over SSH (prompt for `user@host[:port]`) |
 | Cmd+W | Close tab |
 | Cmd+1..9 | Jump to tab N |
 | Cmd+[ / Cmd+] | Prev / next tab |
@@ -66,7 +71,7 @@ how the OS, the shell, and a graphics library all meet.
 ### macOS (fastest path)
 
 ```bash
-brew install raylib
+brew install raylib libssh
 make            # ./rbterm
 make app        # ./rbterm.app with icon + Info.plist
 ./run.sh        # kills any running rbterm, rebuilds, launches
@@ -88,6 +93,8 @@ Windows needs:
 Linux needs:
 - GLFW's X11/Wayland deps (raylib builds them via its submodules)
 - `libutil` (for `forkpty`)
+- `libssh` (either installed — `apt install libssh-dev` — or let
+  CMake FetchContent pull it in with mbedTLS)
 
 ## Usage
 

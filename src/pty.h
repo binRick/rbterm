@@ -16,6 +16,15 @@ typedef struct Pty Pty;
    Returns NULL on failure. */
 Pty *pty_open(int cols, int rows);
 
+/* Connect a PTY to a remote shell over SSH. `target` is "user@host" or
+   "user@host:port"; if `user@` is omitted, $USER is used. On failure,
+   returns NULL and writes a human-readable reason into `err` (if
+   non-NULL and `errsz > 0`). Uses libssh with publickey auth
+   (ssh-agent + ~/.ssh/id_*). Auto-adds unknown host keys to
+   ~/.ssh/known_hosts (MVP trust-on-first-use). */
+Pty *pty_open_ssh(const char *target, int cols, int rows,
+                  char *err, size_t errsz);
+
 /* Kill (SIGHUP or TerminateProcess) + wait for child, release all
    resources. Safe to call on a dead Pty. */
 void pty_close(Pty *p);

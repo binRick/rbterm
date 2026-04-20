@@ -28,10 +28,13 @@ remain up to date.
 
 | file | contents |
 |------|----------|
-| `src/main.c` | Event loop, tab bar UI, clipboard, mouse/keyboard routing |
-| `src/pty.h` | Platform-agnostic PTY interface |
-| `src/pty_unix.c` | `forkpty` + non-blocking read (macOS/Linux) |
-| `src/pty_win.c` | ConPTY + reader thread + ring buffer (Windows) |
+| `src/main.c` | Event loop, tab bar UI, SSH prompt modal, clipboard, mouse/keyboard routing |
+| `src/pty.h` | Platform-agnostic PTY interface (public) |
+| `src/pty_internal.h` | Shared `struct Pty` + backend function prototypes |
+| `src/pty_dispatch.c` | Dispatches `pty_*` calls to the right backend |
+| `src/pty_unix.c` | Local PTY via `forkpty` + non-blocking read (macOS/Linux) |
+| `src/pty_win.c` | Local PTY via ConPTY + reader thread + ring buffer (Windows) |
+| `src/pty_ssh.c` | SSH backend via libssh — key auth, trust-on-first-use |
 | `src/screen.{c,h}` | ANSI/VT parser, grid buffer, scrollback, reflow |
 | `src/render.{c,h}` | raylib rendering, glyph atlas, emoji cache, cursor |
 | `src/input.{c,h}` | raylib event → PTY bytes (C0 chords, arrow keys, UTF-8) |
@@ -144,8 +147,36 @@ cmake --build build
   first fix was to add Menlo fallback, the second was to recognise
   Core Text does font substitution itself via `CTFontCreateForString`.
 
+## SSH
+
+- `src/pty_ssh.c` uses libssh. Cross-platform via the same dispatch
+  layer: a `PTY_SSH` Pty holds an `SshPty *impl` with an `ssh_session`
+  + `ssh_channel`. The session is flipped to non-blocking after
+  auth/channel setup, so `pty_read` drains via
+  `ssh_channel_read_nonblocking` the same way local PTYs drain via
+  `read() + EAGAIN`.
+- Connect/auth/channel setup happens on the main thread. The UI
+  stalls for 1-2 seconds during connect — future work is to punt
+  this to a thread and show a spinner.
+- Auth is key-only: `ssh_userauth_publickey_auto` (agent first, then
+  `~/.ssh/id_*`). No interactive password prompt yet; user needs
+  ssh-agent or a non-encrypted key. The interactive prompt would
+  route through the Screen (write to display, capture input) — not
+  trivial.
+- Host-key policy is trust-on-first-use: unknown keys go into
+  `~/.ssh/known_hosts`; `SSH_KNOWN_HOSTS_CHANGED` aborts with a
+  message in the prompt modal.
+- The UI modal lives in `main.c`. Toggled by `Cmd+Shift+T`, takes over
+  input until Enter or Esc. `ssh_prompt_handle_keys` calls
+  `tab_open_ssh`, which writes any libssh error back into a fixed
+  buffer the modal renders in red.
+
 ## Things left for later
 
+- SSH interactive password / keyboard-interactive auth (draw a prompt
+  through the Screen buffer and capture typed chars).
+- Async SSH connect so the UI doesn't freeze during the handshake.
+- Saved SSH profiles / a connect history.
 - DirectWrite emoji for Windows.
 - Sixel / kitty graphics protocol.
 - Ligatures (needs shaping — HarfBuzz).

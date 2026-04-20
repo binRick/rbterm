@@ -12,8 +12,8 @@ LDLIBS   ?= -lraylib -lm
 ifeq ($(UNAME_S),Darwin)
   BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
   ifneq ($(BREW_PREFIX),)
-    CFLAGS  += -I$(BREW_PREFIX)/include
-    LDFLAGS += -L$(BREW_PREFIX)/lib
+    CFLAGS  += -I$(BREW_PREFIX)/include -I$(BREW_PREFIX)/opt/libssh/include
+    LDFLAGS += -L$(BREW_PREFIX)/lib     -L$(BREW_PREFIX)/opt/libssh/lib
   endif
   LDLIBS += -framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL \
             -framework CoreText -framework CoreGraphics -framework Foundation
@@ -26,7 +26,11 @@ ifeq ($(UNAME_S),Linux)
   LDLIBS += -lutil -lpthread -ldl
 endif
 
-SRCS := src/main.c src/screen.c src/render.c src/input.c src/pty_unix.c
+# libssh: brew install libssh (macOS) / apt install libssh-dev (Linux).
+LDLIBS += -lssh
+
+SRCS := src/main.c src/screen.c src/render.c src/input.c \
+        src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c
 OBJS := $(SRCS:.c=.o) $(EMOJI_OBJ)
 
 all: rbterm

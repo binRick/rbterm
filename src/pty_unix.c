@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define _GNU_SOURCE
-#include "pty.h"
+#include "pty_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,13 +22,13 @@
   #include <pty.h>
 #endif
 
-struct Pty {
+typedef struct {
     pid_t pid;
     int   fd;
     bool  alive;
-};
+} LocalPty;
 
-Pty *pty_open(int cols, int rows) {
+void *local_open_impl(int cols, int rows) {
     struct winsize ws = { .ws_row = (unsigned short)rows,
                           .ws_col = (unsigned short)cols };
     int master;
@@ -69,14 +69,15 @@ Pty *pty_open(int cols, int rows) {
     int flags = fcntl(master, F_GETFL, 0);
     fcntl(master, F_SETFL, flags | O_NONBLOCK);
 
-    Pty *p = calloc(1, sizeof(*p));
+    LocalPty *p = calloc(1, sizeof(*p));
     p->pid = pid;
     p->fd  = master;
     p->alive = true;
     return p;
 }
 
-void pty_close(Pty *p) {
+void local_close_impl(void *impl) {
+    LocalPty *p = impl;
     if (!p) return;
     if (p->pid > 0) {
         kill(p->pid, SIGHUP);
@@ -87,7 +88,8 @@ void pty_close(Pty *p) {
     free(p);
 }
 
-bool pty_alive(Pty *p) {
+bool local_alive_impl(void *impl) {
+    LocalPty *p = impl;
     if (!p || !p->alive) return false;
     int status;
     pid_t w = waitpid(p->pid, &status, WNOHANG);
@@ -95,7 +97,8 @@ bool pty_alive(Pty *p) {
     return true;
 }
 
-int pty_read(Pty *p, uint8_t *buf, size_t cap) {
+int local_read_impl(void *impl, uint8_t *buf, size_t cap) {
+    LocalPty *p = impl;
     if (!p || p->fd < 0) return -1;
     ssize_t n = read(p->fd, buf, cap);
     if (n > 0) return (int)n;
@@ -106,7 +109,8 @@ int pty_read(Pty *p, uint8_t *buf, size_t cap) {
     return -1;
 }
 
-void pty_write(Pty *p, const uint8_t *buf, size_t n) {
+void local_write_impl(void *impl, const uint8_t *buf, size_t n) {
+    LocalPty *p = impl;
     if (!p || p->fd < 0) return;
     size_t off = 0;
     while (off < n) {
@@ -120,14 +124,16 @@ void pty_write(Pty *p, const uint8_t *buf, size_t n) {
     }
 }
 
-void pty_resize(Pty *p, int cols, int rows) {
+void local_resize_impl(void *impl, int cols, int rows) {
+    LocalPty *p = impl;
     if (!p || p->fd < 0) return;
     struct winsize ws = { .ws_row = (unsigned short)rows,
                           .ws_col = (unsigned short)cols };
     ioctl(p->fd, TIOCSWINSZ, &ws);
 }
 
-bool pty_cwd(Pty *p, char *out, size_t cap) {
+bool local_cwd_impl(void *impl, char *out, size_t cap) {
+    LocalPty *p = impl;
     if (!p || !out || cap == 0 || p->pid <= 0) return false;
 #if defined(__APPLE__)
     struct proc_vnodepathinfo vpi;

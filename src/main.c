@@ -43,6 +43,14 @@ static Tab *g_tabs[MAX_TABS];
 static int g_num_tabs = 0;
 static int g_active = 0;
 
+/* Modal SSH prompt — when non-zero the terminal is locked; keystrokes
+   edit the prompt buffer instead of going to the active tab. */
+typedef enum { UI_NORMAL = 0, UI_SSH_PROMPT } UiMode;
+static UiMode g_ui_mode = UI_NORMAL;
+static char   g_prompt_input[256];
+static int    g_prompt_len = 0;
+static char   g_prompt_error[256];
+
 static Tab *active_tab(void) {
     if (g_num_tabs == 0) return NULL;
     if (g_active < 0) g_active = 0;
@@ -71,6 +79,27 @@ static Tab *tab_open(int cols, int rows) {
     t->last_click_time = -1.0;
     t->last_click_col = t->last_click_row = -1;
     t->pty = pty_open(cols, rows);
+    if (!t->pty) { free(t); return NULL; }
+    ScreenIO io = { .user = t, .write = io_write_cb,
+                    .set_title = io_set_title_cb, .bell = io_bell_cb };
+    t->scr = screen_new(cols, rows, 5000, io);
+    g_tabs[g_num_tabs] = t;
+    g_active = g_num_tabs;
+    g_num_tabs++;
+    return t;
+}
+
+static Tab *tab_open_ssh(const char *target, int cols, int rows,
+                         char *err, size_t errsz) {
+    if (g_num_tabs >= MAX_TABS) return NULL;
+    Tab *t = calloc(1, sizeof(Tab));
+    snprintf(t->title, sizeof(t->title), "%s", target);
+    /* Use the SSH target as the tab label (pty_cwd is a no-op for SSH
+       sessions — we never overwrite this with a polled directory). */
+    snprintf(t->cwd, sizeof(t->cwd), "%s", target);
+    t->last_click_time = -1.0;
+    t->last_click_col = t->last_click_row = -1;
+    t->pty = pty_open_ssh(target, cols, rows, err, errsz);
     if (!t->pty) { free(t); return NULL; }
     ScreenIO io = { .user = t, .write = io_write_cb,
                     .set_title = io_set_title_cb, .bell = io_bell_cb };
@@ -272,6 +301,88 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                18, 0, (Color){200, 200, 215, 255});
 }
 
+/* ---------- SSH prompt modal ---------- */
+
+static void ssh_prompt_open(void) {
+    g_ui_mode = UI_SSH_PROMPT;
+    g_prompt_input[0] = 0;
+    g_prompt_len = 0;
+    g_prompt_error[0] = 0;
+}
+
+static void ssh_prompt_handle_keys(int cols, int rows) {
+    if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        if (g_prompt_len > 0) {
+            char err[256] = {0};
+            Tab *t = tab_open_ssh(g_prompt_input, cols, rows, err, sizeof(err));
+            if (t) {
+                g_ui_mode = UI_NORMAL;
+            } else {
+                strncpy(g_prompt_error, err[0] ? err : "connection failed",
+                        sizeof(g_prompt_error) - 1);
+                g_prompt_error[sizeof(g_prompt_error) - 1] = 0;
+            }
+        }
+        return;
+    }
+    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+        if (g_prompt_len > 0) {
+            g_prompt_input[--g_prompt_len] = 0;
+            g_prompt_error[0] = 0;
+        }
+    }
+    int cp;
+    while ((cp = GetCharPressed()) != 0) {
+        if (cp < 32 || cp >= 127) continue;
+        if (g_prompt_len + 1 >= (int)sizeof(g_prompt_input)) continue;
+        g_prompt_input[g_prompt_len++] = (char)cp;
+        g_prompt_input[g_prompt_len] = 0;
+        g_prompt_error[0] = 0;
+    }
+}
+
+static void draw_ssh_prompt(Renderer *r, int win_w, int win_h) {
+    DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
+
+    int modal_w = win_w * 3 / 5;
+    if (modal_w < 420) modal_w = 420;
+    if (modal_w > 720) modal_w = 720;
+    int modal_h = g_prompt_error[0] ? 138 : 108;
+    int modal_x = (win_w - modal_w) / 2;
+    int modal_y = (win_h - modal_h) / 2;
+
+    DrawRectangle(modal_x, modal_y, modal_w, modal_h, (Color){30, 34, 46, 255});
+    DrawRectangleLines(modal_x, modal_y, modal_w, modal_h, (Color){125, 207, 255, 200});
+
+    Font *f = (Font *)r->font_data;
+    DrawTextEx(*f, "SSH — connect to:",
+               (Vector2){modal_x + 18, modal_y + 14},
+               14, 0, (Color){200, 200, 215, 255});
+
+    /* Input row: blinking block cursor after the typed text. */
+    int input_y = modal_y + 40;
+    DrawRectangle(modal_x + 16, input_y - 4, modal_w - 32, 30,
+                  (Color){22, 25, 34, 255});
+    Vector2 ip = { modal_x + 22, input_y };
+    DrawTextEx(*f, g_prompt_input, ip, 18, 0, (Color){230, 232, 240, 255});
+    Vector2 tsz = MeasureTextEx(*f, g_prompt_input, 18, 0);
+    if (((long long)(GetTime() * 2.0) & 1) == 0) {
+        DrawRectangle((int)(ip.x + tsz.x + 1), input_y, 10, 18,
+                      (Color){125, 207, 255, 255});
+    }
+
+    /* Help + error text. */
+    DrawTextEx(*f, "user@host[:port]   Enter = connect   Esc = cancel",
+               (Vector2){modal_x + 18, modal_y + 78},
+               11, 0, (Color){140, 145, 160, 255});
+    if (g_prompt_error[0]) {
+        DrawTextEx(*f, g_prompt_error,
+                   (Vector2){modal_x + 18, modal_y + 104},
+                   11, 0, (Color){240, 100, 100, 255});
+    }
+}
+
 /* ---------- Modifier helpers ---------- */
 
 static bool ui_key_down(void) {
@@ -292,7 +403,8 @@ static void usage(void) {
            "  --cols N        initial cols (default 100)\n"
            "  --rows N        initial rows (default 30)\n"
            "\nKeys (Cmd on macOS, Ctrl on Linux/Windows):\n"
-           "  Cmd + T           open a new tab\n"
+           "  Cmd + T           open a new tab (local shell)\n"
+           "  Cmd + Shift + T   open an SSH tab (user@host[:port])\n"
            "  Cmd + W           close the current tab\n"
            "  Cmd + 1..9        switch to tab N\n"
            "  Cmd + [ / ]       prev / next tab\n"
@@ -449,9 +561,32 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Modal SSH prompt — swallow input until the user submits or cancels. */
+        if (g_ui_mode == UI_SSH_PROMPT) {
+            ssh_prompt_handle_keys(content_cols, content_rows);
+            cur = active_tab();
+            if (!cur) break;
+            if (cur->title_dirty) {
+                SetWindowTitle(cur->title[0] ? cur->title : tab_label(cur));
+                cur->title_dirty = false;
+            }
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
+                          &cur->sel, TAB_BAR_H);
+            draw_ssh_prompt(&r, win_w_now, win_h_now);
+            EndDrawing();
+            continue;
+        }
+
         /* Tab shortcuts (pre-input so Cmd/Ctrl+T/W/digit don't slip into the shell). */
+        bool shift_held = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         if (ui_key_down()) {
-            if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
+            if (shift_held && IsKeyPressed(KEY_T)) {
+                ssh_prompt_open();
+            }
+            else if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
             else if (IsKeyPressed(KEY_W)) {
                 tab_close(g_active);
                 if (g_num_tabs == 0) break;
@@ -470,6 +605,20 @@ int main(int argc, char **argv) {
         }
 
         if (!cur) break;
+        if (g_ui_mode == UI_SSH_PROMPT) {
+            if (cur->title_dirty) {
+                SetWindowTitle(cur->title[0] ? cur->title : tab_label(cur));
+                cur->title_dirty = false;
+            }
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
+                          &cur->sel, TAB_BAR_H);
+            draw_ssh_prompt(&r, win_w_now, win_h_now);
+            EndDrawing();
+            continue;
+        }
 
         InputActions acts;
         size_t in_n = input_poll(cur->scr, inputbuf, sizeof(inputbuf), &acts);
