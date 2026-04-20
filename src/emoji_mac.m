@@ -2,9 +2,10 @@
  * Produces RGBA (top-down, premultiplied alpha) suitable for uploading
  * to a raylib Texture2D with PIXELFORMAT_UNCOMPRESSED_R8G8B8A8.
  *
- * Colour emoji fonts (SBIX) ignore the fill colour and draw their bitmap
- * directly, so callers can tint with WHITE. Vector fonts fill in white,
- * so callers tint with the desired foreground color. */
+ * Uses CTLineDraw so Core Text's automatic font substitution picks up
+ * any installed font that has the glyph when the preferred font doesn't.
+ * Colour emoji fonts (SBIX) ignore the fill colour; vector fonts are
+ * filled white so the caller can tint. */
 #include "emoji.h"
 #import <CoreText/CoreText.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -19,17 +20,9 @@ bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
     if (pixel_size < 8) pixel_size = 8;
     if (!font_name) font_name = "Apple Color Emoji";
 
-    CFStringRef name = CFStringCreateWithCString(NULL, font_name,
-                                                 kCFStringEncodingUTF8);
-    if (!name) return false;
-    CTFontRef font = CTFontCreateWithName(name, (CGFloat)pixel_size, NULL);
-    CFRelease(name);
-    if (!font) return false;
-
-    /* Convert codepoint -> UTF-16 code units */
+    /* Build a UTF-16 string for the codepoint. */
     UniChar chars[2];
-    CGGlyph glyphs[2] = {0, 0};
-    CFIndex nchars = 0;
+    CFIndex nchars;
     if (codepoint <= 0xFFFF) {
         chars[0] = (UniChar)codepoint;
         nchars = 1;
@@ -39,45 +32,84 @@ bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
         chars[1] = (UniChar)(0xDC00 | (c & 0x3FF));
         nchars = 2;
     }
-    if (!CTFontGetGlyphsForCharacters(font, chars, glyphs, nchars) || glyphs[0] == 0) {
-        CFRelease(font);
+    CFStringRef str = CFStringCreateWithCharacters(NULL, chars, nchars);
+    if (!str) return false;
+
+    CFStringRef name = CFStringCreateWithCString(NULL, font_name,
+                                                 kCFStringEncodingUTF8);
+    if (!name) { CFRelease(str); return false; }
+    CTFontRef primary = CTFontCreateWithName(name, (CGFloat)pixel_size, NULL);
+    CFRelease(name);
+    if (!primary) { CFRelease(str); return false; }
+
+    /* Let Core Text pick the best installed font for *this* codepoint.
+       Falls back automatically if `primary` lacks the glyph. */
+    CFRange full = CFRangeMake(0, CFStringGetLength(str));
+    CTFontRef best = CTFontCreateForString(primary, str, full);
+    CFRelease(primary);
+    if (!best) { CFRelease(str); return false; }
+
+    CFMutableAttributedStringRef attr =
+        CFAttributedStringCreateMutable(NULL, 0);
+    CFAttributedStringReplaceString(attr, CFRangeMake(0, 0), str);
+    CFAttributedStringSetAttribute(attr, full, kCTFontAttributeName, best);
+
+    /* Fill color only affects vector glyphs (SBIX bitmaps ignore it). */
+    CGColorRef white = CGColorCreateGenericRGB(1.0, 1.0, 1.0, 1.0);
+    CFAttributedStringSetAttribute(attr, full,
+                                   kCTForegroundColorAttributeName, white);
+    CGColorRelease(white);
+
+    CTLineRef line = CTLineCreateWithAttributedString(attr);
+    if (!line) {
+        CFRelease(attr);
+        CFRelease(best);
+        CFRelease(str);
         return false;
     }
-    CGGlyph g = glyphs[0];
+
+    CGFloat ascent = 0, descent = 0, leading = 0;
+    double w = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
+    if (w <= 0) w = pixel_size;
 
     int size = pixel_size;
     size_t bytes = (size_t)size * size * 4;
     uint8_t *data = (uint8_t *)calloc(bytes, 1);
-    if (!data) { CFRelease(font); return false; }
+    if (!data) {
+        CFRelease(line); CFRelease(attr); CFRelease(best); CFRelease(str);
+        return false;
+    }
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(
         data, size, size, 8, (size_t)size * 4, cs,
         kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(cs);
-    if (!ctx) { free(data); CFRelease(font); return false; }
+    if (!ctx) {
+        free(data);
+        CFRelease(line); CFRelease(attr); CFRelease(best); CFRelease(str);
+        return false;
+    }
 
     CGContextSetShouldAntialias(ctx, true);
     CGContextSetShouldSmoothFonts(ctx, true);
-    /* White fill so vector glyphs render as alpha masks we can tint later.
-     * SBIX colour bitmaps ignore this. */
-    CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
 
-    /* Flip so (0,0) is top-left to match raylib's texture orientation. */
+    /* Flip so (0,0) is top-left; compensate on the text matrix so glyphs
+       aren't drawn upside-down. */
     CGContextTranslateCTM(ctx, 0, size);
     CGContextScaleCTM(ctx, 1.0, -1.0);
     CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1.0, -1.0));
 
-    CGRect bbox;
-    CTFontGetBoundingRectsForGlyphs(font, kCTFontOrientationHorizontal,
-                                    &g, &bbox, 1);
-    CGFloat dx = ((CGFloat)size - bbox.size.width)  / 2.0 - bbox.origin.x;
-    CGFloat dy = ((CGFloat)size - bbox.size.height) / 2.0 + bbox.size.height + bbox.origin.y;
-    CGPoint pos = CGPointMake(dx, dy);
-    CTFontDrawGlyphs(font, &g, &pos, 1, ctx);
+    CGFloat dx = ((CGFloat)size - (CGFloat)w) / 2.0;
+    CGFloat dy = ((CGFloat)size - (ascent + descent)) / 2.0 + ascent;
+    CGContextSetTextPosition(ctx, dx, dy);
+    CTLineDraw(line, ctx);
 
     CGContextRelease(ctx);
-    CFRelease(font);
+    CFRelease(line);
+    CFRelease(attr);
+    CFRelease(best);
+    CFRelease(str);
 
     *out_rgba = data;
     *out_w = size;
