@@ -6,49 +6,62 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
-/* --- Emoji texture cache --- */
+/* --- Glyph texture caches ---
+   Two caches backed by the same rasterizer:
+   * g_emoji:    colour emoji (e.g. Apple Color Emoji) — tint WHITE at draw.
+   * g_fallback: monochrome vector glyphs from a broad-coverage font
+                 (e.g. Menlo) — tint with the cell's fg at draw. Used when
+                 the main font is missing the glyph AND it's not a colour
+                 emoji either. */
 
 typedef struct {
     uint32_t cp;
     Texture2D tex;
-    bool ok;         /* true if glyph was rasterized */
-    bool attempted;  /* true once we've tried; don't retry */
-} EmojiEntry;
+    bool ok;
+    bool attempted;
+} GlyphEntry;
 
 typedef struct {
-    EmojiEntry *items;
+    GlyphEntry *items;
     int count, cap;
-    int pixel_size;  /* size at which entries were rendered */
-} EmojiCache;
+    int pixel_size;
+    const char *font_name;
+} GlyphCache;
 
-static EmojiCache g_emoji;
+static GlyphCache g_emoji    = { .font_name = "Apple Color Emoji" };
+static GlyphCache g_fallback = { .font_name = "Menlo" };
 
-static void emoji_cache_clear(void) {
-    for (int i = 0; i < g_emoji.count; i++) {
-        if (g_emoji.items[i].ok) UnloadTexture(g_emoji.items[i].tex);
+static void glyph_cache_clear(GlyphCache *c) {
+    for (int i = 0; i < c->count; i++) {
+        if (c->items[i].ok) UnloadTexture(c->items[i].tex);
     }
-    g_emoji.count = 0;
+    c->count = 0;
 }
 
-static EmojiEntry *emoji_lookup(uint32_t cp, int pixel_size) {
-    if (g_emoji.pixel_size != pixel_size) {
-        emoji_cache_clear();
-        g_emoji.pixel_size = pixel_size;
+static void emoji_cache_clear(void) {
+    glyph_cache_clear(&g_emoji);
+    glyph_cache_clear(&g_fallback);
+}
+
+static GlyphEntry *glyph_lookup(GlyphCache *c, uint32_t cp, int pixel_size) {
+    if (c->pixel_size != pixel_size) {
+        glyph_cache_clear(c);
+        c->pixel_size = pixel_size;
     }
-    for (int i = 0; i < g_emoji.count; i++) {
-        if (g_emoji.items[i].cp == cp) return &g_emoji.items[i];
+    for (int i = 0; i < c->count; i++) {
+        if (c->items[i].cp == cp) return &c->items[i];
     }
-    if (g_emoji.count == g_emoji.cap) {
-        g_emoji.cap = g_emoji.cap ? g_emoji.cap * 2 : 32;
-        g_emoji.items = realloc(g_emoji.items, sizeof(EmojiEntry) * g_emoji.cap);
+    if (c->count == c->cap) {
+        c->cap = c->cap ? c->cap * 2 : 32;
+        c->items = realloc(c->items, sizeof(GlyphEntry) * c->cap);
     }
-    EmojiEntry *e = &g_emoji.items[g_emoji.count++];
+    GlyphEntry *e = &c->items[c->count++];
     e->cp = cp;
     e->ok = false;
     e->attempted = true;
     uint8_t *rgba = NULL;
     int w = 0, h = 0;
-    if (emoji_render(cp, pixel_size, &rgba, &w, &h) && rgba) {
+    if (glyph_render(c->font_name, cp, pixel_size, &rgba, &w, &h) && rgba) {
         Image img = {
             .data = rgba,
             .width = w, .height = h, .mipmaps = 1,
@@ -227,9 +240,8 @@ bool renderer_init(Renderer *r, const char *font_path, int font_size) {
 
 void renderer_shutdown(Renderer *r) {
     emoji_cache_clear();
-    free(g_emoji.items);
-    g_emoji.items = NULL;
-    g_emoji.cap = 0;
+    free(g_emoji.items);    g_emoji.items = NULL;    g_emoji.cap = 0;
+    free(g_fallback.items); g_fallback.items = NULL; g_fallback.cap = 0;
     missing_set_clear();
     if (!r || !r->font_data) return;
     UnloadFont(*as_font(r));
@@ -353,42 +365,46 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             int span = (c.attrs & ATTR_WIDE) ? 2 : 1;
 
             bool main_has_glyph = !font_missing(c.cp);
-            bool try_emoji = !main_has_glyph || c.cp >= 0x1F000;
 
-            if (try_emoji) {
-                EmojiEntry *e = emoji_lookup(c.cp, emoji_px);
-                if (e && e->ok) {
-                    float dst_w = (float)(cw * span);
-                    float dst_h = (float)ch;
-                    float scale = (dst_h / (float)e->tex.height);
-                    if ((float)e->tex.width * scale > dst_w)
-                        scale = dst_w / (float)e->tex.width;
-                    float w = (float)e->tex.width * scale;
-                    float h = (float)e->tex.height * scale;
-                    Rectangle src = {0, 0, (float)e->tex.width, (float)e->tex.height};
-                    Rectangle dst = {
-                        (float)(x * cw) + (dst_w - w) / 2.0f,
-                        (float)(y * ch) + (dst_h - h) / 2.0f,
-                        w, h
-                    };
-                    DrawTexturePro(e->tex, src, dst, (Vector2){0, 0}, 0.0f,
-                                   col_from_rgb(0xFFFFFF, alpha));
-                    continue;
-                }
-                if (!main_has_glyph) {
-                    /* Neither main nor emoji has it — draw a fallback '?' so
-                       something visible appears. */
-                    pos.x = (float)(x * cw);
-                    pos.y = (float)(y * ch + glyph_y_offset);
-                    DrawTextCodepoint(*f, '?', pos, (float)r->font_size,
-                                      col_from_rgb(fg, alpha * 0.6f));
-                    continue;
-                }
+            /* Helper lambda-alike: draw a cached glyph texture at this cell,
+               returns false if nothing was drawn. */
+            #define DRAW_GLYPH(cache, tint) do {                                     \
+                GlyphEntry *_e = glyph_lookup(&(cache), c.cp, emoji_px);             \
+                if (_e && _e->ok) {                                                  \
+                    float _dw = (float)(cw * span), _dh = (float)ch;                 \
+                    float _s = _dh / (float)_e->tex.height;                          \
+                    if ((float)_e->tex.width * _s > _dw) _s = _dw / (float)_e->tex.width; \
+                    float _w = (float)_e->tex.width * _s, _h = (float)_e->tex.height * _s; \
+                    Rectangle _src = {0, 0, (float)_e->tex.width, (float)_e->tex.height}; \
+                    Rectangle _dst = { (float)(x * cw) + (_dw - _w) / 2.0f,          \
+                                       (float)(y * ch) + (_dh - _h) / 2.0f, _w, _h }; \
+                    DrawTexturePro(_e->tex, _src, _dst, (Vector2){0, 0}, 0.0f, tint);\
+                    goto glyph_drawn;                                                \
+                }                                                                    \
+            } while (0)
+
+            /* Try emoji cache first for high-plane emoji (always), or for any
+               codepoint the main font can't render. */
+            if (c.cp >= 0x1F000 || !main_has_glyph) {
+                DRAW_GLYPH(g_emoji, col_from_rgb(0xFFFFFF, alpha));
+            }
+            /* Try Menlo fallback for anything the main font doesn't have. */
+            if (!main_has_glyph) {
+                DRAW_GLYPH(g_fallback, col_from_rgb(fg, alpha));
+                /* Nothing in any font: visible placeholder. */
+                pos.x = (float)(x * cw);
+                pos.y = (float)(y * ch + glyph_y_offset);
+                DrawTextCodepoint(*f, '?', pos, (float)r->font_size,
+                                  col_from_rgb(fg, alpha * 0.6f));
+                continue;
             }
 
             pos.x = (float)(x * cw);
             pos.y = (float)(y * ch + glyph_y_offset);
             DrawTextCodepoint(*f, (int)c.cp, pos, (float)r->font_size, col_from_rgb(fg, alpha));
+
+        glyph_drawn:;
+            #undef DRAW_GLYPH
             if (c.attrs & ATTR_BOLD) {
                 Vector2 p2 = { pos.x + 1.0f, pos.y };
                 DrawTextCodepoint(*f, (int)c.cp, p2, (float)r->font_size, col_from_rgb(fg, alpha));
