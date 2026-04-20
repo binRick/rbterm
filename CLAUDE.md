@@ -162,6 +162,24 @@ than a one-off shortcut or CLI flag. Current controls:
   calls `tab_log_write` with every byte read from the PTY. Log
   directory is an editable text field with `$HOME` / `%USERPROFILE%`
   tilde expansion; `mkdir_p` creates the tree on first write.
+  Details worth knowing:
+    - Writes are **raw PTY bytes** — ANSI escapes, cursor moves and
+      colour SGRs included. Good for replay (`cat` into a real
+      terminal) and exact debugging; if you want plain text, run
+      the file through `sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'` or `ansi2txt`.
+    - `fflush` after every write so a crash or forced-quit still
+      leaves the log intact up to the last byte we saw.
+    - Toggling the checkbox or editing the path calls
+      `refresh_tab_logs`, which immediately opens/closes log handles
+      on **every** currently-open tab — you don't have to restart
+      tabs to start or stop capturing them.
+    - The `tab<N>` slot number in the filename is the tab's current
+      index at open time, so multiple tabs opened in the same second
+      don't collide. Closing a tab lower in the index doesn't rename
+      remaining files.
+    - Settings (logging on/off + path) live in `AppSettings` which is
+      process-local: nothing is persisted to disk yet. Restarting
+      rbterm loses both toggle state and any custom log directory.
 
 The layout is computed once per frame in `settings_layout` so draw +
 hit-test share rects. Modifier chords (`Cmd+A` / `Ctrl+A` for select
