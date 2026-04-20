@@ -1,126 +1,25 @@
-#define _DARWIN_C_SOURCE
-#define _GNU_SOURCE
 #include "raylib.h"
 #include "screen.h"
 #include "render.h"
 #include "input.h"
+#include "pty.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pwd.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <termios.h>
-#include <unistd.h>
 
-#if defined(__APPLE__)
-  #include <util.h>
-  #include <libproc.h>
-#elif defined(__linux__)
-  #include <pty.h>
-#else
-  #error "Unsupported platform (needs PTY support)"
+#ifndef _WIN32
+#include <signal.h>
 #endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
 
-static bool pid_cwd(pid_t pid, char *out, size_t out_sz) {
-    if (pid <= 0 || !out || out_sz == 0) return false;
-#if defined(__APPLE__)
-    struct proc_vnodepathinfo vpi;
-    int r = proc_pidinfo((int)pid, PROC_PIDVNODEPATHINFO, 0, &vpi, sizeof(vpi));
-    if (r <= 0) return false;
-    strncpy(out, vpi.pvi_cdir.vip_path, out_sz - 1);
-    out[out_sz - 1] = 0;
-    return out[0] != 0;
-#else
-    char link[64];
-    snprintf(link, sizeof(link), "/proc/%d/cwd", (int)pid);
-    ssize_t n = readlink(link, out, out_sz - 1);
-    if (n <= 0) return false;
-    out[n] = 0;
-    return true;
-#endif
-}
-
-/* ---------- PTY ---------- */
-
-typedef struct {
-    pid_t pid;
-    int   fd;
-} Pty;
-
-static bool pty_spawn_shell(Pty *out, int cols, int rows) {
-    struct winsize ws = { .ws_row = (unsigned short)rows,
-                          .ws_col = (unsigned short)cols };
-    int master;
-    pid_t pid = forkpty(&master, NULL, NULL, &ws);
-    if (pid < 0) { perror("forkpty"); return false; }
-    if (pid == 0) {
-        signal(SIGCHLD, SIG_DFL);
-        signal(SIGHUP,  SIG_DFL);
-        signal(SIGINT,  SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGALRM, SIG_DFL);
-        setenv("TERM", "xterm-256color", 1);
-        setenv("COLORTERM", "truecolor", 1);
-        unsetenv("TERM_PROGRAM");
-        unsetenv("TERM_SESSION_ID");
-
-        const char *home = getenv("HOME");
-        if (!home || !*home) {
-            struct passwd *pw = getpwuid(getuid());
-            if (pw && pw->pw_dir) home = pw->pw_dir;
-        }
-        if (home && *home) {
-            (void)chdir(home);
-            setenv("PWD", home, 1);
-        }
-
-        const char *shell = getenv("SHELL");
-        if (!shell || !*shell) shell = "/bin/bash";
-        const char *argv0 = strrchr(shell, '/');
-        argv0 = argv0 ? argv0 + 1 : shell;
-        char dash[64];
-        snprintf(dash, sizeof(dash), "-%s", argv0);
-        execl(shell, dash, (char *)NULL);
-        perror("execl");
-        _exit(127);
-    }
-    int flags = fcntl(master, F_GETFL, 0);
-    fcntl(master, F_SETFL, flags | O_NONBLOCK);
-    out->pid = pid;
-    out->fd  = master;
-    return true;
-}
-
-static void pty_resize(Pty *p, int cols, int rows) {
-    struct winsize ws = { .ws_row = (unsigned short)rows,
-                          .ws_col = (unsigned short)cols };
-    ioctl(p->fd, TIOCSWINSZ, &ws);
-}
-
-static void pty_write_all(Pty *p, const uint8_t *buf, size_t n) {
-    size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(p->fd, buf + off, n - off);
-        if (w < 0) { if (errno == EINTR) continue; if (errno == EAGAIN) return; return; }
-        off += (size_t)w;
-    }
-}
-
 /* ---------- Tabs ---------- */
 
 typedef struct {
-    Pty pty;
+    Pty *pty;
     Screen *scr;
     Selection sel;
     char title[256];
@@ -151,11 +50,11 @@ static Tab *active_tab(void) {
     return g_tabs[g_active];
 }
 
-/* ---------- IO glue for screen -> PTY writes (per-tab) ---------- */
+/* ---------- IO glue: screen callbacks route to owning tab's PTY ---------- */
 
 static void io_write_cb(void *u, const uint8_t *buf, size_t n) {
     Tab *t = (Tab *)u;
-    pty_write_all(&t->pty, buf, n);
+    pty_write(t->pty, buf, n);
 }
 static void io_set_title_cb(void *u, const char *title) {
     Tab *t = (Tab *)u;
@@ -171,7 +70,8 @@ static Tab *tab_open(int cols, int rows) {
     strncpy(t->title, "shell", sizeof(t->title) - 1);
     t->last_click_time = -1.0;
     t->last_click_col = t->last_click_row = -1;
-    if (!pty_spawn_shell(&t->pty, cols, rows)) { free(t); return NULL; }
+    t->pty = pty_open(cols, rows);
+    if (!t->pty) { free(t); return NULL; }
     ScreenIO io = { .user = t, .write = io_write_cb,
                     .set_title = io_set_title_cb, .bell = io_bell_cb };
     t->scr = screen_new(cols, rows, 5000, io);
@@ -184,12 +84,7 @@ static Tab *tab_open(int cols, int rows) {
 static void tab_close(int idx) {
     if (idx < 0 || idx >= g_num_tabs) return;
     Tab *t = g_tabs[idx];
-    if (t->pty.pid > 0) {
-        kill(t->pty.pid, SIGHUP);
-        int status;
-        waitpid(t->pty.pid, &status, 0);
-    }
-    close(t->pty.fd);
+    pty_close(t->pty);
     screen_free(t->scr);
     free(t);
     for (int i = idx; i < g_num_tabs - 1; i++) g_tabs[i] = g_tabs[i + 1];
@@ -281,20 +176,25 @@ static void select_line(Screen *s, Selection *sel, int row) {
 }
 
 /* Label shown on a tab: prefer the shell's current working directory
-   (shortened to a basename, with $HOME rewritten to "~") over any OSC
-   title the shell might have set. Falls back to title, then "shell". */
+   (shortened to a basename, with $HOME / %USERPROFILE% rewritten to "~")
+   over any OSC title the shell set. Falls back to title, then "shell". */
 static const char *tab_label(const Tab *t) {
     if (t->cwd[0]) {
         const char *home = getenv("HOME");
+#ifdef _WIN32
+        if (!home || !*home) home = getenv("USERPROFILE");
+#endif
         if (home && *home) {
             size_t hn = strlen(home);
             if (strncmp(t->cwd, home, hn) == 0 &&
-                (t->cwd[hn] == 0 || t->cwd[hn] == '/')) {
+                (t->cwd[hn] == 0 || t->cwd[hn] == '/' || t->cwd[hn] == '\\')) {
                 if (t->cwd[hn] == 0) return "~";
             }
         }
         if (strcmp(t->cwd, "/") == 0) return "/";
-        const char *base = strrchr(t->cwd, '/');
+        const char *b1 = strrchr(t->cwd, '/');
+        const char *b2 = strrchr(t->cwd, '\\');
+        const char *base = (b1 && b2) ? (b1 > b2 ? b1 : b2) : (b1 ? b1 : b2);
         if (base) return base + 1;
         return t->cwd;
     }
@@ -304,7 +204,7 @@ static const char *tab_label(const Tab *t) {
 /* ---------- Tab bar UI ---------- */
 
 typedef struct {
-    int tab_idx;    /* -1 if not on a tab */
+    int tab_idx;
     bool on_close;
     bool on_plus;
 } TabBarHit;
@@ -332,7 +232,6 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
 }
 
 static void draw_tab_bar(Renderer *r, int win_w) {
-    /* Bar background. */
     DrawRectangle(0, 0, win_w, TAB_BAR_H, (Color){24, 24, 32, 255});
     DrawRectangle(0, TAB_BAR_H - 1, win_w, 1, (Color){60, 60, 75, 255});
 
@@ -346,28 +245,23 @@ static void draw_tab_bar(Renderer *r, int win_w) {
         Color bg = active ? (Color){46, 52, 70, 255} : (Color){28, 32, 44, 255};
         Color fg = active ? (Color){230, 230, 240, 255} : (Color){150, 150, 165, 255};
         DrawRectangle(x, 0, tw, TAB_BAR_H, bg);
-        if (active) {
-            DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
-        }
-        /* Tab title (scissored so it doesn't bleed into the close X). */
+        if (active) DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
+
         const char *title = tab_label(g_tabs[i]);
         BeginScissorMode(x + 8, 0, tw - TAB_CLOSE_W - 12, TAB_BAR_H);
         Vector2 tsz = MeasureTextEx(*f, title, fs, 0);
         Vector2 tp  = { x + 10, (TAB_BAR_H - tsz.y) / 2.0f };
         DrawTextEx(*f, title, tp, fs, 0, fg);
         EndScissorMode();
-        /* Close X */
         const char *cross = "x";
         Vector2 csz = MeasureTextEx(*f, cross, fs, 0);
         DrawTextEx(*f, cross,
                    (Vector2){ x + tw - TAB_CLOSE_W / 2 - csz.x / 2,
                               (TAB_BAR_H - csz.y) / 2.0f },
                    fs, 0, fg);
-        /* Separator between tabs (skip before first). */
         if (i > 0) DrawLine(x, 4, x, TAB_BAR_H - 4, (Color){60, 60, 75, 255});
     }
 
-    /* Plus button on the right. */
     int plus_x = win_w - TAB_PLUS_W;
     DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){28, 32, 44, 255});
     const char *plus = "+";
@@ -378,7 +272,7 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                18, 0, (Color){200, 200, 215, 255});
 }
 
-/* ---------- Cmd / Ctrl helpers ---------- */
+/* ---------- Modifier helpers ---------- */
 
 static bool ui_key_down(void) {
 #if defined(__APPLE__)
@@ -397,7 +291,7 @@ static void usage(void) {
            "  --size N        font size in points (default 20)\n"
            "  --cols N        initial cols (default 100)\n"
            "  --rows N        initial rows (default 30)\n"
-           "\nKeys:\n"
+           "\nKeys (Cmd on macOS, Ctrl on Linux/Windows):\n"
            "  Cmd + T           open a new tab\n"
            "  Cmd + W           close the current tab\n"
            "  Cmd + 1..9        switch to tab N\n"
@@ -424,7 +318,9 @@ int main(int argc, char **argv) {
     if (init_cols < 20) init_cols = 20;
     if (init_rows < 5)  init_rows = 5;
 
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
     SetTraceLogLevel(LOG_WARNING);
@@ -457,7 +353,6 @@ int main(int argc, char **argv) {
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
-        /* Resize — apply to every tab. */
         int content_rows = (win_h_now - TAB_BAR_H) / r.cell_h;
         int content_cols = win_w_now / r.cell_w;
         if (content_cols < 1) content_cols = 1;
@@ -466,41 +361,34 @@ int main(int argc, char **argv) {
             if (screen_cols(g_tabs[i]->scr) != content_cols ||
                 screen_rows(g_tabs[i]->scr) != content_rows) {
                 screen_resize(g_tabs[i]->scr, content_cols, content_rows);
-                pty_resize(&g_tabs[i]->pty, content_cols, content_rows);
+                pty_resize(g_tabs[i]->pty, content_cols, content_rows);
             }
         }
 
-        /* Read from every PTY, not just the active one, so background tabs
-           stay up-to-date. */
+        /* Drain each PTY so background tabs stay live. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
             for (int iter = 0; iter < 32; iter++) {
-                ssize_t n = read(t->pty.fd, readbuf, sizeof(readbuf));
+                int n = pty_read(t->pty, readbuf, sizeof(readbuf));
                 if (n > 0) { screen_feed(t->scr, readbuf, (size_t)n); continue; }
-                if (n == 0) { t->dead = true; break; }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                if (errno == EINTR) continue;
-                t->dead = true; break;
+                if (n < 0) { t->dead = true; }
+                break;
             }
-            int status;
-            pid_t w = waitpid(t->pty.pid, &status, WNOHANG);
-            if (w == t->pty.pid) t->dead = true;
+            if (!pty_alive(t->pty)) t->dead = true;
         }
-        /* Reap dead tabs (iterate backwards to keep indices stable). */
         for (int i = g_num_tabs - 1; i >= 0; i--) {
             if (g_tabs[i]->dead) tab_close(i);
         }
         if (g_num_tabs == 0) break;
 
-        /* Refresh each tab's CWD a few times per second so the label tracks
-           `cd` without any shell-side cooperation. */
+        /* CWD label refresh (no-op on Windows — pty_cwd returns false). */
         double now = GetTime();
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
             if (now - t->cwd_poll_at < 0.3) continue;
             t->cwd_poll_at = now;
             char buf[PATH_MAX];
-            if (pid_cwd(t->pty.pid, buf, sizeof(buf)) &&
+            if (pty_cwd(t->pty, buf, sizeof(buf)) &&
                 strcmp(buf, t->cwd) != 0) {
                 strncpy(t->cwd, buf, sizeof(t->cwd) - 1);
                 t->cwd[sizeof(t->cwd) - 1] = 0;
@@ -509,22 +397,16 @@ int main(int argc, char **argv) {
         }
 
         Tab *cur = active_tab();
-
-        /* Tab-bar mouse and content-area selection both need the pointer. */
         Vector2 mp = GetMousePosition();
         bool in_tab_bar = (mp.y < TAB_BAR_H);
 
         if (in_tab_bar) {
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 TabBarHit h = tab_bar_hit_test(win_w_now, (int)mp.x, (int)mp.y);
-                if (h.on_plus) {
-                    tab_open(content_cols, content_rows);
-                } else if (h.tab_idx >= 0) {
-                    if (h.on_close) {
-                        tab_close(h.tab_idx);
-                    } else {
-                        g_active = h.tab_idx;
-                    }
+                if (h.on_plus) tab_open(content_cols, content_rows);
+                else if (h.tab_idx >= 0) {
+                    if (h.on_close) tab_close(h.tab_idx);
+                    else g_active = h.tab_idx;
                 }
                 cur = active_tab();
             }
@@ -544,12 +426,9 @@ int main(int argc, char **argv) {
                 cur->last_click_time = t;
                 cur->last_click_col = mcol;
                 cur->last_click_row = mrow;
-                if (cur->click_count == 2) {
-                    select_word(cur->scr, &cur->sel, mcol, mrow);
-                } else if (cur->click_count >= 3) {
-                    select_line(cur->scr, &cur->sel, mrow);
-                    cur->click_count = 3;
-                } else {
+                if (cur->click_count == 2)      select_word(cur->scr, &cur->sel, mcol, mrow);
+                else if (cur->click_count >= 3) { select_line(cur->scr, &cur->sel, mrow); cur->click_count = 3; }
+                else {
                     cur->sel.active = true;
                     cur->sel.dragging = true;
                     cur->sel.a_col = cur->sel.b_col = mcol;
@@ -570,24 +449,17 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Tab keyboard shortcuts — check before input_poll. Cmd+letter chords
-           don't produce GetCharPressed events on macOS so input_poll won't
-           also send these bytes to the shell. */
+        /* Tab shortcuts (pre-input so Cmd/Ctrl+T/W/digit don't slip into the shell). */
         if (ui_key_down()) {
-            if (IsKeyPressed(KEY_T)) {
-                tab_open(content_cols, content_rows);
-                cur = active_tab();
-            } else if (IsKeyPressed(KEY_W)) {
+            if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
+            else if (IsKeyPressed(KEY_W)) {
                 tab_close(g_active);
                 if (g_num_tabs == 0) break;
                 cur = active_tab();
-            } else if (IsKeyPressed(KEY_LEFT_BRACKET)) {
-                g_active = (g_active - 1 + g_num_tabs) % g_num_tabs;
-                cur = active_tab();
-            } else if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
-                g_active = (g_active + 1) % g_num_tabs;
-                cur = active_tab();
-            } else {
+            }
+            else if (IsKeyPressed(KEY_LEFT_BRACKET))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
+            else if (IsKeyPressed(KEY_RIGHT_BRACKET)) { g_active = (g_active + 1) % g_num_tabs; cur = active_tab(); }
+            else {
                 for (int k = 0; k < 9; k++) {
                     if (IsKeyPressed(KEY_ONE + k)) {
                         if (k < g_num_tabs) { g_active = k; cur = active_tab(); }
@@ -599,14 +471,13 @@ int main(int argc, char **argv) {
 
         if (!cur) break;
 
-        /* Input + clipboard + font chords — all targeted at the active tab. */
         InputActions acts;
         size_t in_n = input_poll(cur->scr, inputbuf, sizeof(inputbuf), &acts);
         if (acts.scroll_rows != 0) screen_scroll_view(cur->scr, acts.scroll_rows);
         if (acts.copy) copy_selection(cur->scr, &cur->sel);
         if (acts.paste) {
             const char *t = GetClipboardText();
-            if (t && *t) pty_write_all(&cur->pty, (const uint8_t *)t, strlen(t));
+            if (t && *t) pty_write(cur->pty, (const uint8_t *)t, strlen(t));
         }
         if (acts.font_delta != 100) {
             int old = r.font_size;
@@ -619,21 +490,18 @@ int main(int argc, char **argv) {
                 if (nr < 1) nr = 1;
                 for (int i = 0; i < g_num_tabs; i++) {
                     screen_resize(g_tabs[i]->scr, nc, nr);
-                    pty_resize(&g_tabs[i]->pty, nc, nr);
+                    pty_resize(g_tabs[i]->pty, nc, nr);
                 }
                 SetWindowMinSize(r.cell_w * 20, r.cell_h * 5 + TAB_BAR_H);
             }
         }
         if (in_n > 0) {
             screen_scroll_reset(cur->scr);
-            pty_write_all(&cur->pty, inputbuf, in_n);
+            pty_write(cur->pty, inputbuf, in_n);
             if (cur->sel.active && !cur->sel.dragging) cur->sel.active = false;
         }
 
         if (cur->title_dirty) {
-            /* Prefer the shell's OSC title for the window title so users
-               who set one via PROMPT_COMMAND still see it; otherwise
-               fall back to the same cwd-based label the tab shows. */
             SetWindowTitle(cur->title[0] ? cur->title : tab_label(cur));
             cur->title_dirty = false;
         }
@@ -646,7 +514,6 @@ int main(int argc, char **argv) {
         EndDrawing();
     }
 
-    /* Shut down any remaining tabs. */
     for (int i = g_num_tabs - 1; i >= 0; i--) tab_close(i);
     renderer_shutdown(&r);
     CloseWindow();

@@ -26,7 +26,7 @@ ifeq ($(UNAME_S),Linux)
   LDLIBS += -lutil -lpthread -ldl
 endif
 
-SRCS := src/main.c src/screen.c src/render.c src/input.c
+SRCS := src/main.c src/screen.c src/render.c src/input.c src/pty_unix.c
 OBJS := $(SRCS:.c=.o) $(EMOJI_OBJ)
 
 all: rbterm
