@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <errno.h>
 
 #ifndef _WIN32
 #include <signal.h>
@@ -15,6 +18,74 @@
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
+
+/* ---------- App-wide settings ---------- */
+
+typedef struct {
+    bool log_enabled;
+    char log_dir[PATH_MAX];
+} AppSettings;
+static AppSettings g_app_settings;
+
+static void expand_home_path(const char *in, char *out, size_t cap);
+
+static void app_settings_init(void) {
+    g_app_settings.log_enabled = false;
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (!home || !*home) home = getenv("USERPROFILE");
+#endif
+    if (home && *home) {
+        snprintf(g_app_settings.log_dir, sizeof(g_app_settings.log_dir),
+                 "%s/.rbterm/logs", home);
+    } else {
+        strncpy(g_app_settings.log_dir, "./rbterm-logs",
+                sizeof(g_app_settings.log_dir) - 1);
+    }
+}
+
+/* Expand a leading "~/" using $HOME / %USERPROFILE%. */
+static void expand_home_path(const char *in, char *out, size_t cap) {
+    if (cap == 0) return;
+    out[0] = 0;
+    if (!in) return;
+    if (in[0] == '~' && (in[1] == '/' || in[1] == 0 || in[1] == '\\')) {
+        const char *home = getenv("HOME");
+#ifdef _WIN32
+        if (!home || !*home) home = getenv("USERPROFILE");
+#endif
+        if (home && *home) {
+            snprintf(out, cap, "%s%s", home, in + 1);
+            return;
+        }
+    }
+    strncpy(out, in, cap - 1);
+    out[cap - 1] = 0;
+}
+
+/* mkdir -p equivalent (portable-ish). */
+static void mkdir_p(const char *path) {
+    if (!path || !*path) return;
+    char tmp[PATH_MAX];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            char c = *p; *p = 0;
+#ifdef _WIN32
+            (void)_mkdir(tmp);
+#else
+            (void)mkdir(tmp, 0700);
+#endif
+            *p = c;
+        }
+    }
+#ifdef _WIN32
+    (void)_mkdir(tmp);
+#else
+    (void)mkdir(tmp, 0700);
+#endif
+}
 
 /* ---------- Tabs ---------- */
 
@@ -30,6 +101,8 @@ typedef struct {
     int last_click_col, last_click_row;
     char cwd[PATH_MAX];
     double cwd_poll_at;
+    FILE *log_fp;                /* session log file, NULL when disabled */
+    char  log_path[PATH_MAX];
 } Tab;
 
 #define MAX_TABS 16
@@ -38,6 +111,7 @@ typedef struct {
 #define TAB_MAX_W 240
 #define TAB_CLOSE_W 22
 #define TAB_PLUS_W  30
+#define TAB_SSH_W   48
 
 static Tab *g_tabs[MAX_TABS];
 static int g_num_tabs = 0;
@@ -47,18 +121,21 @@ static int g_active = 0;
    keystrokes edit form fields and mouse clicks focus them instead of
    going to the active tab. Layout is computed on the fly in
    ssh_form_layout() so draw and hit-test share one source of truth. */
-typedef enum { UI_NORMAL = 0, UI_SSH_FORM } UiMode;
+typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS } UiMode;
 typedef enum {
-    F_HOST = 0, F_PORT, F_USER, F_KEY,
+    F_HOST = 0, F_PORT, F_USER, F_PASS, F_KEY,
     F_CONNECT, F_CANCEL,
     F_COUNT
 } SshField;
+#define F_TEXT_FIELDS 5    /* host, port, user, pass, key */
 typedef struct {
     char host[256];
     char port[16];
     char user[96];
+    char pass[256];
     char key[512];
     int  focus;              /* SshField */
+    bool sel_all;            /* focused text field's contents are fully selected */
     char error[256];
 } SshForm;
 static UiMode  g_ui_mode = UI_NORMAL;
@@ -70,7 +147,7 @@ typedef struct {
 
 typedef struct {
     Rect modal;
-    Rect field[4];  /* host, port, user, key */
+    Rect field[F_TEXT_FIELDS];  /* host, port, user, pass, key */
     Rect connect;
     Rect cancel;
 } SshFormLayout;
@@ -80,6 +157,59 @@ static Tab *active_tab(void) {
     if (g_active < 0) g_active = 0;
     if (g_active >= g_num_tabs) g_active = g_num_tabs - 1;
     return g_tabs[g_active];
+}
+
+/* Open a fresh per-tab log file under the current log directory. Silent
+   on failure so the user's session isn't derailed by a bad path. */
+static void tab_log_open(Tab *t) {
+    if (!t || t->log_fp) return;
+    if (!g_app_settings.log_enabled) return;
+    if (!g_app_settings.log_dir[0]) return;
+    char dir[PATH_MAX];
+    expand_home_path(g_app_settings.log_dir, dir, sizeof(dir));
+    mkdir_p(dir);
+    time_t now = time(NULL);
+    struct tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &now);
+    struct tm *lt = &tm_buf;
+#else
+    struct tm *lt = localtime_r(&now, &tm_buf);
+#endif
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", lt);
+    /* Slot number stabilises the filename if multiple tabs open in the
+       same second. */
+    int slot = 0;
+    for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { slot = i; break; }
+    snprintf(t->log_path, sizeof(t->log_path), "%s/rbterm-%s-tab%d.log",
+             dir, stamp, slot);
+    t->log_fp = fopen(t->log_path, "ab");
+    if (!t->log_fp) {
+        t->log_path[0] = 0;
+        fprintf(stderr, "rbterm: can't open log %s: %s\n",
+                t->log_path, strerror(errno));
+    }
+}
+
+static void tab_log_close(Tab *t) {
+    if (!t) return;
+    if (t->log_fp) { fclose(t->log_fp); t->log_fp = NULL; }
+}
+
+static void tab_log_write(Tab *t, const uint8_t *buf, size_t n) {
+    if (!t || !t->log_fp || n == 0) return;
+    fwrite(buf, 1, n, t->log_fp);
+    fflush(t->log_fp);
+}
+
+/* (Re-)open logs on every tab based on the current setting. Called when
+   the user toggles "log to file" in Settings. */
+static void refresh_tab_logs(void) {
+    for (int i = 0; i < g_num_tabs; i++) {
+        if (g_app_settings.log_enabled) tab_log_open(g_tabs[i]);
+        else                            tab_log_close(g_tabs[i]);
+    }
 }
 
 /* ---------- IO glue: screen callbacks route to owning tab's PTY ---------- */
@@ -110,11 +240,13 @@ static Tab *tab_open(int cols, int rows) {
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
     g_num_tabs++;
+    tab_log_open(t);
     return t;
 }
 
 static Tab *tab_open_ssh(const char *user, const char *host, int port,
-                         const char *keyfile, int cols, int rows,
+                         const char *password, const char *keyfile,
+                         int cols, int rows,
                          char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
     Tab *t = calloc(1, sizeof(Tab));
@@ -132,7 +264,8 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     snprintf(t->title, sizeof(t->title), "%s", t->cwd);
     t->last_click_time = -1.0;
     t->last_click_col = t->last_click_row = -1;
-    t->pty = pty_open_ssh(user, host, port, keyfile, cols, rows, err, errsz);
+    t->pty = pty_open_ssh(user, host, port, password, keyfile,
+                          cols, rows, err, errsz);
     if (!t->pty) { free(t); return NULL; }
     ScreenIO io = { .user = t, .write = io_write_cb,
                     .set_title = io_set_title_cb, .bell = io_bell_cb };
@@ -140,12 +273,14 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
     g_num_tabs++;
+    tab_log_open(t);
     return t;
 }
 
 static void tab_close(int idx) {
     if (idx < 0 || idx >= g_num_tabs) return;
     Tab *t = g_tabs[idx];
+    tab_log_close(t);
     pty_close(t->pty);
     screen_free(t->scr);
     free(t);
@@ -269,10 +404,11 @@ typedef struct {
     int tab_idx;
     bool on_close;
     bool on_plus;
+    bool on_ssh;
 } TabBarHit;
 
 static int tab_width_for(int win_w) {
-    int avail = win_w - TAB_PLUS_W;
+    int avail = win_w - TAB_PLUS_W - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -281,10 +417,12 @@ static int tab_width_for(int win_w) {
 }
 
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false };
+    TabBarHit h = { -1, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     int plus_x = win_w - TAB_PLUS_W;
+    int ssh_x  = plus_x - TAB_SSH_W;
     if (mx >= plus_x) { h.on_plus = true; return h; }
+    if (mx >= ssh_x)  { h.on_ssh  = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = mx / tw;
     if (idx < 0 || idx >= g_num_tabs) return h;
@@ -325,7 +463,21 @@ static void draw_tab_bar(Renderer *r, int win_w) {
     }
 
     int plus_x = win_w - TAB_PLUS_W;
+    int ssh_x  = plus_x - TAB_SSH_W;
+
+    /* "ssh" button. */
+    DrawRectangle(ssh_x, 0, TAB_SSH_W, TAB_BAR_H, (Color){28, 32, 44, 255});
+    DrawLine(ssh_x, 4, ssh_x, TAB_BAR_H - 4, (Color){60, 60, 75, 255});
+    const char *ssh_label = "ssh";
+    Vector2 ssz = MeasureTextEx(*f, ssh_label, 13, 0);
+    DrawTextEx(*f, ssh_label,
+               (Vector2){ ssh_x + (TAB_SSH_W - ssz.x) / 2.0f,
+                          (TAB_BAR_H - ssz.y) / 2.0f },
+               13, 0, (Color){125, 207, 255, 255});
+
+    /* "+" button. */
     DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){28, 32, 44, 255});
+    DrawLine(plus_x, 4, plus_x, TAB_BAR_H - 4, (Color){60, 60, 75, 255});
     const char *plus = "+";
     Vector2 psz = MeasureTextEx(*f, plus, 18, 0);
     DrawTextEx(*f, plus,
@@ -356,6 +508,7 @@ static char *form_buf(int field, size_t *cap) {
     case F_HOST: *cap = sizeof(g_form.host); return g_form.host;
     case F_PORT: *cap = sizeof(g_form.port); return g_form.port;
     case F_USER: *cap = sizeof(g_form.user); return g_form.user;
+    case F_PASS: *cap = sizeof(g_form.pass); return g_form.pass;
     case F_KEY:  *cap = sizeof(g_form.key);  return g_form.key;
     default: *cap = 0; return NULL;
     }
@@ -363,7 +516,7 @@ static char *form_buf(int field, size_t *cap) {
 
 static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     SshFormLayout L = {0};
-    int w = 600, h = 320;
+    int w = 600, h = 360;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -377,7 +530,7 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     int field_w = w - 130 - pad;
     int field_h = 28;
     int y = L.modal.y + title_h + 10;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < F_TEXT_FIELDS; i++) {
         L.field[i].x = field_x;
         L.field[i].y = y;
         L.field[i].w = field_w;
@@ -414,9 +567,12 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.user[0] ? g_form.user : NULL,
         g_form.host,
         port,
-        g_form.key[0] ? g_form.key : NULL,
+        g_form.pass[0] ? g_form.pass : NULL,
+        g_form.key[0]  ? g_form.key  : NULL,
         cols, rows, err, sizeof(err));
     if (t) {
+        /* Clear the password from memory as soon as we no longer need it. */
+        memset(g_form.pass, 0, sizeof(g_form.pass));
         g_ui_mode = UI_NORMAL;
     } else {
         strncpy(g_form.error, err[0] ? err : "connection failed",
@@ -427,6 +583,7 @@ static void ssh_form_submit(int cols, int rows) {
 
 static void ssh_form_advance_focus(int delta) {
     g_form.focus = (g_form.focus + delta + F_COUNT) % F_COUNT;
+    g_form.sel_all = false;
 }
 
 static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
@@ -449,8 +606,22 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
 
 static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    bool cmd   = IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#else
+    bool cmd   = false;
+#endif
+    bool mod   = ctrl || cmd;
+    bool is_text_field = (g_form.focus >= F_HOST && g_form.focus <= F_KEY);
 
     if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
+
+    /* Select-all (Ctrl+A / Cmd+A). */
+    if (mod && IsKeyPressed(KEY_A)) {
+        if (is_text_field) g_form.sel_all = true;
+        return;
+    }
 
     if (IsKeyPressed(KEY_TAB) || IsKeyPressedRepeat(KEY_TAB)) {
         ssh_form_advance_focus(shift ? -1 : +1);
@@ -466,8 +637,13 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
         ssh_form_advance_focus(+1);
         return;
     }
+    /* Left/right arrow in a text field just clears any select-all marker. */
+    if (is_text_field && (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT) ||
+                          IsKeyPressed(KEY_HOME) || IsKeyPressed(KEY_END))) {
+        g_form.sel_all = false;
+    }
 
-    /* Clicks on Connect/Cancel via space while they're focused. */
+    /* Space on Connect / Cancel acts as a click. */
     if (g_form.focus == F_CONNECT && IsKeyPressed(KEY_SPACE)) {
         ssh_form_submit(cols, rows); return;
     }
@@ -475,18 +651,34 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
         g_ui_mode = UI_NORMAL; return;
     }
 
-    /* Text edit the focused field (only real text fields). */
-    if (g_form.focus >= F_HOST && g_form.focus <= F_KEY) {
+    /* Text edit the focused text field. */
+    if (is_text_field) {
         size_t cap;
         char *buf = form_buf(g_form.focus, &cap);
         int len = (int)strlen(buf);
+
         if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
-            if (len > 0) { buf[len - 1] = 0; g_form.error[0] = 0; }
+            if (g_form.sel_all) {
+                memset(buf, 0, cap);
+                g_form.sel_all = false;
+            } else if (len > 0) {
+                buf[len - 1] = 0;
+            }
+            g_form.error[0] = 0;
         }
+
         int cp;
         while ((cp = GetCharPressed()) != 0) {
+            /* Swallow characters generated alongside a modifier chord
+               (e.g. the 'a' from Cmd+A) so they don't land in the field. */
+            if (mod) continue;
             if (cp < 32 || cp >= 127) continue;
             if (g_form.focus == F_PORT && !(cp >= '0' && cp <= '9')) continue;
+            if (g_form.sel_all) {
+                memset(buf, 0, cap);
+                len = 0;
+                g_form.sel_all = false;
+            }
             if (len + 1 >= (int)cap) continue;
             buf[len++] = (char)cp;
             buf[len] = 0;
@@ -511,37 +703,67 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                16, 0, (Color){230, 232, 240, 255});
 
     /* Fields. */
-    const char *labels[4]   = {"Host",         "Port",  "Username", "Key file"};
-    const char *hints[4]    = {"example.com",  "22",    getenv("USER"),
-                               "(default: ssh-agent + ~/.ssh/id_*)"};
-    const char *values[4]   = {g_form.host,    g_form.port, g_form.user, g_form.key};
+    const char *labels[F_TEXT_FIELDS] = {
+        "Host", "Port", "Username", "Password", "Key file"
+    };
+    const char *hints[F_TEXT_FIELDS]  = {
+        "example.com", "22", getenv("USER"),
+        "(leave blank to use key)",
+        "(default: ssh-agent + ~/.ssh/id_*)"
+    };
+    const char *values[F_TEXT_FIELDS] = {
+        g_form.host, g_form.port, g_form.user, g_form.pass, g_form.key
+    };
 
-    for (int i = 0; i < 4; i++) {
-        /* Label. */
+    char masked[256];
+    for (int i = 0; i < F_TEXT_FIELDS; i++) {
         DrawTextEx(*f, labels[i],
                    (Vector2){L.modal.x + 22, L.field[i].y + 7},
                    13, 0, (Color){180, 185, 200, 255});
-        /* Field box. */
+
         bool focused = g_form.focus == i;
         DrawRectangle(L.field[i].x, L.field[i].y, L.field[i].w, L.field[i].h,
                       (Color){22, 25, 34, 255});
         DrawRectangleLines(L.field[i].x, L.field[i].y, L.field[i].w, L.field[i].h,
                            focused ? (Color){125, 207, 255, 255}
                                    : (Color){70, 74, 90, 255});
-        /* Value or placeholder. */
-        const char *shown = values[i][0] ? values[i]
-                            : (hints[i] ? hints[i] : "");
-        Color tc = values[i][0]
-                   ? (Color){230, 232, 240, 255}
-                   : (Color){110, 115, 130, 255};
+
+        /* Mask password field as dots so onlookers don't get a freebie. */
+        const char *shown;
+        Color tc;
+        if (values[i][0]) {
+            if (i == F_PASS) {
+                int n = (int)strlen(values[i]);
+                if (n > (int)sizeof(masked) - 1) n = (int)sizeof(masked) - 1;
+                for (int k = 0; k < n; k++) masked[k] = '*';
+                masked[n] = 0;
+                shown = masked;
+            } else {
+                shown = values[i];
+            }
+            tc = (Color){230, 232, 240, 255};
+        } else {
+            shown = hints[i] ? hints[i] : "";
+            tc = (Color){110, 115, 130, 255};
+        }
+
         BeginScissorMode(L.field[i].x + 6, L.field[i].y,
                          L.field[i].w - 12, L.field[i].h);
+        /* Selection highlight when Ctrl/Cmd-A selected the whole field. */
+        if (focused && g_form.sel_all && values[i][0]) {
+            Vector2 ssz = MeasureTextEx(*f, shown, 14, 0);
+            int sw = (int)ssz.x + 4;
+            if (sw > L.field[i].w - 12) sw = L.field[i].w - 12;
+            DrawRectangle(L.field[i].x + 6, L.field[i].y + 4,
+                          sw, L.field[i].h - 8,
+                          (Color){64, 100, 150, 200});
+        }
         DrawTextEx(*f, shown,
                    (Vector2){L.field[i].x + 8, L.field[i].y + 7},
                    14, 0, tc);
-        if (focused && values[i][0] &&
+        if (focused && values[i][0] && !g_form.sel_all &&
             ((long long)(GetTime() * 2.0) & 1) == 0) {
-            Vector2 vsz = MeasureTextEx(*f, values[i], 14, 0);
+            Vector2 vsz = MeasureTextEx(*f, shown, 14, 0);
             DrawRectangle(L.field[i].x + 8 + (int)vsz.x + 1,
                           L.field[i].y + 6, 8, 16,
                           (Color){125, 207, 255, 255});
@@ -582,6 +804,260 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
 
     /* Footer hint. */
     DrawTextEx(*f, "Tab / Shift+Tab navigate   Enter connects   Esc cancels",
+               (Vector2){L.modal.x + 22, L.modal.y + L.modal.h - 22},
+               11, 0, (Color){110, 115, 130, 255});
+}
+
+/* ---------- Settings modal ----------
+ * Minimal today (just font size), but the intent is this is *the*
+ * preferences surface — new settings get an entry here rather than a
+ * one-off shortcut. Keep it boring and extensible. */
+
+static void settings_open(void) { g_ui_mode = UI_SETTINGS; }
+
+static void settings_apply_font_size(Renderer *r, int new_size) {
+    if (renderer_set_font_size(r, new_size)) {
+        int nc = GetScreenWidth()  / r->cell_w;
+        int nr = (GetScreenHeight() - TAB_BAR_H) / r->cell_h;
+        if (nc < 1) nc = 1;
+        if (nr < 1) nr = 1;
+        for (int i = 0; i < g_num_tabs; i++) {
+            screen_resize(g_tabs[i]->scr, nc, nr);
+            pty_resize(g_tabs[i]->pty, nc, nr);
+        }
+        SetWindowMinSize(r->cell_w * 20, r->cell_h * 5 + TAB_BAR_H);
+    }
+}
+
+typedef struct {
+    Rect modal;
+    Rect font_val;   /* current font size display */
+    Rect dec, inc;   /* font -/+ buttons */
+    Rect log_toggle; /* on/off button */
+    Rect log_dir;    /* editable text box with log directory */
+    Rect close;
+} SettingsLayout;
+
+static bool g_settings_dir_focus = false;
+static bool g_settings_dir_sel_all = false;
+
+static SettingsLayout settings_layout(int win_w, int win_h) {
+    SettingsLayout L = {0};
+    int w = 560, h = 300;
+    if (w > win_w - 40) w = win_w - 40;
+    if (h > win_h - 40) h = win_h - 40;
+    L.modal.x = (win_w - w) / 2;
+    L.modal.y = (win_h - h) / 2;
+    L.modal.w = w;
+    L.modal.h = h;
+
+    int btn = 32;
+    int font_row_y = L.modal.y + 70;
+    L.font_val = (Rect){ L.modal.x + w - 214, font_row_y, 66, btn };
+    L.dec      = (Rect){ L.modal.x + w - 138, font_row_y, btn, btn };
+    L.inc      = (Rect){ L.modal.x + w - 60,  font_row_y, btn, btn };
+
+    int log_row1_y = font_row_y + btn + 22;
+    L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
+
+    int log_row2_y = log_row1_y + btn + 10;
+    L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
+
+    int close_w = 90, close_h = 32;
+    L.close = (Rect){ L.modal.x + w - 22 - close_w,
+                      L.modal.y + h - 22 - close_h,
+                      close_w, close_h };
+    return L;
+}
+
+static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+    Vector2 mp = GetMousePosition();
+    int mx = (int)mp.x, my = (int)mp.y;
+    if (rect_hit(L.dec, mx, my))   { settings_apply_font_size(r, r->font_size - 1); return; }
+    if (rect_hit(L.inc, mx, my))   { settings_apply_font_size(r, r->font_size + 1); return; }
+    if (rect_hit(L.log_toggle, mx, my)) {
+        g_app_settings.log_enabled = !g_app_settings.log_enabled;
+        refresh_tab_logs();
+        return;
+    }
+    if (rect_hit(L.log_dir, mx, my)) {
+        g_settings_dir_focus = true;
+        g_settings_dir_sel_all = false;
+        return;
+    }
+    if (rect_hit(L.close, mx, my)) { g_ui_mode = UI_NORMAL; g_settings_dir_focus = false; return; }
+    /* Click elsewhere drops focus from the text input. */
+    g_settings_dir_focus = false;
+}
+
+static void settings_handle_keys(Renderer *r) {
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    bool cmd  = IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#else
+    bool cmd  = false;
+#endif
+    bool mod  = ctrl || cmd;
+
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        if (g_settings_dir_focus) { g_settings_dir_focus = false; return; }
+        g_ui_mode = UI_NORMAL; return;
+    }
+
+    if (g_settings_dir_focus) {
+        /* Text input on the log directory. */
+        if (mod && IsKeyPressed(KEY_A)) { g_settings_dir_sel_all = true; return; }
+        size_t len = strlen(g_app_settings.log_dir);
+        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+            if (g_settings_dir_sel_all) {
+                g_app_settings.log_dir[0] = 0;
+                g_settings_dir_sel_all = false;
+            } else if (len > 0) {
+                g_app_settings.log_dir[len - 1] = 0;
+            }
+        }
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+            /* Re-open logs against the (possibly new) path. */
+            if (g_app_settings.log_enabled) {
+                for (int i = 0; i < g_num_tabs; i++) tab_log_close(g_tabs[i]);
+                refresh_tab_logs();
+            }
+            g_settings_dir_focus = false;
+            return;
+        }
+        int cp;
+        while ((cp = GetCharPressed()) != 0) {
+            if (mod) continue;
+            if (cp < 32 || cp >= 127) continue;
+            if (g_settings_dir_sel_all) {
+                g_app_settings.log_dir[0] = 0;
+                len = 0;
+                g_settings_dir_sel_all = false;
+            }
+            if (len + 1 >= sizeof(g_app_settings.log_dir)) continue;
+            g_app_settings.log_dir[len++] = (char)cp;
+            g_app_settings.log_dir[len] = 0;
+        }
+        return;
+    }
+
+    /* Not editing the path — keyboard shortcuts adjust font size. */
+    if (IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP) ||
+        IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD))
+        settings_apply_font_size(r, r->font_size + 1);
+    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN) ||
+        IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT))
+        settings_apply_font_size(r, r->font_size - 1);
+    /* Space toggles logging when not editing the path. */
+    if (IsKeyPressed(KEY_SPACE)) {
+        g_app_settings.log_enabled = !g_app_settings.log_enabled;
+        refresh_tab_logs();
+    }
+}
+
+static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
+    DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
+    DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                  (Color){30, 34, 46, 255});
+    DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                       (Color){125, 207, 255, 220});
+    DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
+                  (Color){38, 42, 58, 255});
+
+    Font *f = (Font *)r->font_data;
+    DrawTextEx(*f, "Settings",
+               (Vector2){L.modal.x + 20, L.modal.y + 11},
+               16, 0, (Color){230, 232, 240, 255});
+
+    /* Font size row. */
+    DrawTextEx(*f, "Font size",
+               (Vector2){L.modal.x + 22, L.font_val.y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", r->font_size);
+    DrawRectangle(L.font_val.x, L.font_val.y, L.font_val.w, L.font_val.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.font_val.x, L.font_val.y, L.font_val.w, L.font_val.h,
+                       (Color){70, 74, 90, 255});
+    Vector2 vsz = MeasureTextEx(*f, buf, 16, 0);
+    DrawTextEx(*f, buf,
+               (Vector2){L.font_val.x + (L.font_val.w - vsz.x) / 2,
+                         L.font_val.y + (L.font_val.h - vsz.y) / 2},
+               16, 0, (Color){230, 232, 240, 255});
+
+    DrawRectangle(L.dec.x, L.dec.y, L.dec.w, L.dec.h, (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.dec.x, L.dec.y, L.dec.w, L.dec.h, (Color){125, 207, 255, 180});
+    Vector2 ms = MeasureTextEx(*f, "-", 18, 0);
+    DrawTextEx(*f, "-",
+               (Vector2){L.dec.x + (L.dec.w - ms.x) / 2,
+                         L.dec.y + (L.dec.h - ms.y) / 2},
+               18, 0, (Color){230, 232, 240, 255});
+    DrawRectangle(L.inc.x, L.inc.y, L.inc.w, L.inc.h, (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.inc.x, L.inc.y, L.inc.w, L.inc.h, (Color){125, 207, 255, 180});
+    Vector2 ps = MeasureTextEx(*f, "+", 18, 0);
+    DrawTextEx(*f, "+",
+               (Vector2){L.inc.x + (L.inc.w - ps.x) / 2,
+                         L.inc.y + (L.inc.h - ps.y) / 2},
+               18, 0, (Color){230, 232, 240, 255});
+
+    /* Session logging rows. */
+    DrawTextEx(*f, "Log session",
+               (Vector2){L.modal.x + 22, L.log_toggle.y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    bool on = g_app_settings.log_enabled;
+    Color tbg = on ? (Color){64, 120, 90, 255} : (Color){60, 60, 72, 255};
+    DrawRectangle(L.log_toggle.x, L.log_toggle.y, L.log_toggle.w, L.log_toggle.h, tbg);
+    DrawRectangleLines(L.log_toggle.x, L.log_toggle.y, L.log_toggle.w, L.log_toggle.h,
+                       (Color){125, 207, 255, 180});
+    const char *toggle_text = on ? "Logging: ON" : "Logging: OFF";
+    Vector2 tsz = MeasureTextEx(*f, toggle_text, 13, 0);
+    DrawTextEx(*f, toggle_text,
+               (Vector2){L.log_toggle.x + (L.log_toggle.w - tsz.x) / 2,
+                         L.log_toggle.y + (L.log_toggle.h - tsz.y) / 2},
+               13, 0, (Color){230, 232, 240, 255});
+
+    DrawTextEx(*f, "Log directory",
+               (Vector2){L.modal.x + 22, L.log_dir.y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    DrawRectangle(L.log_dir.x, L.log_dir.y, L.log_dir.w, L.log_dir.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.log_dir.x, L.log_dir.y, L.log_dir.w, L.log_dir.h,
+                       g_settings_dir_focus ? (Color){125, 207, 255, 255}
+                                            : (Color){70, 74, 90, 255});
+    BeginScissorMode(L.log_dir.x + 6, L.log_dir.y,
+                     L.log_dir.w - 12, L.log_dir.h);
+    if (g_settings_dir_focus && g_settings_dir_sel_all && g_app_settings.log_dir[0]) {
+        Vector2 ssz = MeasureTextEx(*f, g_app_settings.log_dir, 13, 0);
+        int sw = (int)ssz.x + 4;
+        if (sw > L.log_dir.w - 12) sw = L.log_dir.w - 12;
+        DrawRectangle(L.log_dir.x + 6, L.log_dir.y + 4, sw,
+                      L.log_dir.h - 8, (Color){64, 100, 150, 200});
+    }
+    DrawTextEx(*f, g_app_settings.log_dir,
+               (Vector2){L.log_dir.x + 8, L.log_dir.y + 8},
+               13, 0, (Color){230, 232, 240, 255});
+    if (g_settings_dir_focus && !g_settings_dir_sel_all &&
+        ((long long)(GetTime() * 2.0) & 1) == 0) {
+        Vector2 dsz = MeasureTextEx(*f, g_app_settings.log_dir, 13, 0);
+        DrawRectangle(L.log_dir.x + 8 + (int)dsz.x + 1,
+                      L.log_dir.y + 8, 8, 14,
+                      (Color){125, 207, 255, 255});
+    }
+    EndScissorMode();
+
+    /* Close button. */
+    DrawRectangle(L.close.x, L.close.y, L.close.w, L.close.h,
+                  (Color){48, 52, 66, 255});
+    DrawRectangleLines(L.close.x, L.close.y, L.close.w, L.close.h,
+                       (Color){150, 155, 170, 200});
+    Vector2 cs = MeasureTextEx(*f, "Close", 14, 0);
+    DrawTextEx(*f, "Close",
+               (Vector2){L.close.x + (L.close.w - cs.x) / 2,
+                         L.close.y + (L.close.h - cs.y) / 2},
+               14, 0, (Color){210, 215, 230, 255});
+
+    DrawTextEx(*f, "Up / Down adjust font   Space toggles logs   Esc closes",
                (Vector2){L.modal.x + 22, L.modal.y + L.modal.h - 22},
                11, 0, (Color){110, 115, 130, 255});
 }
@@ -632,6 +1108,8 @@ int main(int argc, char **argv) {
     }
     if (init_cols < 20) init_cols = 20;
     if (init_rows < 5)  init_rows = 5;
+
+    app_settings_init();
 
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -685,7 +1163,11 @@ int main(int argc, char **argv) {
             Tab *t = g_tabs[i];
             for (int iter = 0; iter < 32; iter++) {
                 int n = pty_read(t->pty, readbuf, sizeof(readbuf));
-                if (n > 0) { screen_feed(t->scr, readbuf, (size_t)n); continue; }
+                if (n > 0) {
+                    screen_feed(t->scr, readbuf, (size_t)n);
+                    tab_log_write(t, readbuf, (size_t)n);
+                    continue;
+                }
                 if (n < 0) { t->dead = true; }
                 break;
             }
@@ -719,6 +1201,7 @@ int main(int argc, char **argv) {
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 TabBarHit h = tab_bar_hit_test(win_w_now, (int)mp.x, (int)mp.y);
                 if (h.on_plus) tab_open(content_cols, content_rows);
+                else if (h.on_ssh) ssh_form_open();
                 else if (h.tab_idx >= 0) {
                     if (h.on_close) tab_close(h.tab_idx);
                     else g_active = h.tab_idx;
@@ -796,10 +1279,32 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Settings modal. */
+        if (g_ui_mode == UI_SETTINGS) {
+            SettingsLayout L = settings_layout(win_w_now, win_h_now);
+            settings_handle_mouse(&r, L);
+            settings_handle_keys(&r);
+            cur = active_tab();
+            if (!cur) break;
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            /* Layout may have changed if font was resized. */
+            L = settings_layout(win_w_now, win_h_now);
+            renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
+                          &cur->sel, TAB_BAR_H);
+            draw_settings(&r, win_w_now, win_h_now, L);
+            EndDrawing();
+            continue;
+        }
+
         /* Tab shortcuts (pre-input so Cmd/Ctrl+T/W/digit don't slip into the shell). */
         bool shift_held = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         if (ui_key_down()) {
-            if (shift_held && IsKeyPressed(KEY_T)) {
+            if (IsKeyPressed(KEY_COMMA)) {
+                settings_open();
+            }
+            else if (shift_held && IsKeyPressed(KEY_T)) {
                 ssh_form_open();
             }
             else if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }

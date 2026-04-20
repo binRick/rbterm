@@ -147,6 +147,41 @@ cmake --build build
   first fix was to add Menlo fallback, the second was to recognise
   Core Text does font substitution itself via `CTFontCreateForString`.
 
+## Settings modal
+
+`Cmd+,` opens the settings modal (`UI_SETTINGS`). This is *the* place
+preferences live — new user-facing options get an entry here rather
+than a one-off shortcut or CLI flag. Current controls:
+
+- **Font size** — live adjust via `+` / `-` buttons, or Up/Down / `=`/`-`
+  keys. Applies immediately through `renderer_set_font_size` and
+  resizes every tab's screen + PTY to fit.
+- **Logging** — toggle (button or Space key) to enable session logging.
+  When on, each tab opens an append file at
+  `<log_dir>/rbterm-<YYYYMMDD-HHMMSS>-tab<N>.log` and the main loop
+  calls `tab_log_write` with every byte read from the PTY. Log
+  directory is an editable text field with `$HOME` / `%USERPROFILE%`
+  tilde expansion; `mkdir_p` creates the tree on first write.
+
+The layout is computed once per frame in `settings_layout` so draw +
+hit-test share rects. Modifier chords (`Cmd+A` / `Ctrl+A` for select
+all in the directory field) are consumed so GetCharPressed doesn't
+leak the `a` into the field. `g_settings_dir_focus` gates whether the
+directory field owns keyboard input.
+
+### Adding a new setting
+
+1. Add the field to `AppSettings` in `main.c` (and `app_settings_init`
+   if it has a non-zero default).
+2. Add a `Rect` for it in `SettingsLayout`, place it in
+   `settings_layout`.
+3. Handle click + keyboard in `settings_handle_mouse` /
+   `settings_handle_keys`.
+4. Draw it in `draw_settings`.
+5. Wire any runtime side-effects (e.g. `refresh_tab_logs` for logging).
+
+Persisting settings between runs is still TODO — everything's in-memory.
+
 ## SSH
 
 - `src/pty_ssh.c` uses libssh. Cross-platform via the same dispatch

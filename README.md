@@ -54,8 +54,9 @@ how the OS, the shell, and a graphics library all meet.
 | Shortcut | Action |
 |----------|--------|
 | Cmd+T | New tab (local shell) |
-| Cmd+Shift+T | New tab over SSH (prompt for `user@host[:port]`) |
+| Cmd+Shift+T | New tab over SSH (PuTTY-style form) |
 | Cmd+W | Close tab |
+| Cmd+, | Settings (font size, session logging) |
 | Cmd+1..9 | Jump to tab N |
 | Cmd+[ / Cmd+] | Prev / next tab |
 | Cmd++ / Cmd+- / Cmd+0 | Grow / shrink / reset font |

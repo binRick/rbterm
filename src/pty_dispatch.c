@@ -19,10 +19,12 @@ Pty *pty_open(int cols, int rows) {
 }
 
 Pty *pty_open_ssh(const char *user, const char *host, int port,
-                  const char *keyfile, int cols, int rows,
+                  const char *password, const char *keyfile,
+                  int cols, int rows,
                   char *err, size_t errsz) {
     if (err && errsz) err[0] = 0;
-    void *impl = ssh_open_impl(user, host, port, keyfile, cols, rows, err, errsz);
+    void *impl = ssh_open_impl(user, host, port, password, keyfile,
+                               cols, rows, err, errsz);
     if (!impl) return NULL;
     Pty *p = calloc(1, sizeof(*p));
     if (!p) { ssh_close_impl(impl); return NULL; }

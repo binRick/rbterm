@@ -17,16 +17,19 @@ typedef struct Pty Pty;
 Pty *pty_open(int cols, int rows);
 
 /* Connect a PTY to a remote shell over SSH.
- *   user:    NULL/"" → $USER / $USERNAME.
- *   host:    required, e.g. "myserver.example.com".
- *   port:    <= 0 → 22.
- *   keyfile: NULL/"" → ssh_userauth_publickey_auto (agent + ~/.ssh/id_*);
- *            otherwise the explicit private-key path to use.
+ *   user:     NULL/"" → $USER / $USERNAME.
+ *   host:     required, e.g. "myserver.example.com".
+ *   port:     <= 0 → 22.
+ *   password: NULL/"" → skip password auth; otherwise tried first.
+ *   keyfile:  NULL/"" → ssh_userauth_publickey_auto (agent + ~/.ssh/id_*);
+ *             otherwise an explicit private-key path.
+ * Auth order: password (if set) → explicit key (if set) → publickey_auto.
  * On failure, returns NULL and writes a human-readable reason into `err`
  * (if non-NULL). Host keys are trust-on-first-use: unknown keys are
  * added to ~/.ssh/known_hosts; a *changed* key aborts. */
 Pty *pty_open_ssh(const char *user, const char *host, int port,
-                  const char *keyfile, int cols, int rows,
+                  const char *password, const char *keyfile,
+                  int cols, int rows,
                   char *err, size_t errsz);
 
 /* Kill (SIGHUP or TerminateProcess) + wait for child, release all

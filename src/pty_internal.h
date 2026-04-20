@@ -31,7 +31,8 @@ bool  local_cwd_impl(void *impl, char *out, size_t cap);
 
 /* SSH backend (src/pty_ssh.c, cross-platform via libssh). See pty.h. */
 void *ssh_open_impl(const char *user, const char *host, int port,
-                    const char *keyfile, int cols, int rows,
+                    const char *password, const char *keyfile,
+                    int cols, int rows,
                     char *err, size_t errsz);
 void  ssh_close_impl(void *impl);
 bool  ssh_alive_impl(void *impl);

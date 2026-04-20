@@ -53,7 +53,8 @@ static void expand_tilde(const char *in, char *out, size_t cap) {
 }
 
 void *ssh_open_impl(const char *user, const char *host, int port,
-                    const char *keyfile, int cols, int rows,
+                    const char *password, const char *keyfile,
+                    int cols, int rows,
                     char *err, size_t errsz) {
     if (!host || !*host) {
         set_err(err, errsz, "Host is required");
@@ -102,7 +103,14 @@ void *ssh_open_impl(const char *user, const char *host, int port,
     }
 
     int auth = SSH_AUTH_ERROR;
-    if (keyfile && *keyfile) {
+
+    /* 1. Password (if provided). */
+    if (password && *password) {
+        auth = ssh_userauth_password(p->session, NULL, password);
+    }
+
+    /* 2. Explicit private key. */
+    if (auth != SSH_AUTH_SUCCESS && keyfile && *keyfile) {
         char expanded[1024];
         expand_tilde(keyfile, expanded, sizeof(expanded));
         ssh_key priv = NULL;
@@ -116,13 +124,18 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         }
         auth = ssh_userauth_publickey(p->session, NULL, priv);
         ssh_key_free(priv);
-    } else {
+    }
+
+    /* 3. ssh-agent + default identities. */
+    if (auth != SSH_AUTH_SUCCESS && !(password && *password)) {
         auth = ssh_userauth_publickey_auto(p->session, NULL, NULL);
     }
+
     if (auth != SSH_AUTH_SUCCESS) {
         const char *msg = ssh_get_error(p->session);
         set_err(err, errsz, "authentication failed%s%s",
-                msg && *msg ? ": " : "", msg ? msg : "");
+                (msg && *msg) ? ": " : "",
+                msg ? msg : "");
         goto fail;
     }
 
