@@ -20,11 +20,35 @@
 
 #if defined(__APPLE__)
   #include <util.h>
+  #include <libproc.h>
 #elif defined(__linux__)
   #include <pty.h>
 #else
   #error "Unsupported platform (needs PTY support)"
 #endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 1024
+#endif
+
+static bool pid_cwd(pid_t pid, char *out, size_t out_sz) {
+    if (pid <= 0 || !out || out_sz == 0) return false;
+#if defined(__APPLE__)
+    struct proc_vnodepathinfo vpi;
+    int r = proc_pidinfo((int)pid, PROC_PIDVNODEPATHINFO, 0, &vpi, sizeof(vpi));
+    if (r <= 0) return false;
+    strncpy(out, vpi.pvi_cdir.vip_path, out_sz - 1);
+    out[out_sz - 1] = 0;
+    return out[0] != 0;
+#else
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/%d/cwd", (int)pid);
+    ssize_t n = readlink(link, out, out_sz - 1);
+    if (n <= 0) return false;
+    out[n] = 0;
+    return true;
+#endif
+}
 
 /* ---------- PTY ---------- */
 
@@ -105,6 +129,8 @@ typedef struct {
     int click_count;
     double last_click_time;
     int last_click_col, last_click_row;
+    char cwd[PATH_MAX];
+    double cwd_poll_at;
 } Tab;
 
 #define MAX_TABS 16
@@ -254,6 +280,27 @@ static void select_line(Screen *s, Selection *sel, int row) {
     sel->b_col = cols - 1; sel->b_row = row;
 }
 
+/* Label shown on a tab: prefer the shell's current working directory
+   (shortened to a basename, with $HOME rewritten to "~") over any OSC
+   title the shell might have set. Falls back to title, then "shell". */
+static const char *tab_label(const Tab *t) {
+    if (t->cwd[0]) {
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            size_t hn = strlen(home);
+            if (strncmp(t->cwd, home, hn) == 0 &&
+                (t->cwd[hn] == 0 || t->cwd[hn] == '/')) {
+                if (t->cwd[hn] == 0) return "~";
+            }
+        }
+        if (strcmp(t->cwd, "/") == 0) return "/";
+        const char *base = strrchr(t->cwd, '/');
+        if (base) return base + 1;
+        return t->cwd;
+    }
+    return t->title[0] ? t->title : "shell";
+}
+
 /* ---------- Tab bar UI ---------- */
 
 typedef struct {
@@ -303,8 +350,7 @@ static void draw_tab_bar(Renderer *r, int win_w) {
             DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
         }
         /* Tab title (scissored so it doesn't bleed into the close X). */
-        const char *title = g_tabs[i]->title;
-        if (!title[0]) title = "shell";
+        const char *title = tab_label(g_tabs[i]);
         BeginScissorMode(x + 8, 0, tw - TAB_CLOSE_W - 12, TAB_BAR_H);
         Vector2 tsz = MeasureTextEx(*f, title, fs, 0);
         Vector2 tp  = { x + 10, (TAB_BAR_H - tsz.y) / 2.0f };
@@ -446,6 +492,22 @@ int main(int argc, char **argv) {
         }
         if (g_num_tabs == 0) break;
 
+        /* Refresh each tab's CWD a few times per second so the label tracks
+           `cd` without any shell-side cooperation. */
+        double now = GetTime();
+        for (int i = 0; i < g_num_tabs; i++) {
+            Tab *t = g_tabs[i];
+            if (now - t->cwd_poll_at < 0.3) continue;
+            t->cwd_poll_at = now;
+            char buf[PATH_MAX];
+            if (pid_cwd(t->pty.pid, buf, sizeof(buf)) &&
+                strcmp(buf, t->cwd) != 0) {
+                strncpy(t->cwd, buf, sizeof(t->cwd) - 1);
+                t->cwd[sizeof(t->cwd) - 1] = 0;
+                if (i == g_active) t->title_dirty = true;
+            }
+        }
+
         Tab *cur = active_tab();
 
         /* Tab-bar mouse and content-area selection both need the pointer. */
@@ -569,7 +631,10 @@ int main(int argc, char **argv) {
         }
 
         if (cur->title_dirty) {
-            SetWindowTitle(cur->title);
+            /* Prefer the shell's OSC title for the window title so users
+               who set one via PROMPT_COMMAND still see it; otherwise
+               fall back to the same cwd-based label the tab shows. */
+            SetWindowTitle(cur->title[0] ? cur->title : tab_label(cur));
             cur->title_dirty = false;
         }
 
