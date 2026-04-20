@@ -11,7 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pwd.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -38,7 +40,7 @@ static bool pty_spawn_shell(Pty *out, int cols, int rows) {
     pid_t pid = forkpty(&master, NULL, NULL, &ws);
     if (pid < 0) { perror("forkpty"); return false; }
     if (pid == 0) {
-        // Child: reset signals, set env, exec shell.
+        // Child: reset signals, set env, chdir to $HOME, exec shell.
         signal(SIGCHLD, SIG_DFL);
         signal(SIGHUP,  SIG_DFL);
         signal(SIGINT,  SIG_DFL);
@@ -49,6 +51,17 @@ static bool pty_spawn_shell(Pty *out, int cols, int rows) {
         setenv("COLORTERM", "truecolor", 1);
         unsetenv("TERM_PROGRAM");
         unsetenv("TERM_SESSION_ID");
+
+        const char *home = getenv("HOME");
+        if (!home || !*home) {
+            struct passwd *pw = getpwuid(getuid());
+            if (pw && pw->pw_dir) home = pw->pw_dir;
+        }
+        if (home && *home) {
+            (void)chdir(home);
+            setenv("PWD", home, 1);
+        }
+
         const char *shell = getenv("SHELL");
         if (!shell || !*shell) shell = "/bin/bash";
         const char *argv0 = strrchr(shell, '/');
