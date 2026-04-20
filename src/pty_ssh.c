@@ -83,6 +83,10 @@ void *ssh_open_impl(const char *user, const char *host, int port,
     ssh_options_set(p->session, SSH_OPTIONS_PORT, &port);
     long timeout_s = 10;
     ssh_options_set(p->session, SSH_OPTIONS_TIMEOUT, &timeout_s);
+    /* Surface libssh's own warnings on stderr — run from a terminal
+       (./run.sh or open --stdout=/dev/stdout) to see them. */
+    int verbosity = SSH_LOG_WARNING;
+    ssh_options_set(p->session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
 
     if (ssh_connect(p->session) != SSH_OK) {
         set_err(err, errsz, "connect %s@%s:%d: %s",
@@ -104,15 +108,39 @@ void *ssh_open_impl(const char *user, const char *host, int port,
 
     int auth = SSH_AUTH_ERROR;
 
+    /* Track which methods we attempted so we can report something
+       concrete back to the user if nothing worked. */
+    char tried[1024];
+    size_t tried_len = 0;
+    #define TRIED(fmt, ...) do { \
+        int _w = snprintf(tried + tried_len, sizeof(tried) - tried_len, \
+                          (tried_len ? ", " fmt : fmt), ##__VA_ARGS__); \
+        if (_w > 0 && (size_t)_w < sizeof(tried) - tried_len) tried_len += (size_t)_w; \
+    } while (0)
+
+    /* Advertise "none" first so the server tells us which methods it
+       actually accepts — lets us skip auth types the server rejects. */
+    (void)ssh_userauth_none(p->session, NULL);
+
     /* 1. Password (if provided). */
     if (password && *password) {
+        TRIED("password");
         auth = ssh_userauth_password(p->session, NULL, password);
+        fprintf(stderr, "rbterm: ssh password auth => %s\n",
+                auth == SSH_AUTH_SUCCESS ? "ok" : ssh_get_error(p->session));
     }
 
-    /* 2. Explicit private key. */
+    /* 2. Explicit private key path. If the user typed a `.pub` path by
+          mistake, strip it — libssh wants the private key counterpart. */
     if (auth != SSH_AUTH_SUCCESS && keyfile && *keyfile) {
         char expanded[1024];
         expand_tilde(keyfile, expanded, sizeof(expanded));
+        size_t el = strlen(expanded);
+        if (el > 4 && strcmp(expanded + el - 4, ".pub") == 0) {
+            expanded[el - 4] = 0;
+            fprintf(stderr, "rbterm: stripped '.pub' from key path; "
+                            "using private key %s\n", expanded);
+        }
         ssh_key priv = NULL;
         int r = ssh_pki_import_privkey_file(expanded, NULL, NULL, NULL, &priv);
         if (r != SSH_OK || !priv) {
@@ -122,22 +150,76 @@ void *ssh_open_impl(const char *user, const char *host, int port,
                     ssh_get_error(p->session));
             goto fail;
         }
+        TRIED("key %s", expanded);
         auth = ssh_userauth_publickey(p->session, NULL, priv);
         ssh_key_free(priv);
+        fprintf(stderr, "rbterm: ssh explicit-key auth => %s\n",
+                auth == SSH_AUTH_SUCCESS ? "ok" : ssh_get_error(p->session));
     }
 
-    /* 3. ssh-agent + default identities. */
+    /* 3. ssh-agent (explicit so we can log what happened). */
     if (auth != SSH_AUTH_SUCCESS && !(password && *password)) {
-        auth = ssh_userauth_publickey_auto(p->session, NULL, NULL);
+        const char *sock = getenv("SSH_AUTH_SOCK");
+        if (sock && *sock) {
+            TRIED("ssh-agent");
+            auth = ssh_userauth_agent(p->session, NULL);
+            fprintf(stderr, "rbterm: ssh-agent auth (%s) => %s\n",
+                    sock,
+                    auth == SSH_AUTH_SUCCESS ? "ok" : ssh_get_error(p->session));
+        } else {
+            fprintf(stderr, "rbterm: SSH_AUTH_SOCK not set — skipping agent "
+                            "(GUI launches on macOS often lose this; try "
+                            "`./run.sh` from a login shell)\n");
+        }
+    }
+
+    /* 4. Each of the common default identity files, explicitly. Lets us
+          report "tried id_rsa" in the error and also works around edge
+          cases where ssh_userauth_publickey_auto silently skips a key. */
+    if (auth != SSH_AUTH_SUCCESS && !(password && *password)) {
+        static const char *defaults[] = {
+            "~/.ssh/id_ed25519",
+            "~/.ssh/id_ecdsa",
+            "~/.ssh/id_rsa",
+            "~/.ssh/id_dsa",
+            NULL,
+        };
+        for (int i = 0; defaults[i] && auth != SSH_AUTH_SUCCESS; i++) {
+            char path[1024];
+            expand_tilde(defaults[i], path, sizeof(path));
+            FILE *fp = fopen(path, "r");
+            if (!fp) continue;
+            fclose(fp);
+            ssh_key priv = NULL;
+            int r = ssh_pki_import_privkey_file(path, NULL, NULL, NULL, &priv);
+            if (r != SSH_OK || !priv) {
+                fprintf(stderr, "rbterm: %s: can't load (passphrase?)\n", path);
+                TRIED("%s [load failed]", defaults[i]);
+                continue;
+            }
+            TRIED("%s", defaults[i]);
+            auth = ssh_userauth_publickey(p->session, NULL, priv);
+            ssh_key_free(priv);
+            fprintf(stderr, "rbterm: %s => %s\n", path,
+                    auth == SSH_AUTH_SUCCESS ? "ok" : ssh_get_error(p->session));
+        }
     }
 
     if (auth != SSH_AUTH_SUCCESS) {
         const char *msg = ssh_get_error(p->session);
-        set_err(err, errsz, "authentication failed%s%s",
-                (msg && *msg) ? ": " : "",
-                msg ? msg : "");
+        if (tried_len > 0) {
+            set_err(err, errsz, "auth failed. Tried: %s%s%s",
+                    tried,
+                    (msg && *msg) ? ". Last error: " : "",
+                    msg ? msg : "");
+        } else {
+            set_err(err, errsz,
+                    "auth failed — no credentials available (no password, "
+                    "no key file, no ssh-agent, no ~/.ssh/id_*)");
+        }
         goto fail;
     }
+    #undef TRIED
 
     p->channel = ssh_channel_new(p->session);
     if (!p->channel) {
