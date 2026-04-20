@@ -1,14 +1,11 @@
 # rbterm
 
-A cross-platform terminal emulator written in C, rendered with **raylib**.
+<p align="center">
+  <img src="assets/icon.png" width="96" alt="rbterm icon"><br>
+  <em>A cross-platform terminal emulator written in C, rendered with <strong>raylib</strong>.</em>
+</p>
 
-<p align="center"><img src="assets/icon.png" width="128" alt="rbterm"></p>
-
-```
-           $ echo "rbterm lives here: $(pwd)"
-           rbterm lives here: ~/Desktop/repos/rbterm
-           $ █
-```
+<p align="center"><img src="docs/screenshot.png" alt="rbterm screenshot — two tabs, live CWD in the tab label, coloured ➜ prompt"></p>
 
 ## Why
 
