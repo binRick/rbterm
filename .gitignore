@@ -1,0 +1,12 @@
+build/
+rbterm
+rbterm.app/
+src/*.o
+tools/gen_icon
+tools/*.dSYM/
+*.dSYM/
+assets/rbterm.iconset/
+assets/rbterm.icns
+compile_commands.json
+.cache/
+.DS_Store
