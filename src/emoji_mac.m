@@ -13,10 +13,12 @@
 #include <string.h>
 
 bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
-                  uint8_t **out_rgba, int *out_w, int *out_h) {
+                  uint8_t **out_rgba, int *out_w, int *out_h,
+                  bool *out_colored) {
     if (out_rgba) *out_rgba = NULL;
     if (out_w) *out_w = 0;
     if (out_h) *out_h = 0;
+    if (out_colored) *out_colored = false;
     if (pixel_size < 8) pixel_size = 8;
     if (!font_name) font_name = "Apple Color Emoji";
 
@@ -111,8 +113,30 @@ bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
     CFRelease(best);
     CFRelease(str);
 
+    /* Classify the rasterized bitmap as colour vs. monochrome, and also
+       detect whether *anything* got drawn. If every non-transparent pixel
+       has roughly equal R/G/B, it's a vector glyph we can tint; otherwise
+       it's a baked colour bitmap (e.g. SBIX emoji). */
+    bool any_pixel = false;
+    bool coloured = false;
+    for (size_t i = 0; i < bytes; i += 4) {
+        uint8_t a = data[i + 3];
+        if (a < 8) continue;
+        any_pixel = true;
+        uint8_t r = data[i], g = data[i + 1], b = data[i + 2];
+        int d1 = (int)r - (int)g; if (d1 < 0) d1 = -d1;
+        int d2 = (int)r - (int)b; if (d2 < 0) d2 = -d2;
+        int d3 = (int)g - (int)b; if (d3 < 0) d3 = -d3;
+        if (d1 > 10 || d2 > 10 || d3 > 10) { coloured = true; break; }
+    }
+    if (!any_pixel) {
+        free(data);
+        return false;
+    }
+
     *out_rgba = data;
     *out_w = size;
     *out_h = size;
+    if (out_colored) *out_colored = coloured;
     return true;
 }

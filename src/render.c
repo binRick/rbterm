@@ -19,6 +19,7 @@ typedef struct {
     Texture2D tex;
     bool ok;
     bool attempted;
+    bool colored;   /* true: SBIX/colour emoji — don't tint; false: vector mask — tint with fg */
 } GlyphEntry;
 
 typedef struct {
@@ -59,9 +60,11 @@ static GlyphEntry *glyph_lookup(GlyphCache *c, uint32_t cp, int pixel_size) {
     e->cp = cp;
     e->ok = false;
     e->attempted = true;
+    e->colored = false;
     uint8_t *rgba = NULL;
     int w = 0, h = 0;
-    if (glyph_render(c->font_name, cp, pixel_size, &rgba, &w, &h) && rgba) {
+    bool colored = false;
+    if (glyph_render(c->font_name, cp, pixel_size, &rgba, &w, &h, &colored) && rgba) {
         Image img = {
             .data = rgba,
             .width = w, .height = h, .mipmaps = 1,
@@ -71,6 +74,7 @@ static GlyphEntry *glyph_lookup(GlyphCache *c, uint32_t cp, int pixel_size) {
         SetTextureFilter(e->tex, TEXTURE_FILTER_BILINEAR);
         free(rgba);
         e->ok = e->tex.id != 0;
+        e->colored = colored;
     }
     return e;
 }
@@ -366,19 +370,23 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
 
             bool main_has_glyph = !font_missing(c.cp);
 
-            /* Helper lambda-alike: draw a cached glyph texture at this cell,
-               returns false if nothing was drawn. */
-            #define DRAW_GLYPH(cache, tint) do {                                     \
+            /* Helper: draw a cached glyph texture. Tint with WHITE for
+               colour bitmap glyphs (preserves baked colours), or with the
+               cell's foreground for monochrome vector masks. */
+            #define DRAW_GLYPH(cache) do {                                           \
                 GlyphEntry *_e = glyph_lookup(&(cache), c.cp, emoji_px);             \
                 if (_e && _e->ok) {                                                  \
+                    Color _tint = _e->colored                                        \
+                        ? col_from_rgb(0xFFFFFF, alpha)                              \
+                        : col_from_rgb(fg, alpha);                                   \
                     float _dw = (float)(cw * span), _dh = (float)ch;                 \
                     float _s = _dh / (float)_e->tex.height;                          \
                     if ((float)_e->tex.width * _s > _dw) _s = _dw / (float)_e->tex.width; \
                     float _w = (float)_e->tex.width * _s, _h = (float)_e->tex.height * _s; \
                     Rectangle _src = {0, 0, (float)_e->tex.width, (float)_e->tex.height}; \
                     Rectangle _dst = { (float)(x * cw) + (_dw - _w) / 2.0f,          \
-                                       (float)(y * ch) + (_dh - _h) / 2.0f, _w, _h }; \
-                    DrawTexturePro(_e->tex, _src, _dst, (Vector2){0, 0}, 0.0f, tint);\
+                                       (float)(y * ch) + (_dh - _h) / 2.0f, _w, _h };\
+                    DrawTexturePro(_e->tex, _src, _dst, (Vector2){0, 0}, 0.0f, _tint);\
                     goto glyph_drawn;                                                \
                 }                                                                    \
             } while (0)
@@ -386,11 +394,11 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             /* Try emoji cache first for high-plane emoji (always), or for any
                codepoint the main font can't render. */
             if (c.cp >= 0x1F000 || !main_has_glyph) {
-                DRAW_GLYPH(g_emoji, col_from_rgb(0xFFFFFF, alpha));
+                DRAW_GLYPH(g_emoji);
             }
             /* Try Menlo fallback for anything the main font doesn't have. */
             if (!main_has_glyph) {
-                DRAW_GLYPH(g_fallback, col_from_rgb(fg, alpha));
+                DRAW_GLYPH(g_fallback);
                 /* Nothing in any font: visible placeholder. */
                 pos.x = (float)(x * cw);
                 pos.y = (float)(y * ch + glyph_y_offset);
