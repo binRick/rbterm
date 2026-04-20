@@ -289,14 +289,20 @@ static bool sel_contains(const Selection *sel, int col, int row) {
 }
 
 void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
-                   const Selection *sel) {
+                   const Selection *sel, int y_offset) {
     Font *f = as_font(r);
     int cols = screen_cols(s);
     int rows = screen_rows(s);
     int cw = r->cell_w, ch = r->cell_h;
 
-    // Clear background with default bg
-    ClearBackground(col_from_rgb(DEFAULT_BG, 1.0f));
+    /* Paint a full-screen backdrop in the default bg (the tab bar paints
+       over the top strip separately). */
+    DrawRectangle(0, y_offset, cols * cw, rows * ch, col_from_rgb(DEFAULT_BG, 1.0f));
+
+    Camera2D cam = {0};
+    cam.offset = (Vector2){0.0f, (float)y_offset};
+    cam.zoom = 1.0f;
+    BeginMode2D(cam);
 
     int cursor_vx = screen_cursor_x(s);
     int cursor_vy = screen_cursor_y(s) + screen_view_offset(s);
@@ -440,4 +446,6 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             DrawRectangle(W - 4, bar_y, 4, bar_h, (Color){200, 200, 200, 200});
         }
     }
+
+    EndMode2D();
 }

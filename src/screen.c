@@ -33,6 +33,9 @@ struct Screen {
 
     Cell *main;
     Cell *alt;
+    uint8_t *main_wrap;   /* size rows: main_wrap[y]=1 means row y ended
+                             by auto-wrapping into row y+1 (as opposed to a
+                             natural line terminator). Used by resize reflow. */
     bool on_alt;
 
     // Scrollback ring buffer: rows of `cols` cells
@@ -58,27 +61,104 @@ struct Screen {
     ScreenIO io;
 };
 
-/* ---------- Palette ---------- */
+/* ---------- Palette (mutable — can be set by OSC 4) ---------- */
 
-static uint32_t base16[16] = {
-    0x000000, 0xCC0000, 0x4E9A06, 0xC4A000,
-    0x3465A4, 0x75507B, 0x06989A, 0xD3D7CF,
-    0x555753, 0xEF2929, 0x8AE234, 0xFCE94F,
-    0x729FCF, 0xAD7FA8, 0x34E2E2, 0xEEEEEC,
-};
+static uint32_t g_palette[256];
+static bool g_palette_ready = false;
 
-static uint32_t palette256(int i) {
-    if (i < 16) return base16[i];
-    if (i < 232) {
+static void palette_reset_defaults(void) {
+    static const uint32_t base[16] = {
+        0x000000, 0xCC0000, 0x4E9A06, 0xC4A000,
+        0x3465A4, 0x75507B, 0x06989A, 0xD3D7CF,
+        0x555753, 0xEF2929, 0x8AE234, 0xFCE94F,
+        0x729FCF, 0xAD7FA8, 0x34E2E2, 0xEEEEEC,
+    };
+    for (int i = 0; i < 16; i++) g_palette[i] = base[i];
+    static const int lut[6] = {0, 95, 135, 175, 215, 255};
+    for (int i = 16; i < 232; i++) {
         int n = i - 16;
-        int r = (n / 36) % 6;
-        int g = (n / 6) % 6;
-        int b = n % 6;
-        static const int lut[6] = {0, 95, 135, 175, 215, 255};
-        return (lut[r] << 16) | (lut[g] << 8) | lut[b];
+        int r = (n / 36) % 6, gg = (n / 6) % 6, bb = n % 6;
+        g_palette[i] = (lut[r] << 16) | (lut[gg] << 8) | lut[bb];
     }
-    int v = 8 + (i - 232) * 10;
-    return (v << 16) | (v << 8) | v;
+    for (int i = 232; i < 256; i++) {
+        int v = 8 + (i - 232) * 10;
+        g_palette[i] = (v << 16) | (v << 8) | v;
+    }
+}
+
+static void palette_init_once(void) {
+    if (g_palette_ready) return;
+    palette_reset_defaults();
+    g_palette_ready = true;
+}
+
+static uint32_t pal(int i) {
+    palette_init_once();
+    if (i < 0 || i > 255) return DEFAULT_FG;
+    return g_palette[i];
+}
+
+/* Parse one OSC 4 colour spec: "#RGB" / "#RRGGBB" / "#RRRRGGGGBBBB"
+   or "rgb:R/G/B" with 1..4 hex digits each. Returns true + rgb. */
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static bool parse_color_spec(const char *s, uint32_t *out) {
+    if (!s || !*s) return false;
+    if (*s == '#') {
+        s++;
+        int n = (int)strlen(s);
+        if (n == 3 || n == 6 || n == 12) {
+            int dig = n / 3;
+            int r = 0, g = 0, b = 0;
+            for (int i = 0; i < dig; i++) {
+                int vr = hexval(s[i]);
+                int vg = hexval(s[i + dig]);
+                int vb = hexval(s[i + 2 * dig]);
+                if (vr < 0 || vg < 0 || vb < 0) return false;
+                r = (r << 4) | vr;
+                g = (g << 4) | vg;
+                b = (b << 4) | vb;
+            }
+            if (dig == 1) { r *= 0x11; g *= 0x11; b *= 0x11; }
+            else if (dig == 4) { r >>= 8; g >>= 8; b >>= 8; }
+            *out = ((uint32_t)(r & 0xff) << 16) | ((uint32_t)(g & 0xff) << 8) | (uint32_t)(b & 0xff);
+            return true;
+        }
+        return false;
+    }
+    if (strncmp(s, "rgb:", 4) == 0) {
+        s += 4;
+        int comps[3] = {0, 0, 0};
+        int ci = 0;
+        int v = 0, vdig = 0;
+        for (; *s && ci < 3; s++) {
+            if (*s == '/') {
+                if (vdig == 0) return false;
+                /* Scale to 8-bit */
+                int shift = (vdig - 1) * 4;
+                comps[ci++] = (v >> shift) & 0xff;
+                v = 0; vdig = 0;
+                if (ci == 3) break;
+            } else {
+                int h = hexval(*s);
+                if (h < 0) return false;
+                v = (v << 4) | h;
+                vdig++;
+            }
+        }
+        if (ci == 2 && vdig > 0) {
+            int shift = (vdig - 1) * 4;
+            comps[ci++] = (v >> shift) & 0xff;
+        }
+        if (ci != 3) return false;
+        *out = ((uint32_t)comps[0] << 16) | ((uint32_t)comps[1] << 8) | (uint32_t)comps[2];
+        return true;
+    }
+    return false;
 }
 
 /* ---------- Helpers ---------- */
@@ -100,6 +180,7 @@ static void clear_row(Screen *s, int y) {
     Cell b = blank_cell(s);
     Cell *r = row_ptr(s, y);
     for (int x = 0; x < s->cols; x++) r[x] = b;
+    if (!s->on_alt && s->main_wrap && y >= 0 && y < s->rows) s->main_wrap[y] = 0;
 }
 
 static void push_scrollback(Screen *s, const Cell *row) {
@@ -124,6 +205,11 @@ static void scroll_up_region(Screen *s, int top, int bot, int n) {
         memmove(base + top * s->cols,
                 base + (top + n) * s->cols,
                 sizeof(Cell) * (span - n) * s->cols);
+        if (!s->on_alt && s->main_wrap) {
+            memmove(s->main_wrap + top,
+                    s->main_wrap + top + n,
+                    (size_t)(span - n));
+        }
     }
     for (int i = 0; i < n; i++) clear_row(s, bot - i);
 }
@@ -137,6 +223,11 @@ static void scroll_down_region(Screen *s, int top, int bot, int n) {
         memmove(base + (top + n) * s->cols,
                 base + top * s->cols,
                 sizeof(Cell) * (span - n) * s->cols);
+        if (!s->on_alt && s->main_wrap) {
+            memmove(s->main_wrap + top + n,
+                    s->main_wrap + top,
+                    (size_t)(span - n));
+        }
     }
     for (int i = 0; i < n; i++) clear_row(s, top + i);
 }
@@ -180,6 +271,10 @@ static void put_cp(Screen *s, uint32_t cp) {
     bool wide = cp_is_wide(cp);
     if (s->cx >= s->cols) s->cx = s->cols - 1;
     if (s->wrap_next && s->autowrap) {
+        /* Mark the current row as having auto-wrapped so that a later
+           resize can rejoin it with its continuation. */
+        if (!s->on_alt && s->main_wrap && s->cy >= 0 && s->cy < s->rows)
+            s->main_wrap[s->cy] = 1;
         s->cx = 0;
         newline(s);
         s->wrap_next = false;
@@ -258,27 +353,27 @@ static void sgr(Screen *s) {
         else if (p == 28)   s->cur_attr.attrs &= ~ATTR_HIDDEN;
         else if (p == 29)   s->cur_attr.attrs &= ~ATTR_STRIKE;
         else if (p >= 30 && p <= 37) {
-            s->cur_attr.fg = base16[p - 30];
+            s->cur_attr.fg = pal(p - 30);
             s->cur_attr.attrs &= ~ATTR_DEFAULT_FG;
         }
         else if (p == 39) { s->cur_attr.fg = DEFAULT_FG; s->cur_attr.attrs |= ATTR_DEFAULT_FG; }
         else if (p >= 40 && p <= 47) {
-            s->cur_attr.bg = base16[p - 40];
+            s->cur_attr.bg = pal(p - 40);
             s->cur_attr.attrs &= ~ATTR_DEFAULT_BG;
         }
         else if (p == 49) { s->cur_attr.bg = DEFAULT_BG; s->cur_attr.attrs |= ATTR_DEFAULT_BG; }
         else if (p >= 90 && p <= 97) {
-            s->cur_attr.fg = base16[p - 90 + 8];
+            s->cur_attr.fg = pal(p - 90 + 8);
             s->cur_attr.attrs &= ~ATTR_DEFAULT_FG;
         }
         else if (p >= 100 && p <= 107) {
-            s->cur_attr.bg = base16[p - 100 + 8];
+            s->cur_attr.bg = pal(p - 100 + 8);
             s->cur_attr.attrs &= ~ATTR_DEFAULT_BG;
         }
         else if (p == 38 || p == 48) {
             bool is_fg = (p == 38);
             if (i + 1 < n && s->params[i + 1] == 5 && i + 2 < n) {
-                uint32_t c = palette256(s->params[i + 2] & 0xff);
+                uint32_t c = pal(s->params[i + 2] & 0xff);
                 if (is_fg) { s->cur_attr.fg = c; s->cur_attr.attrs &= ~ATTR_DEFAULT_FG; }
                 else       { s->cur_attr.bg = c; s->cur_attr.attrs &= ~ATTR_DEFAULT_BG; }
                 i += 2;
@@ -459,12 +554,57 @@ static void handle_csi(Screen *s, uint8_t b) {
 
 static void finish_osc(Screen *s) {
     s->osc[s->osc_len] = 0;
-    // Parse Ps;Pt
     int ps = 0;
     const char *p = s->osc;
     while (*p && *p != ';') { if (*p >= '0' && *p <= '9') ps = ps * 10 + (*p - '0'); p++; }
     if (*p == ';') p++;
-    if ((ps == 0 || ps == 2) && s->io.set_title) s->io.set_title(s->io.user, p);
+
+    if (ps == 0 || ps == 2) {
+        if (s->io.set_title) s->io.set_title(s->io.user, p);
+        return;
+    }
+    if (ps == 4) {
+        /* OSC 4;N;spec[;N;spec...] — set one or more palette entries. */
+        palette_init_once();
+        while (*p) {
+            int idx = 0; bool any = false;
+            while (*p >= '0' && *p <= '9') { idx = idx * 10 + (*p - '0'); any = true; p++; }
+            if (!any || *p != ';') break;
+            p++;
+            char spec[128]; int si = 0;
+            while (*p && *p != ';' && si + 1 < (int)sizeof(spec)) spec[si++] = *p++;
+            spec[si] = 0;
+            uint32_t col;
+            if (idx >= 0 && idx < 256 && parse_color_spec(spec, &col)) {
+                g_palette[idx] = col;
+            }
+            if (*p == ';') p++; else break;
+        }
+        return;
+    }
+    if (ps == 104) {
+        /* OSC 104 — reset palette entries (all if no arg; otherwise listed). */
+        palette_init_once();
+        if (!*p) {
+            palette_reset_defaults();
+            return;
+        }
+        while (*p) {
+            int idx = 0; bool any = false;
+            while (*p >= '0' && *p <= '9') { idx = idx * 10 + (*p - '0'); any = true; p++; }
+            if (any && idx >= 0 && idx < 256) {
+                /* Reset single entry by recomputing its default. */
+                uint32_t saved[256];
+                memcpy(saved, g_palette, sizeof(saved));
+                palette_reset_defaults();
+                uint32_t restored = g_palette[idx];
+                memcpy(g_palette, saved, sizeof(saved));
+                g_palette[idx] = restored;
+            }
+            if (*p == ';') p++; else break;
+        }
+        return;
+    }
 }
 
 static void handle_esc(Screen *s, uint8_t b) {
@@ -595,6 +735,7 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
     s->main = calloc((size_t)cols * rows, sizeof(Cell));
     s->alt  = calloc((size_t)cols * rows, sizeof(Cell));
+    s->main_wrap = calloc((size_t)rows, 1);
     for (int y = 0; y < rows; y++) {
         Cell b = blank_cell(s);
         for (int x = 0; x < cols; x++) s->main[y * cols + x] = b;
@@ -608,7 +749,7 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
 
 void screen_free(Screen *s) {
     if (!s) return;
-    free(s->main); free(s->alt); free(s->sb);
+    free(s->main); free(s->alt); free(s->sb); free(s->main_wrap);
     free(s);
 }
 
@@ -616,43 +757,179 @@ void screen_resize(Screen *s, int cols, int rows) {
     if (cols == s->cols && rows == s->rows) return;
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
+    int old_cols = s->cols;
+    int old_rows = s->rows;
+    Cell blank = blank_cell(s);
 
-    Cell *nmain = calloc((size_t)cols * rows, sizeof(Cell));
-    Cell *nalt  = calloc((size_t)cols * rows, sizeof(Cell));
-    Cell b = blank_cell(s);
-    for (int y = 0; y < rows; y++)
-        for (int x = 0; x < cols; x++) { nmain[y * cols + x] = b; nalt[y * cols + x] = b; }
-
-    // Copy overlap (top-aligned, simple preservation)
-    int cx = (cols < s->cols) ? cols : s->cols;
-    int cy = (rows < s->rows) ? rows : s->rows;
-    for (int y = 0; y < cy; y++) {
-        memcpy(nmain + y * cols, s->main + y * s->cols, sizeof(Cell) * cx);
-        memcpy(nalt  + y * cols, s->alt  + y * s->cols, sizeof(Cell) * cx);
+    /* --- Main screen: reflow. Collect logical lines, then rewrap at new_cols.
+           If the emitted content exceeds new_rows, the top overflow is pushed
+           into scrollback (pre-reflow scrollback is kept as-is). --- */
+    int line_cap = old_rows;
+    Cell **lines = calloc(line_cap, sizeof(Cell *));
+    int *line_lens = calloc(line_cap, sizeof(int));
+    int num_lines = 0;
+    {
+        int y = 0;
+        while (y < old_rows) {
+            int start = y;
+            int total = 0;
+            int last = y;
+            while (last < old_rows) {
+                bool wrapped = s->main_wrap && s->main_wrap[last];
+                int rl = old_cols;
+                if (!wrapped) {
+                    while (rl > 0) {
+                        Cell c = s->main[last * old_cols + rl - 1];
+                        if (c.cp != 0 && c.cp != ' ') break;
+                        rl--;
+                    }
+                }
+                total += rl;
+                if (!wrapped) break;
+                last++;
+            }
+            if (total > 0) {
+                Cell *line = malloc(sizeof(Cell) * total);
+                int pos = 0;
+                for (int yy = start; yy <= last && yy < old_rows; yy++) {
+                    bool wrapped = s->main_wrap && s->main_wrap[yy];
+                    int rl = old_cols;
+                    if (!wrapped) {
+                        while (rl > 0) {
+                            Cell c = s->main[yy * old_cols + rl - 1];
+                            if (c.cp != 0 && c.cp != ' ') break;
+                            rl--;
+                        }
+                    }
+                    memcpy(line + pos, s->main + yy * old_cols, sizeof(Cell) * rl);
+                    pos += rl;
+                }
+                lines[num_lines] = line;
+                line_lens[num_lines] = total;
+            } else {
+                lines[num_lines] = NULL;
+                line_lens[num_lines] = 0;
+            }
+            num_lines++;
+            y = last + 1;
+        }
     }
 
-    // Rebuild scrollback at new width (truncate per row)
+    /* Emit lines into a scratch buffer wide new_cols. */
+    int max_rows = 1;
+    for (int i = 0; i < num_lines; i++) {
+        int n = line_lens[i];
+        max_rows += n == 0 ? 1 : (n + cols - 1) / cols;
+    }
+    if (max_rows < rows) max_rows = rows;
+    Cell *scratch = calloc((size_t)max_rows * cols, sizeof(Cell));
+    uint8_t *scratch_wrap = calloc((size_t)max_rows, 1);
+    for (int r = 0; r < max_rows; r++)
+        for (int x = 0; x < cols; x++) scratch[r * cols + x] = blank;
+    int emit = 0;
+    for (int i = 0; i < num_lines; i++) {
+        int len = line_lens[i];
+        if (len == 0) { emit++; continue; }
+        int pos = 0;
+        while (pos < len && emit < max_rows) {
+            int take = len - pos;
+            if (take > cols) take = cols;
+            memcpy(scratch + (size_t)emit * cols, lines[i] + pos, sizeof(Cell) * take);
+            pos += take;
+            if (pos < len) scratch_wrap[emit] = 1;
+            emit++;
+        }
+    }
+
+    /* Copy the last `rows` emitted rows into the new main buffer; shove
+       overflow into the (un-reflowed) scrollback so nothing is lost. */
+    Cell *nmain = calloc((size_t)cols * rows, sizeof(Cell));
+    uint8_t *nwrap = calloc((size_t)rows, 1);
+    for (int r = 0; r < rows; r++)
+        for (int x = 0; x < cols; x++) nmain[r * cols + x] = blank;
+    int start_row = emit - rows;
+    if (start_row < 0) start_row = 0;
+
+    /* Rebuild scrollback at new width (preserve its existing content; just
+       re-bucket into the new col count). */
     Cell *nsb = NULL;
     if (s->sb_cap > 0) {
         nsb = calloc((size_t)s->sb_cap * cols, sizeof(Cell));
         for (int y = 0; y < s->sb_cap; y++)
-            for (int x = 0; x < cols; x++) nsb[y * cols + x] = b;
-        int ccols = (cols < s->cols) ? cols : s->cols;
+            for (int x = 0; x < cols; x++) nsb[y * cols + x] = blank;
+        int ccols = (cols < old_cols) ? cols : old_cols;
         for (int i = 0; i < s->sb_len; i++) {
             int src = ((s->sb_head - s->sb_len + i) % s->sb_cap + s->sb_cap) % s->sb_cap;
-            int dst = i;
-            memcpy(nsb + dst * cols, s->sb + src * s->cols, sizeof(Cell) * ccols);
+            memcpy(nsb + (size_t)i * cols, s->sb + (size_t)src * old_cols,
+                   sizeof(Cell) * ccols);
         }
         s->sb_head = s->sb_len % s->sb_cap;
     }
+    /* Push overflow to scrollback by writing into nsb directly. */
+    if (s->sb_cap > 0 && start_row > 0) {
+        Cell *saved_sb_was = s->sb;
+        int saved_cols = s->cols;
+        s->sb = nsb;
+        s->cols = cols;   /* temporarily switch so push_scrollback writes with new width */
+        for (int r = 0; r < start_row; r++) {
+            push_scrollback(s, scratch + (size_t)r * cols);
+        }
+        s->cols = saved_cols;
+        (void)saved_sb_was;
+    }
+    int copy_count = emit - start_row;
+    if (copy_count > rows) copy_count = rows;
+    for (int r = 0; r < copy_count; r++) {
+        memcpy(nmain + (size_t)r * cols, scratch + (size_t)(start_row + r) * cols,
+               sizeof(Cell) * cols);
+        nwrap[r] = scratch_wrap[start_row + r];
+    }
 
-    free(s->main); free(s->alt); free(s->sb);
-    s->main = nmain; s->alt = nalt; s->sb = nsb;
+    /* Alt screen: copy overlap with top-left alignment (full-screen apps will
+       redraw on SIGWINCH). */
+    Cell *nalt = calloc((size_t)cols * rows, sizeof(Cell));
+    for (int r = 0; r < rows; r++)
+        for (int x = 0; x < cols; x++) nalt[r * cols + x] = blank;
+    int ox = (cols < old_cols) ? cols : old_cols;
+    int oy = (rows < old_rows) ? rows : old_rows;
+    for (int y = 0; y < oy; y++) {
+        memcpy(nalt + (size_t)y * cols, s->alt + (size_t)y * old_cols,
+               sizeof(Cell) * ox);
+    }
+
+    /* Install. */
+    for (int i = 0; i < num_lines; i++) free(lines[i]);
+    free(lines);
+    free(line_lens);
+    free(scratch);
+    free(scratch_wrap);
+    free(s->main); free(s->alt); free(s->sb); free(s->main_wrap);
+    s->main = nmain; s->alt = nalt; s->sb = nsb; s->main_wrap = nwrap;
     s->cols = cols; s->rows = rows;
     s->scroll_top = 0;
     s->scroll_bot = rows - 1;
     if (s->cx >= cols) s->cx = cols - 1;
     if (s->cy >= rows) s->cy = rows - 1;
+    /* Move cursor to the end of the last row that holds real content — lets
+       bash redraw its prompt in place after SIGWINCH. */
+    int last_content_row = -1;
+    for (int y = rows - 1; y >= 0; y--) {
+        for (int x = 0; x < cols; x++) {
+            uint32_t cp = s->main[y * cols + x].cp;
+            if (cp != 0 && cp != ' ') { last_content_row = y; break; }
+        }
+        if (last_content_row >= 0) break;
+    }
+    if (last_content_row >= 0) {
+        s->cy = last_content_row;
+        int cx_end = 0;
+        for (int x = 0; x < cols; x++) {
+            uint32_t cp = s->main[last_content_row * cols + x].cp;
+            if (cp != 0 && cp != ' ') cx_end = x + 1;
+        }
+        if (cx_end >= cols) cx_end = cols - 1;
+        s->cx = cx_end;
+    }
     s->wrap_next = false;
     if (s->view_off > s->sb_len) s->view_off = s->sb_len;
 }

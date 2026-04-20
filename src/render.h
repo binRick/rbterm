@@ -25,9 +25,10 @@ void renderer_shutdown(Renderer *r);
 bool renderer_set_font_size(Renderer *r, int font_size);
 bool renderer_set_font_path(Renderer *r, const char *path);
 
-// Draw entire screen. Pass in blink time for cursor blinking.
+// Draw a screen's contents. `y_offset` is the pixel offset from the top of
+// the window where row 0 should be drawn (used to leave space for a tab bar).
 void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
-                   const Selection *sel);
+                   const Selection *sel, int y_offset);
 
 // Find a default system monospace font. Returns static buffer.
 const char *renderer_find_default_font(void);

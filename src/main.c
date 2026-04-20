@@ -40,7 +40,6 @@ static bool pty_spawn_shell(Pty *out, int cols, int rows) {
     pid_t pid = forkpty(&master, NULL, NULL, &ws);
     if (pid < 0) { perror("forkpty"); return false; }
     if (pid == 0) {
-        // Child: reset signals, set env, chdir to $HOME, exec shell.
         signal(SIGCHLD, SIG_DFL);
         signal(SIGHUP,  SIG_DFL);
         signal(SIGINT,  SIG_DFL);
@@ -67,7 +66,7 @@ static bool pty_spawn_shell(Pty *out, int cols, int rows) {
         const char *argv0 = strrchr(shell, '/');
         argv0 = argv0 ? argv0 + 1 : shell;
         char dash[64];
-        snprintf(dash, sizeof(dash), "-%s", argv0);  // login shell
+        snprintf(dash, sizeof(dash), "-%s", argv0);
         execl(shell, dash, (char *)NULL);
         perror("execl");
         _exit(127);
@@ -89,27 +88,92 @@ static void pty_write_all(Pty *p, const uint8_t *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
         ssize_t w = write(p->fd, buf + off, n - off);
-        if (w < 0) { if (errno == EINTR) continue; if (errno == EAGAIN) { /* drop */ return; } return; }
+        if (w < 0) { if (errno == EINTR) continue; if (errno == EAGAIN) return; return; }
         off += (size_t)w;
     }
 }
 
-/* ---------- IO glue for screen -> PTY writes ---------- */
+/* ---------- Tabs ---------- */
 
-static void io_write(void *u, const uint8_t *buf, size_t n) {
-    pty_write_all((Pty *)u, buf, n);
-}
-static char g_title[256] = "rbterm";
-static bool g_title_dirty = false;
-static void io_set_title(void *u, const char *t) {
-    (void)u;
-    strncpy(g_title, t, sizeof(g_title) - 1);
-    g_title[sizeof(g_title) - 1] = 0;
-    g_title_dirty = true;
-}
-static void io_bell(void *u) { (void)u; /* TODO: flash */ }
+typedef struct {
+    Pty pty;
+    Screen *scr;
+    Selection sel;
+    char title[256];
+    bool title_dirty;
+    bool dead;
+    int click_count;
+    double last_click_time;
+    int last_click_col, last_click_row;
+} Tab;
 
-/* ---------- Clipboard + selection ---------- */
+#define MAX_TABS 16
+#define TAB_BAR_H 30
+#define TAB_MIN_W 100
+#define TAB_MAX_W 240
+#define TAB_CLOSE_W 22
+#define TAB_PLUS_W  30
+
+static Tab *g_tabs[MAX_TABS];
+static int g_num_tabs = 0;
+static int g_active = 0;
+
+static Tab *active_tab(void) {
+    if (g_num_tabs == 0) return NULL;
+    if (g_active < 0) g_active = 0;
+    if (g_active >= g_num_tabs) g_active = g_num_tabs - 1;
+    return g_tabs[g_active];
+}
+
+/* ---------- IO glue for screen -> PTY writes (per-tab) ---------- */
+
+static void io_write_cb(void *u, const uint8_t *buf, size_t n) {
+    Tab *t = (Tab *)u;
+    pty_write_all(&t->pty, buf, n);
+}
+static void io_set_title_cb(void *u, const char *title) {
+    Tab *t = (Tab *)u;
+    strncpy(t->title, title, sizeof(t->title) - 1);
+    t->title[sizeof(t->title) - 1] = 0;
+    t->title_dirty = true;
+}
+static void io_bell_cb(void *u) { (void)u; }
+
+static Tab *tab_open(int cols, int rows) {
+    if (g_num_tabs >= MAX_TABS) return NULL;
+    Tab *t = calloc(1, sizeof(Tab));
+    strncpy(t->title, "shell", sizeof(t->title) - 1);
+    t->last_click_time = -1.0;
+    t->last_click_col = t->last_click_row = -1;
+    if (!pty_spawn_shell(&t->pty, cols, rows)) { free(t); return NULL; }
+    ScreenIO io = { .user = t, .write = io_write_cb,
+                    .set_title = io_set_title_cb, .bell = io_bell_cb };
+    t->scr = screen_new(cols, rows, 5000, io);
+    g_tabs[g_num_tabs] = t;
+    g_active = g_num_tabs;
+    g_num_tabs++;
+    return t;
+}
+
+static void tab_close(int idx) {
+    if (idx < 0 || idx >= g_num_tabs) return;
+    Tab *t = g_tabs[idx];
+    if (t->pty.pid > 0) {
+        kill(t->pty.pid, SIGHUP);
+        int status;
+        waitpid(t->pty.pid, &status, 0);
+    }
+    close(t->pty.fd);
+    screen_free(t->scr);
+    free(t);
+    for (int i = idx; i < g_num_tabs - 1; i++) g_tabs[i] = g_tabs[i + 1];
+    g_tabs[g_num_tabs - 1] = NULL;
+    g_num_tabs--;
+    if (g_active >= g_num_tabs) g_active = g_num_tabs - 1;
+    if (g_active < 0) g_active = 0;
+}
+
+/* ---------- Clipboard + selection helpers ---------- */
 
 static size_t utf8_emit(char *buf, uint32_t cp) {
     if (cp < 0x80)    { buf[0] = (char)cp; return 1; }
@@ -163,7 +227,6 @@ static void copy_selection(Screen *s, const Selection *sel) {
     free(buf);
 }
 
-/* Expand selection to a word/line when double/triple-clicking. */
 static bool cell_is_word(Screen *s, int col, int row) {
     if (col < 0 || row < 0 || col >= screen_cols(s) || row >= screen_rows(s)) return false;
     Cell c = screen_view_cell(s, col, row);
@@ -191,21 +254,112 @@ static void select_line(Screen *s, Selection *sel, int row) {
     sel->b_col = cols - 1; sel->b_row = row;
 }
 
+/* ---------- Tab bar UI ---------- */
+
+typedef struct {
+    int tab_idx;    /* -1 if not on a tab */
+    bool on_close;
+    bool on_plus;
+} TabBarHit;
+
+static int tab_width_for(int win_w) {
+    int avail = win_w - TAB_PLUS_W;
+    if (g_num_tabs <= 0) return TAB_MIN_W;
+    int w = avail / g_num_tabs;
+    if (w > TAB_MAX_W) w = TAB_MAX_W;
+    if (w < TAB_MIN_W) w = TAB_MIN_W;
+    return w;
+}
+
+static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
+    TabBarHit h = { -1, false, false };
+    if (my < 0 || my >= TAB_BAR_H) return h;
+    int plus_x = win_w - TAB_PLUS_W;
+    if (mx >= plus_x) { h.on_plus = true; return h; }
+    int tw = tab_width_for(win_w);
+    int idx = mx / tw;
+    if (idx < 0 || idx >= g_num_tabs) return h;
+    h.tab_idx = idx;
+    if (mx >= idx * tw + tw - TAB_CLOSE_W) h.on_close = true;
+    return h;
+}
+
+static void draw_tab_bar(Renderer *r, int win_w) {
+    /* Bar background. */
+    DrawRectangle(0, 0, win_w, TAB_BAR_H, (Color){24, 24, 32, 255});
+    DrawRectangle(0, TAB_BAR_H - 1, win_w, 1, (Color){60, 60, 75, 255});
+
+    int tw = tab_width_for(win_w);
+    Font *f = (Font *)r->font_data;
+    float fs = 13.0f;
+
+    for (int i = 0; i < g_num_tabs; i++) {
+        int x = i * tw;
+        bool active = (i == g_active);
+        Color bg = active ? (Color){46, 52, 70, 255} : (Color){28, 32, 44, 255};
+        Color fg = active ? (Color){230, 230, 240, 255} : (Color){150, 150, 165, 255};
+        DrawRectangle(x, 0, tw, TAB_BAR_H, bg);
+        if (active) {
+            DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
+        }
+        /* Tab title (scissored so it doesn't bleed into the close X). */
+        const char *title = g_tabs[i]->title;
+        if (!title[0]) title = "shell";
+        BeginScissorMode(x + 8, 0, tw - TAB_CLOSE_W - 12, TAB_BAR_H);
+        Vector2 tsz = MeasureTextEx(*f, title, fs, 0);
+        Vector2 tp  = { x + 10, (TAB_BAR_H - tsz.y) / 2.0f };
+        DrawTextEx(*f, title, tp, fs, 0, fg);
+        EndScissorMode();
+        /* Close X */
+        const char *cross = "x";
+        Vector2 csz = MeasureTextEx(*f, cross, fs, 0);
+        DrawTextEx(*f, cross,
+                   (Vector2){ x + tw - TAB_CLOSE_W / 2 - csz.x / 2,
+                              (TAB_BAR_H - csz.y) / 2.0f },
+                   fs, 0, fg);
+        /* Separator between tabs (skip before first). */
+        if (i > 0) DrawLine(x, 4, x, TAB_BAR_H - 4, (Color){60, 60, 75, 255});
+    }
+
+    /* Plus button on the right. */
+    int plus_x = win_w - TAB_PLUS_W;
+    DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){28, 32, 44, 255});
+    const char *plus = "+";
+    Vector2 psz = MeasureTextEx(*f, plus, 18, 0);
+    DrawTextEx(*f, plus,
+               (Vector2){ plus_x + (TAB_PLUS_W - psz.x) / 2.0f,
+                          (TAB_BAR_H - psz.y) / 2.0f },
+               18, 0, (Color){200, 200, 215, 255});
+}
+
+/* ---------- Cmd / Ctrl helpers ---------- */
+
+static bool ui_key_down(void) {
+#if defined(__APPLE__)
+    return IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#else
+    return IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#endif
+}
+
 /* ---------- Main ---------- */
 
 static void usage(void) {
     printf("rbterm — raylib terminal emulator\n"
            "Usage: rbterm [--font PATH] [--size N] [--cols N] [--rows N]\n"
            "  --font PATH     path to a .ttf / .otf / .ttc monospace font\n"
-           "  --size N        font size in points (default 14)\n"
+           "  --size N        font size in points (default 20)\n"
            "  --cols N        initial cols (default 100)\n"
            "  --rows N        initial rows (default 30)\n"
            "\nKeys:\n"
-           "  Ctrl/Cmd + +/-/0   grow/shrink/reset font size\n"
-           "  Shift + PgUp/PgDn  scroll through history\n"
-           "  Mouse wheel        scroll through history\n"
-           "  Cmd+C / Ctrl+Shift+C   copy visible screen to clipboard\n"
-           "  Cmd+V / Ctrl+Shift+V   paste clipboard into terminal\n");
+           "  Cmd + T           open a new tab\n"
+           "  Cmd + W           close the current tab\n"
+           "  Cmd + 1..9        switch to tab N\n"
+           "  Cmd + [ / ]       prev / next tab\n"
+           "  Cmd + + / - / 0   grow/shrink/reset font size\n"
+           "  Shift + PgUp/PgDn scroll through history\n"
+           "  Mouse wheel       scroll through history\n"
+           "  Cmd + C / V       copy selection / paste\n");
 }
 
 int main(int argc, char **argv) {
@@ -224,14 +378,12 @@ int main(int argc, char **argv) {
     if (init_cols < 20) init_cols = 20;
     if (init_rows < 5)  init_rows = 5;
 
-    // Ignore SIGPIPE so PTY write failures don't kill us.
     signal(SIGPIPE, SIG_IGN);
 
-    // Raylib setup — use a placeholder size; we'll resize after font loads.
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(800, 500, "rbterm");
-    SetExitKey(KEY_NULL);  // don't let raylib intercept ESC
+    SetExitKey(KEY_NULL);
 
     Renderer r;
     if (!renderer_init(&r, font_path, font_size)) {
@@ -240,161 +392,197 @@ int main(int argc, char **argv) {
     }
 
     int win_w = init_cols * r.cell_w;
-    int win_h = init_rows * r.cell_h;
+    int win_h = init_rows * r.cell_h + TAB_BAR_H;
     SetWindowSize(win_w, win_h);
-    SetWindowMinSize(r.cell_w * 20, r.cell_h * 5);
+    SetWindowMinSize(r.cell_w * 20, r.cell_h * 5 + TAB_BAR_H);
 
-    Pty pty;
-    if (!pty_spawn_shell(&pty, init_cols, init_rows)) {
+    if (!tab_open(init_cols, init_rows)) {
         renderer_shutdown(&r);
         CloseWindow();
         return 1;
     }
-
-    ScreenIO sio = { .user = &pty, .write = io_write,
-                     .set_title = io_set_title, .bell = io_bell };
-    Screen *scr = screen_new(init_cols, init_rows, 5000, sio);
 
     SetTargetFPS(60);
 
     uint8_t readbuf[65536];
     uint8_t inputbuf[4096];
 
-    bool child_exited = false;
+    while (!WindowShouldClose() && g_num_tabs > 0) {
+        int win_w_now = GetScreenWidth();
+        int win_h_now = GetScreenHeight();
 
-    Selection sel = {0};
-    int click_count = 0;
-    double last_click_time = -1.0;
-    int last_click_col = -1, last_click_row = -1;
-
-    while (!WindowShouldClose()) {
-        // Handle resize of raylib window -> resize screen + pty
-        if (IsWindowResized() || GetScreenWidth() == 0) {
-            int w = GetScreenWidth();
-            int h = GetScreenHeight();
-            int cols = w / r.cell_w;
-            int rows = h / r.cell_h;
-            if (cols < 1) cols = 1;
-            if (rows < 1) rows = 1;
-            if (cols != screen_cols(scr) || rows != screen_rows(scr)) {
-                screen_resize(scr, cols, rows);
-                pty_resize(&pty, cols, rows);
+        /* Resize — apply to every tab. */
+        int content_rows = (win_h_now - TAB_BAR_H) / r.cell_h;
+        int content_cols = win_w_now / r.cell_w;
+        if (content_cols < 1) content_cols = 1;
+        if (content_rows < 1) content_rows = 1;
+        for (int i = 0; i < g_num_tabs; i++) {
+            if (screen_cols(g_tabs[i]->scr) != content_cols ||
+                screen_rows(g_tabs[i]->scr) != content_rows) {
+                screen_resize(g_tabs[i]->scr, content_cols, content_rows);
+                pty_resize(&g_tabs[i]->pty, content_cols, content_rows);
             }
         }
 
-        // Read from PTY (non-blocking) into screen
-        for (int iter = 0; iter < 64; iter++) {
-            ssize_t n = read(pty.fd, readbuf, sizeof(readbuf));
-            if (n > 0) {
-                screen_feed(scr, readbuf, (size_t)n);
-                continue;
+        /* Read from every PTY, not just the active one, so background tabs
+           stay up-to-date. */
+        for (int i = 0; i < g_num_tabs; i++) {
+            Tab *t = g_tabs[i];
+            for (int iter = 0; iter < 32; iter++) {
+                ssize_t n = read(t->pty.fd, readbuf, sizeof(readbuf));
+                if (n > 0) { screen_feed(t->scr, readbuf, (size_t)n); continue; }
+                if (n == 0) { t->dead = true; break; }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
+                t->dead = true; break;
             }
-            if (n == 0) { child_exited = true; break; }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            if (errno == EINTR) continue;
-            child_exited = true;
-            break;
+            int status;
+            pid_t w = waitpid(t->pty.pid, &status, WNOHANG);
+            if (w == t->pty.pid) t->dead = true;
         }
-        if (child_exited) break;
+        /* Reap dead tabs (iterate backwards to keep indices stable). */
+        for (int i = g_num_tabs - 1; i >= 0; i--) {
+            if (g_tabs[i]->dead) tab_close(i);
+        }
+        if (g_num_tabs == 0) break;
 
-        // Check child status non-blocking
-        int status;
-        pid_t w = waitpid(pty.pid, &status, WNOHANG);
-        if (w == pty.pid) { child_exited = true; break; }
+        Tab *cur = active_tab();
 
-        // Mouse selection
-        {
-            Vector2 mp = GetMousePosition();
+        /* Tab-bar mouse and content-area selection both need the pointer. */
+        Vector2 mp = GetMousePosition();
+        bool in_tab_bar = (mp.y < TAB_BAR_H);
+
+        if (in_tab_bar) {
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                TabBarHit h = tab_bar_hit_test(win_w_now, (int)mp.x, (int)mp.y);
+                if (h.on_plus) {
+                    tab_open(content_cols, content_rows);
+                } else if (h.tab_idx >= 0) {
+                    if (h.on_close) {
+                        tab_close(h.tab_idx);
+                    } else {
+                        g_active = h.tab_idx;
+                    }
+                }
+                cur = active_tab();
+            }
+        } else if (cur) {
             int mcol = (int)(mp.x / r.cell_w);
-            int mrow = (int)(mp.y / r.cell_h);
-            if (mcol < 0) mcol = 0;
-            if (mcol >= screen_cols(scr)) mcol = screen_cols(scr) - 1;
-            if (mrow < 0) mrow = 0;
-            if (mrow >= screen_rows(scr)) mrow = screen_rows(scr) - 1;
+            int mrow = (int)((mp.y - TAB_BAR_H) / r.cell_h);
+            int cmax = screen_cols(cur->scr) - 1;
+            int rmax = screen_rows(cur->scr) - 1;
+            if (mcol < 0) mcol = 0; if (mcol > cmax) mcol = cmax;
+            if (mrow < 0) mrow = 0; if (mrow > rmax) mrow = rmax;
 
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 double t = GetTime();
-                bool fast = (t - last_click_time < 0.45);
-                bool same = (mcol == last_click_col && mrow == last_click_row);
-                click_count = (fast && same) ? (click_count + 1) : 1;
-                last_click_time = t;
-                last_click_col = mcol;
-                last_click_row = mrow;
-
-                if (click_count == 2) {
-                    select_word(scr, &sel, mcol, mrow);
-                } else if (click_count >= 3) {
-                    select_line(scr, &sel, mrow);
-                    click_count = 3;
+                bool fast = (t - cur->last_click_time < 0.45);
+                bool same = (mcol == cur->last_click_col && mrow == cur->last_click_row);
+                cur->click_count = (fast && same) ? (cur->click_count + 1) : 1;
+                cur->last_click_time = t;
+                cur->last_click_col = mcol;
+                cur->last_click_row = mrow;
+                if (cur->click_count == 2) {
+                    select_word(cur->scr, &cur->sel, mcol, mrow);
+                } else if (cur->click_count >= 3) {
+                    select_line(cur->scr, &cur->sel, mrow);
+                    cur->click_count = 3;
                 } else {
-                    sel.active = true;
-                    sel.dragging = true;
-                    sel.a_col = sel.b_col = mcol;
-                    sel.a_row = sel.b_row = mrow;
+                    cur->sel.active = true;
+                    cur->sel.dragging = true;
+                    cur->sel.a_col = cur->sel.b_col = mcol;
+                    cur->sel.a_row = cur->sel.b_row = mrow;
                 }
             }
-            if (sel.dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                sel.b_col = mcol;
-                sel.b_row = mrow;
+            if (cur->sel.dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                cur->sel.b_col = mcol; cur->sel.b_row = mrow;
             }
             if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-                if (sel.dragging && click_count < 2) {
-                    sel.dragging = false;
-                    if (sel.a_col == sel.b_col && sel.a_row == sel.b_row) {
-                        sel.active = false;   // simple click deselects
+                if (cur->sel.dragging && cur->click_count < 2) {
+                    cur->sel.dragging = false;
+                    if (cur->sel.a_col == cur->sel.b_col &&
+                        cur->sel.a_row == cur->sel.b_row) {
+                        cur->sel.active = false;
                     }
                 }
             }
         }
 
-        // Input
-        InputActions acts;
-        size_t in_n = input_poll(scr, inputbuf, sizeof(inputbuf), &acts);
-        if (acts.scroll_rows != 0) {
-            screen_scroll_view(scr, acts.scroll_rows);
+        /* Tab keyboard shortcuts — check before input_poll. Cmd+letter chords
+           don't produce GetCharPressed events on macOS so input_poll won't
+           also send these bytes to the shell. */
+        if (ui_key_down()) {
+            if (IsKeyPressed(KEY_T)) {
+                tab_open(content_cols, content_rows);
+                cur = active_tab();
+            } else if (IsKeyPressed(KEY_W)) {
+                tab_close(g_active);
+                if (g_num_tabs == 0) break;
+                cur = active_tab();
+            } else if (IsKeyPressed(KEY_LEFT_BRACKET)) {
+                g_active = (g_active - 1 + g_num_tabs) % g_num_tabs;
+                cur = active_tab();
+            } else if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
+                g_active = (g_active + 1) % g_num_tabs;
+                cur = active_tab();
+            } else {
+                for (int k = 0; k < 9; k++) {
+                    if (IsKeyPressed(KEY_ONE + k)) {
+                        if (k < g_num_tabs) { g_active = k; cur = active_tab(); }
+                        break;
+                    }
+                }
+            }
         }
-        if (acts.copy) copy_selection(scr, &sel);
+
+        if (!cur) break;
+
+        /* Input + clipboard + font chords — all targeted at the active tab. */
+        InputActions acts;
+        size_t in_n = input_poll(cur->scr, inputbuf, sizeof(inputbuf), &acts);
+        if (acts.scroll_rows != 0) screen_scroll_view(cur->scr, acts.scroll_rows);
+        if (acts.copy) copy_selection(cur->scr, &cur->sel);
         if (acts.paste) {
             const char *t = GetClipboardText();
-            if (t && *t) pty_write_all(&pty, (const uint8_t *)t, strlen(t));
+            if (t && *t) pty_write_all(&cur->pty, (const uint8_t *)t, strlen(t));
         }
         if (acts.font_delta != 100) {
             int old = r.font_size;
-            int ns = (acts.font_delta == 0) ? 14
+            int ns = (acts.font_delta == 0) ? 20
                     : old + (acts.font_delta > 0 ? 1 : -1);
             if (renderer_set_font_size(&r, ns)) {
-                // Recompute cols/rows to fit current window
-                int cols = GetScreenWidth()  / r.cell_w;
-                int rows = GetScreenHeight() / r.cell_h;
-                if (cols < 1) cols = 1;
-                if (rows < 1) rows = 1;
-                screen_resize(scr, cols, rows);
-                pty_resize(&pty, cols, rows);
-                SetWindowMinSize(r.cell_w * 20, r.cell_h * 5);
+                int nc = GetScreenWidth()  / r.cell_w;
+                int nr = (GetScreenHeight() - TAB_BAR_H) / r.cell_h;
+                if (nc < 1) nc = 1;
+                if (nr < 1) nr = 1;
+                for (int i = 0; i < g_num_tabs; i++) {
+                    screen_resize(g_tabs[i]->scr, nc, nr);
+                    pty_resize(&g_tabs[i]->pty, nc, nr);
+                }
+                SetWindowMinSize(r.cell_w * 20, r.cell_h * 5 + TAB_BAR_H);
             }
         }
         if (in_n > 0) {
-            screen_scroll_reset(scr);
-            pty_write_all(&pty, inputbuf, in_n);
-            /* Any typing clears a pending selection. */
-            if (sel.active && !sel.dragging) sel.active = false;
+            screen_scroll_reset(cur->scr);
+            pty_write_all(&cur->pty, inputbuf, in_n);
+            if (cur->sel.active && !cur->sel.dragging) cur->sel.active = false;
         }
 
-        if (g_title_dirty) { SetWindowTitle(g_title); g_title_dirty = false; }
+        if (cur->title_dirty) {
+            SetWindowTitle(cur->title);
+            cur->title_dirty = false;
+        }
 
         BeginDrawing();
-        renderer_draw(&r, scr, GetTime(), IsWindowFocused(), &sel);
+        ClearBackground((Color){0, 0, 0, 255});
+        draw_tab_bar(&r, win_w_now);
+        renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
+                      &cur->sel, TAB_BAR_H);
         EndDrawing();
     }
 
-    // Cleanup
-    if (pty.pid > 0) {
-        kill(pty.pid, SIGHUP);
-        int status;
-        waitpid(pty.pid, &status, 0);
-    }
-    close(pty.fd);
-    screen_free(scr);
+    /* Shut down any remaining tabs. */
+    for (int i = g_num_tabs - 1; i >= 0; i--) tab_close(i);
     renderer_shutdown(&r);
     CloseWindow();
     return 0;
