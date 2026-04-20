@@ -429,15 +429,22 @@ static void ssh_form_advance_focus(int delta) {
     g_form.focus = (g_form.focus + delta + F_COUNT) % F_COUNT;
 }
 
-static void ssh_form_handle_mouse(SshFormLayout L) {
+static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
     for (int i = 0; i < 4; i++) {
         if (rect_hit(L.field[i], mx, my)) { g_form.focus = i; return; }
     }
-    if (rect_hit(L.connect, mx, my)) g_form.focus = F_CONNECT;
-    if (rect_hit(L.cancel,  mx, my)) g_form.focus = F_CANCEL;
+    if (rect_hit(L.connect, mx, my)) {
+        g_form.focus = F_CONNECT;
+        ssh_form_submit(cols, rows);
+        return;
+    }
+    if (rect_hit(L.cancel, mx, my)) {
+        g_ui_mode = UI_NORMAL;
+        return;
+    }
 }
 
 static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
@@ -760,7 +767,18 @@ int main(int argc, char **argv) {
         /* Modal SSH form — swallow input until the user connects or cancels. */
         if (g_ui_mode == UI_SSH_FORM) {
             SshFormLayout L = ssh_form_layout(win_w_now, win_h_now);
-            ssh_form_handle_mouse(L);
+            ssh_form_handle_mouse(L, content_cols, content_rows);
+            if (g_ui_mode != UI_SSH_FORM) {
+                cur = active_tab();
+                if (!cur) break;
+                BeginDrawing();
+                ClearBackground((Color){0, 0, 0, 255});
+                draw_tab_bar(&r, win_w_now);
+                renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
+                              &cur->sel, TAB_BAR_H);
+                EndDrawing();
+                continue;
+            }
             ssh_form_handle_keys(content_cols, content_rows, L);
             cur = active_tab();
             if (!cur) break;
