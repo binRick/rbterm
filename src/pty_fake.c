@@ -69,6 +69,7 @@ typedef struct {
 
     char    line[LINE_MAX];
     int     line_len;
+    int     cursor;           /* insertion point within line[], 0..line_len */
 
     FNode  *root;
     FNode  *cwd;
@@ -346,13 +347,16 @@ static void run_line(FakePty *p, const char *line) {
 /* ---------- Input handling / line editor ---------- */
 
 static void replace_line(FakePty *p, const char *newline) {
-    /* Erase current visible line and replace. */
+    /* Move the visual cursor to end of current line, then erase back to 0. */
+    for (int i = p->cursor; i < p->line_len; i++) out_str(p, "\x1b[C");
     for (int i = 0; i < p->line_len; i++) out_str(p, "\b \b");
     p->line_len = 0;
+    p->cursor = 0;
     size_t n = strlen(newline);
     if (n >= LINE_MAX) n = LINE_MAX - 1;
     memcpy(p->line, newline, n);
     p->line_len = (int)n;
+    p->cursor = (int)n;
     p->line[n] = 0;
     for (size_t i = 0; i < n; i++) out_byte(p, (uint8_t)newline[i]);
 }
@@ -383,7 +387,22 @@ static void feed_char(FakePty *p, uint8_t b) {
                 }
                 return;
             }
-            /* Left / right / home / end — ignore for the demo. */
+            if (fn == 'D') {  /* left */
+                if (p->cursor > 0) { p->cursor--; out_str(p, "\x1b[D"); }
+                return;
+            }
+            if (fn == 'C') {  /* right */
+                if (p->cursor < p->line_len) { p->cursor++; out_str(p, "\x1b[C"); }
+                return;
+            }
+            if (fn == 'H') {  /* home */
+                while (p->cursor > 0) { p->cursor--; out_str(p, "\x1b[D"); }
+                return;
+            }
+            if (fn == 'F') {  /* end */
+                while (p->cursor < p->line_len) { p->cursor++; out_str(p, "\x1b[C"); }
+                return;
+            }
         }
         if (p->esc_len >= 3) { p->esc_mode = false; p->esc_len = 0; }
         return;
@@ -393,6 +412,7 @@ static void feed_char(FakePty *p, uint8_t b) {
     if (b == 0x03) {   /* Ctrl+C */
         out_str(p, "^C\r\n");
         p->line_len = 0;
+        p->cursor = 0;
         prompt(p);
         return;
     }
@@ -408,14 +428,35 @@ static void feed_char(FakePty *p, uint8_t b) {
         p->line[p->line_len] = 0;
         run_line(p, p->line);
         p->line_len = 0;
+        p->cursor = 0;
         prompt(p);
         return;
     }
     if (b == 0x7f || b == 0x08) {  /* backspace / DEL */
-        if (p->line_len > 0) {
+        if (p->cursor > 0) {
+            memmove(&p->line[p->cursor - 1], &p->line[p->cursor],
+                    p->line_len - p->cursor);
+            p->cursor--;
             p->line_len--;
             p->line[p->line_len] = 0;
-            out_str(p, "\b \b");
+            /* Move visual cursor left, then delete the char there. */
+            out_str(p, "\b\x1b[P");
+        }
+        return;
+    }
+    if (b == 0x01) {   /* Ctrl+A — beginning of line */
+        while (p->cursor > 0) { p->cursor--; out_str(p, "\x1b[D"); }
+        return;
+    }
+    if (b == 0x05) {   /* Ctrl+E — end of line */
+        while (p->cursor < p->line_len) { p->cursor++; out_str(p, "\x1b[C"); }
+        return;
+    }
+    if (b == 0x0b) {   /* Ctrl+K — kill to end of line */
+        if (p->cursor < p->line_len) {
+            p->line_len = p->cursor;
+            p->line[p->line_len] = 0;
+            out_str(p, "\x1b[K");
         }
         return;
     }
@@ -423,11 +464,33 @@ static void feed_char(FakePty *p, uint8_t b) {
         replace_line(p, "");
         return;
     }
+    if (b == 0x0c) {   /* Ctrl+L — clear screen, redraw prompt + line */
+        out_str(p, "\x1b[2J\x1b[H");
+        prompt(p);
+        if (p->line_len > 0) {
+            for (int i = 0; i < p->line_len; i++) out_byte(p, (uint8_t)p->line[i]);
+            /* Cursor ended up at end; move back to logical cursor. */
+            for (int i = p->cursor; i < p->line_len; i++) out_str(p, "\x1b[D");
+        }
+        return;
+    }
     if (b >= 0x20 && b < 0x7f) {
         if (p->line_len + 1 < LINE_MAX) {
-            p->line[p->line_len++] = (char)b;
+            /* Insert b at p->cursor. */
+            memmove(&p->line[p->cursor + 1], &p->line[p->cursor],
+                    p->line_len - p->cursor);
+            p->line[p->cursor] = (char)b;
+            p->line_len++;
+            p->cursor++;
             p->line[p->line_len] = 0;
-            out_byte(p, b);
+            if (p->cursor == p->line_len) {
+                /* Append — no shift needed. */
+                out_byte(p, b);
+            } else {
+                /* Mid-line insert: open a slot with ICH, then write the char. */
+                out_str(p, "\x1b[@");
+                out_byte(p, b);
+            }
         }
         return;
     }

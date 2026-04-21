@@ -875,6 +875,17 @@ static bool rect_hit(Rect r, int x, int y) {
 }
 
 static void ssh_form_submit(int cols, int rows) {
+#ifdef __EMSCRIPTEN__
+    /* Web demo: SSH is stubbed out and the browser can't open sockets
+       to arbitrary hosts anyway. Make Connect a visible no-op with an
+       explanatory status line — don't try to spawn anything. */
+    (void)cols; (void)rows;
+    strncpy(g_form.error,
+            "SSH is disabled in the web demo. Try the native build for this.",
+            sizeof(g_form.error) - 1);
+    g_form.error[sizeof(g_form.error) - 1] = 0;
+    return;
+#else
     if (!g_form.host[0]) {
         strncpy(g_form.error, "Host is required", sizeof(g_form.error) - 1);
         g_form.focus = F_HOST;
@@ -899,6 +910,7 @@ static void ssh_form_submit(int cols, int rows) {
                 sizeof(g_form.error) - 1);
         g_form.error[sizeof(g_form.error) - 1] = 0;
     }
+#endif
 }
 
 static void ssh_form_advance_focus(int delta) {
@@ -2051,12 +2063,33 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    unsigned int cfg_flags = FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI;
+#ifdef __EMSCRIPTEN__
+    /* Web demo: keep the window at a fixed size that matches the
+       canvas CSS in web/shell.html. Both FLAG_WINDOW_RESIZABLE and
+       FLAG_WINDOW_HIGHDPI cause raylib's EmscriptenResizeCallback to
+       resize CORE.Window.screen to window.innerWidth/Height, while
+       GLFW keeps mouse coords in canvas-CSS space (0..960). Layout
+       rects computed from GetScreenWidth() then sit in one coord
+       system, mouse clicks in another, and every button misses. */
+    unsigned int cfg_flags = FLAG_VSYNC_HINT;
+#else
+    unsigned int cfg_flags = FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT
+                           | FLAG_WINDOW_HIGHDPI;
+#endif
     if (init_opacity < 0.999f) cfg_flags |= FLAG_WINDOW_TRANSPARENT;
     if (init_undecorated)      cfg_flags |= FLAG_WINDOW_UNDECORATED;
     SetConfigFlags(cfg_flags);
     SetTraceLogLevel(LOG_WARNING);
+#ifdef __EMSCRIPTEN__
+    /* Match the CSS size of the canvas in web/shell.html so that mouse
+       event coordinates (which come through in canvas-element space)
+       line up 1:1 with layout rects drawn with GetScreenWidth/Height.
+       If these diverge, buttons like Cancel/+ visually land in one
+       place but hit-test at another. */
+    InitWindow(960, 560, "rbterm");
+#else
     InitWindow(800, 500, "rbterm");
+#endif
     SetExitKey(KEY_NULL);
 
     Renderer r;

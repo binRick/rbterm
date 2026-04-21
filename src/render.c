@@ -207,6 +207,16 @@ static bool file_exists(const char *p) {
 
 const char *renderer_find_default_font(void) {
     static const char *candidates[] = {
+#if defined(__EMSCRIPTEN__)
+        /* WebAssembly demo: fonts are preloaded from assets/fonts/ into
+           /fonts in MEMFS by the CMake --preload-file flag. */
+        "/fonts/JetBrainsMono-Regular.ttf",
+        "/fonts/FiraCode-Regular.ttf",
+        "/fonts/SourceCodePro-Regular.ttf",
+        "/fonts/Hack-Regular.ttf",
+        "/fonts/IBMPlexMono-Regular.ttf",
+        "/fonts/Inconsolata-Regular.ttf",
+#endif
         // Consolas first (Microsoft). Common install paths on all platforms.
         "/Library/Fonts/Consolas.ttf",
         "/Library/Fonts/Microsoft/Consolas.ttf",
