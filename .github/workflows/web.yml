@@ -1,0 +1,67 @@
+name: Web demo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only one concurrent deploy — cancel older runs rather than queueing them.
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
+
+      - name: Install emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.67'
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Configure (emcmake)
+        run: emcmake cmake -S . -B build-web -GNinja -DCMAKE_BUILD_TYPE=Release -DRBTERM_WEB=ON
+
+      - name: Build
+        run: cmake --build build-web --config Release
+
+      - name: Stage site
+        run: |
+          mkdir -p site
+          cp build-web/rbterm.html site/index.html
+          cp build-web/rbterm.js   site/
+          cp build-web/rbterm.wasm site/
+          # Only present when --preload-file is used; guard with -f.
+          cp build-web/rbterm.data site/ 2>/dev/null || true
+          ls -la site/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

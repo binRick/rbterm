@@ -1467,6 +1467,10 @@ static void scan_bundled_fonts(void) {
        `./rbterm` straight out of the repo root. */
     scan_font_dir("assets/fonts");
     scan_font_dir("fonts");
+#ifdef __EMSCRIPTEN__
+    /* Emscripten --preload-file mounts everything at an absolute root. */
+    scan_font_dir("/fonts");
+#endif
 }
 
 static void fonts_load(const char *current_path) {

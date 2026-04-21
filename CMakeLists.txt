@@ -24,6 +24,15 @@ set(SUPPORT_MODULE_RAUDIO OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(raylib)
 
 option(RBTERM_SSH "Build with embedded SSH support via libssh" ON)
+option(RBTERM_WEB "Build the WebAssembly demo (requires emscripten)" OFF)
+
+# Emscripten → WebAssembly demo build. No forked shell, no SSH, no
+# signals — just a fake shell backed by an in-memory tree. Auto-detect
+# an emcc toolchain so plain `emcmake cmake …` flips the switch.
+if(EMSCRIPTEN)
+    set(RBTERM_WEB ON CACHE BOOL "" FORCE)
+    set(RBTERM_SSH OFF CACHE BOOL "" FORCE)
+endif()
 
 set(RBTERM_SOURCES
     src/main.c
@@ -34,7 +43,9 @@ set(RBTERM_SOURCES
 )
 
 # Platform-specific backends: local PTY + emoji rasterizer.
-if(WIN32)
+if(RBTERM_WEB)
+    list(APPEND RBTERM_SOURCES src/pty_fake.c src/emoji_stub.c)
+elseif(WIN32)
     list(APPEND RBTERM_SOURCES src/pty_win.c src/emoji_stub.c)
 elseif(APPLE)
     list(APPEND RBTERM_SOURCES src/pty_unix.c src/emoji_mac.m)
@@ -106,6 +117,25 @@ endif()
 
 if(UNIX AND NOT APPLE)
   target_link_libraries(rbterm PRIVATE util m pthread dl)
+endif()
+
+if(EMSCRIPTEN)
+  # raylib's CMake autodetects PLATFORM=Web when EMSCRIPTEN is set,
+  # but we still need to hand emcc the right flags for the final link.
+  # ASYNCIFY lets us keep the regular blocking main loop; font files
+  # get preloaded into emscripten's virtual FS so fonts_load finds them.
+  set_target_properties(rbterm PROPERTIES SUFFIX ".html")
+  target_link_options(rbterm PRIVATE
+    "SHELL:-s USE_GLFW=3"
+    "SHELL:-s ASYNCIFY=1"
+    "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+    "SHELL:-s INITIAL_MEMORY=64MB"
+    "SHELL:-s STACK_SIZE=8MB"
+    "SHELL:-s FORCE_FILESYSTEM=1"
+    "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/assets/fonts@fonts"
+    "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/web/shell.html"
+  )
+  target_compile_definitions(rbterm PRIVATE PLATFORM_WEB=1)
 endif()
 
 if(WIN32)
