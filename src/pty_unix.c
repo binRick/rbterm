@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
@@ -22,11 +23,50 @@
   #include <pty.h>
 #endif
 
+#define RING_CAP (1u << 20)   /* 1 MB per tab */
+
 typedef struct {
     pid_t pid;
     int   fd;
     bool  alive;
+
+    /* Reader thread keeps the PTY drained into a ring buffer regardless
+       of the frame rate. Without this, bursty commands like `find /usr`
+       stall waiting for the main loop's next frame to drain the kernel's
+       PTY buffer. */
+    pthread_t       reader;
+    pthread_mutex_t lock;
+    uint8_t        *ring;
+    size_t          head;
+    size_t          tail;
+    volatile int    stop;
+    volatile int    eof;
 } LocalPty;
+
+static void *local_reader(void *arg) {
+    LocalPty *p = (LocalPty *)arg;
+    uint8_t buf[16384];
+    while (!__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) {
+        ssize_t n = read(p->fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        pthread_mutex_lock(&p->lock);
+        for (ssize_t i = 0; i < n; i++) {
+            p->ring[p->head] = buf[i];
+            p->head = (p->head + 1) & (RING_CAP - 1);
+            if (p->head == p->tail) {
+                /* overrun — drop oldest byte */
+                p->tail = (p->tail + 1) & (RING_CAP - 1);
+            }
+        }
+        pthread_mutex_unlock(&p->lock);
+    }
+    __atomic_store_n(&p->eof, 1, __ATOMIC_RELAXED);
+    return NULL;
+}
 
 void *local_open_impl(int cols, int rows) {
     struct winsize ws = { .ws_row = (unsigned short)rows,
@@ -76,25 +116,40 @@ void *local_open_impl(int cols, int rows) {
         perror("execl");
         _exit(127);
     }
-    int flags = fcntl(master, F_GETFL, 0);
-    fcntl(master, F_SETFL, flags | O_NONBLOCK);
-
+    /* Reader thread uses blocking reads — leave the fd in blocking mode. */
     LocalPty *p = calloc(1, sizeof(*p));
     p->pid = pid;
     p->fd  = master;
     p->alive = true;
+    p->ring = malloc(RING_CAP);
+    if (!p->ring) { close(master); free(p); return NULL; }
+    pthread_mutex_init(&p->lock, NULL);
+    if (pthread_create(&p->reader, NULL, local_reader, p) != 0) {
+        pthread_mutex_destroy(&p->lock);
+        close(master);
+        free(p->ring);
+        free(p);
+        return NULL;
+    }
     return p;
 }
 
 void local_close_impl(void *impl) {
     LocalPty *p = impl;
     if (!p) return;
+    __atomic_store_n(&p->stop, 1, __ATOMIC_RELAXED);
     if (p->pid > 0) {
         kill(p->pid, SIGHUP);
         int status;
         waitpid(p->pid, &status, 0);
     }
-    if (p->fd >= 0) close(p->fd);
+    if (p->fd >= 0) {
+        close(p->fd);           /* unblocks any pending read() in the thread */
+        p->fd = -1;
+    }
+    if (p->reader) pthread_join(p->reader, NULL);
+    pthread_mutex_destroy(&p->lock);
+    free(p->ring);
     free(p);
 }
 
@@ -109,14 +164,18 @@ bool local_alive_impl(void *impl) {
 
 int local_read_impl(void *impl, uint8_t *buf, size_t cap) {
     LocalPty *p = impl;
-    if (!p || p->fd < 0) return -1;
-    ssize_t n = read(p->fd, buf, cap);
+    if (!p) return -1;
+    size_t n = 0;
+    pthread_mutex_lock(&p->lock);
+    while (n < cap && p->tail != p->head) {
+        buf[n++] = p->ring[p->tail];
+        p->tail = (p->tail + 1) & (RING_CAP - 1);
+    }
+    pthread_mutex_unlock(&p->lock);
     if (n > 0) return (int)n;
-    if (n == 0) { p->alive = false; return -1; }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-    if (errno == EINTR) return 0;
-    p->alive = false;
-    return -1;
+    /* No data right now — but the child / reader may have ended. */
+    if (__atomic_load_n(&p->eof, __ATOMIC_RELAXED) && !local_alive_impl(p)) return -1;
+    return 0;
 }
 
 void local_write_impl(void *impl, const uint8_t *buf, size_t n) {

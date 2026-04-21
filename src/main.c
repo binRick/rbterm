@@ -109,6 +109,8 @@ typedef struct {
     double cwd_poll_at;
     FILE *log_fp;                /* session log file, NULL when disabled */
     char  log_path[PATH_MAX];
+    bool  is_ssh;
+    char  ssh_target[256];       /* user@host[:port] for SSH tabs */
 } Tab;
 
 #define MAX_TABS 16
@@ -250,6 +252,13 @@ static void io_set_clipboard_cb(void *u, const char *utf8) {
     (void)u;
     if (utf8 && *utf8) SetClipboardText(utf8);
 }
+static void io_set_cwd_cb(void *u, const char *path) {
+    Tab *t = (Tab *)u;
+    if (!t || !path || !*path) return;
+    strncpy(t->cwd, path, sizeof(t->cwd) - 1);
+    t->cwd[sizeof(t->cwd) - 1] = 0;
+    t->title_dirty = true;
+}
 
 static Tab *tab_open(int cols, int rows) {
     if (g_num_tabs >= MAX_TABS) return NULL;
@@ -260,7 +269,7 @@ static Tab *tab_open(int cols, int rows) {
     t->pty = pty_open(cols, rows);
     if (!t->pty) { free(t); return NULL; }
     ScreenIO io = { .user = t, .write = io_write_cb,
-                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb };
+                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb, .set_cwd = io_set_cwd_cb };
     t->scr = screen_new(cols, rows, 5000, io);
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
@@ -279,21 +288,23 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     /* Build a pretty label for the tab. */
     if (user && *user) {
         if (port == 22)
-            snprintf(t->cwd, sizeof(t->cwd), "%s@%s", user, host);
+            snprintf(t->ssh_target, sizeof(t->ssh_target), "%s@%s", user, host);
         else
-            snprintf(t->cwd, sizeof(t->cwd), "%s@%s:%d", user, host, port);
+            snprintf(t->ssh_target, sizeof(t->ssh_target), "%s@%s:%d", user, host, port);
     } else {
-        if (port == 22) snprintf(t->cwd, sizeof(t->cwd), "%s", host);
-        else snprintf(t->cwd, sizeof(t->cwd), "%s:%d", host, port);
+        if (port == 22) snprintf(t->ssh_target, sizeof(t->ssh_target), "%s", host);
+        else snprintf(t->ssh_target, sizeof(t->ssh_target), "%s:%d", host, port);
     }
-    snprintf(t->title, sizeof(t->title), "%s", t->cwd);
+    t->is_ssh = true;
+    snprintf(t->title, sizeof(t->title), "%s", t->ssh_target);
+    t->cwd[0] = 0;   /* OSC 7 from the remote shell will populate this */
     t->last_click_time = -1.0;
     t->last_click_col = t->last_click_row = -1;
     t->pty = pty_open_ssh(user, host, port, password, keyfile,
                           cols, rows, err, errsz);
     if (!t->pty) { free(t); return NULL; }
     ScreenIO io = { .user = t, .write = io_write_cb,
-                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb };
+                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb, .set_cwd = io_set_cwd_cb };
     t->scr = screen_new(cols, rows, 5000, io);
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
@@ -401,6 +412,27 @@ static void select_line(Screen *s, Selection *sel, int row) {
    (shortened to a basename, with $HOME / %USERPROFILE% rewritten to "~")
    over any OSC title the shell set. Falls back to title, then "shell". */
 static const char *tab_label(const Tab *t) {
+    /* SSH tabs: "user@host[:port] [basename]". Buffer is a rotating
+       set of per-tab statics so multiple tabs can be drawn in one
+       frame without overwriting each other. */
+    if (t->is_ssh) {
+        static char buf[MAX_TABS][320];
+        static int  slot = 0;
+        int idx = -1;
+        for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { idx = i; break; }
+        if (idx < 0) idx = slot++ % MAX_TABS;
+        char *out = buf[idx];
+        if (!t->cwd[0]) {
+            return t->ssh_target;
+        }
+        /* Basename of the remote path, with "~" or "/" shortcuts. */
+        const char *dir_label = t->cwd;
+        const char *b = strrchr(t->cwd, '/');
+        if (strcmp(t->cwd, "/") == 0) dir_label = "/";
+        else if (b) dir_label = (*(b + 1) ? b + 1 : b);   /* trailing slash → "/" */
+        snprintf(out, sizeof(buf[0]), "%s %s", t->ssh_target, dir_label);
+        return out;
+    }
     if (t->cwd[0]) {
         const char *home = getenv("HOME");
 #ifdef _WIN32

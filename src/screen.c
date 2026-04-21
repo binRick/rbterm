@@ -671,6 +671,35 @@ static void finish_osc(Screen *s) {
         }
         return;
     }
+    if (ps == 7) {
+        /* OSC 7 — current working directory, emitted by most shells on
+           every prompt. Format: file://<host>/<urlencoded-path>. We
+           ignore <host> (for SSH the remote sends its own hostname,
+           which isn't useful to us) and URL-decode the path. */
+        if (strncmp(p, "file://", 7) == 0) {
+            const char *q = p + 7;
+            const char *slash = strchr(q, '/');
+            if (slash) {
+                char out[1024];
+                size_t oi = 0;
+                const char *r = slash;
+                while (*r && oi + 1 < sizeof(out)) {
+                    if (*r == '%' && r[1] && r[2] &&
+                        isxdigit((unsigned char)r[1]) &&
+                        isxdigit((unsigned char)r[2])) {
+                        int h1 = hexval(r[1]), h2 = hexval(r[2]);
+                        out[oi++] = (char)((h1 << 4) | h2);
+                        r += 3;
+                    } else {
+                        out[oi++] = *r++;
+                    }
+                }
+                out[oi] = 0;
+                if (s->io.set_cwd) s->io.set_cwd(s->io.user, out);
+            }
+        }
+        return;
+    }
     if (ps == 10 || ps == 11 || ps == 12) {
         /* OSC 10/11/12 — default fg / bg / cursor colour. `?` queries;
            anything else sets. */

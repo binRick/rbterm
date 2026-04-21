@@ -40,7 +40,8 @@ typedef struct {
     void (*write)(void *user, const uint8_t *buf, size_t n);
     void (*set_title)(void *user, const char *title);
     void (*bell)(void *user);
-    void (*set_clipboard)(void *user, const char *utf8); /* OSC 52 */
+    void (*set_clipboard)(void *user, const char *utf8);   /* OSC 52 */
+    void (*set_cwd)(void *user, const char *path);         /* OSC 7 */
 } ScreenIO;
 
 Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io);
