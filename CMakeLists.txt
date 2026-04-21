@@ -83,6 +83,12 @@ else()
     list(APPEND RBTERM_SOURCES src/pty_ssh_stub.c)
 endif()
 
+if(WIN32)
+    # Embed the icon so Explorer / Alt-Tab / taskbar use rbterm.ico
+    # instead of the default generic exe icon.
+    list(APPEND RBTERM_SOURCES assets/rbterm.rc)
+endif()
+
 add_executable(rbterm ${RBTERM_SOURCES})
 target_include_directories(rbterm PRIVATE src)
 target_link_libraries(rbterm PRIVATE raylib)

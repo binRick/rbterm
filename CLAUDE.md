@@ -224,6 +224,53 @@ Persisting settings between runs is still TODO — everything's in-memory.
   `tab_open_ssh`, which writes any libssh error back into a fixed
   buffer the modal renders in red.
 
+## Commit + release flow
+
+When the user says **"commit"** or **"commit to github"**: `git add -A`,
+make a clear commit, and `git push`. That's it — nothing fancy.
+
+When the user says **"commit and release"** or **"publish a release"**
+(or a variant like "update the release"): do everything above, plus
+**re-tag `v0.1.0`** so CI rebuilds and re-publishes the release. The
+flow is:
+
+```bash
+# after the commit + push is done…
+git tag -d v0.1.0
+git push origin :refs/tags/v0.1.0
+gh release delete v0.1.0 --repo binRick/rbterm --yes --cleanup-tag || true
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+The tag push triggers `.github/workflows/release.yml`, which builds
+`rbterm-linux-x86_64` and `rbterm-windows-x86_64.exe` and attaches
+them to the release. Takes ~2 min. Use `gh run watch <run_id>` to
+block until it's done.
+
+When the user says **"copy the exe to my windows vm"** (or similar):
+the host alias is `win` in their `~/.ssh/config`. The Windows
+Downloads folder is redirected to `\\Mac\Home\Downloads` (Parallels/
+Fusion shared folder), so the reliable drop is
+`~/Downloads/rbterm-windows-x86_64.exe` on the **Mac side** — that's
+what Windows Explorer's Downloads sidebar shows. `scp`-ing into
+`win:Downloads/` lands in `C:\Users\richardblundell\Downloads\`,
+which is a separate, physical Windows folder the user usually isn't
+browsing. Always land the file on the Mac side:
+
+```bash
+gh release download v0.1.0 --repo binRick/rbterm \
+    --pattern 'rbterm-windows-x86_64.exe' \
+    --dir ~/Downloads --clobber
+```
+
+Defender will quarantine unsigned exes on sight. If that happens, add
+the exclusion first before re-copying:
+
+```bash
+ssh win 'powershell -NoProfile -Command "Add-MpPreference -ExclusionPath \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\""'
+```
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt

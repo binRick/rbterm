@@ -1,0 +1,7 @@
+/* Windows resource script. Compiled by MSVC's rc.exe (or MinGW's
+ * windres) via CMake and linked into rbterm.exe so Windows uses
+ * our icon in Explorer, Alt+Tab and the taskbar. */
+
+/* Any numeric ID works; Windows picks the lowest-ID ICON resource
+ * as the executable's default icon. */
+101 ICON "rbterm.ico"
