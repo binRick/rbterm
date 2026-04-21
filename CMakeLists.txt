@@ -121,7 +121,7 @@ if(APPLE)
   target_compile_options(rbterm PRIVATE $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>)
 endif()
 
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
   target_link_libraries(rbterm PRIVATE util m pthread dl)
 endif()
 
