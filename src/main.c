@@ -1250,11 +1250,20 @@ static int       g_font_list_scroll = 0;
 static int       g_font_list_selected = -1;
 
 static bool looks_monospace(const char *name) {
+    /* Anything whose filename contains one of these fragments is shown
+       in the picker. Keep the list generous — false positives in the
+       picker are cheap, false negatives leave fonts unreachable. */
     static const char *pat[] = {
         "Mono", "Menlo", "Monaco", "Consolas", "Courier", "Code",
         "Fira", "JetBrains", "Hack", "Inconsolata", "Terminus",
         "Fixed", "Source Code", "Anonymous", "Noto Sans Mono",
-        "SF Mono", "SFMono", "Iosevka", "Cascadia", NULL
+        "SF Mono", "SFMono", "Iosevka", "Cascadia",
+        "IBMPlex", "Plex", "RobotoMono", "Roboto Mono", "SpaceMono",
+        "Space Mono", "Victor", "Ubuntu Mono", "Liberation",
+        "DejaVu", "Nimbus", "Office Code Pro", "OfficeCodePro",
+        "GoMono", "Go Mono", "Iosevka", "Envy", "Pragmata",
+        "Terminess", "Mononoki", "MPlus", "M+", "TerminalVector",
+        NULL
     };
     for (int i = 0; pat[i]; i++) if (strstr(name, pat[i])) return true;
     return false;
@@ -1328,11 +1337,34 @@ static void fonts_free_previews(void) {
     }
 }
 
+/* Scan rbterm's own bundled fonts directory in every plausible location
+   — next to the binary, inside a macOS .app Resources folder, and
+   relative to the current working directory for dev runs from the repo. */
+static void scan_bundled_fonts(void) {
+    const char *exe_dir = GetApplicationDirectory();
+    if (exe_dir && *exe_dir) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%sfonts", exe_dir);         /* exe-side */
+        scan_font_dir(p);
+        snprintf(p, sizeof(p), "%sassets/fonts", exe_dir);  /* dev build dir */
+        scan_font_dir(p);
+        /* macOS .app: exe at Contents/MacOS/, fonts at Contents/Resources/fonts */
+        snprintf(p, sizeof(p), "%s../Resources/fonts", exe_dir);
+        scan_font_dir(p);
+    }
+    /* Relative to the current working directory — useful when running
+       `./rbterm` straight out of the repo root. */
+    scan_font_dir("assets/fonts");
+    scan_font_dir("fonts");
+}
+
 static void fonts_load(const char *current_path) {
     fonts_free_previews();
     g_font_count = 0;
     g_font_list_scroll = 0;
     g_font_list_selected = -1;
+
+    scan_bundled_fonts();
 #ifdef _WIN32
     scan_font_dir("C:/Windows/Fonts");
     char user_fonts[1024];

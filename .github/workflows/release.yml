@@ -4,10 +4,10 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:   # allow manual runs for debugging
+  workflow_dispatch:
 
 permissions:
-  contents: write      # needed by softprops/action-gh-release
+  contents: write
 
 jobs:
   build:
@@ -19,12 +19,13 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux-x86_64
-            asset_name: rbterm-linux-x86_64
+            asset_name: rbterm-linux-x86_64.zip
             build_subdir: build
             binary_name: rbterm
+            cmake_extra: ""
           - os: windows-latest
             platform: windows-x86_64
-            asset_name: rbterm-windows-x86_64.exe
+            asset_name: rbterm-windows-x86_64.zip
             build_subdir: build/Release
             binary_name: rbterm.exe
             cmake_extra: "-DRBTERM_SSH=OFF"
@@ -32,14 +33,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false    # alacritty is for reference only
+          submodules: false
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config \
+            build-essential cmake ninja-build pkg-config zip \
             libgl1-mesa-dev libglu1-mesa-dev \
             libx11-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxi-dev libxkbcommon-dev \
@@ -52,24 +53,21 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Stage binary
+      - name: Stage binary + fonts
         shell: bash
         run: |
-          mkdir -p out
-          cp "${{ matrix.build_subdir }}/${{ matrix.binary_name }}" "out/${{ matrix.asset_name }}"
+          mkdir -p pkg out
+          cp "${{ matrix.build_subdir }}/${{ matrix.binary_name }}" "pkg/${{ matrix.binary_name }}"
+          cp -R assets/fonts pkg/fonts
 
       - name: Self-sign Windows binary
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          # Self-signed cert so the exe isn't "completely unsigned". It
-          # won't remove the SmartScreen warning (no publisher reputation
-          # or EV cert) but the Signature tab now shows a signing subject,
-          # the Authenticode embedded timestamp proves when it was
-          # signed, and some AV engines treat signed-with-any-cert
-          # differently from raw unsigned. Users who want to fully
-          # silence Windows warnings can import the cert into the
-          # Trusted Publishers store once.
+          # Self-signed cert so the exe isn't "completely unsigned". Won't
+          # silence SmartScreen (no publisher reputation) but the Signature
+          # tab shows a valid signer and users can import the cert into
+          # Trusted Publishers to bypass warnings permanently.
           $cert = New-SelfSignedCertificate `
               -Subject "CN=rbterm CI (binRick)" `
               -Type CodeSigning `
@@ -77,13 +75,22 @@ jobs:
               -CertStoreLocation Cert:\CurrentUser\My `
               -NotAfter (Get-Date).AddYears(3)
           Set-AuthenticodeSignature `
-              -FilePath "out\${{ matrix.asset_name }}" `
+              -FilePath "pkg\${{ matrix.binary_name }}" `
               -Certificate $cert `
               -HashAlgorithm SHA256 `
               -TimestampServer "http://timestamp.digicert.com"
-          $sig = Get-AuthenticodeSignature "out\${{ matrix.asset_name }}"
-          Write-Host "Signature status: $($sig.Status)"
-          Write-Host "Signer:          $($sig.SignerCertificate.Subject)"
+          (Get-AuthenticodeSignature "pkg\${{ matrix.binary_name }}") | Format-List Status, SignerCertificate
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          cd pkg
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path * -DestinationPath '../out/${{ matrix.asset_name }}' -Force"
+          else
+            zip -r "../out/${{ matrix.asset_name }}" .
+          fi
+          ls -la ../out/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -98,8 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4    # needed so the release notes generator
-                                     # can see commit/tag history
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 

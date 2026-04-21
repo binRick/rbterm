@@ -73,10 +73,13 @@ $(ICNS): assets/icon.png
 
 app: rbterm $(ICNS) Info.plist
 	rm -rf rbterm.app
-	mkdir -p rbterm.app/Contents/MacOS rbterm.app/Contents/Resources
+	mkdir -p rbterm.app/Contents/MacOS rbterm.app/Contents/Resources/fonts
 	cp rbterm rbterm.app/Contents/MacOS/rbterm
 	cp $(ICNS) rbterm.app/Contents/Resources/rbterm.icns
 	cp Info.plist rbterm.app/Contents/Info.plist
+	# Bundle the curated OSS fonts so the picker has choices out of the box
+	# regardless of what the user has installed system-wide.
+	-cp assets/fonts/*.ttf rbterm.app/Contents/Resources/fonts/ 2>/dev/null
 	# Ensure LaunchServices notices the bundle
 	touch rbterm.app
 
