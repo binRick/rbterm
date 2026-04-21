@@ -15,13 +15,13 @@ fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   make app
-  # -W waits for the app to exit; --stdout/--stderr pipe rbterm's output
-  # back to this terminal so ssh-auth logs, font-load messages, and any
-  # libssh warnings stream here while you're using the app.
-  exec open -n -W \
-       --stdout=/dev/stdout \
-       --stderr=/dev/stderr \
-       ./rbterm.app --args "$@"
+  # Launching the binary directly (rather than via `open`) keeps
+  # stdout/stderr attached to this terminal so you can see the SSH
+  # auth trace and any libssh warnings live. macOS still reads the
+  # enclosing Info.plist for Cmd+Tab label and Dock icon since the
+  # binary is inside rbterm.app. `exec` replaces the shell so Ctrl+C
+  # in this terminal sends SIGINT directly to rbterm.
+  exec ./rbterm.app/Contents/MacOS/rbterm "$@"
 else
   make
   exec ./rbterm "$@"
