@@ -1226,6 +1226,8 @@ typedef struct {
     Rect font_list;  /* scrollable list of monospace fonts */
     Rect pad_val;
     Rect pad_dec, pad_inc;
+    Rect spc_val;
+    Rect spc_dec, spc_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
     Rect close;
@@ -1436,12 +1438,26 @@ static void settings_apply_padding(Renderer *r, int new_pad) {
                      r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
 }
 
+static void settings_apply_spacing(Renderer *r, int new_extra) {
+    renderer_set_cell_spacing(r, new_extra);
+    int nc = (GetScreenWidth()  - 2 * r->pad_x) / r->cell_w;
+    int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r->pad_y) / r->cell_h;
+    if (nc < 1) nc = 1;
+    if (nr < 1) nr = 1;
+    for (int i = 0; i < g_num_tabs; i++) {
+        screen_resize(g_tabs[i]->scr, nc, nr);
+        pty_resize(g_tabs[i]->pty, nc, nr);
+    }
+    SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x,
+                     r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
+}
+
 static bool g_settings_dir_focus = false;
 static bool g_settings_dir_sel_all = false;
 
 static SettingsLayout settings_layout(int win_w, int win_h) {
     SettingsLayout L = {0};
-    int w = 600, h = 520;
+    int w = 600, h = 580;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -1463,7 +1479,12 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     L.pad_dec  = (Rect){ L.modal.x + w - 138, pad_row_y, btn, btn };
     L.pad_inc  = (Rect){ L.modal.x + w - 60,  pad_row_y, btn, btn };
 
-    int log_row1_y = pad_row_y + btn + 14;
+    int spc_row_y = pad_row_y + btn + 10;
+    L.spc_val  = (Rect){ L.modal.x + w - 214, spc_row_y, 66, btn };
+    L.spc_dec  = (Rect){ L.modal.x + w - 138, spc_row_y, btn, btn };
+    L.spc_inc  = (Rect){ L.modal.x + w - 60,  spc_row_y, btn, btn };
+
+    int log_row1_y = spc_row_y + btn + 14;
     L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
 
     int log_row2_y = log_row1_y + btn + 10;
@@ -1492,6 +1513,8 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     if (rect_hit(L.inc, mx, my))   { settings_apply_font_size(r, r->font_size + 1); return; }
     if (rect_hit(L.pad_dec, mx, my)) { settings_apply_padding(r, r->pad_x - 2); return; }
     if (rect_hit(L.pad_inc, mx, my)) { settings_apply_padding(r, r->pad_x + 2); return; }
+    if (rect_hit(L.spc_dec, mx, my)) { settings_apply_spacing(r, r->cell_extra_w - 1); return; }
+    if (rect_hit(L.spc_inc, mx, my)) { settings_apply_spacing(r, r->cell_extra_w + 1); return; }
     if (rect_hit(L.font_list, mx, my)) {
         int row_h = 22;
         int idx = (my - L.font_list.y) / row_h + g_font_list_scroll;
@@ -1720,6 +1743,34 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     DrawTextEx(*f, "+",
                (Vector2){L.pad_inc.x + (L.pad_inc.w - ps.x) / 2,
                          L.pad_inc.y + (L.pad_inc.h - ps.y) / 2},
+               18, 0, (Color){230, 232, 240, 255});
+
+    /* Letter-spacing row. */
+    DrawTextEx(*f, "Spacing",
+               (Vector2){L.modal.x + 22, L.spc_val.y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    char sbuf[32];
+    snprintf(sbuf, sizeof(sbuf), "%d", r->cell_extra_w);
+    DrawRectangle(L.spc_val.x, L.spc_val.y, L.spc_val.w, L.spc_val.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.spc_val.x, L.spc_val.y, L.spc_val.w, L.spc_val.h,
+                       (Color){70, 74, 90, 255});
+    Vector2 svsz = MeasureTextEx(*f, sbuf, 16, 0);
+    DrawTextEx(*f, sbuf,
+               (Vector2){L.spc_val.x + (L.spc_val.w - svsz.x) / 2,
+                         L.spc_val.y + (L.spc_val.h - svsz.y) / 2},
+               16, 0, (Color){230, 232, 240, 255});
+    DrawRectangle(L.spc_dec.x, L.spc_dec.y, L.spc_dec.w, L.spc_dec.h, (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.spc_dec.x, L.spc_dec.y, L.spc_dec.w, L.spc_dec.h, (Color){125, 207, 255, 180});
+    DrawTextEx(*f, "-",
+               (Vector2){L.spc_dec.x + (L.spc_dec.w - ms.x) / 2,
+                         L.spc_dec.y + (L.spc_dec.h - ms.y) / 2},
+               18, 0, (Color){230, 232, 240, 255});
+    DrawRectangle(L.spc_inc.x, L.spc_inc.y, L.spc_inc.w, L.spc_inc.h, (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.spc_inc.x, L.spc_inc.y, L.spc_inc.w, L.spc_inc.h, (Color){125, 207, 255, 180});
+    DrawTextEx(*f, "+",
+               (Vector2){L.spc_inc.x + (L.spc_inc.w - ps.x) / 2,
+                         L.spc_inc.y + (L.spc_inc.h - ps.y) / 2},
                18, 0, (Color){230, 232, 240, 255});
 
     /* Session logging rows. */

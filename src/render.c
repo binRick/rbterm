@@ -243,11 +243,18 @@ static void measure_cell(Renderer *r) {
     Vector2 v = MeasureTextEx(*f, "M", (float)r->font_size, 0.0f);
     int w = (int)(v.x + 0.5f);
     if (w < 1) w = r->font_size / 2;
-    // Use slightly taller line height for nicer spacing.
     int h = (int)((float)r->font_size * 1.2f + 0.5f);
     if (h < w) h = w;
-    r->cell_w = w;
+    r->cell_w_base = w;
+    r->cell_w = w + r->cell_extra_w;
     r->cell_h = h;
+}
+
+void renderer_set_cell_spacing(Renderer *r, int extra_w) {
+    if (extra_w < 0)  extra_w = 0;
+    if (extra_w > 32) extra_w = 32;
+    r->cell_extra_w = extra_w;
+    r->cell_w = r->cell_w_base + extra_w;
 }
 
 static bool load_font_into(Renderer *r, const char *path, int size) {
@@ -468,7 +475,7 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             if (!main_has_glyph) {
                 DRAW_GLYPH(g_fallback);
                 /* Nothing in any font: visible placeholder. */
-                pos.x = (float)(x * cw);
+                pos.x = (float)(x * cw + r->cell_extra_w / 2);
                 pos.y = (float)(y * ch + glyph_y_offset);
                 DrawTextCodepoint(*f, '?', pos, (float)r->font_size,
                                   col_from_rgb(fg, alpha * 0.6f));
@@ -483,7 +490,11 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                 goto glyph_drawn;
             }
 
-            pos.x = (float)(x * cw);
+            /* Centre the glyph horizontally within the cell so added
+               letter spacing sits as equal whitespace on both sides,
+               rather than leaving a visible gap only on the right. */
+            int glyph_x_offset = r->cell_extra_w / 2;
+            pos.x = (float)(x * cw + glyph_x_offset);
             pos.y = (float)(y * ch + glyph_y_offset);
             DrawTextCodepoint(*f, (int)c.cp, pos, (float)r->font_size, col_from_rgb(fg, alpha));
 
