@@ -260,7 +260,13 @@ void renderer_set_cell_spacing(Renderer *r, int extra_w) {
 static bool load_font_into(Renderer *r, const char *path, int size) {
     int cp_count;
     int *cps = build_codepoints(&cp_count);
-    Font f = LoadFontEx(path, size, cps, cp_count);
+    /* Rasterise the atlas at 2× the display size and downsample at draw
+       time. The extra glyph resolution survives the bilinear filter so
+       strokes look brighter / less washed out — without this the default
+       white text reads as gray-ish because sRGB blending eats the edges. */
+    int atlas_size = size * 2;
+    if (atlas_size > 96) atlas_size = 96;   /* atlas size cap */
+    Font f = LoadFontEx(path, atlas_size, cps, cp_count);
     free(cps);
     if (f.texture.id == 0) return false;
     SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
@@ -497,6 +503,13 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             pos.x = (float)(x * cw + glyph_x_offset);
             pos.y = (float)(y * ch + glyph_y_offset);
             DrawTextCodepoint(*f, (int)c.cp, pos, (float)r->font_size, col_from_rgb(fg, alpha));
+            /* Stroke-thickening pass: redraw the glyph half a pixel to
+               the right. Compensates for sRGB-space alpha blending
+               eating the edges of antialiased strokes, which otherwise
+               makes "white" text read as gray. Same trick iTerm2 uses
+               when "thin strokes" is off. */
+            Vector2 p_thick = { pos.x + 0.5f, pos.y };
+            DrawTextCodepoint(*f, (int)c.cp, p_thick, (float)r->font_size, col_from_rgb(fg, alpha));
 
         glyph_drawn:;
             #undef DRAW_GLYPH
