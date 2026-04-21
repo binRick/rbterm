@@ -6,8 +6,21 @@
  * under a critical section. local_read_impl drains the ring without
  * blocking, matching the semantics O_NONBLOCK gives Unix for free. */
 
+/* Ask for the Win10 1809+ SDK so PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE
+   and CreatePseudoConsole are declared. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER 0x0A00
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE
+/* Older SDKs don't expose it as a constant but the ConPTY APIs still
+   work. 0x00020016 matches the value MS ships. */
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE 0x00020016
+#endif
 #include <wchar.h>
 #include <stdio.h>
 #include <stdlib.h>
