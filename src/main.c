@@ -752,15 +752,27 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
 
-    /* Click on a saved host → populate fields from ~/.ssh/config and
-       connect immediately. The form closes on success. */
+    /* Click on a saved host → populate fields from ~/.ssh/config. The
+       user hits Connect (or double-clicks) to actually open the session
+       — keeps single-click from making a tab before you've checked the
+       fields match what you wanted. */
     if (L.list.w > 0 && rect_hit(L.list, mx, my)) {
         int row_h = 22;
         int idx = (my - L.list.y) / row_h + g_ssh_list_scroll;
         if (idx >= 0 && idx < g_ssh_profile_count) {
+            static double last_pick_t = -1.0;
+            static int    last_pick_i = -1;
             g_ssh_list_selected = idx;
             ssh_form_apply_profile(&g_ssh_profiles[idx]);
-            ssh_form_submit(cols, rows);
+            g_form.focus = F_CONNECT;
+            double now = GetTime();
+            if (idx == last_pick_i && now - last_pick_t < 0.45) {
+                ssh_form_submit(cols, rows);  /* double-click */
+                last_pick_i = -1;
+            } else {
+                last_pick_i = idx;
+                last_pick_t = now;
+            }
         }
         return;
     }
