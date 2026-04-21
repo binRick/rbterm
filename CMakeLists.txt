@@ -69,8 +69,11 @@ if(NOT libssh_FOUND)
     set(WITH_GSSAPI    OFF CACHE BOOL "" FORCE)
     set(WITH_SERVER    OFF CACHE BOOL "" FORCE)
     set(WITH_EXAMPLES  OFF CACHE BOOL "" FORCE)
+    set(WITH_ZLIB      OFF CACHE BOOL "" FORCE)  # no zlib on Windows runner
+    set(WITH_NACL      OFF CACHE BOOL "" FORCE)
     set(UNIT_TESTING   OFF CACHE BOOL "" FORCE)
     set(CLIENT_TESTING OFF CACHE BOOL "" FORCE)
+    set(BUILD_STATIC_LIB ON  CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(libssh)
 endif()
 
