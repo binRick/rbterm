@@ -23,13 +23,14 @@ set(BUILD_GAMES      OFF CACHE BOOL "" FORCE)
 set(SUPPORT_MODULE_RAUDIO OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(raylib)
 
+option(RBTERM_SSH "Build with embedded SSH support via libssh" ON)
+
 set(RBTERM_SOURCES
     src/main.c
     src/screen.c
     src/render.c
     src/input.c
     src/pty_dispatch.c
-    src/pty_ssh.c
 )
 
 # Platform-specific backends: local PTY + emoji rasterizer.
@@ -41,45 +42,53 @@ else()
     list(APPEND RBTERM_SOURCES src/pty_unix.c src/emoji_stub.c)
 endif()
 
-# libssh for the SSH backend. Prefer an installed copy; otherwise fetch
-# both libssh and mbedTLS (its crypto backend) via FetchContent. mbedTLS
-# is chosen over OpenSSL because it's pure-C CMake and builds cleanly on
-# Windows without external tooling.
-find_package(libssh QUIET)
-if(NOT libssh_FOUND)
-    message(STATUS "libssh not installed — fetching via FetchContent")
+# SSH backend is optional — libssh + mbedTLS integration via FetchContent
+# is fiddly on Windows so CI builds pass -DRBTERM_SSH=OFF and ship a stub
+# that reports "not built in this binary". Linux / macOS builds pick it
+# up normally.
+if(RBTERM_SSH)
+    list(APPEND RBTERM_SOURCES src/pty_ssh.c)
 
-    FetchContent_Declare(
-      mbedtls
-      GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
-      GIT_TAG        v3.6.2
-      GIT_SHALLOW    TRUE
-    )
-    set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
-    set(ENABLE_TESTING  OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(mbedtls)
+    find_package(libssh QUIET)
+    if(NOT libssh_FOUND)
+        message(STATUS "libssh not installed — fetching via FetchContent")
 
-    FetchContent_Declare(
-      libssh
-      GIT_REPOSITORY https://gitlab.com/libssh/libssh-mirror.git
-      GIT_TAG        libssh-0.11.1
-      GIT_SHALLOW    TRUE
-    )
-    set(WITH_MBEDTLS   ON  CACHE BOOL "" FORCE)
-    set(WITH_GSSAPI    OFF CACHE BOOL "" FORCE)
-    set(WITH_SERVER    OFF CACHE BOOL "" FORCE)
-    set(WITH_EXAMPLES  OFF CACHE BOOL "" FORCE)
-    set(WITH_ZLIB      OFF CACHE BOOL "" FORCE)  # no zlib on Windows runner
-    set(WITH_NACL      OFF CACHE BOOL "" FORCE)
-    set(UNIT_TESTING   OFF CACHE BOOL "" FORCE)
-    set(CLIENT_TESTING OFF CACHE BOOL "" FORCE)
-    set(BUILD_STATIC_LIB ON  CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(libssh)
+        FetchContent_Declare(
+          mbedtls
+          GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
+          GIT_TAG        v3.6.2
+          GIT_SHALLOW    TRUE
+        )
+        set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+        set(ENABLE_TESTING  OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(mbedtls)
+
+        FetchContent_Declare(
+          libssh
+          GIT_REPOSITORY https://gitlab.com/libssh/libssh-mirror.git
+          GIT_TAG        libssh-0.11.1
+          GIT_SHALLOW    TRUE
+        )
+        set(WITH_MBEDTLS   ON  CACHE BOOL "" FORCE)
+        set(WITH_GSSAPI    OFF CACHE BOOL "" FORCE)
+        set(WITH_SERVER    OFF CACHE BOOL "" FORCE)
+        set(WITH_EXAMPLES  OFF CACHE BOOL "" FORCE)
+        set(WITH_ZLIB      OFF CACHE BOOL "" FORCE)
+        set(WITH_NACL      OFF CACHE BOOL "" FORCE)
+        set(UNIT_TESTING   OFF CACHE BOOL "" FORCE)
+        set(CLIENT_TESTING OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(libssh)
+    endif()
+else()
+    list(APPEND RBTERM_SOURCES src/pty_ssh_stub.c)
 endif()
 
 add_executable(rbterm ${RBTERM_SOURCES})
 target_include_directories(rbterm PRIVATE src)
-target_link_libraries(rbterm PRIVATE raylib ssh)
+target_link_libraries(rbterm PRIVATE raylib)
+if(RBTERM_SSH)
+    target_link_libraries(rbterm PRIVATE ssh)
+endif()
 
 if(APPLE)
   target_link_libraries(rbterm PRIVATE

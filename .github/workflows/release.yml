@@ -27,6 +27,7 @@ jobs:
             asset_name: rbterm-windows-x86_64.exe
             build_subdir: build/Release
             binary_name: rbterm.exe
+            cmake_extra: "-DRBTERM_SSH=OFF"
 
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +47,7 @@ jobs:
             libssh-dev
 
       - name: Configure (CMake)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
 
       - name: Build
         run: cmake --build build --config Release --parallel
