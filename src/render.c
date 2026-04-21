@@ -233,6 +233,7 @@ static bool load_font_into(Renderer *r, const char *path, int size) {
 bool renderer_init(Renderer *r, const char *font_path, int font_size) {
     memset(r, 0, sizeof(*r));
     if (font_size < 6) font_size = 14;
+    r->bg_alpha = 1.0f;
     if (!font_path || !*font_path) font_path = renderer_find_default_font();
     if (!font_path) {
         fprintf(stderr, "rbterm: no system monospace font found; pass --font PATH\n");
@@ -294,13 +295,20 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     int cols = screen_cols(s);
     int rows = screen_rows(s);
     int cw = r->cell_w, ch = r->cell_h;
+    int px = r->pad_x, py = r->pad_y;
+    float bga = r->bg_alpha;
+    if (bga < 0.0f) bga = 0.0f;
+    if (bga > 1.0f) bga = 1.0f;
 
-    /* Paint a full-screen backdrop in the default bg (the tab bar paints
-       over the top strip separately). */
-    DrawRectangle(0, y_offset, cols * cw, rows * ch, col_from_rgb(DEFAULT_BG, 1.0f));
+    /* Backdrop: paint the whole terminal region (including padding) in
+       the default bg, honouring the configured opacity. Non-default
+       cell backgrounds drawn below still land at full alpha. */
+    DrawRectangle(0, y_offset,
+                  cols * cw + 2 * px, rows * ch + 2 * py,
+                  col_from_rgb(DEFAULT_BG, bga));
 
     Camera2D cam = {0};
-    cam.offset = (Vector2){0.0f, (float)y_offset};
+    cam.offset = (Vector2){(float)px, (float)(y_offset + py)};
     cam.zoom = 1.0f;
     BeginMode2D(cam);
 

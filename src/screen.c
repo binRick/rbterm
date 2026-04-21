@@ -51,6 +51,8 @@ struct Screen {
     bool param_set[MAX_PARAMS];
     int param_cnt;
     bool priv;       // '?' seen
+    bool inter_gt;   // '>' seen  (secondary DA etc.)
+    bool inter_eq;   // '=' seen  (tertiary DA)
     uint32_t uni_cp;
     int uni_need;
 
@@ -321,6 +323,8 @@ static void reset_params(Screen *s) {
     for (int i = 0; i < MAX_PARAMS; i++) { s->params[i] = 0; s->param_set[i] = false; }
     s->param_cnt = 0;
     s->priv = false;
+    s->inter_gt = false;
+    s->inter_eq = false;
     s->osc_len = 0;
 }
 
@@ -453,6 +457,8 @@ static void set_mode(Screen *s, int p, bool on) {
 
 static void handle_csi(Screen *s, uint8_t b) {
     if (b == '?') { s->priv = true; return; }
+    if (b == '>') { s->inter_gt = true; return; }
+    if (b == '=') { s->inter_eq = true; return; }
     if (b >= '0' && b <= '9') {
         if (s->param_cnt == 0) s->param_cnt = 1;
         int i = s->param_cnt - 1;
@@ -538,12 +544,22 @@ static void handle_csi(Screen *s, uint8_t b) {
         }
         break;
     case 'c': {
-        /* Device Attributes reply. Tmux specifically looks for the xterm
-           Primary DA shape `CSI ? 1 ; 2 c`; if we answered with the old
-           VT102 `?6c` format it didn't consume the response and the bytes
-           leaked onto the screen. */
-        if (s->io.write) {
-            const char *resp = "\x1b[?1;2c";
+        /* Device Attributes. Three flavours, distinguished by the CSI
+           intermediate byte:
+             CSI  c     — Primary DA   → `CSI ? 65 ; 1 ; 9 c` (VT520 + printer + UTF-8)
+             CSI >c     — Secondary DA → `CSI > 0 ; 95 ; 0 c` (firmware 95, matches xterm)
+             CSI =c     — Tertiary DA  → ignored (some terminals reply "rbTM\\")
+           Answering Primary-DA to a Secondary-DA query made tmux's
+           inner shell display the reply literally. */
+        if (!s->io.write) break;
+        if (s->inter_gt) {
+            const char *resp = "\x1b[>0;95;0c";
+            s->io.write(s->io.user, (const uint8_t *)resp, strlen(resp));
+        } else if (s->inter_eq) {
+            /* Intentionally silent — xterm responds with a DCS id which
+               some shells also mis-parse. */
+        } else {
+            const char *resp = "\x1b[?65;1;9c";
             s->io.write(s->io.user, (const uint8_t *)resp, strlen(resp));
         }
         break;

@@ -5,8 +5,11 @@ typedef struct {
     int font_size;
     int cell_w;
     int cell_h;
+    int pad_x;        /* horizontal padding in pixels around the grid */
+    int pad_y;        /* vertical padding (applied above + below terminal) */
+    float bg_alpha;   /* default-background opacity, 0..1 */
     char font_path[1024];
-    void *font_data; // Font* (opaque)
+    void *font_data;  // Font* (opaque)
 } Renderer;
 
 typedef struct {

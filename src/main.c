@@ -1060,7 +1060,7 @@ static void settings_apply_font_size(Renderer *r, int new_size) {
             screen_resize(g_tabs[i]->scr, nc, nr);
             pty_resize(g_tabs[i]->pty, nc, nr);
         }
-        SetWindowMinSize(r->cell_w * 20, r->cell_h * 5 + TAB_BAR_H);
+        SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x, r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
     }
 }
 
@@ -1068,17 +1068,36 @@ typedef struct {
     Rect modal;
     Rect font_val;   /* current font size display */
     Rect dec, inc;   /* font -/+ buttons */
+    Rect pad_val;
+    Rect pad_dec, pad_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
     Rect close;
 } SettingsLayout;
+
+static void settings_apply_padding(Renderer *r, int new_pad) {
+    if (new_pad < 0) new_pad = 0;
+    if (new_pad > 64) new_pad = 64;
+    r->pad_x = new_pad;
+    r->pad_y = new_pad;
+    int nc = (GetScreenWidth()  - 2 * r->pad_x) / r->cell_w;
+    int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r->pad_y) / r->cell_h;
+    if (nc < 1) nc = 1;
+    if (nr < 1) nr = 1;
+    for (int i = 0; i < g_num_tabs; i++) {
+        screen_resize(g_tabs[i]->scr, nc, nr);
+        pty_resize(g_tabs[i]->pty, nc, nr);
+    }
+    SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x,
+                     r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
+}
 
 static bool g_settings_dir_focus = false;
 static bool g_settings_dir_sel_all = false;
 
 static SettingsLayout settings_layout(int win_w, int win_h) {
     SettingsLayout L = {0};
-    int w = 560, h = 300;
+    int w = 560, h = 350;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -1092,7 +1111,12 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     L.dec      = (Rect){ L.modal.x + w - 138, font_row_y, btn, btn };
     L.inc      = (Rect){ L.modal.x + w - 60,  font_row_y, btn, btn };
 
-    int log_row1_y = font_row_y + btn + 22;
+    int pad_row_y = font_row_y + btn + 10;
+    L.pad_val  = (Rect){ L.modal.x + w - 214, pad_row_y, 66, btn };
+    L.pad_dec  = (Rect){ L.modal.x + w - 138, pad_row_y, btn, btn };
+    L.pad_inc  = (Rect){ L.modal.x + w - 60,  pad_row_y, btn, btn };
+
+    int log_row1_y = pad_row_y + btn + 18;
     L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
 
     int log_row2_y = log_row1_y + btn + 10;
@@ -1111,6 +1135,8 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     int mx = (int)mp.x, my = (int)mp.y;
     if (rect_hit(L.dec, mx, my))   { settings_apply_font_size(r, r->font_size - 1); return; }
     if (rect_hit(L.inc, mx, my))   { settings_apply_font_size(r, r->font_size + 1); return; }
+    if (rect_hit(L.pad_dec, mx, my)) { settings_apply_padding(r, r->pad_x - 2); return; }
+    if (rect_hit(L.pad_inc, mx, my)) { settings_apply_padding(r, r->pad_x + 2); return; }
     if (rect_hit(L.log_toggle, mx, my)) {
         g_app_settings.log_enabled = !g_app_settings.log_enabled;
         refresh_tab_logs();
@@ -1236,6 +1262,34 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                          L.inc.y + (L.inc.h - ps.y) / 2},
                18, 0, (Color){230, 232, 240, 255});
 
+    /* Padding row. */
+    DrawTextEx(*f, "Padding",
+               (Vector2){L.modal.x + 22, L.pad_val.y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    char pbuf[32];
+    snprintf(pbuf, sizeof(pbuf), "%d", r->pad_x);
+    DrawRectangle(L.pad_val.x, L.pad_val.y, L.pad_val.w, L.pad_val.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.pad_val.x, L.pad_val.y, L.pad_val.w, L.pad_val.h,
+                       (Color){70, 74, 90, 255});
+    Vector2 pvsz = MeasureTextEx(*f, pbuf, 16, 0);
+    DrawTextEx(*f, pbuf,
+               (Vector2){L.pad_val.x + (L.pad_val.w - pvsz.x) / 2,
+                         L.pad_val.y + (L.pad_val.h - pvsz.y) / 2},
+               16, 0, (Color){230, 232, 240, 255});
+    DrawRectangle(L.pad_dec.x, L.pad_dec.y, L.pad_dec.w, L.pad_dec.h, (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.pad_dec.x, L.pad_dec.y, L.pad_dec.w, L.pad_dec.h, (Color){125, 207, 255, 180});
+    DrawTextEx(*f, "-",
+               (Vector2){L.pad_dec.x + (L.pad_dec.w - ms.x) / 2,
+                         L.pad_dec.y + (L.pad_dec.h - ms.y) / 2},
+               18, 0, (Color){230, 232, 240, 255});
+    DrawRectangle(L.pad_inc.x, L.pad_inc.y, L.pad_inc.w, L.pad_inc.h, (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.pad_inc.x, L.pad_inc.y, L.pad_inc.w, L.pad_inc.h, (Color){125, 207, 255, 180});
+    DrawTextEx(*f, "+",
+               (Vector2){L.pad_inc.x + (L.pad_inc.w - ps.x) / 2,
+                         L.pad_inc.y + (L.pad_inc.h - ps.y) / 2},
+               18, 0, (Color){230, 232, 240, 255});
+
     /* Session logging rows. */
     DrawTextEx(*f, "Log session",
                (Vector2){L.modal.x + 22, L.log_toggle.y + 8},
@@ -1316,6 +1370,9 @@ static void usage(void) {
            "  --size N        font size in points (default 20)\n"
            "  --cols N        initial cols (default 100)\n"
            "  --rows N        initial rows (default 30)\n"
+           "  --padding N     inset around the grid in pixels (default 6)\n"
+           "  --opacity F     window opacity 0.2..1.0 (default 1.0)\n"
+           "  --undecorated   hide the native title bar\n"
            "\nKeys (Cmd on macOS, Ctrl on Linux/Windows):\n"
            "  Cmd + T           open a new tab (local shell)\n"
            "  Cmd + Shift + T   open an SSH tab (user@host[:port])\n"
@@ -1332,6 +1389,9 @@ int main(int argc, char **argv) {
     const char *font_path = NULL;
     int font_size = 20;
     int init_cols = 100, init_rows = 30;
+    int init_padding = 6;
+    float init_opacity = 1.0f;
+    bool init_undecorated = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
@@ -1339,8 +1399,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) font_size = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cols") && i + 1 < argc) init_cols = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rows") && i + 1 < argc) init_rows = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--padding") && i + 1 < argc) init_padding = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--opacity") && i + 1 < argc) init_opacity = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--undecorated")) init_undecorated = true;
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(); return 2; }
     }
+    if (init_padding < 0) init_padding = 0;
+    if (init_padding > 64) init_padding = 64;
+    if (init_opacity < 0.2f) init_opacity = 0.2f;
+    if (init_opacity > 1.0f) init_opacity = 1.0f;
     if (init_cols < 20) init_cols = 20;
     if (init_rows < 5)  init_rows = 5;
 
@@ -1350,7 +1417,10 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
+    unsigned int cfg_flags = FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI;
+    if (init_opacity < 0.999f) cfg_flags |= FLAG_WINDOW_TRANSPARENT;
+    if (init_undecorated)      cfg_flags |= FLAG_WINDOW_UNDECORATED;
+    SetConfigFlags(cfg_flags);
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(800, 500, "rbterm");
     SetExitKey(KEY_NULL);
@@ -1360,9 +1430,12 @@ int main(int argc, char **argv) {
         CloseWindow();
         return 1;
     }
+    r.pad_x = init_padding;
+    r.pad_y = init_padding;
+    r.bg_alpha = init_opacity;
 
-    int win_w = init_cols * r.cell_w;
-    int win_h = init_rows * r.cell_h + TAB_BAR_H;
+    int win_w = init_cols * r.cell_w + 2 * r.pad_x;
+    int win_h = init_rows * r.cell_h + TAB_BAR_H + 2 * r.pad_y;
 
     /* Clamp the requested size to what fits on the current monitor
        (minus rough room for the menu bar + Dock), then centre — otherwise
@@ -1389,7 +1462,7 @@ int main(int argc, char **argv) {
     }
 
     SetWindowSize(win_w, win_h);
-    SetWindowMinSize(r.cell_w * 20, r.cell_h * 5 + TAB_BAR_H);
+    SetWindowMinSize(r.cell_w * 20 + 2 * r.pad_x, r.cell_h * 5 + TAB_BAR_H + 2 * r.pad_y);
 
     if (mw > 0 && mh > 0) {
         Vector2 mp = GetMonitorPosition(mi);
@@ -1414,8 +1487,8 @@ int main(int argc, char **argv) {
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
-        int content_rows = (win_h_now - TAB_BAR_H) / r.cell_h;
-        int content_cols = win_w_now / r.cell_w;
+        int content_rows = (win_h_now - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
+        int content_cols = (win_w_now - 2 * r.pad_x) / r.cell_w;
         if (content_cols < 1) content_cols = 1;
         if (content_rows < 1) content_rows = 1;
         for (int i = 0; i < g_num_tabs; i++) {
@@ -1486,8 +1559,8 @@ int main(int argc, char **argv) {
                 cur = active_tab();
             }
         } else if (cur) {
-            int mcol = (int)(mp.x / r.cell_w);
-            int mrow = (int)((mp.y - TAB_BAR_H) / r.cell_h);
+            int mcol = (int)((mp.x - r.pad_x) / r.cell_w);
+            int mrow = (int)((mp.y - TAB_BAR_H - r.pad_y) / r.cell_h);
             int cmax = screen_cols(cur->scr) - 1;
             int rmax = screen_rows(cur->scr) - 1;
             if (mcol < 0) mcol = 0; if (mcol > cmax) mcol = cmax;
@@ -1617,15 +1690,15 @@ int main(int argc, char **argv) {
             int ns = (acts.font_delta == 0) ? 20
                     : old + (acts.font_delta > 0 ? 1 : -1);
             if (renderer_set_font_size(&r, ns)) {
-                int nc = GetScreenWidth()  / r.cell_w;
-                int nr = (GetScreenHeight() - TAB_BAR_H) / r.cell_h;
+                int nc = (GetScreenWidth() - 2 * r.pad_x) / r.cell_w;
+                int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
                 if (nc < 1) nc = 1;
                 if (nr < 1) nr = 1;
                 for (int i = 0; i < g_num_tabs; i++) {
                     screen_resize(g_tabs[i]->scr, nc, nr);
                     pty_resize(g_tabs[i]->pty, nc, nr);
                 }
-                SetWindowMinSize(r.cell_w * 20, r.cell_h * 5 + TAB_BAR_H);
+                SetWindowMinSize(r.cell_w * 20 + 2 * r.pad_x, r.cell_h * 5 + TAB_BAR_H + 2 * r.pad_y);
             }
         }
         if (in_n > 0) {
