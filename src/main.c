@@ -10,11 +10,13 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
-#include <strings.h>     /* strcasecmp */
 #ifdef _WIN32
-#include <windows.h>
+  #include <windows.h>
+  #define strcasecmp  _stricmp
+  #define strncasecmp _strnicmp
 #else
-#include <dirent.h>
+  #include <strings.h>   /* strcasecmp */
+  #include <dirent.h>
 #endif
 
 #ifndef _WIN32
