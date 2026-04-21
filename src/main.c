@@ -1238,6 +1238,9 @@ typedef struct {
 typedef struct {
     char name[128];
     char path[512];
+    void *preview;       /* Font *, loaded lazily the first time the row
+                            is visible in the settings font list. */
+    bool  load_failed;   /* Set once LoadFontEx fails so we don't retry. */
 } FontEntry;
 
 #define MAX_FONTS 256
@@ -1312,7 +1315,21 @@ static void scan_font_dir(const char *dir) {
 #endif
 }
 
+/* Release every loaded preview-font texture. Called whenever we re-scan
+   the font directories (each scan rebuilds the list from scratch). */
+static void fonts_free_previews(void) {
+    for (int i = 0; i < g_font_count; i++) {
+        if (g_fonts[i].preview) {
+            UnloadFont(*(Font *)g_fonts[i].preview);
+            free(g_fonts[i].preview);
+            g_fonts[i].preview = NULL;
+        }
+        g_fonts[i].load_failed = false;
+    }
+}
+
 static void fonts_load(const char *current_path) {
+    fonts_free_previews();
     g_font_count = 0;
     g_font_list_scroll = 0;
     g_font_list_selected = -1;
@@ -1608,9 +1625,25 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                               L.font_list.w - 4, row_h,
                               (Color){46, 62, 90, 220});
             }
-            DrawTextEx(*f, g_fonts[i].name,
+            /* Lazy-load a small preview of the font the first time its
+               row scrolls into view so each name renders in its own
+               typeface. Failures are sticky so we don't retry each frame. */
+            if (!g_fonts[i].preview && !g_fonts[i].load_failed) {
+                Font fprev = LoadFontEx(g_fonts[i].path, 14, NULL, 0);
+                if (fprev.texture.id == 0) {
+                    g_fonts[i].load_failed = true;
+                } else {
+                    SetTextureFilter(fprev.texture, TEXTURE_FILTER_BILINEAR);
+                    g_fonts[i].preview = malloc(sizeof(Font));
+                    *(Font *)g_fonts[i].preview = fprev;
+                }
+            }
+            Font *row_font = g_fonts[i].preview
+                                ? (Font *)g_fonts[i].preview
+                                : f;
+            DrawTextEx(*row_font, g_fonts[i].name,
                        (Vector2){L.font_list.x + 10, ry + 4},
-                       13, 0,
+                       14, 0,
                        sel ? (Color){230, 232, 240, 255}
                            : (Color){200, 205, 220, 255});
         }
