@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:   # allow manual runs for debugging
+
+permissions:
+  contents: write      # needed by softprops/action-gh-release
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            asset_name: rbterm-linux-x86_64
+            build_subdir: build
+            binary_name: rbterm
+          - os: windows-latest
+            platform: windows-x86_64
+            asset_name: rbterm-windows-x86_64.exe
+            build_subdir: build/Release
+            binary_name: rbterm.exe
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false    # alacritty is for reference only
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libgl1-mesa-dev libglu1-mesa-dev \
+            libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols \
+            libssh-dev
+
+      - name: Configure (CMake)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "${{ matrix.build_subdir }}/${{ matrix.binary_name }}" "out/${{ matrix.asset_name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: out/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4    # needed so the release notes generator
+                                     # can see commit/tag history
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
