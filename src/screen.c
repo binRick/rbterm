@@ -537,12 +537,17 @@ static void handle_csi(Screen *s, uint8_t b) {
             s->io.write(s->io.user, (const uint8_t *)buf, n);
         }
         break;
-    case 'c':
+    case 'c': {
+        /* Device Attributes reply. Tmux specifically looks for the xterm
+           Primary DA shape `CSI ? 1 ; 2 c`; if we answered with the old
+           VT102 `?6c` format it didn't consume the response and the bytes
+           leaked onto the screen. */
         if (s->io.write) {
-            const char *resp = "\x1b[?6c";
+            const char *resp = "\x1b[?1;2c";
             s->io.write(s->io.user, (const uint8_t *)resp, strlen(resp));
         }
         break;
+    }
     case 's': s->saved_cx = s->cx; s->saved_cy = s->cy; break;
     case 'u': s->cx = s->saved_cx; s->cy = s->saved_cy; break;
     default: break;
@@ -717,7 +722,27 @@ static void feed_byte(Screen *s, uint8_t b) {
 }
 
 void screen_feed(Screen *s, const uint8_t *data, size_t n) {
-    for (size_t i = 0; i < n; i++) feed_byte(s, data[i]);
+    /* Hot path: when we're in GROUND state and the next bytes are all
+       printable ASCII, write them straight into the current row without
+       the state-machine per-byte dispatch. This matters for commands
+       like `find /usr` that flood the PTY with newline-terminated text
+       — the vanilla loop pays ~5x the cycles per byte and then the
+       shell stalls on full PTY buffers. */
+    size_t i = 0;
+    while (i < n) {
+        if (s->pstate == ST_GROUND) {
+            uint8_t b = data[i];
+            if (b >= 0x20 && b < 0x7f) {
+                size_t j = i + 1;
+                while (j < n && data[j] >= 0x20 && data[j] < 0x7f) j++;
+                for (size_t k = i; k < j; k++) put_cp(s, data[k]);
+                i = j;
+                continue;
+            }
+        }
+        feed_byte(s, data[i]);
+        i++;
+    }
 }
 
 /* ---------- Construction ---------- */

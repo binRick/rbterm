@@ -146,7 +146,21 @@ typedef struct {
 } Rect;
 
 typedef struct {
+    char name[128];        /* alias from `Host X` */
+    char hostname[256];    /* HostName */
+    char user[96];         /* User */
+    char identity[PATH_MAX];
+    int  port;
+} SshProfile;
+
+#define SSH_PROFILES_MAX 128
+static SshProfile g_ssh_profiles[SSH_PROFILES_MAX];
+static int        g_ssh_profile_count = 0;
+static int        g_ssh_list_scroll = 0;   /* in rows */
+
+typedef struct {
     Rect modal;
+    Rect list;                  /* saved-hosts sidebar */
     Rect field[F_TEXT_FIELDS];  /* host, port, user, pass, key */
     Rect connect;
     Rect cancel;
@@ -488,6 +502,126 @@ static void draw_tab_bar(Renderer *r, int win_w) {
 
 /* ---------- SSH connection form (PuTTY-style) ---------- */
 
+/* Parse ~/.ssh/config into g_ssh_profiles. Only the fields we actually
+   surface in the form are extracted (HostName / User / Port / IdentityFile);
+   wildcard stanzas (`Host *`, `Host !foo`) are skipped. Keys are
+   case-insensitive per the ssh_config(5) spec. */
+static int ci_prefix(const char *s, const char *pfx) {
+    /* Returns length of pfx if s starts with pfx case-insensitively
+       AND the next char is whitespace or '='; else 0. */
+    size_t n = strlen(pfx);
+    for (size_t i = 0; i < n; i++) {
+        char a = s[i], b = pfx[i];
+        if (a >= 'A' && a <= 'Z') a = a - 'A' + 'a';
+        if (b >= 'A' && b <= 'Z') b = b - 'A' + 'a';
+        if (a != b) return 0;
+    }
+    char c = s[n];
+    return (c == ' ' || c == '\t' || c == '=') ? (int)n : 0;
+}
+
+static const char *skip_ws(const char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '=') s++;
+    return s;
+}
+
+static void trim_end(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t' ||
+                     s[n-1] == '\r' || s[n-1] == '\n'))
+        s[--n] = 0;
+}
+
+static void ssh_profiles_load(void) {
+    g_ssh_profile_count = 0;
+    g_ssh_list_scroll = 0;
+    char path[PATH_MAX];
+    expand_home_path("~/.ssh/config", path, sizeof(path));
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    SshProfile *cur = NULL;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == 0 || *p == '\r') continue;
+        trim_end(p);
+
+        int k = ci_prefix(p, "host");
+        if (k) {
+            const char *rest = skip_ws(p + k);
+            /* Take just the first token on multi-alias lines. */
+            char name[128];
+            size_t ni = 0;
+            while (*rest && *rest != ' ' && *rest != '\t' && ni + 1 < sizeof(name))
+                name[ni++] = *rest++;
+            name[ni] = 0;
+            /* Skip pattern / wildcard stanzas. */
+            if (!name[0] || strchr(name, '*') || strchr(name, '?') || name[0] == '!') {
+                cur = NULL;
+                continue;
+            }
+            if (g_ssh_profile_count >= SSH_PROFILES_MAX) break;
+            cur = &g_ssh_profiles[g_ssh_profile_count++];
+            memset(cur, 0, sizeof(*cur));
+            strncpy(cur->name, name, sizeof(cur->name) - 1);
+            cur->port = 0;
+            continue;
+        }
+
+        if (!cur) continue;  /* directive outside any Host stanza */
+
+        k = ci_prefix(p, "hostname");
+        if (k) {
+            const char *rest = skip_ws(p + k);
+            strncpy(cur->hostname, rest, sizeof(cur->hostname) - 1);
+            continue;
+        }
+        k = ci_prefix(p, "user");
+        if (k) {
+            const char *rest = skip_ws(p + k);
+            strncpy(cur->user, rest, sizeof(cur->user) - 1);
+            continue;
+        }
+        k = ci_prefix(p, "port");
+        if (k) {
+            const char *rest = skip_ws(p + k);
+            cur->port = atoi(rest);
+            continue;
+        }
+        k = ci_prefix(p, "identityfile");
+        if (k) {
+            const char *rest = skip_ws(p + k);
+            strncpy(cur->identity, rest, sizeof(cur->identity) - 1);
+            continue;
+        }
+    }
+    fclose(fp);
+}
+
+static void ssh_form_apply_profile(const SshProfile *prof) {
+    if (!prof) return;
+    /* HostName falls back to the alias itself (ssh(1) does the same). */
+    const char *hostname = prof->hostname[0] ? prof->hostname : prof->name;
+    strncpy(g_form.host, hostname, sizeof(g_form.host) - 1);
+    g_form.host[sizeof(g_form.host) - 1] = 0;
+    if (prof->port > 0) snprintf(g_form.port, sizeof(g_form.port), "%d", prof->port);
+    else strncpy(g_form.port, "22", sizeof(g_form.port) - 1);
+    if (prof->user[0]) {
+        strncpy(g_form.user, prof->user, sizeof(g_form.user) - 1);
+        g_form.user[sizeof(g_form.user) - 1] = 0;
+    }
+    if (prof->identity[0]) {
+        strncpy(g_form.key, prof->identity, sizeof(g_form.key) - 1);
+        g_form.key[sizeof(g_form.key) - 1] = 0;
+    } else {
+        g_form.key[0] = 0;
+    }
+    g_form.sel_all = false;
+    g_form.error[0] = 0;
+}
+
 static void ssh_form_open(void) {
     g_ui_mode = UI_SSH_FORM;
     memset(&g_form, 0, sizeof(g_form));
@@ -501,6 +635,9 @@ static void ssh_form_open(void) {
         g_form.user[sizeof(g_form.user) - 1] = 0;
     }
     g_form.focus = F_HOST;
+    /* Refresh the saved-hosts list every time the modal opens so edits
+       to ~/.ssh/config show up without restarting rbterm. */
+    ssh_profiles_load();
 }
 
 static char *form_buf(int field, size_t *cap) {
@@ -516,7 +653,7 @@ static char *form_buf(int field, size_t *cap) {
 
 static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     SshFormLayout L = {0};
-    int w = 600, h = 360;
+    int w = 800, h = 380;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -526,8 +663,18 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
 
     int pad = 22;
     int title_h = 46;
-    int field_x = L.modal.x + 130;
-    int field_w = w - 130 - pad;
+    int list_w = (g_ssh_profile_count > 0) ? 210 : 0;
+    if (list_w > 0) {
+        L.list.x = L.modal.x + pad;
+        L.list.y = L.modal.y + title_h + 10;
+        L.list.w = list_w;
+        L.list.h = h - title_h - 10 - pad - 40;   /* leaves room for buttons */
+    }
+
+    int form_x = L.modal.x + pad + list_w + (list_w > 0 ? 14 : 0);
+    int label_w = 100;
+    int field_x = form_x + label_w;
+    int field_w = L.modal.x + w - pad - field_x;
     int field_h = 28;
     int y = L.modal.y + title_h + 10;
     for (int i = 0; i < F_TEXT_FIELDS; i++) {
@@ -587,11 +734,36 @@ static void ssh_form_advance_focus(int delta) {
 }
 
 static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
+    /* Wheel-scroll the hosts list whenever the pointer is over it. */
+    if (L.list.w > 0) {
+        Vector2 mp = GetMousePosition();
+        if (rect_hit(L.list, (int)mp.x, (int)mp.y)) {
+            float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f) {
+                g_ssh_list_scroll -= (int)(wheel * 3.0f);
+                if (g_ssh_list_scroll < 0) g_ssh_list_scroll = 0;
+            }
+        }
+    }
+
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
-    for (int i = 0; i < 4; i++) {
-        if (rect_hit(L.field[i], mx, my)) { g_form.focus = i; return; }
+
+    /* Click on a saved host → populate fields from ~/.ssh/config and
+       connect immediately. The form closes on success. */
+    if (L.list.w > 0 && rect_hit(L.list, mx, my)) {
+        int row_h = 22;
+        int idx = (my - L.list.y) / row_h + g_ssh_list_scroll;
+        if (idx >= 0 && idx < g_ssh_profile_count) {
+            ssh_form_apply_profile(&g_ssh_profiles[idx]);
+            ssh_form_submit(cols, rows);
+        }
+        return;
+    }
+
+    for (int i = 0; i < F_TEXT_FIELDS; i++) {
+        if (rect_hit(L.field[i], mx, my)) { g_form.focus = i; g_form.sel_all = false; return; }
     }
     if (rect_hit(L.connect, mx, my)) {
         g_form.focus = F_CONNECT;
@@ -715,10 +887,60 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
         g_form.host, g_form.port, g_form.user, g_form.pass, g_form.key
     };
 
+    /* Saved-hosts sidebar. */
+    if (L.list.w > 0) {
+        DrawRectangle(L.list.x, L.list.y, L.list.w, L.list.h,
+                      (Color){22, 25, 34, 255});
+        DrawRectangleLines(L.list.x, L.list.y, L.list.w, L.list.h,
+                           (Color){70, 74, 90, 255});
+        DrawTextEx(*f, "Saved hosts (~/.ssh/config)",
+                   (Vector2){L.list.x + 8, L.list.y - 18},
+                   11, 0, (Color){140, 145, 160, 255});
+        int row_h = 22;
+        int visible = L.list.h / row_h;
+        if (g_ssh_list_scroll < 0) g_ssh_list_scroll = 0;
+        int max_scroll = g_ssh_profile_count - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (g_ssh_list_scroll > max_scroll) g_ssh_list_scroll = max_scroll;
+        BeginScissorMode(L.list.x + 2, L.list.y + 2,
+                         L.list.w - 4, L.list.h - 4);
+        for (int i = 0; i < g_ssh_profile_count; i++) {
+            int ry = L.list.y + (i - g_ssh_list_scroll) * row_h;
+            if (ry + row_h < L.list.y || ry > L.list.y + L.list.h) continue;
+            bool on_this = strcmp(g_form.host, g_ssh_profiles[i].hostname[0]
+                                                ? g_ssh_profiles[i].hostname
+                                                : g_ssh_profiles[i].name) == 0;
+            if (on_this) {
+                DrawRectangle(L.list.x + 2, ry, L.list.w - 4, row_h,
+                              (Color){46, 62, 90, 220});
+            }
+            DrawTextEx(*f, g_ssh_profiles[i].name,
+                       (Vector2){L.list.x + 10, ry + 4},
+                       13, 0,
+                       on_this ? (Color){230, 232, 240, 255}
+                               : (Color){200, 205, 220, 255});
+        }
+        EndScissorMode();
+        if (g_ssh_profile_count > visible) {
+            /* Thin scrollbar indicator. */
+            int track_x = L.list.x + L.list.w - 5;
+            int bar_h = L.list.h * visible / g_ssh_profile_count;
+            if (bar_h < 24) bar_h = 24;
+            int bar_y = L.list.y + (L.list.h - bar_h) * g_ssh_list_scroll /
+                        (max_scroll > 0 ? max_scroll : 1);
+            DrawRectangle(track_x, L.list.y, 3, L.list.h,
+                          (Color){40, 45, 58, 255});
+            DrawRectangle(track_x, bar_y, 3, bar_h,
+                          (Color){110, 130, 170, 255});
+        }
+    }
+
     char masked[256];
     for (int i = 0; i < F_TEXT_FIELDS; i++) {
+        /* Labels sit just to the left of each field, not hugging the
+           modal edge — otherwise they'd collide with the hosts list. */
         DrawTextEx(*f, labels[i],
-                   (Vector2){L.modal.x + 22, L.field[i].y + 7},
+                   (Vector2){L.field[i].x - 104, L.field[i].y + 7},
                    13, 0, (Color){180, 185, 200, 255});
 
         bool focused = g_form.focus == i;
@@ -1158,14 +1380,23 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Drain each PTY so background tabs stay live. */
+        /* Drain each PTY until EAGAIN or a safety cap. The cap is just a
+           watchdog for a runaway writer pinning the UI — under normal
+           output bursts (`find /usr`, etc.) we want to pull everything
+           the kernel has buffered before rendering, otherwise the shell
+           stalls on full PTY-buffer writes and the whole command takes
+           seconds longer than in a native terminal. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            for (int iter = 0; iter < 32; iter++) {
+            size_t drained = 0;
+            const size_t drain_cap = 16 * 1024 * 1024;
+            for (;;) {
                 int n = pty_read(t->pty, readbuf, sizeof(readbuf));
                 if (n > 0) {
                     screen_feed(t->scr, readbuf, (size_t)n);
                     tab_log_write(t, readbuf, (size_t)n);
+                    drained += (size_t)n;
+                    if (drained >= drain_cap) break;
                     continue;
                 }
                 if (n < 0) { t->dead = true; }
