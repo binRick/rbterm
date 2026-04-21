@@ -236,6 +236,7 @@ typedef struct {
 #define TAB_MAX_W 240
 #define TAB_CLOSE_W 22
 #define TAB_PLUS_W  30
+#define TAB_GEAR_W  30
 #define TAB_SSH_W   48
 
 static Tab *g_tabs[MAX_TABS];
@@ -582,10 +583,11 @@ typedef struct {
     bool on_close;
     bool on_plus;
     bool on_ssh;
+    bool on_gear;
 } TabBarHit;
 
 static int tab_width_for(int win_w) {
-    int avail = win_w - TAB_PLUS_W - TAB_SSH_W;
+    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -593,14 +595,16 @@ static int tab_width_for(int win_w) {
     return w;
 }
 
-/* Layout: [ssh] | tab1 | tab2 | ... | [+] */
+/* Layout: [ssh] | tab1 | tab2 | ... | [gear] | [+] */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false };
+    TabBarHit h = { -1, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     int plus_x   = win_w - TAB_PLUS_W;
+    int gear_x   = plus_x - TAB_GEAR_W;
     int tab_start = TAB_SSH_W;
     if (mx < TAB_SSH_W)  { h.on_ssh  = true; return h; }
     if (mx >= plus_x)    { h.on_plus = true; return h; }
+    if (mx >= gear_x)    { h.on_gear = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
     if (idx < 0 || idx >= g_num_tabs) return h;
@@ -610,8 +614,27 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     return h;
 }
 
+static void draw_gear_icon(float cx, float cy, float size, Color c, Color hole_bg) {
+    float r_body = size * 0.32f;
+    float r_hole = size * 0.14f;
+    float tw     = size * 0.20f;
+    float th     = size * 0.22f;
+    int teeth    = 8;
+    for (int i = 0; i < teeth; i++) {
+        float a = (float)i * (360.0f / (float)teeth);
+        DrawRectanglePro(
+            (Rectangle){ cx, cy, tw, th },
+            (Vector2){ tw / 2.0f, r_body + th },
+            a,
+            c);
+    }
+    DrawCircle((int)cx, (int)cy, r_body, c);
+    DrawCircle((int)cx, (int)cy, r_hole, hole_bg);
+}
+
 static void draw_tab_bar(Renderer *r, int win_w) {
-    DrawRectangle(0, 0, win_w, TAB_BAR_H, (Color){24, 24, 32, 255});
+    Color bar_bg = (Color){24, 24, 32, 255};
+    DrawRectangle(0, 0, win_w, TAB_BAR_H, bar_bg);
     DrawRectangle(0, TAB_BAR_H - 1, win_w, 1, (Color){60, 60, 75, 255});
 
     Font *f = (Font *)r->font_data;
@@ -638,6 +661,15 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                (Vector2){ plus_x + (TAB_PLUS_W - psz.x) / 2.0f,
                           (TAB_BAR_H - psz.y) / 2.0f },
                18, 0, (Color){230, 240, 255, 255});
+
+    /* Gear (settings) button, immediately left of the "+" button. */
+    int gear_x = plus_x - TAB_GEAR_W;
+    Color gear_bg = (Color){38, 48, 66, 255};
+    DrawRectangle(gear_x, 0, TAB_GEAR_W, TAB_BAR_H, gear_bg);
+    DrawRectangleLines(gear_x, 2, TAB_GEAR_W - 1, TAB_BAR_H - 4,
+                       (Color){125, 207, 255, 200});
+    draw_gear_icon(gear_x + TAB_GEAR_W / 2.0f, TAB_BAR_H / 2.0f,
+                   TAB_BAR_H * 0.55f, (Color){220, 235, 255, 255}, gear_bg);
 
     /* Tabs fill the space between the two buttons. */
     int tab_start = TAB_SSH_W;
@@ -2223,6 +2255,7 @@ int main(int argc, char **argv) {
                 TabBarHit h = tab_bar_hit_test(win_w_now, (int)mp.x, (int)mp.y);
                 if (h.on_plus) tab_open(content_cols, content_rows);
                 else if (h.on_ssh) ssh_form_open();
+                else if (h.on_gear) settings_open(&r);
                 else if (h.tab_idx >= 0) {
                     if (h.on_close) tab_close(h.tab_idx);
                     else g_active = h.tab_idx;
