@@ -532,25 +532,28 @@ static void draw_tab_bar(Renderer *r, int win_w) {
     int plus_x = win_w - TAB_PLUS_W;
     int ssh_x  = plus_x - TAB_SSH_W;
 
-    /* "ssh" button. */
-    DrawRectangle(ssh_x, 0, TAB_SSH_W, TAB_BAR_H, (Color){28, 32, 44, 255});
-    DrawLine(ssh_x, 4, ssh_x, TAB_BAR_H - 4, (Color){60, 60, 75, 255});
+    /* "ssh" button — brighter bg + accent outline so it's obvious against
+       the tab strip on every monitor. */
+    DrawRectangle(ssh_x, 0, TAB_SSH_W, TAB_BAR_H, (Color){38, 48, 66, 255});
+    DrawRectangleLines(ssh_x, 2, TAB_SSH_W - 1, TAB_BAR_H - 4,
+                       (Color){125, 207, 255, 180});
     const char *ssh_label = "ssh";
     Vector2 ssz = MeasureTextEx(*f, ssh_label, 13, 0);
     DrawTextEx(*f, ssh_label,
                (Vector2){ ssh_x + (TAB_SSH_W - ssz.x) / 2.0f,
                           (TAB_BAR_H - ssz.y) / 2.0f },
-               13, 0, (Color){125, 207, 255, 255});
+               13, 0, (Color){180, 220, 255, 255});
 
     /* "+" button. */
-    DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){28, 32, 44, 255});
-    DrawLine(plus_x, 4, plus_x, TAB_BAR_H - 4, (Color){60, 60, 75, 255});
+    DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){38, 48, 66, 255});
+    DrawRectangleLines(plus_x, 2, TAB_PLUS_W - 1, TAB_BAR_H - 4,
+                       (Color){125, 207, 255, 180});
     const char *plus = "+";
     Vector2 psz = MeasureTextEx(*f, plus, 18, 0);
     DrawTextEx(*f, plus,
                (Vector2){ plus_x + (TAB_PLUS_W - psz.x) / 2.0f,
                           (TAB_BAR_H - psz.y) / 2.0f },
-               18, 0, (Color){200, 200, 215, 255});
+               18, 0, (Color){220, 230, 240, 255});
 }
 
 /* ---------- SSH connection form (PuTTY-style) ---------- */

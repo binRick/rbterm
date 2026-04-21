@@ -108,8 +108,15 @@ if(WIN32)
   target_link_libraries(rbterm PRIVATE kernel32 user32 gdi32 winmm)
   target_compile_definitions(rbterm PRIVATE _CRT_SECURE_NO_WARNINGS
                                              NOMINMAX WIN32_LEAN_AND_MEAN)
+  # Ship as a GUI-subsystem binary so Windows doesn't open the black
+  # console window beside ours. Keep `main()` as the entry point via
+  # /ENTRY:mainCRTStartup (MSVC) or -mwindows (MinGW).
   if(MSVC)
+    set_target_properties(rbterm PROPERTIES
+      LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
     target_compile_options(rbterm PRIVATE /W3)
+  else()
+    target_link_options(rbterm PRIVATE -mwindows)
   endif()
 endif()
 
