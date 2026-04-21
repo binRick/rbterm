@@ -79,6 +79,47 @@ static GlyphEntry *glyph_lookup(GlyphCache *c, uint32_t cp, int pixel_size) {
     return e;
 }
 
+/* Hand-rasterised box-drawing glyphs. Fonts don't always draw these to the
+   exact cell-edge, so adjacent cells would show thin gaps between "─" runs.
+   Drawing them as rectangles guarantees every `─` butts against its
+   neighbour. Returns true when the codepoint was handled. */
+static bool draw_box_drawing(int x, int y, int cw, int ch,
+                             uint32_t cp, Color col) {
+    int t = 1;                    /* thin-line thickness */
+    int t2 = 2;                   /* heavy-line thickness */
+    int mx = x + cw / 2;
+    int my = y + ch / 2;
+    int left_w  = cw / 2 + t;     /* from x to middle inclusive */
+    int right_w = cw - cw / 2;    /* from middle to x+cw */
+    int up_h    = ch / 2 + t;
+    int down_h  = ch - ch / 2;
+
+    switch (cp) {
+    /* Light lines */
+    case 0x2500: DrawRectangle(x, my, cw, t, col); return true;                            /* ─ */
+    case 0x2502: DrawRectangle(mx, y, t, ch, col); return true;                            /* │ */
+    /* Corners */
+    case 0x250C: DrawRectangle(mx, my, right_w, t, col); DrawRectangle(mx, my, t, down_h, col); return true; /* ┌ */
+    case 0x2510: DrawRectangle(x, my, left_w, t, col); DrawRectangle(mx, my, t, down_h, col); return true;   /* ┐ */
+    case 0x2514: DrawRectangle(mx, my, right_w, t, col); DrawRectangle(mx, y, t, up_h, col); return true;    /* └ */
+    case 0x2518: DrawRectangle(x, my, left_w, t, col); DrawRectangle(mx, y, t, up_h, col); return true;      /* ┘ */
+    /* Tees */
+    case 0x251C: DrawRectangle(mx, y, t, ch, col); DrawRectangle(mx, my, right_w, t, col); return true;      /* ├ */
+    case 0x2524: DrawRectangle(mx, y, t, ch, col); DrawRectangle(x, my, left_w, t, col); return true;        /* ┤ */
+    case 0x252C: DrawRectangle(x, my, cw, t, col); DrawRectangle(mx, my, t, down_h, col); return true;       /* ┬ */
+    case 0x2534: DrawRectangle(x, my, cw, t, col); DrawRectangle(mx, y, t, up_h, col); return true;          /* ┴ */
+    /* Cross */
+    case 0x253C: DrawRectangle(x, my, cw, t, col); DrawRectangle(mx, y, t, ch, col); return true;            /* ┼ */
+    /* Heavy lines */
+    case 0x2501: DrawRectangle(x, my - t2/2, cw, t2, col); return true;                    /* ━ */
+    case 0x2503: DrawRectangle(mx - t2/2, y, t2, ch, col); return true;                    /* ┃ */
+    /* Double lines (simple two-line approximation) */
+    case 0x2550: DrawRectangle(x, my - 2, cw, t, col); DrawRectangle(x, my + 1, cw, t, col); return true;    /* ═ */
+    case 0x2551: DrawRectangle(mx - 2, y, t, ch, col); DrawRectangle(mx + 1, y, t, ch, col); return true;    /* ║ */
+    }
+    return false;
+}
+
 static bool is_emoji_cp(uint32_t cp) {
     if (cp >= 0x1F000) return true;
     if (cp >= 0x2600  && cp <= 0x27BF) return true;
@@ -419,6 +460,14 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                 DrawTextCodepoint(*f, '?', pos, (float)r->font_size,
                                   col_from_rgb(fg, alpha * 0.6f));
                 continue;
+            }
+
+            /* Box-drawing: paint our own lines so they reach the cell
+               edges regardless of font metrics. Must come before the
+               main-font fallback or SF Mono's '─' leaves 1 px gaps. */
+            if (c.cp >= 0x2500 && c.cp <= 0x2551 &&
+                draw_box_drawing(x * cw, y * ch, cw, ch, c.cp, col_from_rgb(fg, alpha))) {
+                goto glyph_drawn;
             }
 
             pos.x = (float)(x * cw);

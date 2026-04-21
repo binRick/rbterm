@@ -45,6 +45,16 @@ void *local_open_impl(int cols, int rows) {
         setenv("COLORTERM", "truecolor", 1);
         unsetenv("TERM_PROGRAM");
         unsetenv("TERM_SESSION_ID");
+        /* Ensure the shell sees a UTF-8 locale so tools like tmux use
+           Unicode box-drawing instead of falling back to '-' / '|'.
+           Only set if the parent didn't explicitly set a locale — if
+           someone runs LANG=C on purpose, we respect it. */
+        if (!getenv("LC_ALL") && !getenv("LC_CTYPE")) {
+            setenv("LC_CTYPE", "en_US.UTF-8", 1);
+        }
+        if (!getenv("LANG")) {
+            setenv("LANG", "en_US.UTF-8", 1);
+        }
 
         const char *home = getenv("HOME");
         if (!home || !*home) {
