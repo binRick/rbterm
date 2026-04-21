@@ -24,9 +24,14 @@ enum {
     ATTR_DEFAULT_BG = 1u << 15,
 };
 
-#define DEFAULT_FG 0xEAEAEAu
-#define DEFAULT_BG 0x111111u
-#define CURSOR_COLOR 0xEAEAEAu
+/* Default palette entries. Runtime-mutable via OSC 10/11/12. */
+extern uint32_t g_default_fg;
+extern uint32_t g_default_bg;
+extern uint32_t g_cursor_color;
+
+#define DEFAULT_FG    (g_default_fg)
+#define DEFAULT_BG    (g_default_bg)
+#define CURSOR_COLOR  (g_cursor_color)
 
 typedef struct Screen Screen;
 
@@ -35,6 +40,7 @@ typedef struct {
     void (*write)(void *user, const uint8_t *buf, size_t n);
     void (*set_title)(void *user, const char *title);
     void (*bell)(void *user);
+    void (*set_clipboard)(void *user, const char *utf8); /* OSC 52 */
 } ScreenIO;
 
 Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io);
@@ -57,3 +63,7 @@ void    screen_scroll_reset(Screen *s);
 Cell    screen_view_cell(const Screen *s, int col, int vy);
 bool    screen_app_cursor(const Screen *s);
 bool    screen_app_keypad(const Screen *s);
+bool    screen_focus_report(const Screen *s);
+bool    screen_bracketed_paste(const Screen *s);
+int     screen_mouse_mode(const Screen *s);   /* 0, 1000, 1002, 1003 */
+bool    screen_mouse_sgr(const Screen *s);    /* true when DECSET 1006 active */

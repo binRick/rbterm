@@ -18,6 +18,11 @@ enum {
 
 #define MAX_PARAMS 16
 
+/* Mutable default colours (OSC 10 / 11 / 12). */
+uint32_t g_default_fg    = 0xEAEAEAu;
+uint32_t g_default_bg    = 0x111111u;
+uint32_t g_cursor_color  = 0xEAEAEAu;
+
 struct Screen {
     int cols, rows;
     int cx, cy;
@@ -30,6 +35,11 @@ struct Screen {
     bool app_keypad;
     bool origin_mode;
     bool autowrap;
+    bool focus_report;   /* DECSET 1004 */
+    bool sync_update;    /* DECSET 2026 */
+    int  mouse_mode;     /* 0, 1000, 1002, 1003 */
+    bool mouse_sgr;      /* DECSET 1006 — SGR encoding on mouse reports */
+    bool bracketed_paste;/* DECSET 2004 */
     int scroll_top, scroll_bot;
     Cell cur_attr;
 
@@ -487,9 +497,13 @@ static void set_mode(Screen *s, int p, bool on) {
     case 6:    s->origin_mode = on; s->cx = 0; s->cy = on ? s->scroll_top : 0; break;
     case 7:    s->autowrap = on; break;
     case 25:   s->cursor_visible = on; break;
-    case 1000: case 1002: case 1003: case 1006: case 1015:
-        // mouse reporting - not implemented
-        break;
+    case 1000: s->mouse_mode = on ? 1000 : 0; break;
+    case 1002: s->mouse_mode = on ? 1002 : 0; break;
+    case 1003: s->mouse_mode = on ? 1003 : 0; break;
+    case 1004: s->focus_report = on; break;
+    case 1006: s->mouse_sgr = on; break;
+    case 1015: /* urxvt mouse encoding — unused */ break;
+    case 2026: s->sync_update = on; break;  /* synchronized updates */
     case 1049: {
         if (on && !s->on_alt) {
             s->saved_cx = s->cx; s->saved_cy = s->cy;
@@ -503,7 +517,7 @@ static void set_mode(Screen *s, int p, bool on) {
         s->wrap_next = false;
         break;
     }
-    case 2004: /* bracketed paste - we set flag but don't need to act on it */ break;
+    case 2004: s->bracketed_paste = on; break;
     }
 }
 
@@ -655,6 +669,82 @@ static void finish_osc(Screen *s) {
             }
             if (*p == ';') p++; else break;
         }
+        return;
+    }
+    if (ps == 10 || ps == 11 || ps == 12) {
+        /* OSC 10/11/12 — default fg / bg / cursor colour. `?` queries;
+           anything else sets. */
+        uint32_t *slot = (ps == 10) ? &g_default_fg
+                       : (ps == 11) ? &g_default_bg
+                                    : &g_cursor_color;
+        if (*p == '?') {
+            char buf[80];
+            uint32_t c = *slot;
+            int n = snprintf(buf, sizeof(buf),
+                             "\x1b]%d;rgb:%02x%02x/%02x%02x/%02x%02x\x1b\\",
+                             ps,
+                             (c >> 16) & 0xff, (c >> 16) & 0xff,
+                             (c >>  8) & 0xff, (c >>  8) & 0xff,
+                             c & 0xff, c & 0xff);
+            if (s->io.write) s->io.write(s->io.user, (const uint8_t *)buf, n);
+        } else {
+            uint32_t col;
+            if (parse_color_spec(p, &col)) *slot = col;
+        }
+        return;
+    }
+    if (ps == 52) {
+        /* OSC 52 — set the system clipboard from base64 (the Pc selector
+           is ignored here; we always target the system clipboard).
+           `OSC 52 ; Pc ; ?` is a query and is ignored (programs mostly
+           use this to paranoidly check and we don't want to leak). */
+        while (*p && *p != ';') p++;
+        if (*p == ';') p++;
+        if (*p == 0 || *p == '?') return;
+        /* base64 decode */
+        static const int8_t b64tab[256] = {
+            ['A']= 0,['B']= 1,['C']= 2,['D']= 3,['E']= 4,['F']= 5,['G']= 6,['H']= 7,
+            ['I']= 8,['J']= 9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,
+            ['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,
+            ['Y']=24,['Z']=25,
+            ['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,['g']=32,['h']=33,
+            ['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,['o']=40,['p']=41,
+            ['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,['w']=48,['x']=49,
+            ['y']=50,['z']=51,
+            ['0']=52,['1']=53,['2']=54,['3']=55,['4']=56,['5']=57,['6']=58,['7']=59,
+            ['8']=60,['9']=61,
+            ['+']=62,['/']=63,
+        };
+        size_t in = strlen(p);
+        char *out = malloc(in); /* overestimate */
+        if (!out) return;
+        size_t n = 0;
+        int acc = 0, bits = 0;
+        for (size_t i = 0; i < in; i++) {
+            unsigned char c = (unsigned char)p[i];
+            if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+            int v = b64tab[c];
+            if (v == 0 && c != 'A') {
+                /* Table initialised to 0 for unset slots; reject anything
+                   that isn't explicitly 'A'. */
+                continue;
+            }
+            acc = (acc << 6) | v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out[n++] = (acc >> bits) & 0xff;
+            }
+        }
+        out[n] = 0;
+        /* SetClipboardText needs to be done by the caller via io.write?
+           No — we can call raylib here but screen.c shouldn't know about
+           raylib. Route through io.set_title? That's abused. Let's add
+           a dedicated callback for clipboard. For now, borrow set_title:
+           no, that'd change window title. Instead, do it via a new
+           io callback. */
+        if (s->io.set_clipboard) s->io.set_clipboard(s->io.user, out);
+        free(out);
         return;
     }
     if (ps == 104) {
@@ -1050,6 +1140,10 @@ int  screen_view_offset(const Screen *s)    { return s->view_off; }
 int  screen_scrollback_len(const Screen *s) { return s->sb_len; }
 bool screen_app_cursor(const Screen *s)     { return s->app_cursor; }
 bool screen_app_keypad(const Screen *s)     { return s->app_keypad; }
+bool screen_focus_report(const Screen *s)   { return s->focus_report; }
+bool screen_bracketed_paste(const Screen *s){ return s->bracketed_paste; }
+int  screen_mouse_mode(const Screen *s)     { return s->mouse_mode; }
+bool screen_mouse_sgr(const Screen *s)      { return s->mouse_sgr; }
 
 void screen_scroll_view(Screen *s, int delta_rows) {
     int v = s->view_off + delta_rows;

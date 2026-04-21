@@ -10,6 +10,12 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <strings.h>     /* strcasecmp */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
 
 #ifndef _WIN32
 #include <signal.h>
@@ -240,6 +246,10 @@ static void io_set_title_cb(void *u, const char *title) {
     t->title_dirty = true;
 }
 static void io_bell_cb(void *u) { (void)u; }
+static void io_set_clipboard_cb(void *u, const char *utf8) {
+    (void)u;
+    if (utf8 && *utf8) SetClipboardText(utf8);
+}
 
 static Tab *tab_open(int cols, int rows) {
     if (g_num_tabs >= MAX_TABS) return NULL;
@@ -250,7 +260,7 @@ static Tab *tab_open(int cols, int rows) {
     t->pty = pty_open(cols, rows);
     if (!t->pty) { free(t); return NULL; }
     ScreenIO io = { .user = t, .write = io_write_cb,
-                    .set_title = io_set_title_cb, .bell = io_bell_cb };
+                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb };
     t->scr = screen_new(cols, rows, 5000, io);
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
@@ -283,7 +293,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                           cols, rows, err, errsz);
     if (!t->pty) { free(t); return NULL; }
     ScreenIO io = { .user = t, .write = io_write_cb,
-                    .set_title = io_set_title_cb, .bell = io_bell_cb };
+                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb };
     t->scr = screen_new(cols, rows, 5000, io);
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
@@ -1048,7 +1058,11 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
  * preferences surface — new settings get an entry here rather than a
  * one-off shortcut. Keep it boring and extensible. */
 
-static void settings_open(void) { g_ui_mode = UI_SETTINGS; }
+static void fonts_load(const char *current_path);
+static void settings_open(Renderer *r) {
+    g_ui_mode = UI_SETTINGS;
+    fonts_load(r ? r->font_path : NULL);
+}
 
 static void settings_apply_font_size(Renderer *r, int new_size) {
     if (renderer_set_font_size(r, new_size)) {
@@ -1068,12 +1082,152 @@ typedef struct {
     Rect modal;
     Rect font_val;   /* current font size display */
     Rect dec, inc;   /* font -/+ buttons */
+    Rect font_list;  /* scrollable list of monospace fonts */
     Rect pad_val;
     Rect pad_dec, pad_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
     Rect close;
 } SettingsLayout;
+
+/* Available-fonts enumeration for the settings modal. Scans system + user
+   font directories for monospace .ttf / .otf / .ttc files; only those whose
+   filename hints at a monospace face (contains "Mono", "Code", "Fira", etc.)
+   are included — scrolling through every font on disk would be noisy. */
+typedef struct {
+    char name[128];
+    char path[512];
+} FontEntry;
+
+#define MAX_FONTS 256
+static FontEntry g_fonts[MAX_FONTS];
+static int       g_font_count = 0;
+static int       g_font_list_scroll = 0;
+static int       g_font_list_selected = -1;
+
+static bool looks_monospace(const char *name) {
+    static const char *pat[] = {
+        "Mono", "Menlo", "Monaco", "Consolas", "Courier", "Code",
+        "Fira", "JetBrains", "Hack", "Inconsolata", "Terminus",
+        "Fixed", "Source Code", "Anonymous", "Noto Sans Mono",
+        "SF Mono", "SFMono", "Iosevka", "Cascadia", NULL
+    };
+    for (int i = 0; pat[i]; i++) if (strstr(name, pat[i])) return true;
+    return false;
+}
+
+static int cmp_font_name(const void *a, const void *b) {
+    return strcasecmp(((const FontEntry *)a)->name,
+                      ((const FontEntry *)b)->name);
+}
+
+static bool ends_with_ci(const char *s, const char *suffix) {
+    size_t ls = strlen(s), lsfx = strlen(suffix);
+    if (ls < lsfx) return false;
+    return strcasecmp(s + ls - lsfx, suffix) == 0;
+}
+
+static void scan_font_dir(const char *dir) {
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s/*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (g_font_count >= MAX_FONTS) break;
+        const char *name = fd.cFileName;
+        if (!(ends_with_ci(name, ".ttf") || ends_with_ci(name, ".otf") ||
+              ends_with_ci(name, ".ttc"))) continue;
+        if (!looks_monospace(name)) continue;
+        FontEntry *f = &g_fonts[g_font_count++];
+        snprintf(f->path, sizeof(f->path), "%s/%s", dir, name);
+        strncpy(f->name, name, sizeof(f->name) - 1);
+        f->name[sizeof(f->name) - 1] = 0;
+        int nl = (int)strlen(f->name);
+        if (nl > 4 && (ends_with_ci(f->name, ".ttf") ||
+                       ends_with_ci(f->name, ".otf") ||
+                       ends_with_ci(f->name, ".ttc")))
+            f->name[nl - 4] = 0;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+    struct dirent *e;
+    while ((e = readdir(dp)) != NULL && g_font_count < MAX_FONTS) {
+        const char *name = e->d_name;
+        if (!(ends_with_ci(name, ".ttf") || ends_with_ci(name, ".otf") ||
+              ends_with_ci(name, ".ttc"))) continue;
+        if (!looks_monospace(name)) continue;
+        FontEntry *f = &g_fonts[g_font_count++];
+        snprintf(f->path, sizeof(f->path), "%s/%s", dir, name);
+        strncpy(f->name, name, sizeof(f->name) - 1);
+        f->name[sizeof(f->name) - 1] = 0;
+        int nl = (int)strlen(f->name);
+        if (nl > 4) f->name[nl - 4] = 0;
+    }
+    closedir(dp);
+#endif
+}
+
+static void fonts_load(const char *current_path) {
+    g_font_count = 0;
+    g_font_list_scroll = 0;
+    g_font_list_selected = -1;
+#ifdef _WIN32
+    scan_font_dir("C:/Windows/Fonts");
+    char user_fonts[1024];
+    const char *up = getenv("LOCALAPPDATA");
+    if (up && *up) {
+        snprintf(user_fonts, sizeof(user_fonts), "%s/Microsoft/Windows/Fonts", up);
+        scan_font_dir(user_fonts);
+    }
+#elif defined(__APPLE__)
+    scan_font_dir("/System/Library/Fonts");
+    scan_font_dir("/System/Library/Fonts/Supplemental");
+    scan_font_dir("/Library/Fonts");
+    char user_fonts[1024];
+    expand_home_path("~/Library/Fonts", user_fonts, sizeof(user_fonts));
+    scan_font_dir(user_fonts);
+#else
+    scan_font_dir("/usr/share/fonts");
+    scan_font_dir("/usr/share/fonts/truetype/dejavu");
+    scan_font_dir("/usr/share/fonts/truetype/liberation");
+    scan_font_dir("/usr/share/fonts/TTF");
+    scan_font_dir("/usr/local/share/fonts");
+    char user_fonts[1024];
+    expand_home_path("~/.local/share/fonts", user_fonts, sizeof(user_fonts));
+    scan_font_dir(user_fonts);
+    expand_home_path("~/.fonts", user_fonts, sizeof(user_fonts));
+    scan_font_dir(user_fonts);
+#endif
+    qsort(g_fonts, g_font_count, sizeof(FontEntry), cmp_font_name);
+    /* Mark the currently-loaded font if it's in the list. */
+    if (current_path) {
+        for (int i = 0; i < g_font_count; i++) {
+            if (strcmp(g_fonts[i].path, current_path) == 0) {
+                g_font_list_selected = i;
+                break;
+            }
+        }
+    }
+}
+
+static void settings_apply_font(Renderer *r, const FontEntry *fe) {
+    if (!fe) return;
+    if (!renderer_set_font_path(r, fe->path)) return;
+    int nc = (GetScreenWidth()  - 2 * r->pad_x) / r->cell_w;
+    int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r->pad_y) / r->cell_h;
+    if (nc < 1) nc = 1;
+    if (nr < 1) nr = 1;
+    for (int i = 0; i < g_num_tabs; i++) {
+        screen_resize(g_tabs[i]->scr, nc, nr);
+        pty_resize(g_tabs[i]->pty, nc, nr);
+    }
+    SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x,
+                     r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
+}
 
 static void settings_apply_padding(Renderer *r, int new_pad) {
     if (new_pad < 0) new_pad = 0;
@@ -1097,7 +1251,7 @@ static bool g_settings_dir_sel_all = false;
 
 static SettingsLayout settings_layout(int win_w, int win_h) {
     SettingsLayout L = {0};
-    int w = 560, h = 350;
+    int w = 600, h = 520;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -1111,12 +1265,15 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     L.dec      = (Rect){ L.modal.x + w - 138, font_row_y, btn, btn };
     L.inc      = (Rect){ L.modal.x + w - 60,  font_row_y, btn, btn };
 
-    int pad_row_y = font_row_y + btn + 10;
+    int font_list_y = font_row_y + btn + 16;
+    L.font_list = (Rect){ L.modal.x + 140, font_list_y, w - 140 - 22, 140 };
+
+    int pad_row_y = font_list_y + L.font_list.h + 16;
     L.pad_val  = (Rect){ L.modal.x + w - 214, pad_row_y, 66, btn };
     L.pad_dec  = (Rect){ L.modal.x + w - 138, pad_row_y, btn, btn };
     L.pad_inc  = (Rect){ L.modal.x + w - 60,  pad_row_y, btn, btn };
 
-    int log_row1_y = pad_row_y + btn + 18;
+    int log_row1_y = pad_row_y + btn + 14;
     L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
 
     int log_row2_y = log_row1_y + btn + 10;
@@ -1130,13 +1287,30 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
 }
 
 static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
-    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
+    /* Wheel-scroll the font list whenever the pointer is over it. */
+    if (rect_hit(L.font_list, mx, my)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_font_list_scroll -= (int)(wheel * 3.0f);
+            if (g_font_list_scroll < 0) g_font_list_scroll = 0;
+        }
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
     if (rect_hit(L.dec, mx, my))   { settings_apply_font_size(r, r->font_size - 1); return; }
     if (rect_hit(L.inc, mx, my))   { settings_apply_font_size(r, r->font_size + 1); return; }
     if (rect_hit(L.pad_dec, mx, my)) { settings_apply_padding(r, r->pad_x - 2); return; }
     if (rect_hit(L.pad_inc, mx, my)) { settings_apply_padding(r, r->pad_x + 2); return; }
+    if (rect_hit(L.font_list, mx, my)) {
+        int row_h = 22;
+        int idx = (my - L.font_list.y) / row_h + g_font_list_scroll;
+        if (idx >= 0 && idx < g_font_count) {
+            g_font_list_selected = idx;
+            settings_apply_font(r, &g_fonts[idx]);
+        }
+        return;
+    }
     if (rect_hit(L.log_toggle, mx, my)) {
         g_app_settings.log_enabled = !g_app_settings.log_enabled;
         refresh_tab_logs();
@@ -1261,6 +1435,58 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                (Vector2){L.inc.x + (L.inc.w - ps.x) / 2,
                          L.inc.y + (L.inc.h - ps.y) / 2},
                18, 0, (Color){230, 232, 240, 255});
+
+    /* Font family list. */
+    DrawTextEx(*f, "Font",
+               (Vector2){L.modal.x + 22, L.font_list.y + 6},
+               14, 0, (Color){200, 205, 220, 255});
+    DrawRectangle(L.font_list.x, L.font_list.y, L.font_list.w, L.font_list.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.font_list.x, L.font_list.y, L.font_list.w, L.font_list.h,
+                       (Color){70, 74, 90, 255});
+    if (g_font_count == 0) {
+        DrawTextEx(*f, "(no monospace fonts found)",
+                   (Vector2){L.font_list.x + 10, L.font_list.y + 10},
+                   12, 0, (Color){140, 145, 160, 255});
+    } else {
+        int row_h = 22;
+        int visible = L.font_list.h / row_h;
+        int max_scroll = g_font_count - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (g_font_list_scroll > max_scroll) g_font_list_scroll = max_scroll;
+        if (g_font_list_scroll < 0) g_font_list_scroll = 0;
+        BeginScissorMode(L.font_list.x + 2, L.font_list.y + 2,
+                         L.font_list.w - 4, L.font_list.h - 4);
+        for (int i = 0; i < g_font_count; i++) {
+            int ry = L.font_list.y + (i - g_font_list_scroll) * row_h;
+            if (ry + row_h < L.font_list.y || ry > L.font_list.y + L.font_list.h)
+                continue;
+            bool sel = (i == g_font_list_selected);
+            if (sel) {
+                DrawRectangle(L.font_list.x + 2, ry,
+                              L.font_list.w - 4, row_h,
+                              (Color){46, 62, 90, 220});
+            }
+            DrawTextEx(*f, g_fonts[i].name,
+                       (Vector2){L.font_list.x + 10, ry + 4},
+                       13, 0,
+                       sel ? (Color){230, 232, 240, 255}
+                           : (Color){200, 205, 220, 255});
+        }
+        EndScissorMode();
+        if (g_font_count > visible) {
+            int track_x = L.font_list.x + L.font_list.w - 5;
+            int bar_h = L.font_list.h * visible / g_font_count;
+            if (bar_h < 24) bar_h = 24;
+            int bar_y = L.font_list.y +
+                        (L.font_list.h - bar_h) * g_font_list_scroll /
+                        (max_scroll > 0 ? max_scroll : 1);
+            DrawRectangle(track_x, L.font_list.y, 3, L.font_list.h,
+                          (Color){40, 45, 58, 255});
+            DrawRectangle(track_x, bar_y, 3, bar_h,
+                          (Color){110, 130, 170, 255});
+        }
+    }
 
     /* Padding row. */
     DrawTextEx(*f, "Padding",
@@ -1482,6 +1708,9 @@ int main(int argc, char **argv) {
 
     uint8_t readbuf[65536];
     uint8_t inputbuf[4096];
+    bool was_focused = true;
+    int  prev_mouse_btn = -1;
+    int  prev_mouse_col = -1, prev_mouse_row = -1;
 
     while (!WindowShouldClose() && g_num_tabs > 0) {
         int win_w_now = GetScreenWidth();
@@ -1566,32 +1795,99 @@ int main(int argc, char **argv) {
             if (mcol < 0) mcol = 0; if (mcol > cmax) mcol = cmax;
             if (mrow < 0) mrow = 0; if (mrow > rmax) mrow = rmax;
 
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                double t = GetTime();
-                bool fast = (t - cur->last_click_time < 0.45);
-                bool same = (mcol == cur->last_click_col && mrow == cur->last_click_row);
-                cur->click_count = (fast && same) ? (cur->click_count + 1) : 1;
-                cur->last_click_time = t;
-                cur->last_click_col = mcol;
-                cur->last_click_row = mrow;
-                if (cur->click_count == 2)      select_word(cur->scr, &cur->sel, mcol, mrow);
-                else if (cur->click_count >= 3) { select_line(cur->scr, &cur->sel, mrow); cur->click_count = 3; }
-                else {
-                    cur->sel.active = true;
-                    cur->sel.dragging = true;
-                    cur->sel.a_col = cur->sel.b_col = mcol;
-                    cur->sel.a_row = cur->sel.b_row = mrow;
+            /* Mouse reporting: when the app has asked for it (DECSET 1000,
+               1002, 1003) and the user isn't holding Shift (the universal
+               override that lets you still select text), we translate
+               mouse events to byte reports on the PTY instead of using
+               them for selection. */
+            bool shift_held = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            int  mmode = screen_mouse_mode(cur->scr);
+            bool to_pty = (mmode != 0) && !shift_held;
+
+            if (to_pty) {
+                bool sgr = screen_mouse_sgr(cur->scr);
+                int shf = shift_held ? 4 : 0;
+                int alt = (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) ? 8 : 0;
+                int ctl = (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) ? 16 : 0;
+                int mods = shf | alt | ctl;
+
+                /* Helper to write one mouse report. */
+                #define MOUSE_EMIT(btn, release, motion) do {                     \
+                    int _b = (btn) + mods + ((motion) ? 32 : 0);                  \
+                    char _buf[32];                                                \
+                    int _n;                                                       \
+                    if (sgr) {                                                    \
+                        _n = snprintf(_buf, sizeof(_buf), "\x1b[<%d;%d;%d%c",     \
+                                      _b, mcol + 1, mrow + 1,                    \
+                                      (release) ? 'm' : 'M');                    \
+                    } else {                                                      \
+                        int _eb = (release) ? (3 + mods + ((motion) ? 32 : 0))    \
+                                            : _b;                                 \
+                        if (mcol + 33 > 255 || mrow + 33 > 255) break;            \
+                        _n = 6;                                                   \
+                        _buf[0] = 0x1b; _buf[1] = '['; _buf[2] = 'M';             \
+                        _buf[3] = (char)(_eb + 32);                               \
+                        _buf[4] = (char)(mcol + 1 + 32);                          \
+                        _buf[5] = (char)(mrow + 1 + 32);                          \
+                    }                                                             \
+                    pty_write(cur->pty, (const uint8_t *)_buf, _n);               \
+                } while (0)
+
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))   MOUSE_EMIT(0, false, false);
+                if (IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE)) MOUSE_EMIT(1, false, false);
+                if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))  MOUSE_EMIT(2, false, false);
+                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))   MOUSE_EMIT(0, true, false);
+                if (IsMouseButtonReleased(MOUSE_BUTTON_MIDDLE)) MOUSE_EMIT(1, true, false);
+                if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT))  MOUSE_EMIT(2, true, false);
+                if (mcol != prev_mouse_col || mrow != prev_mouse_row) {
+                    int held = IsMouseButtonDown(MOUSE_BUTTON_LEFT)   ? 0
+                             : IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ? 1
+                             : IsMouseButtonDown(MOUSE_BUTTON_RIGHT)  ? 2 : -1;
+                    if (mmode == 1003 || (mmode == 1002 && held >= 0)) {
+                        int b = (held >= 0) ? held : 3;
+                        MOUSE_EMIT(b, false, true);
+                    }
+                    prev_mouse_col = mcol; prev_mouse_row = mrow;
                 }
-            }
-            if (cur->sel.dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                cur->sel.b_col = mcol; cur->sel.b_row = mrow;
-            }
-            if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-                if (cur->sel.dragging && cur->click_count < 2) {
-                    cur->sel.dragging = false;
-                    if (cur->sel.a_col == cur->sel.b_col &&
-                        cur->sel.a_row == cur->sel.b_row) {
-                        cur->sel.active = false;
+                float wheel = GetMouseWheelMove();
+                if (wheel != 0.0f) {
+                    int b = (wheel > 0) ? 64 : 65;
+                    MOUSE_EMIT(b, false, false);
+                }
+                /* Update button cache for 1002 motion tracking. */
+                prev_mouse_btn = IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 0 :
+                                 IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ? 1 :
+                                 IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ? 2 : -1;
+                (void)prev_mouse_btn;
+                #undef MOUSE_EMIT
+            } else {
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                    double t = GetTime();
+                    bool fast = (t - cur->last_click_time < 0.45);
+                    bool same = (mcol == cur->last_click_col && mrow == cur->last_click_row);
+                    cur->click_count = (fast && same) ? (cur->click_count + 1) : 1;
+                    cur->last_click_time = t;
+                    cur->last_click_col = mcol;
+                    cur->last_click_row = mrow;
+                    if (cur->click_count == 2)      select_word(cur->scr, &cur->sel, mcol, mrow);
+                    else if (cur->click_count >= 3) { select_line(cur->scr, &cur->sel, mrow); cur->click_count = 3; }
+                    else {
+                        cur->sel.active = true;
+                        cur->sel.dragging = true;
+                        cur->sel.a_col = cur->sel.b_col = mcol;
+                        cur->sel.a_row = cur->sel.b_row = mrow;
+                    }
+                }
+                if (cur->sel.dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                    cur->sel.b_col = mcol; cur->sel.b_row = mrow;
+                }
+                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                    if (cur->sel.dragging && cur->click_count < 2) {
+                        cur->sel.dragging = false;
+                        if (cur->sel.a_col == cur->sel.b_col &&
+                            cur->sel.a_row == cur->sel.b_row) {
+                            cur->sel.active = false;
+                        }
                     }
                 }
             }
@@ -1652,7 +1948,7 @@ int main(int argc, char **argv) {
         bool shift_held = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         if (ui_key_down()) {
             if (IsKeyPressed(KEY_COMMA)) {
-                settings_open();
+                settings_open(&r);
             }
             else if (shift_held && IsKeyPressed(KEY_T)) {
                 ssh_form_open();
@@ -1683,7 +1979,29 @@ int main(int argc, char **argv) {
         if (acts.copy) copy_selection(cur->scr, &cur->sel);
         if (acts.paste) {
             const char *t = GetClipboardText();
-            if (t && *t) pty_write(cur->pty, (const uint8_t *)t, strlen(t));
+            if (t && *t) {
+                if (screen_bracketed_paste(cur->scr)) {
+                    pty_write(cur->pty, (const uint8_t *)"\x1b[200~", 6);
+                    pty_write(cur->pty, (const uint8_t *)t, strlen(t));
+                    pty_write(cur->pty, (const uint8_t *)"\x1b[201~", 6);
+                } else {
+                    pty_write(cur->pty, (const uint8_t *)t, strlen(t));
+                }
+            }
+        }
+
+        /* Focus events (DECSET 1004). Emit CSI I on gain, CSI O on loss. */
+        {
+            bool is_focused = IsWindowFocused();
+            if (is_focused != was_focused) {
+                was_focused = is_focused;
+                if (cur && screen_focus_report(cur->scr)) {
+                    pty_write(cur->pty,
+                              is_focused ? (const uint8_t *)"\x1b[I"
+                                         : (const uint8_t *)"\x1b[O",
+                              3);
+                }
+            }
         }
         if (acts.font_delta != 100) {
             int old = r.font_size;
