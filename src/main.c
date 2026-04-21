@@ -11,6 +11,14 @@
 #include <time.h>
 #include <errno.h>
 #ifdef _WIN32
+  /* windows.h brings in wingdi.h / winuser.h which define Rectangle,
+     CloseWindow, ShowCursor, DrawText as macros and collide with
+     raylib's types of the same name. NOGDI / NOUSER strip those
+     declarations; we only need kernel32 bits (FindFirstFile etc.)
+     from main.c so nothing's lost. */
+  #define NOGDI
+  #define NOUSER
+  #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
   #define strcasecmp  _stricmp
   #define strncasecmp _strnicmp
