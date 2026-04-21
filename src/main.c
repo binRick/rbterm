@@ -142,7 +142,7 @@ static int g_active = 0;
 typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS } UiMode;
 typedef enum {
     F_HOST = 0, F_PORT, F_USER, F_PASS, F_KEY,
-    F_CONNECT, F_CANCEL,
+    F_CONNECT, F_SAVE, F_CANCEL,
     F_COUNT
 } SshField;
 #define F_TEXT_FIELDS 5    /* host, port, user, pass, key */
@@ -182,8 +182,11 @@ typedef struct {
     Rect list;                  /* saved-hosts sidebar */
     Rect field[F_TEXT_FIELDS];  /* host, port, user, pass, key */
     Rect connect;
+    Rect save;
     Rect cancel;
 } SshFormLayout;
+
+static char g_form_status[192];   /* positive status line (e.g. "saved") */
 
 static Tab *active_tab(void) {
     if (g_num_tabs == 0) return NULL;
@@ -483,15 +486,14 @@ static int tab_width_for(int win_w) {
     return w;
 }
 
+/* Layout: [ssh] | tab1 | tab2 | ... | [+] */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     TabBarHit h = { -1, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
-    /* Buttons live on the LEFT so they can never be clipped by a narrow
-       window, a DPI miscalculation, or anything else that shrinks the
-       right edge. */
-    if (mx < TAB_PLUS_W)                        { h.on_plus = true; return h; }
-    if (mx < TAB_PLUS_W + TAB_SSH_W)            { h.on_ssh  = true; return h; }
-    int tab_start = TAB_PLUS_W + TAB_SSH_W;
+    int plus_x   = win_w - TAB_PLUS_W;
+    int tab_start = TAB_SSH_W;
+    if (mx < TAB_SSH_W)  { h.on_ssh  = true; return h; }
+    if (mx >= plus_x)    { h.on_plus = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
     if (idx < 0 || idx >= g_num_tabs) return h;
@@ -508,19 +510,8 @@ static void draw_tab_bar(Renderer *r, int win_w) {
     Font *f = (Font *)r->font_data;
     float fs = 13.0f;
 
-    /* Left-anchored control buttons, drawn first so tabs render to their
-       right. */
-    int plus_x = 0;
-    int ssh_x  = TAB_PLUS_W;
-    DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){38, 48, 66, 255});
-    DrawRectangleLines(plus_x, 2, TAB_PLUS_W - 1, TAB_BAR_H - 4,
-                       (Color){125, 207, 255, 200});
-    Vector2 psz = MeasureTextEx(*f, "+", 18, 0);
-    DrawTextEx(*f, "+",
-               (Vector2){ plus_x + (TAB_PLUS_W - psz.x) / 2.0f,
-                          (TAB_BAR_H - psz.y) / 2.0f },
-               18, 0, (Color){230, 240, 255, 255});
-
+    /* "ssh" button anchored top-left. */
+    int ssh_x  = 0;
     DrawRectangle(ssh_x, 0, TAB_SSH_W, TAB_BAR_H, (Color){38, 48, 66, 255});
     DrawRectangleLines(ssh_x, 2, TAB_SSH_W - 1, TAB_BAR_H - 4,
                        (Color){125, 207, 255, 200});
@@ -530,8 +521,19 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                           (TAB_BAR_H - ssz.y) / 2.0f },
                13, 0, (Color){180, 230, 255, 255});
 
-    /* Tabs fill the remainder to the right of the buttons. */
-    int tab_start = TAB_PLUS_W + TAB_SSH_W;
+    /* "+" button anchored top-right. */
+    int plus_x = win_w - TAB_PLUS_W;
+    DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){38, 48, 66, 255});
+    DrawRectangleLines(plus_x, 2, TAB_PLUS_W - 1, TAB_BAR_H - 4,
+                       (Color){125, 207, 255, 200});
+    Vector2 psz = MeasureTextEx(*f, "+", 18, 0);
+    DrawTextEx(*f, "+",
+               (Vector2){ plus_x + (TAB_PLUS_W - psz.x) / 2.0f,
+                          (TAB_BAR_H - psz.y) / 2.0f },
+               18, 0, (Color){230, 240, 255, 255});
+
+    /* Tabs fill the space between the two buttons. */
+    int tab_start = TAB_SSH_W;
     int tw = tab_width_for(win_w);
 
     for (int i = 0; i < g_num_tabs; i++) {
@@ -684,6 +686,7 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
 
 static void ssh_form_open(void) {
     g_ui_mode = UI_SSH_FORM;
+    g_form_status[0] = 0;
     memset(&g_form, 0, sizeof(g_form));
     strncpy(g_form.port, "22", sizeof(g_form.port) - 1);
     const char *u = getenv("USER");
@@ -747,13 +750,16 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
 
     int btn_h = 32;
     int btn_y = L.modal.y + L.modal.h - btn_h - pad - (g_form.error[0] ? 24 : 0);
-    int connect_w = 120, cancel_w = 96;
-    L.connect.w = connect_w;  L.connect.h = btn_h;
-    L.cancel.w  = cancel_w;   L.cancel.h  = btn_h;
-    L.connect.x = L.modal.x + L.modal.w - pad - connect_w - 8 - cancel_w;
-    L.connect.y = btn_y;
-    L.cancel.x  = L.modal.x + L.modal.w - pad - cancel_w;
-    L.cancel.y  = btn_y;
+    int connect_w = 110, save_w = 90, cancel_w = 96;
+    int gap = 8;
+    int right_edge = L.modal.x + L.modal.w - pad;
+    L.cancel.w  = cancel_w;  L.cancel.h  = btn_h;
+    L.save.w    = save_w;    L.save.h    = btn_h;
+    L.connect.w = connect_w; L.connect.h = btn_h;
+    L.cancel.x  = right_edge - cancel_w;
+    L.save.x    = L.cancel.x - gap - save_w;
+    L.connect.x = L.save.x - gap - connect_w;
+    L.cancel.y = L.save.y = L.connect.y = btn_y;
     return L;
 }
 
@@ -791,6 +797,67 @@ static void ssh_form_submit(int cols, int rows) {
 static void ssh_form_advance_focus(int delta) {
     g_form.focus = (g_form.focus + delta + F_COUNT) % F_COUNT;
     g_form.sel_all = false;
+}
+
+/* Append the form's current values as a `Host` stanza to ~/.ssh/config.
+   Refuses to overwrite an existing alias. The alias we save under is the
+   Host field — convenient because after saving, clicking the new entry
+   in the sidebar re-populates identical values. */
+static bool ssh_form_save_to_config(void) {
+    if (!g_form.host[0]) {
+        strncpy(g_form.error, "Host is required before saving",
+                sizeof(g_form.error) - 1);
+        g_form.focus = F_HOST;
+        return false;
+    }
+    char path[PATH_MAX];
+    expand_home_path("~/.ssh/config", path, sizeof(path));
+    /* Make sure the parent ~/.ssh exists. */
+    char ssh_dir[PATH_MAX];
+    expand_home_path("~/.ssh", ssh_dir, sizeof(ssh_dir));
+    mkdir_p(ssh_dir);
+#ifndef _WIN32
+    chmod(ssh_dir, 0700);
+#endif
+
+    /* Refuse to clobber an existing stanza with the same alias. */
+    for (int i = 0; i < g_ssh_profile_count; i++) {
+        if (strcmp(g_ssh_profiles[i].name, g_form.host) == 0) {
+            snprintf(g_form.error, sizeof(g_form.error),
+                     "Host '%s' already exists in ~/.ssh/config — edit manually to overwrite",
+                     g_form.host);
+            return false;
+        }
+    }
+
+    FILE *fp = fopen(path, "a");
+    if (!fp) {
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "Can't open %s for append: %s", path, strerror(errno));
+        return false;
+    }
+    /* Leading blank line in case the previous content doesn't end with one. */
+    fputc('\n', fp);
+    fprintf(fp, "Host %s\n", g_form.host);
+    fprintf(fp, "    HostName %s\n", g_form.host);
+    if (g_form.user[0])
+        fprintf(fp, "    User %s\n", g_form.user);
+    int port = atoi(g_form.port);
+    if (port > 0 && port != 22)
+        fprintf(fp, "    Port %d\n", port);
+    if (g_form.key[0])
+        fprintf(fp, "    IdentityFile %s\n", g_form.key);
+    fclose(fp);
+#ifndef _WIN32
+    chmod(path, 0600);
+#endif
+
+    snprintf(g_form_status, sizeof(g_form_status),
+             "Saved '%s' to %s", g_form.host, path);
+    g_form.error[0] = 0;
+    /* Refresh the sidebar so the new entry shows immediately. */
+    ssh_profiles_load();
+    return true;
 }
 
 static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
@@ -843,6 +910,11 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
         ssh_form_submit(cols, rows);
         return;
     }
+    if (rect_hit(L.save, mx, my)) {
+        g_form.focus = F_SAVE;
+        ssh_form_save_to_config();
+        return;
+    }
     if (rect_hit(L.cancel, mx, my)) {
         g_ui_mode = UI_NORMAL;
         return;
@@ -875,6 +947,10 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
         if (g_form.focus == F_CANCEL) { g_ui_mode = UI_NORMAL; return; }
+        if (g_form.focus == F_SAVE) {
+            ssh_form_save_to_config();
+            return;
+        }
         if (g_form.focus == F_CONNECT || g_form.focus == F_KEY) {
             ssh_form_submit(cols, rows);
             return;
@@ -891,6 +967,9 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     /* Space on Connect / Cancel acts as a click. */
     if (g_form.focus == F_CONNECT && IsKeyPressed(KEY_SPACE)) {
         ssh_form_submit(cols, rows); return;
+    }
+    if (g_form.focus == F_SAVE && IsKeyPressed(KEY_SPACE)) {
+        ssh_form_save_to_config(); return;
     }
     if (g_form.focus == F_CANCEL && IsKeyPressed(KEY_SPACE)) {
         g_ui_mode = UI_NORMAL; return;
@@ -1076,6 +1155,17 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                          L.connect.y + (L.connect.h - csz.y) / 2},
                14, 0, (Color){240, 245, 255, 255});
 
+    bool sf = g_form.focus == F_SAVE;
+    DrawRectangle(L.save.x, L.save.y, L.save.w, L.save.h,
+                  sf ? (Color){80, 120, 80, 255} : (Color){48, 78, 58, 255});
+    DrawRectangleLines(L.save.x, L.save.y, L.save.w, L.save.h,
+                       (Color){150, 220, 170, sf ? 255 : 170});
+    Vector2 ssz2 = MeasureTextEx(*f, "Save", 14, 0);
+    DrawTextEx(*f, "Save",
+               (Vector2){L.save.x + (L.save.w - ssz2.x) / 2,
+                         L.save.y + (L.save.h - ssz2.y) / 2},
+               14, 0, (Color){220, 240, 225, 255});
+
     bool xf = g_form.focus == F_CANCEL;
     DrawRectangle(L.cancel.x, L.cancel.y, L.cancel.w, L.cancel.h,
                   xf ? (Color){72, 76, 96, 255} : (Color){48, 52, 66, 255});
@@ -1087,16 +1177,19 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                          L.cancel.y + (L.cancel.h - xsz.y) / 2},
                14, 0, (Color){210, 215, 230, 255});
 
-    /* Error line. */
+    /* Status (success) / error line under the buttons. */
     if (g_form.error[0]) {
-        int ey = L.connect.y + L.connect.h + 10;
         DrawTextEx(*f, g_form.error,
-                   (Vector2){L.modal.x + 22, ey}, 12, 0,
-                   (Color){240, 100, 100, 255});
+                   (Vector2){L.modal.x + 22, L.connect.y + L.connect.h + 10},
+                   12, 0, (Color){240, 100, 100, 255});
+    } else if (g_form_status[0]) {
+        DrawTextEx(*f, g_form_status,
+                   (Vector2){L.modal.x + 22, L.connect.y + L.connect.h + 10},
+                   12, 0, (Color){120, 220, 140, 255});
     }
 
     /* Footer hint. */
-    DrawTextEx(*f, "Tab / Shift+Tab navigate   Enter connects   Esc cancels",
+    DrawTextEx(*f, "Tab navigates · Enter connects · Save appends to ~/.ssh/config · Esc cancels",
                (Vector2){L.modal.x + 22, L.modal.y + L.modal.h - 22},
                11, 0, (Color){110, 115, 130, 255});
 }

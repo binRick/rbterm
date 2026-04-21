@@ -58,6 +58,33 @@ jobs:
           mkdir -p out
           cp "${{ matrix.build_subdir }}/${{ matrix.binary_name }}" "out/${{ matrix.asset_name }}"
 
+      - name: Self-sign Windows binary
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          # Self-signed cert so the exe isn't "completely unsigned". It
+          # won't remove the SmartScreen warning (no publisher reputation
+          # or EV cert) but the Signature tab now shows a signing subject,
+          # the Authenticode embedded timestamp proves when it was
+          # signed, and some AV engines treat signed-with-any-cert
+          # differently from raw unsigned. Users who want to fully
+          # silence Windows warnings can import the cert into the
+          # Trusted Publishers store once.
+          $cert = New-SelfSignedCertificate `
+              -Subject "CN=rbterm CI (binRick)" `
+              -Type CodeSigning `
+              -KeyAlgorithm RSA -KeyLength 2048 `
+              -CertStoreLocation Cert:\CurrentUser\My `
+              -NotAfter (Get-Date).AddYears(3)
+          Set-AuthenticodeSignature `
+              -FilePath "out\${{ matrix.asset_name }}" `
+              -Certificate $cert `
+              -HashAlgorithm SHA256 `
+              -TimestampServer "http://timestamp.digicert.com"
+          $sig = Get-AuthenticodeSignature "out\${{ matrix.asset_name }}"
+          Write-Host "Signature status: $($sig.Status)"
+          Write-Host "Signer:          $($sig.SignerCertificate.Subject)"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

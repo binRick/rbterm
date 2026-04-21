@@ -317,6 +317,21 @@ static Color col_from_rgb(uint32_t v, float alpha) {
     return c;
 }
 
+/* Resolve a cell's stored fg/bg to a concrete RGB. Cells hold a palette
+   index when ATTR_*_INDEX is set, a default marker when ATTR_DEFAULT_*
+   is set, and a raw RGB otherwise. Looking up on every draw means OSC 4
+   palette changes retroactively recolour every cell on screen. */
+static uint32_t resolve_fg(Cell c) {
+    if (c.attrs & ATTR_DEFAULT_FG) return g_default_fg;
+    if (c.attrs & ATTR_FG_INDEX)   return screen_palette((int)(c.fg & 0xff));
+    return c.fg;
+}
+static uint32_t resolve_bg(Cell c) {
+    if (c.attrs & ATTR_DEFAULT_BG) return g_default_bg;
+    if (c.attrs & ATTR_BG_INDEX)   return screen_palette((int)(c.bg & 0xff));
+    return c.bg;
+}
+
 static bool sel_contains(const Selection *sel, int col, int row) {
     if (!sel || !sel->active) return false;
     int r1 = sel->a_row, c1 = sel->a_col;
@@ -365,13 +380,12 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
         int x = 0;
         while (x < cols) {
             Cell c = screen_view_cell(s, x, y);
-            uint32_t bg = c.bg;
             uint16_t at = c.attrs;
-            if (at & ATTR_REVERSE) { uint32_t t = bg; bg = c.fg; (void)t; }
+            uint32_t bg = (at & ATTR_REVERSE) ? resolve_fg(c) : resolve_bg(c);
             int x2 = x + 1;
             while (x2 < cols) {
                 Cell d = screen_view_cell(s, x2, y);
-                uint32_t dbg = (d.attrs & ATTR_REVERSE) ? d.fg : d.bg;
+                uint32_t dbg = (d.attrs & ATTR_REVERSE) ? resolve_fg(d) : resolve_bg(d);
                 if (dbg != bg) break;
                 x2++;
             }
@@ -413,8 +427,7 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             if (c.cp == 0 || c.cp == ' ') continue;
             if (c.attrs & ATTR_HIDDEN) continue;
 
-            uint32_t fg = c.fg;
-            if (c.attrs & ATTR_REVERSE) fg = c.bg;
+            uint32_t fg = (c.attrs & ATTR_REVERSE) ? resolve_bg(c) : resolve_fg(c);
 
             bool at_cursor = (show_cursor && x == cursor_vx && y == cursor_vy
                               && ((long long)(time_sec * 2.0) & 1) == 0 && focused);

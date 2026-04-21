@@ -20,6 +20,8 @@ enum {
     ATTR_HIDDEN    = 1u << 6,
     ATTR_WIDE      = 1u << 7,   /* first half of a double-width character */
     ATTR_WIDE_CONT = 1u << 8,   /* right-hand continuation of a wide char  */
+    ATTR_FG_INDEX  = 1u << 9,   /* fg holds a palette index (0..255), not RGB */
+    ATTR_BG_INDEX  = 1u << 10,  /* bg holds a palette index (0..255), not RGB */
     ATTR_DEFAULT_FG = 1u << 14,
     ATTR_DEFAULT_BG = 1u << 15,
 };
@@ -28,6 +30,9 @@ enum {
 extern uint32_t g_default_fg;
 extern uint32_t g_default_bg;
 extern uint32_t g_cursor_color;
+
+/* Palette index → RGB. Reads g_palette[i]; safe for any i (clamped). */
+uint32_t screen_palette(int i);
 
 #define DEFAULT_FG    (g_default_fg)
 #define DEFAULT_BG    (g_default_bg)

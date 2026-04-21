@@ -421,42 +421,65 @@ static void sgr(Screen *s) {
         else if (p == 28)   s->cur_attr.attrs &= ~ATTR_HIDDEN;
         else if (p == 29)   s->cur_attr.attrs &= ~ATTR_STRIKE;
         else if (p >= 30 && p <= 37) {
-            s->cur_attr.fg = pal(p - 30);
-            s->cur_attr.attrs &= ~ATTR_DEFAULT_FG;
+            /* Store the palette INDEX and flag it; rendering resolves the
+               current RGB each frame, so OSC 4 palette changes retro-
+               actively recolour existing cells. */
+            s->cur_attr.fg = (uint32_t)(p - 30);
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_FG) | ATTR_FG_INDEX);
         }
-        else if (p == 39) { s->cur_attr.fg = DEFAULT_FG; s->cur_attr.attrs |= ATTR_DEFAULT_FG; }
+        else if (p == 39) {
+            s->cur_attr.fg = DEFAULT_FG;
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_FG) & ~ATTR_FG_INDEX);
+        }
         else if (p >= 40 && p <= 47) {
-            s->cur_attr.bg = pal(p - 40);
-            s->cur_attr.attrs &= ~ATTR_DEFAULT_BG;
+            s->cur_attr.bg = (uint32_t)(p - 40);
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
         }
-        else if (p == 49) { s->cur_attr.bg = DEFAULT_BG; s->cur_attr.attrs |= ATTR_DEFAULT_BG; }
+        else if (p == 49) {
+            s->cur_attr.bg = DEFAULT_BG;
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_BG) & ~ATTR_BG_INDEX);
+        }
         else if (p >= 90 && p <= 97) {
-            s->cur_attr.fg = pal(p - 90 + 8);
-            s->cur_attr.attrs &= ~ATTR_DEFAULT_FG;
+            s->cur_attr.fg = (uint32_t)(p - 90 + 8);
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_FG) | ATTR_FG_INDEX);
         }
         else if (p >= 100 && p <= 107) {
-            s->cur_attr.bg = pal(p - 100 + 8);
-            s->cur_attr.attrs &= ~ATTR_DEFAULT_BG;
+            s->cur_attr.bg = (uint32_t)(p - 100 + 8);
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
         }
         else if (p == 38 || p == 48) {
             bool is_fg = (p == 38);
             if (i + 1 < n && s->params[i + 1] == 5 && i + 2 < n) {
-                uint32_t c = pal(s->params[i + 2] & 0xff);
-                if (is_fg) { s->cur_attr.fg = c; s->cur_attr.attrs &= ~ATTR_DEFAULT_FG; }
-                else       { s->cur_attr.bg = c; s->cur_attr.attrs &= ~ATTR_DEFAULT_BG; }
+                /* 256-color: store index, flag it. */
+                uint32_t idx = (uint32_t)(s->params[i + 2] & 0xff);
+                if (is_fg) {
+                    s->cur_attr.fg = idx;
+                    s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_FG) | ATTR_FG_INDEX);
+                } else {
+                    s->cur_attr.bg = idx;
+                    s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
+                }
                 i += 2;
             } else if (i + 1 < n && s->params[i + 1] == 2 && i + 4 < n) {
+                /* 24-bit truecolor: store the RGB literal, clear index flag. */
                 uint32_t r = s->params[i + 2] & 0xff;
                 uint32_t g = s->params[i + 3] & 0xff;
                 uint32_t b = s->params[i + 4] & 0xff;
                 uint32_t c = (r << 16) | (g << 8) | b;
-                if (is_fg) { s->cur_attr.fg = c; s->cur_attr.attrs &= ~ATTR_DEFAULT_FG; }
-                else       { s->cur_attr.bg = c; s->cur_attr.attrs &= ~ATTR_DEFAULT_BG; }
+                if (is_fg) {
+                    s->cur_attr.fg = c;
+                    s->cur_attr.attrs = (uint16_t)(s->cur_attr.attrs & ~(ATTR_DEFAULT_FG | ATTR_FG_INDEX));
+                } else {
+                    s->cur_attr.bg = c;
+                    s->cur_attr.attrs = (uint16_t)(s->cur_attr.attrs & ~(ATTR_DEFAULT_BG | ATTR_BG_INDEX));
+                }
                 i += 4;
             }
         }
     }
 }
+
+uint32_t screen_palette(int i) { return pal(i); }
 
 /* ---------- Erase ---------- */
 
