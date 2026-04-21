@@ -11,7 +11,9 @@ enum {
     ST_OSC,
     ST_OSC_ESC,
     ST_UTF8,
-    ST_CHARSET,
+    ST_CHARSET,      /* ESC * X or ESC + X — G2/G3, we ignore the payload */
+    ST_CHARSET_G0,   /* ESC ( X — pick G0 charset */
+    ST_CHARSET_G1,   /* ESC ) X — pick G1 charset */
 };
 
 #define MAX_PARAMS 16
@@ -53,6 +55,14 @@ struct Screen {
     bool priv;       // '?' seen
     bool inter_gt;   // '>' seen  (secondary DA etc.)
     bool inter_eq;   // '=' seen  (tertiary DA)
+
+    /* Charset state for DEC Special Graphics / Line Drawing. tmux
+       selects this via `ESC ( 0` (G0 = line drawing) and then prints
+       the lowercase letters q/x/j/k/l/m/n/t/u/v/w for the lines and
+       corners of its pane borders. */
+    char charset_g0;      /* 'B' = US-ASCII (default), '0' = DEC graphics */
+    char charset_g1;
+    int  charset_active;  /* 0 = G0, 1 = G1 (toggled by SI/SO) */
     uint32_t uni_cp;
     int uni_need;
 
@@ -165,6 +175,47 @@ static bool parse_color_spec(const char *s, uint32_t *out) {
 
 /* ---------- Helpers ---------- */
 
+/* Translate a 7-bit ASCII code through the DEC Special Graphics set.
+   Only printable codes 0x60..0x7E have interesting mappings; anything
+   else passes through unchanged. */
+static uint32_t dec_graphic(uint32_t cp) {
+    if (cp < 0x60 || cp > 0x7E) return cp;
+    static const uint32_t table[0x7F - 0x60 + 1] = {
+        0x25C6, /* ` diamond            */
+        0x2592, /* a checkerboard       */
+        0x2409, /* b HT                 */
+        0x240C, /* c FF                 */
+        0x240D, /* d CR                 */
+        0x240A, /* e LF                 */
+        0x00B0, /* f degree             */
+        0x00B1, /* g plus/minus         */
+        0x2424, /* h NL                 */
+        0x240B, /* i VT                 */
+        0x2518, /* j ┘                  */
+        0x2510, /* k ┐                  */
+        0x250C, /* l ┌                  */
+        0x2514, /* m └                  */
+        0x253C, /* n ┼                  */
+        0x23BA, /* o ⎺                  */
+        0x23BB, /* p ⎻                  */
+        0x2500, /* q ─                  */
+        0x23BC, /* r ⎼                  */
+        0x23BD, /* s ⎽                  */
+        0x251C, /* t ├                  */
+        0x2524, /* u ┤                  */
+        0x2534, /* v ┴                  */
+        0x252C, /* w ┬                  */
+        0x2502, /* x │                  */
+        0x2264, /* y ≤                  */
+        0x2265, /* z ≥                  */
+        0x03C0, /* { π                  */
+        0x2260, /* | ≠                  */
+        0x00A3, /* } £                  */
+        0x00B7, /* ~ ·                  */
+    };
+    return table[cp - 0x60];
+}
+
 static Cell blank_cell(Screen *s) {
     Cell c;
     c.cp = 0;
@@ -270,6 +321,9 @@ static bool cp_is_wide(uint32_t cp) {
 }
 
 static void put_cp(Screen *s, uint32_t cp) {
+    /* Apply the active charset mapping before any width/wrap logic. */
+    char active = (s->charset_active == 1) ? s->charset_g1 : s->charset_g0;
+    if (active == '0' && cp >= 0x20 && cp < 0x7F) cp = dec_graphic(cp);
     bool wide = cp_is_wide(cp);
     if (s->cx >= s->cols) s->cx = s->cols - 1;
     if (s->wrap_next && s->autowrap) {
@@ -654,9 +708,13 @@ static void handle_esc(Screen *s, uint8_t b) {
         s->scroll_top = 0; s->scroll_bot = s->rows - 1;
         s->cur_attr.fg = DEFAULT_FG; s->cur_attr.bg = DEFAULT_BG;
         s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
+        s->charset_g0 = 'B'; s->charset_g1 = 'B'; s->charset_active = 0;
         for (int y = 0; y < s->rows; y++) clear_row(s, y);
         s->pstate = ST_GROUND; return;
-    case '(': case ')': case '*': case '+':
+    case '(': s->pstate = ST_CHARSET_G0; return;
+    case ')': s->pstate = ST_CHARSET_G1; return;
+    case '*': case '+':
+        /* G2/G3 — we don't implement these yet, just swallow the next byte. */
         s->pstate = ST_CHARSET; return;
     default:
         s->pstate = ST_GROUND; return;
@@ -686,7 +744,8 @@ static void handle_c0(Screen *s, uint8_t b) {
         s->cx = 0;
         s->wrap_next = false;
         break;
-    case 0x0E: case 0x0F: break; // SO/SI: charset - ignore
+    case 0x0E: s->charset_active = 1; break; /* SO: shift to G1 */
+    case 0x0F: s->charset_active = 0; break; /* SI: shift to G0 */
     default: break;
     }
     s->view_off = 0;
@@ -707,6 +766,8 @@ static void feed_byte(Screen *s, uint8_t b) {
         s->pstate = ST_OSC; return;
     }
     if (s->pstate == ST_CHARSET) { s->pstate = ST_GROUND; return; }
+    if (s->pstate == ST_CHARSET_G0) { s->charset_g0 = (char)b; s->pstate = ST_GROUND; return; }
+    if (s->pstate == ST_CHARSET_G1) { s->charset_g1 = (char)b; s->pstate = ST_GROUND; return; }
     if (b == 0x18 || b == 0x1a) { s->pstate = ST_GROUND; return; }
     if (b == 0x1b) { s->pstate = ST_ESC; reset_params(s); return; }
 
@@ -774,6 +835,9 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     s->cur_attr.fg = DEFAULT_FG;
     s->cur_attr.bg = DEFAULT_BG;
     s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
+    s->charset_g0 = 'B';
+    s->charset_g1 = 'B';
+    s->charset_active = 0;
     s->main = calloc((size_t)cols * rows, sizeof(Cell));
     s->alt  = calloc((size_t)cols * rows, sizeof(Cell));
     s->main_wrap = calloc((size_t)rows, 1);
