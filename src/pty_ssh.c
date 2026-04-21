@@ -60,14 +60,6 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         set_err(err, errsz, "Host is required");
         return NULL;
     }
-    if (!user || !*user) {
-        user = getenv("USER");
-#ifdef _WIN32
-        if (!user || !*user) user = getenv("USERNAME");
-#endif
-        if (!user || !*user) user = "user";
-    }
-    if (port <= 0) port = 22;
 
     SshPty *p = calloc(1, sizeof(*p));
     if (!p) { set_err(err, errsz, "out of memory"); return NULL; }
@@ -78,15 +70,43 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         return NULL;
     }
 
-    ssh_options_set(p->session, SSH_OPTIONS_HOST, host);
-    ssh_options_set(p->session, SSH_OPTIONS_USER, user);
-    ssh_options_set(p->session, SSH_OPTIONS_PORT, &port);
-    long timeout_s = 10;
-    ssh_options_set(p->session, SSH_OPTIONS_TIMEOUT, &timeout_s);
-    /* Surface libssh's own warnings on stderr — run from a terminal
-       (./run.sh or open --stdout=/dev/stdout) to see them. */
     int verbosity = SSH_LOG_WARNING;
     ssh_options_set(p->session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    long timeout_s = 10;
+    ssh_options_set(p->session, SSH_OPTIONS_TIMEOUT, &timeout_s);
+
+    /* `host` may be an alias from ~/.ssh/config (e.g. "mia"). Set it,
+       then let libssh parse ~/.ssh/config to apply HostName, User,
+       Port, IdentityFile, ProxyJump, PubkeyAcceptedAlgorithms and
+       everything else the user has configured. Form-supplied values
+       override the config ones below. */
+    ssh_options_set(p->session, SSH_OPTIONS_HOST, host);
+    if (ssh_options_parse_config(p->session, NULL) != 0) {
+        fprintf(stderr, "rbterm: ssh_options_parse_config: %s\n",
+                ssh_get_error(p->session));
+    }
+
+    if (user && *user) {
+        ssh_options_set(p->session, SSH_OPTIONS_USER, user);
+    }
+    if (port > 0) {
+        ssh_options_set(p->session, SSH_OPTIONS_PORT, &port);
+    }
+
+    /* Log what libssh settled on so the user can see whether the
+       config alias resolved the way they expect. */
+    char *resolved_host = NULL, *resolved_user = NULL;
+    unsigned int resolved_port = 0;
+    ssh_options_get(p->session, SSH_OPTIONS_HOST, &resolved_host);
+    ssh_options_get(p->session, SSH_OPTIONS_USER, &resolved_user);
+    ssh_options_get_port(p->session, &resolved_port);
+    fprintf(stderr, "rbterm: ssh connecting as %s@%s:%u (alias: %s)\n",
+            resolved_user ? resolved_user : "?",
+            resolved_host ? resolved_host : host,
+            resolved_port,
+            host);
+    ssh_string_free_char(resolved_host);
+    ssh_string_free_char(resolved_user);
 
     if (ssh_connect(p->session) != SSH_OK) {
         set_err(err, errsz, "connect %s@%s:%d: %s",
