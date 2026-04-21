@@ -35,6 +35,45 @@
 #define PATH_MAX 1024
 #endif
 
+/* ---------- Persistent config ----------
+ * Plain key=value file at ~/.config/rbterm/config.ini. Loaded once at
+ * startup and re-written by the "Save as Default" button in Settings. */
+
+static void expand_home_path(const char *in, char *out, size_t cap);
+static void mkdir_p(const char *path);
+
+static void config_path(char *out, size_t cap) {
+    expand_home_path("~/.config/rbterm/config.ini", out, cap);
+}
+
+static void config_dir(char *out, size_t cap) {
+    expand_home_path("~/.config/rbterm", out, cap);
+}
+
+/* Lightweight key=value parser. Trims whitespace, ignores comments
+   starting with '#'. */
+static bool ini_split(char *line, char **k_out, char **v_out) {
+    /* trim leading ws */
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '#' || *line == 0 || *line == '\n' || *line == '\r') return false;
+    char *eq = strchr(line, '=');
+    if (!eq) return false;
+    *eq = 0;
+    char *k = line;
+    char *v = eq + 1;
+    /* trim trailing ws on key */
+    char *kp = k + strlen(k);
+    while (kp > k && (kp[-1] == ' ' || kp[-1] == '\t')) *--kp = 0;
+    /* trim leading ws on value, trailing newline/ws */
+    while (*v == ' ' || *v == '\t') v++;
+    char *vp = v + strlen(v);
+    while (vp > v && (vp[-1] == '\n' || vp[-1] == '\r' ||
+                      vp[-1] == ' '  || vp[-1] == '\t')) *--vp = 0;
+    *k_out = k;
+    *v_out = v;
+    return true;
+}
+
 /* ---------- App-wide settings ---------- */
 
 typedef struct {
@@ -42,8 +81,76 @@ typedef struct {
     char log_dir[PATH_MAX];
 } AppSettings;
 static AppSettings g_app_settings;
+static char        g_settings_status[160]; /* status line in the settings modal */
 
-static void expand_home_path(const char *in, char *out, size_t cap);
+/* Defaults read from the config file at startup. Consumed (and cleared)
+   by main() after the renderer and tabs exist. */
+typedef struct {
+    bool has_font_path;   char font_path[1024];
+    bool has_font_size;   int  font_size;
+    bool has_padding;     int  padding;
+    bool has_spacing;     int  spacing;
+    bool has_log;
+} PersistedDefaults;
+static PersistedDefaults g_persisted;
+
+static void config_load_into_defaults(void) {
+    char path[PATH_MAX];
+    config_path(path, sizeof(path));
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        char *k, *v;
+        if (!ini_split(line, &k, &v)) continue;
+        if (strcmp(k, "font_path") == 0) {
+            char resolved[1024];
+            expand_home_path(v, resolved, sizeof(resolved));
+            strncpy(g_persisted.font_path, resolved, sizeof(g_persisted.font_path) - 1);
+            g_persisted.font_path[sizeof(g_persisted.font_path) - 1] = 0;
+            g_persisted.has_font_path = true;
+        } else if (strcmp(k, "font_size") == 0) {
+            g_persisted.font_size = atoi(v);
+            g_persisted.has_font_size = true;
+        } else if (strcmp(k, "padding") == 0) {
+            g_persisted.padding = atoi(v);
+            g_persisted.has_padding = true;
+        } else if (strcmp(k, "cell_spacing") == 0) {
+            g_persisted.spacing = atoi(v);
+            g_persisted.has_spacing = true;
+        } else if (strcmp(k, "log_enabled") == 0) {
+            g_app_settings.log_enabled = (strcmp(v, "true") == 0 || strcmp(v, "1") == 0);
+            g_persisted.has_log = true;
+        } else if (strcmp(k, "log_dir") == 0) {
+            strncpy(g_app_settings.log_dir, v, sizeof(g_app_settings.log_dir) - 1);
+            g_app_settings.log_dir[sizeof(g_app_settings.log_dir) - 1] = 0;
+        }
+    }
+    fclose(fp);
+}
+
+/* Write the current renderer / app settings back to ~/.config/rbterm/config.ini.
+   Used by the "Save as Default" button. Returns true on success. */
+static bool config_save(Renderer *r) {
+    char dir[PATH_MAX], path[PATH_MAX];
+    config_dir(dir, sizeof(dir));
+    config_path(path, sizeof(path));
+    mkdir_p(dir);
+    FILE *fp = fopen(path, "w");
+    if (!fp) return false;
+    fprintf(fp, "# rbterm defaults — rewritten by Settings → Save as Default\n");
+    if (r->font_path[0]) fprintf(fp, "font_path=%s\n", r->font_path);
+    fprintf(fp, "font_size=%d\n",    r->font_size);
+    fprintf(fp, "padding=%d\n",      r->pad_x);
+    fprintf(fp, "cell_spacing=%d\n", r->cell_extra_w);
+    fprintf(fp, "log_enabled=%s\n",  g_app_settings.log_enabled ? "true" : "false");
+    if (g_app_settings.log_dir[0]) fprintf(fp, "log_dir=%s\n", g_app_settings.log_dir);
+    fclose(fp);
+#ifndef _WIN32
+    chmod(path, 0600);
+#endif
+    return true;
+}
 
 static void app_settings_init(void) {
     g_app_settings.log_enabled = false;
@@ -1202,6 +1309,7 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
 static void fonts_load(const char *current_path);
 static void settings_open(Renderer *r) {
     g_ui_mode = UI_SETTINGS;
+    g_settings_status[0] = 0;
     fonts_load(r ? r->font_path : NULL);
 }
 
@@ -1230,6 +1338,7 @@ typedef struct {
     Rect spc_dec, spc_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
+    Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
 
@@ -1490,10 +1599,10 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     int log_row2_y = log_row1_y + btn + 10;
     L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
 
-    int close_w = 90, close_h = 32;
-    L.close = (Rect){ L.modal.x + w - 22 - close_w,
-                      L.modal.y + h - 22 - close_h,
-                      close_w, close_h };
+    int close_w = 90, close_h = 32, save_def_w = 150;
+    int row_y = L.modal.y + h - 22 - close_h;
+    L.close = (Rect){ L.modal.x + w - 22 - close_w, row_y, close_w, close_h };
+    L.save_default = (Rect){ L.close.x - 8 - save_def_w, row_y, save_def_w, close_h };
     return L;
 }
 
@@ -1532,6 +1641,17 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     if (rect_hit(L.log_dir, mx, my)) {
         g_settings_dir_focus = true;
         g_settings_dir_sel_all = false;
+        return;
+    }
+    if (rect_hit(L.save_default, mx, my)) {
+        if (config_save(r)) {
+            snprintf(g_settings_status, sizeof(g_settings_status),
+                     "Defaults saved. Next launch will use these settings.");
+        } else {
+            snprintf(g_settings_status, sizeof(g_settings_status),
+                     "Failed to write ~/.config/rbterm/config.ini: %s",
+                     strerror(errno));
+        }
         return;
     }
     if (rect_hit(L.close, mx, my)) { g_ui_mode = UI_NORMAL; g_settings_dir_focus = false; return; }
@@ -1818,6 +1938,19 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     }
     EndScissorMode();
 
+    /* Save-as-Default button. */
+    DrawRectangle(L.save_default.x, L.save_default.y,
+                  L.save_default.w, L.save_default.h,
+                  (Color){48, 78, 58, 255});
+    DrawRectangleLines(L.save_default.x, L.save_default.y,
+                       L.save_default.w, L.save_default.h,
+                       (Color){150, 220, 170, 200});
+    Vector2 sdsz = MeasureTextEx(*f, "Save as Default", 13, 0);
+    DrawTextEx(*f, "Save as Default",
+               (Vector2){L.save_default.x + (L.save_default.w - sdsz.x) / 2,
+                         L.save_default.y + (L.save_default.h - sdsz.y) / 2},
+               13, 0, (Color){220, 240, 225, 255});
+
     /* Close button. */
     DrawRectangle(L.close.x, L.close.y, L.close.w, L.close.h,
                   (Color){48, 52, 66, 255});
@@ -1828,6 +1961,13 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                (Vector2){L.close.x + (L.close.w - cs.x) / 2,
                          L.close.y + (L.close.h - cs.y) / 2},
                14, 0, (Color){210, 215, 230, 255});
+
+    /* Status line above the footer. */
+    if (g_settings_status[0]) {
+        DrawTextEx(*f, g_settings_status,
+                   (Vector2){L.modal.x + 22, L.save_default.y - 22},
+                   11, 0, (Color){140, 220, 160, 255});
+    }
 
     DrawTextEx(*f, "Up / Down adjust font   Space toggles logs   Esc closes",
                (Vector2){L.modal.x + 22, L.modal.y + L.modal.h - 22},
@@ -1895,6 +2035,13 @@ int main(int argc, char **argv) {
     if (init_rows < 5)  init_rows = 5;
 
     app_settings_init();
+    /* Apply ~/.config/rbterm/config.ini before we commit to font path,
+       size, padding, etc. CLI flags the user passed on the command line
+       still win — they were parsed before this. */
+    config_load_into_defaults();
+    if (g_persisted.has_font_path && !font_path) font_path = g_persisted.font_path;
+    if (g_persisted.has_font_size) font_size = g_persisted.font_size;
+    if (g_persisted.has_padding)   init_padding = g_persisted.padding;
 
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -1916,6 +2063,7 @@ int main(int argc, char **argv) {
     r.pad_x = init_padding;
     r.pad_y = init_padding;
     r.bg_alpha = init_opacity;
+    if (g_persisted.has_spacing) renderer_set_cell_spacing(&r, g_persisted.spacing);
 
     int win_w = init_cols * r.cell_w + 2 * r.pad_x;
     int win_h = init_rows * r.cell_h + TAB_BAR_H + 2 * r.pad_y;

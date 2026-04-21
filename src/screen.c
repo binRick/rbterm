@@ -19,9 +19,9 @@ enum {
 #define MAX_PARAMS 16
 
 /* Mutable default colours (OSC 10 / 11 / 12). */
-uint32_t g_default_fg    = 0xEAEAEAu;
+uint32_t g_default_fg    = 0xFFFFFFu;   /* pure white — was 0xEAEAEA, felt gray */
 uint32_t g_default_bg    = 0x111111u;
-uint32_t g_cursor_color  = 0xEAEAEAu;
+uint32_t g_cursor_color  = 0xFFFFFFu;
 
 struct Screen {
     int cols, rows;
