@@ -21,6 +21,12 @@ FetchContent_Declare(
 set(BUILD_EXAMPLES   OFF CACHE BOOL "" FORCE)
 set(BUILD_GAMES      OFF CACHE BOOL "" FORCE)
 set(SUPPORT_MODULE_RAUDIO OFF CACHE BOOL "" FORCE)
+# raylib's CMake doesn't auto-detect emscripten — have to pin the
+# platform before MakeAvailable or it tries to find X11 and fails.
+if(EMSCRIPTEN)
+  set(PLATFORM Web        CACHE STRING "" FORCE)
+  set(GRAPHICS GRAPHICS_API_OPENGL_ES2 CACHE STRING "" FORCE)
+endif()
 FetchContent_MakeAvailable(raylib)
 
 option(RBTERM_SSH "Build with embedded SSH support via libssh" ON)
