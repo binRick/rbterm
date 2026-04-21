@@ -157,6 +157,7 @@ typedef struct {
 static SshProfile g_ssh_profiles[SSH_PROFILES_MAX];
 static int        g_ssh_profile_count = 0;
 static int        g_ssh_list_scroll = 0;   /* in rows */
+static int        g_ssh_list_selected = -1; /* highlighted row, -1 = none */
 
 typedef struct {
     Rect modal;
@@ -535,6 +536,7 @@ static void trim_end(char *s) {
 static void ssh_profiles_load(void) {
     g_ssh_profile_count = 0;
     g_ssh_list_scroll = 0;
+    g_ssh_list_selected = -1;
     char path[PATH_MAX];
     expand_home_path("~/.ssh/config", path, sizeof(path));
     FILE *fp = fopen(path, "r");
@@ -756,6 +758,7 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
         int row_h = 22;
         int idx = (my - L.list.y) / row_h + g_ssh_list_scroll;
         if (idx >= 0 && idx < g_ssh_profile_count) {
+            g_ssh_list_selected = idx;
             ssh_form_apply_profile(&g_ssh_profiles[idx]);
             ssh_form_submit(cols, rows);
         }
@@ -907,9 +910,7 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
         for (int i = 0; i < g_ssh_profile_count; i++) {
             int ry = L.list.y + (i - g_ssh_list_scroll) * row_h;
             if (ry + row_h < L.list.y || ry > L.list.y + L.list.h) continue;
-            bool on_this = strcmp(g_form.host, g_ssh_profiles[i].hostname[0]
-                                                ? g_ssh_profiles[i].hostname
-                                                : g_ssh_profiles[i].name) == 0;
+            bool on_this = (i == g_ssh_list_selected);
             if (on_this) {
                 DrawRectangle(L.list.x + 2, ry, L.list.w - 4, row_h,
                               (Color){46, 62, 90, 220});
