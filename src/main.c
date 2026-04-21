@@ -1350,8 +1350,41 @@ int main(int argc, char **argv) {
 
     int win_w = init_cols * r.cell_w;
     int win_h = init_rows * r.cell_h + TAB_BAR_H;
+
+    /* Clamp the requested size to what fits on the current monitor
+       (minus rough room for the menu bar + Dock), then centre — otherwise
+       at 100x30 / 20 pt the default window is tall enough to land below
+       the visible area on smaller laptops and you can't reach the bottom. */
+    int mi = GetCurrentMonitor();
+    int mw = GetMonitorWidth(mi);
+    int mh = GetMonitorHeight(mi);
+    if (mw > 0 && mh > 0) {
+        int safe_w = mw - 40;
+        int safe_h = mh - 120;              /* menu bar + Dock headroom */
+        if (win_w > safe_w) {
+            int nc = safe_w / r.cell_w;
+            if (nc < 20) nc = 20;
+            init_cols = nc;
+            win_w = nc * r.cell_w;
+        }
+        if (win_h > safe_h) {
+            int nr = (safe_h - TAB_BAR_H) / r.cell_h;
+            if (nr < 10) nr = 10;
+            init_rows = nr;
+            win_h = nr * r.cell_h + TAB_BAR_H;
+        }
+    }
+
     SetWindowSize(win_w, win_h);
     SetWindowMinSize(r.cell_w * 20, r.cell_h * 5 + TAB_BAR_H);
+
+    if (mw > 0 && mh > 0) {
+        Vector2 mp = GetMonitorPosition(mi);
+        int x = (int)mp.x + (mw - win_w) / 2;
+        int y = (int)mp.y + (mh - win_h) / 2;
+        if (y < (int)mp.y + 40) y = (int)mp.y + 40; /* stay below menu bar */
+        SetWindowPosition(x, y);
+    }
 
     if (!tab_open(init_cols, init_rows)) {
         renderer_shutdown(&r);
