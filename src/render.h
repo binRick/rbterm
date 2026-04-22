@@ -33,10 +33,12 @@ bool renderer_set_font_path(Renderer *r, const char *path);
 // place; no atlas rebuild needed. The caller still owns reflowing tabs.
 void renderer_set_cell_spacing(Renderer *r, int extra_w);
 
-// Draw a screen's contents. `y_offset` is the pixel offset from the top of
-// the window where row 0 should be drawn (used to leave space for a tab bar).
+// Draw a screen's contents. `x_offset` / `y_offset` are the pixel offsets
+// from the top-left of the window where the pane's top-left should land
+// (y_offset leaves space for a tab bar; x_offset lets two panes share
+// the window side-by-side).
 void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
-                   const Selection *sel, int y_offset);
+                   const Selection *sel, int x_offset, int y_offset);
 
 // Find a default system monospace font. Returns static buffer.
 const char *renderer_find_default_font(void);

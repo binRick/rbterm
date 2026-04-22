@@ -369,7 +369,7 @@ static bool sel_contains(const Selection *sel, int col, int row) {
 }
 
 void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
-                   const Selection *sel, int y_offset) {
+                   const Selection *sel, int x_offset, int y_offset) {
     Font *f = as_font(r);
     int cols = screen_cols(s);
     int rows = screen_rows(s);
@@ -382,12 +382,12 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     /* Backdrop: paint the whole terminal region (including padding) in
        the default bg, honouring the configured opacity. Non-default
        cell backgrounds drawn below still land at full alpha. */
-    DrawRectangle(0, y_offset,
+    DrawRectangle(x_offset, y_offset,
                   cols * cw + 2 * px, rows * ch + 2 * py,
                   col_from_rgb(DEFAULT_BG, bga));
 
     Camera2D cam = {0};
-    cam.offset = (Vector2){(float)px, (float)(y_offset + py)};
+    cam.offset = (Vector2){(float)(x_offset + px), (float)(y_offset + py)};
     cam.zoom = 1.0f;
     BeginMode2D(cam);
 

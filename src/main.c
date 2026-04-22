@@ -210,15 +210,16 @@ static void mkdir_p(const char *path) {
 #endif
 }
 
-/* ---------- Tabs ---------- */
+/* ---------- Tabs + panes ---------- */
 
+/* A Pane is one PTY/Screen/Selection — i.e. one running shell. Tabs can
+   host either one Pane (no split) or two (vertical or horizontal split). */
 typedef struct {
     Pty *pty;
     Screen *scr;
     Selection sel;
     char title[256];
     bool title_dirty;
-    bool dead;
     int click_count;
     double last_click_time;
     int last_click_col, last_click_row;
@@ -226,8 +227,30 @@ typedef struct {
     double cwd_poll_at;
     FILE *log_fp;                /* session log file, NULL when disabled */
     char  log_path[PATH_MAX];
+} Pane;
+
+typedef enum {
+    SPLIT_NONE = 0,
+    SPLIT_VERTICAL   = 1,   /* pane[0] left, pane[1] right   — splitter is a vertical line */
+    SPLIT_HORIZONTAL = 2    /* pane[0] top,  pane[1] bottom  — splitter is a horizontal line */
+} SplitMode;
+
+typedef struct {
+    Pane panes[2];
+    int  num_panes;              /* 1 or 2 */
+    int  active_pane;            /* 0 or 1 */
+    SplitMode split;
+    float split_ratio;           /* fraction of available extent given to panes[0] (0.15..0.85) */
+    bool splitter_drag;
+    bool dead;
     bool  is_ssh;
     char  ssh_target[256];       /* user@host[:port] for SSH tabs */
+    /* Stashed SSH connect params so a split can re-dial the same host. */
+    char  ssh_host[256];
+    char  ssh_user[96];
+    char  ssh_pass[256];
+    char  ssh_key[PATH_MAX];
+    int   ssh_port;
 } Tab;
 
 #define MAX_TABS 16
@@ -237,6 +260,7 @@ typedef struct {
 #define TAB_CLOSE_W 22
 #define TAB_PLUS_W  30
 #define TAB_GEAR_W  30
+#define TAB_SPLIT_W 28          /* one split button (two of them — vertical + horizontal) */
 #define TAB_SSH_W   48
 
 static Tab *g_tabs[MAX_TABS];
@@ -303,10 +327,10 @@ static Tab *active_tab(void) {
     return g_tabs[g_active];
 }
 
-/* Open a fresh per-tab log file under the current log directory. Silent
+/* Open a fresh per-pane log file under the current log directory. Silent
    on failure so the user's session isn't derailed by a bad path. */
-static void tab_log_open(Tab *t) {
-    if (!t || t->log_fp) return;
+static void pane_log_open(Tab *t, Pane *p, int pane_idx) {
+    if (!t || !p || p->log_fp) return;
     if (!g_app_settings.log_enabled) return;
     if (!g_app_settings.log_dir[0]) return;
     char dir[PATH_MAX];
@@ -326,47 +350,61 @@ static void tab_log_open(Tab *t) {
        same second. */
     int slot = 0;
     for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { slot = i; break; }
-    snprintf(t->log_path, sizeof(t->log_path), "%s/rbterm-%s-tab%d.log",
-             dir, stamp, slot);
-    t->log_fp = fopen(t->log_path, "ab");
-    if (!t->log_fp) {
-        t->log_path[0] = 0;
+    if (t->num_panes > 1 || pane_idx > 0) {
+        snprintf(p->log_path, sizeof(p->log_path),
+                 "%s/rbterm-%s-tab%d-p%d.log", dir, stamp, slot, pane_idx);
+    } else {
+        snprintf(p->log_path, sizeof(p->log_path),
+                 "%s/rbterm-%s-tab%d.log", dir, stamp, slot);
+    }
+    p->log_fp = fopen(p->log_path, "ab");
+    if (!p->log_fp) {
         fprintf(stderr, "rbterm: can't open log %s: %s\n",
-                t->log_path, strerror(errno));
+                p->log_path, strerror(errno));
+        p->log_path[0] = 0;
     }
 }
 
-static void tab_log_close(Tab *t) {
+static void pane_log_close(Pane *p) {
+    if (!p) return;
+    if (p->log_fp) { fclose(p->log_fp); p->log_fp = NULL; }
+}
+
+static void pane_log_write(Pane *p, const uint8_t *buf, size_t n) {
+    if (!p || !p->log_fp || n == 0) return;
+    fwrite(buf, 1, n, p->log_fp);
+    fflush(p->log_fp);
+}
+
+static void tab_log_open_all(Tab *t) {
     if (!t) return;
-    if (t->log_fp) { fclose(t->log_fp); t->log_fp = NULL; }
+    for (int i = 0; i < t->num_panes; i++) pane_log_open(t, &t->panes[i], i);
+}
+static void tab_log_close_all(Tab *t) {
+    if (!t) return;
+    for (int i = 0; i < t->num_panes; i++) pane_log_close(&t->panes[i]);
 }
 
-static void tab_log_write(Tab *t, const uint8_t *buf, size_t n) {
-    if (!t || !t->log_fp || n == 0) return;
-    fwrite(buf, 1, n, t->log_fp);
-    fflush(t->log_fp);
-}
-
-/* (Re-)open logs on every tab based on the current setting. Called when
-   the user toggles "log to file" in Settings. */
+/* (Re-)open logs on every pane in every tab based on the current
+   setting. Called when the user toggles "log to file" in Settings. */
 static void refresh_tab_logs(void) {
     for (int i = 0; i < g_num_tabs; i++) {
-        if (g_app_settings.log_enabled) tab_log_open(g_tabs[i]);
-        else                            tab_log_close(g_tabs[i]);
+        if (g_app_settings.log_enabled) tab_log_open_all(g_tabs[i]);
+        else                            tab_log_close_all(g_tabs[i]);
     }
 }
 
-/* ---------- IO glue: screen callbacks route to owning tab's PTY ---------- */
+/* ---------- IO glue: screen callbacks route to owning pane's PTY ---------- */
 
 static void io_write_cb(void *u, const uint8_t *buf, size_t n) {
-    Tab *t = (Tab *)u;
-    pty_write(t->pty, buf, n);
+    Pane *p = (Pane *)u;
+    pty_write(p->pty, buf, n);
 }
 static void io_set_title_cb(void *u, const char *title) {
-    Tab *t = (Tab *)u;
-    strncpy(t->title, title, sizeof(t->title) - 1);
-    t->title[sizeof(t->title) - 1] = 0;
-    t->title_dirty = true;
+    Pane *p = (Pane *)u;
+    strncpy(p->title, title, sizeof(p->title) - 1);
+    p->title[sizeof(p->title) - 1] = 0;
+    p->title_dirty = true;
 }
 static void io_bell_cb(void *u) { (void)u; }
 static void io_set_clipboard_cb(void *u, const char *utf8) {
@@ -374,28 +412,66 @@ static void io_set_clipboard_cb(void *u, const char *utf8) {
     if (utf8 && *utf8) SetClipboardText(utf8);
 }
 static void io_set_cwd_cb(void *u, const char *path) {
-    Tab *t = (Tab *)u;
-    if (!t || !path || !*path) return;
-    strncpy(t->cwd, path, sizeof(t->cwd) - 1);
-    t->cwd[sizeof(t->cwd) - 1] = 0;
-    t->title_dirty = true;
+    Pane *p = (Pane *)u;
+    if (!p || !path || !*path) return;
+    strncpy(p->cwd, path, sizeof(p->cwd) - 1);
+    p->cwd[sizeof(p->cwd) - 1] = 0;
+    p->title_dirty = true;
+}
+
+static void pane_init_click_state(Pane *p) {
+    p->last_click_time = -1.0;
+    p->last_click_col = p->last_click_row = -1;
+}
+
+/* Build the ScreenIO for a pane (caller owns the Pane pointer for its lifetime). */
+static ScreenIO pane_io(Pane *p) {
+    ScreenIO io = { .user = p, .write = io_write_cb,
+                    .set_title = io_set_title_cb, .bell = io_bell_cb,
+                    .set_clipboard = io_set_clipboard_cb,
+                    .set_cwd = io_set_cwd_cb };
+    return io;
+}
+
+static bool pane_open_local(Pane *p, int cols, int rows) {
+    pane_init_click_state(p);
+    strncpy(p->title, "shell", sizeof(p->title) - 1);
+    p->pty = pty_open(cols, rows);
+    if (!p->pty) return false;
+    p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    return true;
+}
+
+static bool pane_open_ssh(Pane *p, const char *user, const char *host, int port,
+                          const char *password, const char *keyfile,
+                          int cols, int rows, char *err, size_t errsz) {
+    pane_init_click_state(p);
+    p->pty = pty_open_ssh(user, host, port, password, keyfile,
+                          cols, rows, err, errsz);
+    if (!p->pty) return false;
+    p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    return true;
+}
+
+static void pane_free(Pane *p) {
+    if (!p) return;
+    pane_log_close(p);
+    if (p->pty) { pty_close(p->pty); p->pty = NULL; }
+    if (p->scr) { screen_free(p->scr); p->scr = NULL; }
 }
 
 static Tab *tab_open(int cols, int rows) {
     if (g_num_tabs >= MAX_TABS) return NULL;
     Tab *t = calloc(1, sizeof(Tab));
-    strncpy(t->title, "shell", sizeof(t->title) - 1);
-    t->last_click_time = -1.0;
-    t->last_click_col = t->last_click_row = -1;
-    t->pty = pty_open(cols, rows);
-    if (!t->pty) { free(t); return NULL; }
-    ScreenIO io = { .user = t, .write = io_write_cb,
-                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb, .set_cwd = io_set_cwd_cb };
-    t->scr = screen_new(cols, rows, 5000, io);
+    t->num_panes = 1;
+    t->active_pane = 0;
+    t->split = SPLIT_NONE;
+    t->split_ratio = 0.5f;
+    if (!pane_open_local(&t->panes[0], cols, rows)) { free(t); return NULL; }
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
     g_num_tabs++;
-    tab_log_open(t);
+    tab_log_open_all(t);
     return t;
 }
 
@@ -405,6 +481,10 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
     Tab *t = calloc(1, sizeof(Tab));
+    t->num_panes = 1;
+    t->active_pane = 0;
+    t->split = SPLIT_NONE;
+    t->split_ratio = 0.5f;
     if (port <= 0) port = 22;
     /* Build a pretty label for the tab. */
     if (user && *user) {
@@ -417,35 +497,105 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
         else snprintf(t->ssh_target, sizeof(t->ssh_target), "%s:%d", host, port);
     }
     t->is_ssh = true;
-    snprintf(t->title, sizeof(t->title), "%s", t->ssh_target);
-    t->cwd[0] = 0;   /* OSC 7 from the remote shell will populate this */
-    t->last_click_time = -1.0;
-    t->last_click_col = t->last_click_row = -1;
-    t->pty = pty_open_ssh(user, host, port, password, keyfile,
-                          cols, rows, err, errsz);
-    if (!t->pty) { free(t); return NULL; }
-    ScreenIO io = { .user = t, .write = io_write_cb,
-                    .set_title = io_set_title_cb, .bell = io_bell_cb, .set_clipboard = io_set_clipboard_cb, .set_cwd = io_set_cwd_cb };
-    t->scr = screen_new(cols, rows, 5000, io);
+    /* Stash connect params so a split can re-dial the same host. */
+    if (host) { strncpy(t->ssh_host, host, sizeof(t->ssh_host) - 1); t->ssh_host[sizeof(t->ssh_host) - 1] = 0; }
+    if (user) { strncpy(t->ssh_user, user, sizeof(t->ssh_user) - 1); t->ssh_user[sizeof(t->ssh_user) - 1] = 0; }
+    if (password) { strncpy(t->ssh_pass, password, sizeof(t->ssh_pass) - 1); t->ssh_pass[sizeof(t->ssh_pass) - 1] = 0; }
+    if (keyfile)  { strncpy(t->ssh_key,  keyfile,  sizeof(t->ssh_key) - 1);  t->ssh_key[sizeof(t->ssh_key) - 1] = 0; }
+    t->ssh_port = port;
+    snprintf(t->panes[0].title, sizeof(t->panes[0].title), "%s", t->ssh_target);
+    if (!pane_open_ssh(&t->panes[0], user, host, port, password, keyfile,
+                       cols, rows, err, errsz)) {
+        free(t); return NULL;
+    }
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
     g_num_tabs++;
-    tab_log_open(t);
+    tab_log_open_all(t);
     return t;
 }
 
 static void tab_close(int idx) {
     if (idx < 0 || idx >= g_num_tabs) return;
     Tab *t = g_tabs[idx];
-    tab_log_close(t);
-    pty_close(t->pty);
-    screen_free(t->scr);
+    for (int i = 0; i < t->num_panes; i++) pane_free(&t->panes[i]);
+    /* Scrub any stashed SSH credentials before freeing. */
+    memset(t->ssh_pass, 0, sizeof(t->ssh_pass));
     free(t);
     for (int i = idx; i < g_num_tabs - 1; i++) g_tabs[i] = g_tabs[i + 1];
     g_tabs[g_num_tabs - 1] = NULL;
     g_num_tabs--;
     if (g_active >= g_num_tabs) g_active = g_num_tabs - 1;
     if (g_active < 0) g_active = 0;
+}
+
+static inline Pane *active_pane_of(Tab *t) {
+    if (!t) return NULL;
+    if (t->active_pane < 0 || t->active_pane >= t->num_panes) t->active_pane = 0;
+    return &t->panes[t->active_pane];
+}
+
+/* Split the active tab. If the tab was opened via SSH, re-dial the same
+   host into the new pane; otherwise open a local shell. No-op when the
+   tab already has two panes. cols/rows are the current full-window cell
+   dims; the pane's real size is resized to fit afterwards by the main
+   loop's tabs_resize_all call. Returns true on success. */
+static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
+                      char *err, size_t errsz) {
+    if (!t) return false;
+    if (t->num_panes >= 2) return false;
+    if (mode != SPLIT_VERTICAL && mode != SPLIT_HORIZONTAL) return false;
+    Pane *np = &t->panes[1];
+    memset(np, 0, sizeof(*np));
+    bool ok;
+    if (t->is_ssh) {
+        ok = pane_open_ssh(np,
+                           t->ssh_user[0] ? t->ssh_user : NULL,
+                           t->ssh_host,
+                           t->ssh_port > 0 ? t->ssh_port : 22,
+                           t->ssh_pass[0] ? t->ssh_pass : NULL,
+                           t->ssh_key[0]  ? t->ssh_key  : NULL,
+                           cols, rows, err, errsz);
+        if (ok) snprintf(np->title, sizeof(np->title), "%s", t->ssh_target);
+    } else {
+        ok = pane_open_local(np, cols, rows);
+    }
+    if (!ok) {
+        memset(np, 0, sizeof(*np));
+        return false;
+    }
+    t->split = mode;
+    t->split_ratio = 0.5f;
+    t->num_panes = 2;
+    t->active_pane = 1;
+    pane_log_open(t, np, 1);
+    return true;
+}
+
+/* Close the active pane. If the tab only has one pane, defer to
+   tab_close for the whole tab. */
+static void pane_close_active(int tab_idx) {
+    if (tab_idx < 0 || tab_idx >= g_num_tabs) return;
+    Tab *t = g_tabs[tab_idx];
+    if (t->num_panes < 2) { tab_close(tab_idx); return; }
+    int closing = t->active_pane;
+    pane_free(&t->panes[closing]);
+    /* Collapse: if we closed pane 0, shift pane 1 down into slot 0. */
+    if (closing == 0) {
+        t->panes[0] = t->panes[1];
+        /* Re-point the screen's io.user to the new Pane address. */
+        if (t->panes[0].scr) screen_set_io_user(t->panes[0].scr, &t->panes[0]);
+        memset(&t->panes[1], 0, sizeof(t->panes[1]));
+    } else {
+        memset(&t->panes[1], 0, sizeof(t->panes[1]));
+    }
+    t->num_panes = 1;
+    t->active_pane = 0;
+    t->split = SPLIT_NONE;
+    t->splitter_drag = false;
+    /* Force a retitle so the tab label and window title pick up the
+       surviving pane. */
+    t->panes[0].title_dirty = true;
 }
 
 /* ---------- Clipboard + selection helpers ---------- */
@@ -533,6 +683,9 @@ static void select_line(Screen *s, Selection *sel, int row) {
    (shortened to a basename, with $HOME / %USERPROFILE% rewritten to "~")
    over any OSC title the shell set. Falls back to title, then "shell". */
 static const char *tab_label(const Tab *t) {
+    /* Derive from the *active* pane: that's whatever the user is
+       currently looking at in that tab, split or not. */
+    const Pane *p = &t->panes[t->active_pane];
     /* SSH tabs: "user@host[:port] [basename]". Buffer is a rotating
        set of per-tab statics so multiple tabs can be drawn in one
        frame without overwriting each other. */
@@ -543,37 +696,177 @@ static const char *tab_label(const Tab *t) {
         for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { idx = i; break; }
         if (idx < 0) idx = slot++ % MAX_TABS;
         char *out = buf[idx];
-        if (!t->cwd[0]) {
+        if (!p->cwd[0]) {
             return t->ssh_target;
         }
         /* Basename of the remote path, with "~" or "/" shortcuts. */
-        const char *dir_label = t->cwd;
-        const char *b = strrchr(t->cwd, '/');
-        if (strcmp(t->cwd, "/") == 0) dir_label = "/";
+        const char *dir_label = p->cwd;
+        const char *b = strrchr(p->cwd, '/');
+        if (strcmp(p->cwd, "/") == 0) dir_label = "/";
         else if (b) dir_label = (*(b + 1) ? b + 1 : b);   /* trailing slash → "/" */
         snprintf(out, sizeof(buf[0]), "%s %s", t->ssh_target, dir_label);
         return out;
     }
-    if (t->cwd[0]) {
+    if (p->cwd[0]) {
         const char *home = getenv("HOME");
 #ifdef _WIN32
         if (!home || !*home) home = getenv("USERPROFILE");
 #endif
         if (home && *home) {
             size_t hn = strlen(home);
-            if (strncmp(t->cwd, home, hn) == 0 &&
-                (t->cwd[hn] == 0 || t->cwd[hn] == '/' || t->cwd[hn] == '\\')) {
-                if (t->cwd[hn] == 0) return "~";
+            if (strncmp(p->cwd, home, hn) == 0 &&
+                (p->cwd[hn] == 0 || p->cwd[hn] == '/' || p->cwd[hn] == '\\')) {
+                if (p->cwd[hn] == 0) return "~";
             }
         }
-        if (strcmp(t->cwd, "/") == 0) return "/";
-        const char *b1 = strrchr(t->cwd, '/');
-        const char *b2 = strrchr(t->cwd, '\\');
+        if (strcmp(p->cwd, "/") == 0) return "/";
+        const char *b1 = strrchr(p->cwd, '/');
+        const char *b2 = strrchr(p->cwd, '\\');
         const char *base = (b1 && b2) ? (b1 > b2 ? b1 : b2) : (b1 ? b1 : b2);
         if (base) return base + 1;
-        return t->cwd;
+        return p->cwd;
     }
-    return t->title[0] ? t->title : "shell";
+    return p->title[0] ? p->title : "shell";
+}
+
+/* ---------- Pane layout ---------- */
+
+/* One pane's rectangle within the terminal area below the tab bar, in
+   window-pixel coords. For an unsplit tab, pane 0 fills the whole area.
+   For a split, the splitter itself is SPLITTER_PX thick and sits
+   between the two panes. */
+#define SPLITTER_PX 4
+
+typedef struct {
+    int x, y, w, h;
+} PaneRect;
+
+static void pane_rect(const Tab *t, int pane_idx, int win_w, int win_h,
+                      PaneRect *out) {
+    int top = TAB_BAR_H;
+    int area_x = 0;
+    int area_y = top;
+    int area_w = win_w;
+    int area_h = win_h - top;
+    if (area_h < 0) area_h = 0;
+    if (t->split == SPLIT_NONE || t->num_panes < 2) {
+        out->x = area_x; out->y = area_y;
+        out->w = area_w; out->h = area_h;
+        return;
+    }
+    float ratio = t->split_ratio;
+    if (ratio < 0.15f) ratio = 0.15f;
+    if (ratio > 0.85f) ratio = 0.85f;
+    if (t->split == SPLIT_VERTICAL) {
+        int half = SPLITTER_PX / 2;
+        int left_w = (int)((area_w - SPLITTER_PX) * ratio);
+        if (pane_idx == 0) {
+            out->x = area_x; out->y = area_y;
+            out->w = left_w; out->h = area_h;
+        } else {
+            out->x = area_x + left_w + SPLITTER_PX;
+            out->y = area_y;
+            out->w = area_w - left_w - SPLITTER_PX;
+            out->h = area_h;
+        }
+        (void)half;
+    } else { /* SPLIT_HORIZONTAL */
+        int top_h = (int)((area_h - SPLITTER_PX) * ratio);
+        if (pane_idx == 0) {
+            out->x = area_x; out->y = area_y;
+            out->w = area_w; out->h = top_h;
+        } else {
+            out->x = area_x;
+            out->y = area_y + top_h + SPLITTER_PX;
+            out->w = area_w;
+            out->h = area_h - top_h - SPLITTER_PX;
+        }
+    }
+}
+
+/* The splitter's own rectangle (the draggable strip between panes). */
+static bool splitter_rect(const Tab *t, int win_w, int win_h, PaneRect *out) {
+    if (t->split == SPLIT_NONE || t->num_panes < 2) return false;
+    PaneRect a, b;
+    pane_rect(t, 0, win_w, win_h, &a);
+    pane_rect(t, 1, win_w, win_h, &b);
+    if (t->split == SPLIT_VERTICAL) {
+        out->x = a.x + a.w;
+        out->y = a.y;
+        out->w = SPLITTER_PX;
+        out->h = a.h;
+    } else {
+        out->x = a.x;
+        out->y = a.y + a.h;
+        out->w = a.w;
+        out->h = SPLITTER_PX;
+    }
+    return true;
+}
+
+/* Columns / rows that fit inside a pane rect, given the renderer's
+   cell dimensions + padding. Guarantees >= 1. */
+static void pane_dims(const Renderer *r, const PaneRect *pr,
+                      int *cols_out, int *rows_out) {
+    int c = (pr->w - 2 * r->pad_x) / r->cell_w;
+    int rs = (pr->h - 2 * r->pad_y) / r->cell_h;
+    if (c  < 1) c  = 1;
+    if (rs < 1) rs = 1;
+    *cols_out = c;
+    *rows_out = rs;
+}
+
+/* Find which pane of the active tab a window-pixel coordinate falls
+   into (or -1 if neither). Used for click-to-focus. */
+static int pane_at(const Tab *t, int win_w, int win_h, int mx, int my) {
+    if (!t) return -1;
+    for (int i = 0; i < t->num_panes; i++) {
+        PaneRect pr;
+        pane_rect(t, i, win_w, win_h, &pr);
+        if (mx >= pr.x && mx < pr.x + pr.w &&
+            my >= pr.y && my < pr.y + pr.h)
+            return i;
+    }
+    return -1;
+}
+
+/* Draw every pane of one tab (plus the splitter bar between them). */
+static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
+                              double time_sec, bool focused) {
+    if (!t) return;
+    for (int pi = 0; pi < t->num_panes; pi++) {
+        Pane *p = &t->panes[pi];
+        if (!p->scr) continue;
+        PaneRect pr;
+        pane_rect(t, pi, win_w, win_h, &pr);
+        bool pane_focused = focused && (pi == t->active_pane);
+        renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel, pr.x, pr.y);
+    }
+    PaneRect sp;
+    if (splitter_rect(t, win_w, win_h, &sp)) {
+        DrawRectangle(sp.x, sp.y, sp.w, sp.h, (Color){60, 60, 75, 255});
+    }
+    (void)win_w; (void)win_h;
+}
+
+/* Resize every pane of every tab to fit its current pane rectangle.
+   Called on window resize, split toggles, and font-size changes. */
+static void tabs_resize_all(const Renderer *r, int win_w, int win_h) {
+    for (int i = 0; i < g_num_tabs; i++) {
+        Tab *t = g_tabs[i];
+        for (int pi = 0; pi < t->num_panes; pi++) {
+            Pane *p = &t->panes[pi];
+            PaneRect pr;
+            pane_rect(t, pi, win_w, win_h, &pr);
+            int cols, rows;
+            pane_dims(r, &pr, &cols, &rows);
+            if (!p->scr) continue;
+            if (screen_cols(p->scr) != cols || screen_rows(p->scr) != rows) {
+                screen_resize(p->scr, cols, rows);
+                pty_resize(p->pty, cols, rows);
+            }
+        }
+    }
 }
 
 /* ---------- Tab bar UI ---------- */
@@ -584,10 +877,13 @@ typedef struct {
     bool on_plus;
     bool on_ssh;
     bool on_gear;
+    bool on_split_v;       /* side-by-side split button */
+    bool on_split_h;       /* top/bottom split button */
 } TabBarHit;
 
 static int tab_width_for(int win_w) {
-    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - TAB_SSH_W;
+    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W
+              - 2 * TAB_SPLIT_W - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -595,16 +891,20 @@ static int tab_width_for(int win_w) {
     return w;
 }
 
-/* Layout: [ssh] | tab1 | tab2 | ... | [gear] | [+] */
+/* Layout: [ssh] | tab1 | tab2 | ... | [split-v] [split-h] [gear] | [+] */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false, false };
+    TabBarHit h = { -1, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
-    int plus_x   = win_w - TAB_PLUS_W;
-    int gear_x   = plus_x - TAB_GEAR_W;
+    int plus_x    = win_w - TAB_PLUS_W;
+    int gear_x    = plus_x - TAB_GEAR_W;
+    int split_h_x = gear_x - TAB_SPLIT_W;
+    int split_v_x = split_h_x - TAB_SPLIT_W;
     int tab_start = TAB_SSH_W;
-    if (mx < TAB_SSH_W)  { h.on_ssh  = true; return h; }
-    if (mx >= plus_x)    { h.on_plus = true; return h; }
-    if (mx >= gear_x)    { h.on_gear = true; return h; }
+    if (mx < TAB_SSH_W)     { h.on_ssh     = true; return h; }
+    if (mx >= plus_x)       { h.on_plus    = true; return h; }
+    if (mx >= gear_x)       { h.on_gear    = true; return h; }
+    if (mx >= split_h_x)    { h.on_split_h = true; return h; }
+    if (mx >= split_v_x)    { h.on_split_v = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
     if (idx < 0 || idx >= g_num_tabs) return h;
@@ -612,6 +912,26 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     int tx = tab_start + idx * tw;
     if (mx >= tx + tw - TAB_CLOSE_W) h.on_close = true;
     return h;
+}
+
+/* Two small filled rectangles with a gap between them, in the layout
+   that the resulting split would produce — horizontal pair for a
+   vertical (side-by-side) split, stacked pair for a horizontal split. */
+static void draw_split_icon(float cx, float cy, float size, bool vertical, Color c) {
+    int w  = (int)(size * 0.82f);
+    int h  = (int)(size * 0.66f);
+    int gap = 2;
+    int x0 = (int)(cx - w / 2.0f);
+    int y0 = (int)(cy - h / 2.0f);
+    if (vertical) {
+        int half = (w - gap) / 2;
+        DrawRectangle(x0, y0, half, h, c);
+        DrawRectangle(x0 + half + gap, y0, w - half - gap, h, c);
+    } else {
+        int half = (h - gap) / 2;
+        DrawRectangle(x0, y0, w, half, c);
+        DrawRectangle(x0, y0 + half + gap, w, h - half - gap, c);
+    }
 }
 
 static void draw_gear_icon(float cx, float cy, float size, Color c, Color hole_bg) {
@@ -670,6 +990,24 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                        (Color){125, 207, 255, 200});
     draw_gear_icon(gear_x + TAB_GEAR_W / 2.0f, TAB_BAR_H / 2.0f,
                    TAB_BAR_H * 0.55f, (Color){220, 235, 255, 255}, gear_bg);
+
+    /* Split buttons — vertical (side-by-side) then horizontal (top/bottom),
+       left of the gear. Icon pair hints at the resulting layout. */
+    int split_h_x = gear_x - TAB_SPLIT_W;
+    int split_v_x = split_h_x - TAB_SPLIT_W;
+    Color split_bg = (Color){38, 48, 66, 255};
+    Color split_outline = (Color){125, 207, 255, 200};
+    Color split_icon = (Color){220, 235, 255, 255};
+
+    DrawRectangle(split_v_x, 0, TAB_SPLIT_W, TAB_BAR_H, split_bg);
+    DrawRectangleLines(split_v_x, 2, TAB_SPLIT_W - 1, TAB_BAR_H - 4, split_outline);
+    draw_split_icon(split_v_x + TAB_SPLIT_W / 2.0f, TAB_BAR_H / 2.0f,
+                    TAB_BAR_H * 0.60f, true, split_icon);
+
+    DrawRectangle(split_h_x, 0, TAB_SPLIT_W, TAB_BAR_H, split_bg);
+    DrawRectangleLines(split_h_x, 2, TAB_SPLIT_W - 1, TAB_BAR_H - 4, split_outline);
+    draw_split_icon(split_h_x + TAB_SPLIT_W / 2.0f, TAB_BAR_H / 2.0f,
+                    TAB_BAR_H * 0.60f, false, split_icon);
 
     /* Tabs fill the space between the two buttons. */
     int tab_start = TAB_SSH_W;
@@ -1359,14 +1697,7 @@ static void settings_open(Renderer *r) {
 
 static void settings_apply_font_size(Renderer *r, int new_size) {
     if (renderer_set_font_size(r, new_size)) {
-        int nc = GetScreenWidth()  / r->cell_w;
-        int nr = (GetScreenHeight() - TAB_BAR_H) / r->cell_h;
-        if (nc < 1) nc = 1;
-        if (nr < 1) nr = 1;
-        for (int i = 0; i < g_num_tabs; i++) {
-            screen_resize(g_tabs[i]->scr, nc, nr);
-            pty_resize(g_tabs[i]->pty, nc, nr);
-        }
+        tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
         SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x, r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
     }
 }
@@ -1566,14 +1897,7 @@ static void fonts_load(const char *current_path) {
 static void settings_apply_font(Renderer *r, const FontEntry *fe) {
     if (!fe) return;
     if (!renderer_set_font_path(r, fe->path)) return;
-    int nc = (GetScreenWidth()  - 2 * r->pad_x) / r->cell_w;
-    int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r->pad_y) / r->cell_h;
-    if (nc < 1) nc = 1;
-    if (nr < 1) nr = 1;
-    for (int i = 0; i < g_num_tabs; i++) {
-        screen_resize(g_tabs[i]->scr, nc, nr);
-        pty_resize(g_tabs[i]->pty, nc, nr);
-    }
+    tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
     SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x,
                      r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
 }
@@ -1583,28 +1907,14 @@ static void settings_apply_padding(Renderer *r, int new_pad) {
     if (new_pad > 64) new_pad = 64;
     r->pad_x = new_pad;
     r->pad_y = new_pad;
-    int nc = (GetScreenWidth()  - 2 * r->pad_x) / r->cell_w;
-    int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r->pad_y) / r->cell_h;
-    if (nc < 1) nc = 1;
-    if (nr < 1) nr = 1;
-    for (int i = 0; i < g_num_tabs; i++) {
-        screen_resize(g_tabs[i]->scr, nc, nr);
-        pty_resize(g_tabs[i]->pty, nc, nr);
-    }
+    tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
     SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x,
                      r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
 }
 
 static void settings_apply_spacing(Renderer *r, int new_extra) {
     renderer_set_cell_spacing(r, new_extra);
-    int nc = (GetScreenWidth()  - 2 * r->pad_x) / r->cell_w;
-    int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r->pad_y) / r->cell_h;
-    if (nc < 1) nc = 1;
-    if (nr < 1) nr = 1;
-    for (int i = 0; i < g_num_tabs; i++) {
-        screen_resize(g_tabs[i]->scr, nc, nr);
-        pty_resize(g_tabs[i]->pty, nc, nr);
-    }
+    tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
     SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x,
                      r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
 }
@@ -1736,7 +2046,7 @@ static void settings_handle_keys(Renderer *r) {
         if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
             /* Re-open logs against the (possibly new) path. */
             if (g_app_settings.log_enabled) {
-                for (int i = 0; i < g_num_tabs; i++) tab_log_close(g_tabs[i]);
+                for (int i = 0; i < g_num_tabs; i++) tab_log_close_all(g_tabs[i]);
                 refresh_tab_logs();
             }
             g_settings_dir_focus = false;
@@ -2190,59 +2500,71 @@ int main(int argc, char **argv) {
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
+        /* Whole-window content cell dims — still used by tab_open for
+           its initial PTY size; individual pane resizing goes through
+           tabs_resize_all below. */
         int content_rows = (win_h_now - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
         int content_cols = (win_w_now - 2 * r.pad_x) / r.cell_w;
         if (content_cols < 1) content_cols = 1;
         if (content_rows < 1) content_rows = 1;
-        for (int i = 0; i < g_num_tabs; i++) {
-            if (screen_cols(g_tabs[i]->scr) != content_cols ||
-                screen_rows(g_tabs[i]->scr) != content_rows) {
-                screen_resize(g_tabs[i]->scr, content_cols, content_rows);
-                pty_resize(g_tabs[i]->pty, content_cols, content_rows);
-            }
-        }
+        tabs_resize_all(&r, win_w_now, win_h_now);
 
-        /* Drain each PTY until EAGAIN or a safety cap. The cap is just a
-           watchdog for a runaway writer pinning the UI — under normal
-           output bursts (`find /usr`, etc.) we want to pull everything
-           the kernel has buffered before rendering, otherwise the shell
-           stalls on full PTY-buffer writes and the whole command takes
-           seconds longer than in a native terminal. */
+        /* Drain each pane's PTY until EAGAIN or a safety cap. The cap is
+           just a watchdog for a runaway writer pinning the UI — under
+           normal output bursts (`find /usr`, etc.) we want to pull
+           everything the kernel has buffered before rendering,
+           otherwise the shell stalls on full PTY-buffer writes and the
+           whole command takes seconds longer than in a native
+           terminal. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            size_t drained = 0;
-            const size_t drain_cap = 16 * 1024 * 1024;
-            for (;;) {
-                int n = pty_read(t->pty, readbuf, sizeof(readbuf));
-                if (n > 0) {
-                    screen_feed(t->scr, readbuf, (size_t)n);
-                    tab_log_write(t, readbuf, (size_t)n);
-                    drained += (size_t)n;
-                    if (drained >= drain_cap) break;
-                    continue;
+            bool any_alive = false;
+            for (int pi = 0; pi < t->num_panes; pi++) {
+                Pane *p = &t->panes[pi];
+                size_t drained = 0;
+                const size_t drain_cap = 16 * 1024 * 1024;
+                bool pane_dead = false;
+                for (;;) {
+                    int n = pty_read(p->pty, readbuf, sizeof(readbuf));
+                    if (n > 0) {
+                        screen_feed(p->scr, readbuf, (size_t)n);
+                        pane_log_write(p, readbuf, (size_t)n);
+                        drained += (size_t)n;
+                        if (drained >= drain_cap) break;
+                        continue;
+                    }
+                    if (n < 0) pane_dead = true;
+                    break;
                 }
-                if (n < 0) { t->dead = true; }
-                break;
+                if (!pty_alive(p->pty)) pane_dead = true;
+                /* A tab only dies when *every* pane's PTY has died. */
+                if (!pane_dead) any_alive = true;
             }
-            if (!pty_alive(t->pty)) t->dead = true;
+            if (!any_alive) t->dead = true;
         }
         for (int i = g_num_tabs - 1; i >= 0; i--) {
             if (g_tabs[i]->dead) tab_close(i);
         }
         if (g_num_tabs == 0) break;
 
-        /* CWD label refresh (no-op on Windows — pty_cwd returns false). */
+        /* CWD label refresh (no-op on Windows — pty_cwd returns false).
+           Track per pane; only the active pane's change bumps the tab
+           title. */
         double now = GetTime();
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            if (now - t->cwd_poll_at < 0.3) continue;
-            t->cwd_poll_at = now;
-            char buf[PATH_MAX];
-            if (pty_cwd(t->pty, buf, sizeof(buf)) &&
-                strcmp(buf, t->cwd) != 0) {
-                strncpy(t->cwd, buf, sizeof(t->cwd) - 1);
-                t->cwd[sizeof(t->cwd) - 1] = 0;
-                if (i == g_active) t->title_dirty = true;
+            for (int pi = 0; pi < t->num_panes; pi++) {
+                Pane *p = &t->panes[pi];
+                if (now - p->cwd_poll_at < 0.3) continue;
+                p->cwd_poll_at = now;
+                char buf[PATH_MAX];
+                if (pty_cwd(p->pty, buf, sizeof(buf)) &&
+                    strcmp(buf, p->cwd) != 0) {
+                    strncpy(p->cwd, buf, sizeof(p->cwd) - 1);
+                    p->cwd[sizeof(p->cwd) - 1] = 0;
+                    if (i == g_active && pi == t->active_pane)
+                        p->title_dirty = true;
+                }
             }
         }
 
@@ -2256,6 +2578,15 @@ int main(int argc, char **argv) {
                 if (h.on_plus) tab_open(content_cols, content_rows);
                 else if (h.on_ssh) ssh_form_open();
                 else if (h.on_gear) settings_open(&r);
+                else if (h.on_split_v || h.on_split_h) {
+                    if (cur) {
+                        SplitMode m = h.on_split_v ? SPLIT_VERTICAL : SPLIT_HORIZONTAL;
+                        char err[256] = {0};
+                        if (!tab_split(cur, m, content_cols, content_rows, err, sizeof(err))) {
+                            if (err[0]) fprintf(stderr, "rbterm: split failed: %s\n", err);
+                        }
+                    }
+                }
                 else if (h.tab_idx >= 0) {
                     if (h.on_close) tab_close(h.tab_idx);
                     else g_active = h.tab_idx;
@@ -2263,105 +2594,148 @@ int main(int argc, char **argv) {
                 cur = active_tab();
             }
         } else if (cur) {
-            int mcol = (int)((mp.x - r.pad_x) / r.cell_w);
-            int mrow = (int)((mp.y - TAB_BAR_H - r.pad_y) / r.cell_h);
-            int cmax = screen_cols(cur->scr) - 1;
-            int rmax = screen_rows(cur->scr) - 1;
-            if (mcol < 0) mcol = 0; if (mcol > cmax) mcol = cmax;
-            if (mrow < 0) mrow = 0; if (mrow > rmax) mrow = rmax;
-
-            /* Mouse reporting: when the app has asked for it (DECSET 1000,
-               1002, 1003) and the user isn't holding Shift (the universal
-               override that lets you still select text), we translate
-               mouse events to byte reports on the PTY instead of using
-               them for selection. */
-            bool shift_held = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-            int  mmode = screen_mouse_mode(cur->scr);
-            bool to_pty = (mmode != 0) && !shift_held;
-
-            if (to_pty) {
-                bool sgr = screen_mouse_sgr(cur->scr);
-                int shf = shift_held ? 4 : 0;
-                int alt = (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) ? 8 : 0;
-                int ctl = (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) ? 16 : 0;
-                int mods = shf | alt | ctl;
-
-                /* Helper to write one mouse report. */
-                #define MOUSE_EMIT(btn, release, motion) do {                     \
-                    int _b = (btn) + mods + ((motion) ? 32 : 0);                  \
-                    char _buf[32];                                                \
-                    int _n;                                                       \
-                    if (sgr) {                                                    \
-                        _n = snprintf(_buf, sizeof(_buf), "\x1b[<%d;%d;%d%c",     \
-                                      _b, mcol + 1, mrow + 1,                    \
-                                      (release) ? 'm' : 'M');                    \
-                    } else {                                                      \
-                        int _eb = (release) ? (3 + mods + ((motion) ? 32 : 0))    \
-                                            : _b;                                 \
-                        if (mcol + 33 > 255 || mrow + 33 > 255) break;            \
-                        _n = 6;                                                   \
-                        _buf[0] = 0x1b; _buf[1] = '['; _buf[2] = 'M';             \
-                        _buf[3] = (char)(_eb + 32);                               \
-                        _buf[4] = (char)(mcol + 1 + 32);                          \
-                        _buf[5] = (char)(mrow + 1 + 32);                          \
-                    }                                                             \
-                    pty_write(cur->pty, (const uint8_t *)_buf, _n);               \
-                } while (0)
-
-                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))   MOUSE_EMIT(0, false, false);
-                if (IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE)) MOUSE_EMIT(1, false, false);
-                if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))  MOUSE_EMIT(2, false, false);
-                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))   MOUSE_EMIT(0, true, false);
-                if (IsMouseButtonReleased(MOUSE_BUTTON_MIDDLE)) MOUSE_EMIT(1, true, false);
-                if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT))  MOUSE_EMIT(2, true, false);
-                if (mcol != prev_mouse_col || mrow != prev_mouse_row) {
-                    int held = IsMouseButtonDown(MOUSE_BUTTON_LEFT)   ? 0
-                             : IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ? 1
-                             : IsMouseButtonDown(MOUSE_BUTTON_RIGHT)  ? 2 : -1;
-                    if (mmode == 1003 || (mmode == 1002 && held >= 0)) {
-                        int b = (held >= 0) ? held : 3;
-                        MOUSE_EMIT(b, false, true);
+            /* Splitter drag takes priority over pane input when active. */
+            PaneRect sp;
+            bool has_split = splitter_rect(cur, win_w_now, win_h_now, &sp);
+            bool on_splitter = has_split &&
+                mp.x >= sp.x && mp.x < sp.x + sp.w &&
+                mp.y >= sp.y && mp.y < sp.y + sp.h;
+            if (on_splitter && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                cur->splitter_drag = true;
+            }
+            if (cur->splitter_drag) {
+                if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                    int top = TAB_BAR_H;
+                    int area_w = win_w_now;
+                    int area_h = win_h_now - top;
+                    float nr;
+                    if (cur->split == SPLIT_VERTICAL) {
+                        nr = (area_w > SPLITTER_PX)
+                             ? (float)((int)mp.x) / (float)(area_w - SPLITTER_PX)
+                             : 0.5f;
+                    } else {
+                        nr = (area_h > SPLITTER_PX)
+                             ? (float)((int)mp.y - top) / (float)(area_h - SPLITTER_PX)
+                             : 0.5f;
                     }
-                    prev_mouse_col = mcol; prev_mouse_row = mrow;
+                    if (nr < 0.15f) nr = 0.15f;
+                    if (nr > 0.85f) nr = 0.85f;
+                    cur->split_ratio = nr;
+                } else {
+                    cur->splitter_drag = false;
                 }
-                float wheel = GetMouseWheelMove();
-                if (wheel != 0.0f) {
-                    int b = (wheel > 0) ? 64 : 65;
-                    MOUSE_EMIT(b, false, false);
-                }
-                /* Update button cache for 1002 motion tracking. */
-                prev_mouse_btn = IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 0 :
-                                 IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ? 1 :
-                                 IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ? 2 : -1;
-                (void)prev_mouse_btn;
-                #undef MOUSE_EMIT
             } else {
+                /* Click-to-focus: left-press inside a pane makes it the active one. */
                 if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                    double t = GetTime();
-                    bool fast = (t - cur->last_click_time < 0.45);
-                    bool same = (mcol == cur->last_click_col && mrow == cur->last_click_row);
-                    cur->click_count = (fast && same) ? (cur->click_count + 1) : 1;
-                    cur->last_click_time = t;
-                    cur->last_click_col = mcol;
-                    cur->last_click_row = mrow;
-                    if (cur->click_count == 2)      select_word(cur->scr, &cur->sel, mcol, mrow);
-                    else if (cur->click_count >= 3) { select_line(cur->scr, &cur->sel, mrow); cur->click_count = 3; }
-                    else {
-                        cur->sel.active = true;
-                        cur->sel.dragging = true;
-                        cur->sel.a_col = cur->sel.b_col = mcol;
-                        cur->sel.a_row = cur->sel.b_row = mrow;
-                    }
+                    int pi = pane_at(cur, win_w_now, win_h_now, (int)mp.x, (int)mp.y);
+                    if (pi >= 0) cur->active_pane = pi;
                 }
-                if (cur->sel.dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                    cur->sel.b_col = mcol; cur->sel.b_row = mrow;
-                }
-                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-                    if (cur->sel.dragging && cur->click_count < 2) {
-                        cur->sel.dragging = false;
-                        if (cur->sel.a_col == cur->sel.b_col &&
-                            cur->sel.a_row == cur->sel.b_row) {
-                            cur->sel.active = false;
+                Pane *p = active_pane_of(cur);
+                if (p && p->scr) {
+                    /* Translate window-pixel coords → active pane's cell coords. */
+                    PaneRect pr;
+                    pane_rect(cur, cur->active_pane, win_w_now, win_h_now, &pr);
+                    int mcol = (int)((mp.x - pr.x - r.pad_x) / r.cell_w);
+                    int mrow = (int)((mp.y - pr.y - r.pad_y) / r.cell_h);
+                    int cmax = screen_cols(p->scr) - 1;
+                    int rmax = screen_rows(p->scr) - 1;
+                    if (mcol < 0) mcol = 0; if (mcol > cmax) mcol = cmax;
+                    if (mrow < 0) mrow = 0; if (mrow > rmax) mrow = rmax;
+
+                    /* Mouse reporting: when the app has asked for it (DECSET 1000,
+                       1002, 1003) and the user isn't holding Shift (the universal
+                       override that lets you still select text), we translate
+                       mouse events to byte reports on the PTY instead of using
+                       them for selection. */
+                    bool shift_held = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                    int  mmode = screen_mouse_mode(p->scr);
+                    bool to_pty = (mmode != 0) && !shift_held;
+
+                    if (to_pty) {
+                        bool sgr = screen_mouse_sgr(p->scr);
+                        int shf = shift_held ? 4 : 0;
+                        int alt = (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) ? 8 : 0;
+                        int ctl = (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) ? 16 : 0;
+                        int mods = shf | alt | ctl;
+
+                        /* Helper to write one mouse report. */
+                        #define MOUSE_EMIT(btn, release, motion) do {                     \
+                            int _b = (btn) + mods + ((motion) ? 32 : 0);                  \
+                            char _buf[32];                                                \
+                            int _n;                                                       \
+                            if (sgr) {                                                    \
+                                _n = snprintf(_buf, sizeof(_buf), "\x1b[<%d;%d;%d%c",     \
+                                              _b, mcol + 1, mrow + 1,                    \
+                                              (release) ? 'm' : 'M');                    \
+                            } else {                                                      \
+                                int _eb = (release) ? (3 + mods + ((motion) ? 32 : 0))    \
+                                                    : _b;                                 \
+                                if (mcol + 33 > 255 || mrow + 33 > 255) break;            \
+                                _n = 6;                                                   \
+                                _buf[0] = 0x1b; _buf[1] = '['; _buf[2] = 'M';             \
+                                _buf[3] = (char)(_eb + 32);                               \
+                                _buf[4] = (char)(mcol + 1 + 32);                          \
+                                _buf[5] = (char)(mrow + 1 + 32);                          \
+                            }                                                             \
+                            pty_write(p->pty, (const uint8_t *)_buf, _n);                 \
+                        } while (0)
+
+                        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))   MOUSE_EMIT(0, false, false);
+                        if (IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE)) MOUSE_EMIT(1, false, false);
+                        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))  MOUSE_EMIT(2, false, false);
+                        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))   MOUSE_EMIT(0, true, false);
+                        if (IsMouseButtonReleased(MOUSE_BUTTON_MIDDLE)) MOUSE_EMIT(1, true, false);
+                        if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT))  MOUSE_EMIT(2, true, false);
+                        if (mcol != prev_mouse_col || mrow != prev_mouse_row) {
+                            int held = IsMouseButtonDown(MOUSE_BUTTON_LEFT)   ? 0
+                                     : IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ? 1
+                                     : IsMouseButtonDown(MOUSE_BUTTON_RIGHT)  ? 2 : -1;
+                            if (mmode == 1003 || (mmode == 1002 && held >= 0)) {
+                                int b = (held >= 0) ? held : 3;
+                                MOUSE_EMIT(b, false, true);
+                            }
+                            prev_mouse_col = mcol; prev_mouse_row = mrow;
+                        }
+                        float wheel = GetMouseWheelMove();
+                        if (wheel != 0.0f) {
+                            int b = (wheel > 0) ? 64 : 65;
+                            MOUSE_EMIT(b, false, false);
+                        }
+                        /* Update button cache for 1002 motion tracking. */
+                        prev_mouse_btn = IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 0 :
+                                         IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ? 1 :
+                                         IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ? 2 : -1;
+                        (void)prev_mouse_btn;
+                        #undef MOUSE_EMIT
+                    } else {
+                        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                            double tnow = GetTime();
+                            bool fast = (tnow - p->last_click_time < 0.45);
+                            bool same = (mcol == p->last_click_col && mrow == p->last_click_row);
+                            p->click_count = (fast && same) ? (p->click_count + 1) : 1;
+                            p->last_click_time = tnow;
+                            p->last_click_col = mcol;
+                            p->last_click_row = mrow;
+                            if (p->click_count == 2)      select_word(p->scr, &p->sel, mcol, mrow);
+                            else if (p->click_count >= 3) { select_line(p->scr, &p->sel, mrow); p->click_count = 3; }
+                            else {
+                                p->sel.active = true;
+                                p->sel.dragging = true;
+                                p->sel.a_col = p->sel.b_col = mcol;
+                                p->sel.a_row = p->sel.b_row = mrow;
+                            }
+                        }
+                        if (p->sel.dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                            p->sel.b_col = mcol; p->sel.b_row = mrow;
+                        }
+                        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                            if (p->sel.dragging && p->click_count < 2) {
+                                p->sel.dragging = false;
+                                if (p->sel.a_col == p->sel.b_col &&
+                                    p->sel.a_row == p->sel.b_row) {
+                                    p->sel.active = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -2378,23 +2752,24 @@ int main(int argc, char **argv) {
                 BeginDrawing();
                 ClearBackground((Color){0, 0, 0, 255});
                 draw_tab_bar(&r, win_w_now);
-                renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
-                              &cur->sel, TAB_BAR_H);
+                draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
                 EndDrawing();
                 continue;
             }
             ssh_form_handle_keys(content_cols, content_rows, L);
             cur = active_tab();
             if (!cur) break;
-            if (cur->title_dirty) {
-                SetWindowTitle(cur->title[0] ? cur->title : tab_label(cur));
-                cur->title_dirty = false;
+            {
+                Pane *ap = active_pane_of(cur);
+                if (ap && ap->title_dirty) {
+                    SetWindowTitle(ap->title[0] ? ap->title : tab_label(cur));
+                    ap->title_dirty = false;
+                }
             }
             BeginDrawing();
             ClearBackground((Color){0, 0, 0, 255});
             draw_tab_bar(&r, win_w_now);
-            renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
-                          &cur->sel, TAB_BAR_H);
+            draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_ssh_form(&r, win_w_now, win_h_now, L);
             EndDrawing();
             continue;
@@ -2412,8 +2787,7 @@ int main(int argc, char **argv) {
             draw_tab_bar(&r, win_w_now);
             /* Layout may have changed if font was resized. */
             L = settings_layout(win_w_now, win_h_now);
-            renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
-                          &cur->sel, TAB_BAR_H);
+            draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_settings(&r, win_w_now, win_h_now, L);
             EndDrawing();
             continue;
@@ -2429,10 +2803,26 @@ int main(int argc, char **argv) {
                 ssh_form_open();
             }
             else if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
-            else if (IsKeyPressed(KEY_W)) {
-                tab_close(g_active);
+            /* Cmd+Shift+W closes the active pane (or the tab if only one
+               pane). We intentionally don't bind plain Cmd+W: macOS
+               intercepts it at the AppKit layer for "Close Window",
+               which quits rbterm regardless of what we do here. */
+            else if (shift_held && IsKeyPressed(KEY_W)) {
+                pane_close_active(g_active);
                 if (g_num_tabs == 0) break;
                 cur = active_tab();
+            }
+            /* Cmd+D / Cmd+Shift+D: split active tab (side-by-side / top-bottom). */
+            else if (IsKeyPressed(KEY_D)) {
+                if (cur) {
+                    SplitMode m = shift_held ? SPLIT_HORIZONTAL : SPLIT_VERTICAL;
+                    char err[256] = {0};
+                    if (!tab_split(cur, m, content_cols, content_rows, err, sizeof(err))) {
+                        /* Silent fail for now; err goes to stderr so the user
+                           can see why an SSH re-dial didn't take. */
+                        if (err[0]) fprintf(stderr, "rbterm: split failed: %s\n", err);
+                    }
+                }
             }
             else if (IsKeyPressed(KEY_LEFT_BRACKET))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
             else if (IsKeyPressed(KEY_RIGHT_BRACKET)) { g_active = (g_active + 1) % g_num_tabs; cur = active_tab(); }
@@ -2448,68 +2838,63 @@ int main(int argc, char **argv) {
 
         if (!cur) break;
 
+        Pane *ap = active_pane_of(cur);
         InputActions acts;
-        size_t in_n = input_poll(cur->scr, inputbuf, sizeof(inputbuf), &acts);
-        if (acts.scroll_rows != 0) screen_scroll_view(cur->scr, acts.scroll_rows);
-        if (acts.copy) copy_selection(cur->scr, &cur->sel);
-        if (acts.paste) {
+        size_t in_n = ap ? input_poll(ap->scr, inputbuf, sizeof(inputbuf), &acts)
+                         : 0;
+        if (ap && acts.scroll_rows != 0) screen_scroll_view(ap->scr, acts.scroll_rows);
+        if (ap && acts.copy) copy_selection(ap->scr, &ap->sel);
+        if (ap && acts.paste) {
             const char *t = GetClipboardText();
             if (t && *t) {
-                if (screen_bracketed_paste(cur->scr)) {
-                    pty_write(cur->pty, (const uint8_t *)"\x1b[200~", 6);
-                    pty_write(cur->pty, (const uint8_t *)t, strlen(t));
-                    pty_write(cur->pty, (const uint8_t *)"\x1b[201~", 6);
+                if (screen_bracketed_paste(ap->scr)) {
+                    pty_write(ap->pty, (const uint8_t *)"\x1b[200~", 6);
+                    pty_write(ap->pty, (const uint8_t *)t, strlen(t));
+                    pty_write(ap->pty, (const uint8_t *)"\x1b[201~", 6);
                 } else {
-                    pty_write(cur->pty, (const uint8_t *)t, strlen(t));
+                    pty_write(ap->pty, (const uint8_t *)t, strlen(t));
                 }
             }
         }
 
-        /* Focus events (DECSET 1004). Emit CSI I on gain, CSI O on loss. */
+        /* Focus events (DECSET 1004). Emit CSI I on gain, CSI O on loss.
+           Only the active pane learns about the window-focus change. */
         {
             bool is_focused = IsWindowFocused();
             if (is_focused != was_focused) {
                 was_focused = is_focused;
-                if (cur && screen_focus_report(cur->scr)) {
-                    pty_write(cur->pty,
+                if (ap && screen_focus_report(ap->scr)) {
+                    pty_write(ap->pty,
                               is_focused ? (const uint8_t *)"\x1b[I"
                                          : (const uint8_t *)"\x1b[O",
                               3);
                 }
             }
         }
-        if (acts.font_delta != 100) {
+        if (ap && acts.font_delta != 100) {
             int old = r.font_size;
             int ns = (acts.font_delta == 0) ? 20
                     : old + (acts.font_delta > 0 ? 1 : -1);
             if (renderer_set_font_size(&r, ns)) {
-                int nc = (GetScreenWidth() - 2 * r.pad_x) / r.cell_w;
-                int nr = (GetScreenHeight() - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
-                if (nc < 1) nc = 1;
-                if (nr < 1) nr = 1;
-                for (int i = 0; i < g_num_tabs; i++) {
-                    screen_resize(g_tabs[i]->scr, nc, nr);
-                    pty_resize(g_tabs[i]->pty, nc, nr);
-                }
+                tabs_resize_all(&r, GetScreenWidth(), GetScreenHeight());
                 SetWindowMinSize(r.cell_w * 20 + 2 * r.pad_x, r.cell_h * 5 + TAB_BAR_H + 2 * r.pad_y);
             }
         }
-        if (in_n > 0) {
-            screen_scroll_reset(cur->scr);
-            pty_write(cur->pty, inputbuf, in_n);
-            if (cur->sel.active && !cur->sel.dragging) cur->sel.active = false;
+        if (ap && in_n > 0) {
+            screen_scroll_reset(ap->scr);
+            pty_write(ap->pty, inputbuf, in_n);
+            if (ap->sel.active && !ap->sel.dragging) ap->sel.active = false;
         }
 
-        if (cur->title_dirty) {
-            SetWindowTitle(cur->title[0] ? cur->title : tab_label(cur));
-            cur->title_dirty = false;
+        if (ap && ap->title_dirty) {
+            SetWindowTitle(ap->title[0] ? ap->title : tab_label(cur));
+            ap->title_dirty = false;
         }
 
         BeginDrawing();
         ClearBackground((Color){0, 0, 0, 255});
         draw_tab_bar(&r, win_w_now);
-        renderer_draw(&r, cur->scr, GetTime(), IsWindowFocused(),
-                      &cur->sel, TAB_BAR_H);
+        draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
         EndDrawing();
     }
 

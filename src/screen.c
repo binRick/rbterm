@@ -1000,6 +1000,11 @@ void screen_free(Screen *s) {
     free(s);
 }
 
+void screen_set_io_user(Screen *s, void *user) {
+    if (!s) return;
+    s->io.user = user;
+}
+
 void screen_resize(Screen *s, int cols, int rows) {
     if (cols == s->cols && rows == s->rows) return;
     if (cols < 1) cols = 1;

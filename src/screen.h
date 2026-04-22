@@ -51,6 +51,10 @@ typedef struct {
 
 Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io);
 void    screen_free(Screen *s);
+/* Retarget the screen's IO callbacks to a different `user` pointer.
+   Used when a Pane moves in memory (e.g. after a pane-0 close in a
+   two-pane tab slides pane-1 into slot 0). */
+void    screen_set_io_user(Screen *s, void *user);
 void    screen_resize(Screen *s, int cols, int rows);
 void    screen_feed(Screen *s, const uint8_t *data, size_t n);
 
