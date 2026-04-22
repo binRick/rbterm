@@ -84,6 +84,7 @@ size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions) {
     actions->font_delta = 100;
     actions->copy = false;
     actions->paste = false;
+    actions->select_all = false;
     actions->scroll_rows = 0;
 
     size_t n = 0;
@@ -117,6 +118,13 @@ size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions) {
     }
     if (copy_chord)  { actions->copy  = true; return n; }
     if (paste_chord) { actions->paste = true; return n; }
+
+#if defined(__APPLE__)
+    bool select_all_chord = cmd && IsKeyPressed(KEY_A);
+#else
+    bool select_all_chord = ctrl && shift && IsKeyPressed(KEY_A);
+#endif
+    if (select_all_chord) { actions->select_all = true; return n; }
 
     // History scroll chords (bare Ctrl, not Cmd, on all platforms).
     if (ctrl && shift && IsKeyPressed(KEY_UP))   { actions->scroll_rows = +1; return n; }

@@ -572,16 +572,14 @@ static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
     return true;
 }
 
-/* Close the active pane. If the tab only has one pane, defer to
-   tab_close for the whole tab. */
-static void pane_close_active(int tab_idx) {
-    if (tab_idx < 0 || tab_idx >= g_num_tabs) return;
-    Tab *t = g_tabs[tab_idx];
-    if (t->num_panes < 2) { tab_close(tab_idx); return; }
-    int closing = t->active_pane;
-    pane_free(&t->panes[closing]);
+/* Close one specific pane of a tab. If it's the only pane, mark the
+   tab itself dead (caller collects via the tab_close sweep). */
+static void tab_close_pane(Tab *t, int pane_idx) {
+    if (!t || pane_idx < 0 || pane_idx >= t->num_panes) return;
+    if (t->num_panes < 2) { t->dead = true; return; }
+    pane_free(&t->panes[pane_idx]);
     /* Collapse: if we closed pane 0, shift pane 1 down into slot 0. */
-    if (closing == 0) {
+    if (pane_idx == 0) {
         t->panes[0] = t->panes[1];
         /* Re-point the screen's io.user to the new Pane address. */
         if (t->panes[0].scr) screen_set_io_user(t->panes[0].scr, &t->panes[0]);
@@ -596,6 +594,15 @@ static void pane_close_active(int tab_idx) {
     /* Force a retitle so the tab label and window title pick up the
        surviving pane. */
     t->panes[0].title_dirty = true;
+}
+
+/* Close the active pane. If the tab only has one pane, defer to
+   tab_close for the whole tab. */
+static void pane_close_active(int tab_idx) {
+    if (tab_idx < 0 || tab_idx >= g_num_tabs) return;
+    Tab *t = g_tabs[tab_idx];
+    if (t->num_panes < 2) { tab_close(tab_idx); return; }
+    tab_close_pane(t, t->active_pane);
 }
 
 /* ---------- Clipboard + selection helpers ---------- */
@@ -881,9 +888,17 @@ typedef struct {
     bool on_split_h;       /* top/bottom split button */
 } TabBarHit;
 
+/* Split buttons are hidden when the active tab is already split — there's
+   nothing useful clicking them would do, and the tabs reclaim the space. */
+static bool split_buttons_visible(void) {
+    if (g_active < 0 || g_active >= g_num_tabs) return true;
+    Tab *t = g_tabs[g_active];
+    return t && t->split == SPLIT_NONE;
+}
+
 static int tab_width_for(int win_w) {
-    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W
-              - 2 * TAB_SPLIT_W - TAB_SSH_W;
+    int split_w = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
+    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - split_w - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -891,20 +906,22 @@ static int tab_width_for(int win_w) {
     return w;
 }
 
-/* Layout: [ssh] | tab1 | tab2 | ... | [split-v] [split-h] [gear] | [+] */
+/* Layout: [ssh] | tab1 | tab2 | ... | [split-v] [split-h] [gear] | [+]
+   The split pair disappears entirely when the active tab is split. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     TabBarHit h = { -1, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
+    bool show_splits = split_buttons_visible();
     int plus_x    = win_w - TAB_PLUS_W;
     int gear_x    = plus_x - TAB_GEAR_W;
-    int split_h_x = gear_x - TAB_SPLIT_W;
-    int split_v_x = split_h_x - TAB_SPLIT_W;
+    int split_h_x = show_splits ? gear_x - TAB_SPLIT_W     : gear_x;
+    int split_v_x = show_splits ? split_h_x - TAB_SPLIT_W  : gear_x;
     int tab_start = TAB_SSH_W;
     if (mx < TAB_SSH_W)     { h.on_ssh     = true; return h; }
     if (mx >= plus_x)       { h.on_plus    = true; return h; }
     if (mx >= gear_x)       { h.on_gear    = true; return h; }
-    if (mx >= split_h_x)    { h.on_split_h = true; return h; }
-    if (mx >= split_v_x)    { h.on_split_v = true; return h; }
+    if (show_splits && mx >= split_h_x) { h.on_split_h = true; return h; }
+    if (show_splits && mx >= split_v_x) { h.on_split_v = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
     if (idx < 0 || idx >= g_num_tabs) return h;
@@ -992,22 +1009,25 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                    TAB_BAR_H * 0.55f, (Color){220, 235, 255, 255}, gear_bg);
 
     /* Split buttons — vertical (side-by-side) then horizontal (top/bottom),
-       left of the gear. Icon pair hints at the resulting layout. */
-    int split_h_x = gear_x - TAB_SPLIT_W;
-    int split_v_x = split_h_x - TAB_SPLIT_W;
-    Color split_bg = (Color){38, 48, 66, 255};
-    Color split_outline = (Color){125, 207, 255, 200};
-    Color split_icon = (Color){220, 235, 255, 255};
+       left of the gear. Icon pair hints at the resulting layout. Hidden
+       once the active tab is already split (clicking them would no-op). */
+    if (split_buttons_visible()) {
+        int split_h_x = gear_x - TAB_SPLIT_W;
+        int split_v_x = split_h_x - TAB_SPLIT_W;
+        Color split_bg = (Color){38, 48, 66, 255};
+        Color split_outline = (Color){125, 207, 255, 200};
+        Color split_icon = (Color){220, 235, 255, 255};
 
-    DrawRectangle(split_v_x, 0, TAB_SPLIT_W, TAB_BAR_H, split_bg);
-    DrawRectangleLines(split_v_x, 2, TAB_SPLIT_W - 1, TAB_BAR_H - 4, split_outline);
-    draw_split_icon(split_v_x + TAB_SPLIT_W / 2.0f, TAB_BAR_H / 2.0f,
-                    TAB_BAR_H * 0.60f, true, split_icon);
+        DrawRectangle(split_v_x, 0, TAB_SPLIT_W, TAB_BAR_H, split_bg);
+        DrawRectangleLines(split_v_x, 2, TAB_SPLIT_W - 1, TAB_BAR_H - 4, split_outline);
+        draw_split_icon(split_v_x + TAB_SPLIT_W / 2.0f, TAB_BAR_H / 2.0f,
+                        TAB_BAR_H * 0.60f, true, split_icon);
 
-    DrawRectangle(split_h_x, 0, TAB_SPLIT_W, TAB_BAR_H, split_bg);
-    DrawRectangleLines(split_h_x, 2, TAB_SPLIT_W - 1, TAB_BAR_H - 4, split_outline);
-    draw_split_icon(split_h_x + TAB_SPLIT_W / 2.0f, TAB_BAR_H / 2.0f,
-                    TAB_BAR_H * 0.60f, false, split_icon);
+        DrawRectangle(split_h_x, 0, TAB_SPLIT_W, TAB_BAR_H, split_bg);
+        DrawRectangleLines(split_h_x, 2, TAB_SPLIT_W - 1, TAB_BAR_H - 4, split_outline);
+        draw_split_icon(split_h_x + TAB_SPLIT_W / 2.0f, TAB_BAR_H / 2.0f,
+                        TAB_BAR_H * 0.60f, false, split_icon);
+    }
 
     /* Tabs fill the space between the two buttons. */
     int tab_start = TAB_SSH_W;
@@ -2515,15 +2535,16 @@ int main(int argc, char **argv) {
            everything the kernel has buffered before rendering,
            otherwise the shell stalls on full PTY-buffer writes and the
            whole command takes seconds longer than in a native
-           terminal. */
+           terminal. Panes whose shell has exited are closed right
+           after the drain — if they're the last pane the tab dies
+           with them. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            bool any_alive = false;
+            bool pane_dead[2] = { false, false };
             for (int pi = 0; pi < t->num_panes; pi++) {
                 Pane *p = &t->panes[pi];
                 size_t drained = 0;
                 const size_t drain_cap = 16 * 1024 * 1024;
-                bool pane_dead = false;
                 for (;;) {
                     int n = pty_read(p->pty, readbuf, sizeof(readbuf));
                     if (n > 0) {
@@ -2533,14 +2554,17 @@ int main(int argc, char **argv) {
                         if (drained >= drain_cap) break;
                         continue;
                     }
-                    if (n < 0) pane_dead = true;
+                    if (n < 0) pane_dead[pi] = true;
                     break;
                 }
-                if (!pty_alive(p->pty)) pane_dead = true;
-                /* A tab only dies when *every* pane's PTY has died. */
-                if (!pane_dead) any_alive = true;
+                if (!pty_alive(p->pty)) pane_dead[pi] = true;
             }
-            if (!any_alive) t->dead = true;
+            /* Close dead panes in reverse so indices stay valid during
+               the sweep. A single-pane tab promotes to t->dead inside
+               tab_close_pane. */
+            for (int pi = t->num_panes - 1; pi >= 0; pi--) {
+                if (pane_dead[pi]) tab_close_pane(t, pi);
+            }
         }
         for (int i = g_num_tabs - 1; i >= 0; i--) {
             if (g_tabs[i]->dead) tab_close(i);
@@ -2843,6 +2867,16 @@ int main(int argc, char **argv) {
         size_t in_n = ap ? input_poll(ap->scr, inputbuf, sizeof(inputbuf), &acts)
                          : 0;
         if (ap && acts.scroll_rows != 0) screen_scroll_view(ap->scr, acts.scroll_rows);
+        if (ap && acts.select_all) {
+            int cols = screen_cols(ap->scr);
+            int rows = screen_rows(ap->scr);
+            ap->sel.active = true;
+            ap->sel.dragging = false;
+            ap->sel.a_col = 0;
+            ap->sel.a_row = 0;
+            ap->sel.b_col = cols - 1;
+            ap->sel.b_row = rows - 1;
+        }
         if (ap && acts.copy) copy_selection(ap->scr, &ap->sel);
         if (ap && acts.paste) {
             const char *t = GetClipboardText();

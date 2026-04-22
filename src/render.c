@@ -344,14 +344,14 @@ static Color col_from_rgb(uint32_t v, float alpha) {
    index when ATTR_*_INDEX is set, a default marker when ATTR_DEFAULT_*
    is set, and a raw RGB otherwise. Looking up on every draw means OSC 4
    palette changes retroactively recolour every cell on screen. */
-static uint32_t resolve_fg(Cell c) {
-    if (c.attrs & ATTR_DEFAULT_FG) return g_default_fg;
-    if (c.attrs & ATTR_FG_INDEX)   return screen_palette((int)(c.fg & 0xff));
+static uint32_t resolve_fg(const Screen *s, Cell c) {
+    if (c.attrs & ATTR_DEFAULT_FG) return screen_default_fg(s);
+    if (c.attrs & ATTR_FG_INDEX)   return screen_palette(s, (int)(c.fg & 0xff));
     return c.fg;
 }
-static uint32_t resolve_bg(Cell c) {
-    if (c.attrs & ATTR_DEFAULT_BG) return g_default_bg;
-    if (c.attrs & ATTR_BG_INDEX)   return screen_palette((int)(c.bg & 0xff));
+static uint32_t resolve_bg(const Screen *s, Cell c) {
+    if (c.attrs & ATTR_DEFAULT_BG) return screen_default_bg(s);
+    if (c.attrs & ATTR_BG_INDEX)   return screen_palette(s, (int)(c.bg & 0xff));
     return c.bg;
 }
 
@@ -384,7 +384,7 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
        cell backgrounds drawn below still land at full alpha. */
     DrawRectangle(x_offset, y_offset,
                   cols * cw + 2 * px, rows * ch + 2 * py,
-                  col_from_rgb(DEFAULT_BG, bga));
+                  col_from_rgb(screen_default_bg(s), bga));
 
     Camera2D cam = {0};
     cam.offset = (Vector2){(float)(x_offset + px), (float)(y_offset + py)};
@@ -404,15 +404,15 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
         while (x < cols) {
             Cell c = screen_view_cell(s, x, y);
             uint16_t at = c.attrs;
-            uint32_t bg = (at & ATTR_REVERSE) ? resolve_fg(c) : resolve_bg(c);
+            uint32_t bg = (at & ATTR_REVERSE) ? resolve_fg(s, c) : resolve_bg(s, c);
             int x2 = x + 1;
             while (x2 < cols) {
                 Cell d = screen_view_cell(s, x2, y);
-                uint32_t dbg = (d.attrs & ATTR_REVERSE) ? resolve_fg(d) : resolve_bg(d);
+                uint32_t dbg = (d.attrs & ATTR_REVERSE) ? resolve_fg(s, d) : resolve_bg(s, d);
                 if (dbg != bg) break;
                 x2++;
             }
-            if (bg != DEFAULT_BG || (at & ATTR_REVERSE)) {
+            if (bg != screen_default_bg(s) || (at & ATTR_REVERSE)) {
                 DrawRectangle(x * cw, y * ch, (x2 - x) * cw, ch, col_from_rgb(bg, 1.0f));
             }
             x = x2;
@@ -432,9 +432,9 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     if (show_cursor) {
         bool blink_on = ((long long)(time_sec * 2.0) & 1) == 0;
         if (!focused) {
-            DrawRectangleLines(cursor_vx * cw, cursor_vy * ch, cw, ch, col_from_rgb(CURSOR_COLOR, 1.0f));
+            DrawRectangleLines(cursor_vx * cw, cursor_vy * ch, cw, ch, col_from_rgb(screen_cursor_color(s), 1.0f));
         } else if (blink_on) {
-            DrawRectangle(cursor_vx * cw, cursor_vy * ch, cw, ch, col_from_rgb(CURSOR_COLOR, 1.0f));
+            DrawRectangle(cursor_vx * cw, cursor_vy * ch, cw, ch, col_from_rgb(screen_cursor_color(s), 1.0f));
         }
     }
 
@@ -450,11 +450,11 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             if (c.cp == 0 || c.cp == ' ') continue;
             if (c.attrs & ATTR_HIDDEN) continue;
 
-            uint32_t fg = (c.attrs & ATTR_REVERSE) ? resolve_bg(c) : resolve_fg(c);
+            uint32_t fg = (c.attrs & ATTR_REVERSE) ? resolve_bg(s, c) : resolve_fg(s, c);
 
             bool at_cursor = (show_cursor && x == cursor_vx && y == cursor_vy
                               && ((long long)(time_sec * 2.0) & 1) == 0 && focused);
-            if (at_cursor) fg = DEFAULT_BG;
+            if (at_cursor) fg = screen_default_bg(s);
 
             float alpha = (c.attrs & ATTR_DIM) ? 0.6f : 1.0f;
             int span = (c.attrs & ATTR_WIDE) ? 2 : 1;

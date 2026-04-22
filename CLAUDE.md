@@ -146,6 +146,13 @@ cmake --build build
 - Prefers real fixes over workarounds — e.g. when `➜` didn't show, the
   first fix was to add Menlo fallback, the second was to recognise
   Core Text does font substitution itself via `CTFontCreateForString`.
+- When the user says **"pal"** they mean the companion CLI at
+  `third_party/pal/` (git submodule, `git@github.com:binRick/pal.git`).
+  It's a palette-theme applier that emits OSC 4 / 10 / 11 codes into
+  the current TTY — used to test rbterm's palette handling. Run it
+  inside a tab to apply a theme to *that* pane only (rbterm keeps
+  palette + default fg/bg/cursor per-Screen, so one pane's theme
+  doesn't bleed into the others).
 
 ## Settings modal
 

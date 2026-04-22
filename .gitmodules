@@ -1,3 +1,6 @@
 [submodule "vendor/alacritty"]
 	path = vendor/alacritty
 	url = https://github.com/alacritty/alacritty
+[submodule "third_party/pal"]
+	path = third_party/pal
+	url = git@github.com:binRick/pal.git

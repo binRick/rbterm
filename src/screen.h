@@ -26,19 +26,18 @@ enum {
     ATTR_DEFAULT_BG = 1u << 15,
 };
 
-/* Default palette entries. Runtime-mutable via OSC 10/11/12. */
-extern uint32_t g_default_fg;
-extern uint32_t g_default_bg;
-extern uint32_t g_cursor_color;
-
-/* Palette index → RGB. Reads g_palette[i]; safe for any i (clamped). */
-uint32_t screen_palette(int i);
-
-#define DEFAULT_FG    (g_default_fg)
-#define DEFAULT_BG    (g_default_bg)
-#define CURSOR_COLOR  (g_cursor_color)
-
 typedef struct Screen Screen;
+
+/* Palette index → RGB. Each Screen owns its own palette (mutable via
+   OSC 4), so changes in one tab/pane don't bleed into others. Safe for
+   any i (clamped). */
+uint32_t screen_palette(const Screen *s, int i);
+
+/* Per-screen default colours. OSC 10/11/12 mutate these, so a theme
+   applied in one pane doesn't bleed into the others. */
+uint32_t screen_default_fg(const Screen *s);
+uint32_t screen_default_bg(const Screen *s);
+uint32_t screen_cursor_color(const Screen *s);
 
 typedef struct {
     void *user;

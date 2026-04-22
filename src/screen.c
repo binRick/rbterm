@@ -18,10 +18,12 @@ enum {
 
 #define MAX_PARAMS 16
 
-/* Mutable default colours (OSC 10 / 11 / 12). */
-uint32_t g_default_fg    = 0xFFFFFFu;   /* pure white — was 0xEAEAEA, felt gray */
-uint32_t g_default_bg    = 0x111111u;
-uint32_t g_cursor_color  = 0xFFFFFFu;
+/* Seed values copied into every new Screen. OSC 10/11/12 mutate the
+   per-screen copy, not these, so one pane's theme doesn't bleed into
+   the others. */
+#define SEED_DEFAULT_FG    0xFFFFFFu   /* pure white — was 0xEAEAEA, felt gray */
+#define SEED_DEFAULT_BG    0x111111u
+#define SEED_CURSOR_COLOR  0xFFFFFFu
 
 struct Screen {
     int cols, rows;
@@ -80,44 +82,48 @@ struct Screen {
     char osc[512];
     int osc_len;
 
+    /* Per-screen palette (mutable via OSC 4/104). Kept per-screen so
+       a tab/pane rewriting its colours doesn't bleed into the others. */
+    uint32_t palette[256];
+    /* Per-screen default colours (mutable via OSC 10/11/12). Same
+       reason — a theme's default-fg/bg change shouldn't escape the
+       pane that applied it. */
+    uint32_t default_fg;
+    uint32_t default_bg;
+    uint32_t cursor_color;
+
     ScreenIO io;
 };
 
+uint32_t screen_default_fg(const Screen *s)    { return s ? s->default_fg    : SEED_DEFAULT_FG; }
+uint32_t screen_default_bg(const Screen *s)    { return s ? s->default_bg    : SEED_DEFAULT_BG; }
+uint32_t screen_cursor_color(const Screen *s)  { return s ? s->cursor_color  : SEED_CURSOR_COLOR; }
+
 /* ---------- Palette (mutable — can be set by OSC 4) ---------- */
 
-static uint32_t g_palette[256];
-static bool g_palette_ready = false;
-
-static void palette_reset_defaults(void) {
+static void palette_fill_defaults(uint32_t dst[256]) {
     static const uint32_t base[16] = {
         0x000000, 0xCC0000, 0x4E9A06, 0xC4A000,
         0x3465A4, 0x75507B, 0x06989A, 0xD3D7CF,
         0x555753, 0xEF2929, 0x8AE234, 0xFCE94F,
         0x729FCF, 0xAD7FA8, 0x34E2E2, 0xEEEEEC,
     };
-    for (int i = 0; i < 16; i++) g_palette[i] = base[i];
+    for (int i = 0; i < 16; i++) dst[i] = base[i];
     static const int lut[6] = {0, 95, 135, 175, 215, 255};
     for (int i = 16; i < 232; i++) {
         int n = i - 16;
         int r = (n / 36) % 6, gg = (n / 6) % 6, bb = n % 6;
-        g_palette[i] = (lut[r] << 16) | (lut[gg] << 8) | lut[bb];
+        dst[i] = (lut[r] << 16) | (lut[gg] << 8) | lut[bb];
     }
     for (int i = 232; i < 256; i++) {
         int v = 8 + (i - 232) * 10;
-        g_palette[i] = (v << 16) | (v << 8) | v;
+        dst[i] = (v << 16) | (v << 8) | v;
     }
 }
 
-static void palette_init_once(void) {
-    if (g_palette_ready) return;
-    palette_reset_defaults();
-    g_palette_ready = true;
-}
-
-static uint32_t pal(int i) {
-    palette_init_once();
-    if (i < 0 || i > 255) return DEFAULT_FG;
-    return g_palette[i];
+static uint32_t pal(const Screen *s, int i) {
+    if (!s || i < 0 || i > 255) return SEED_DEFAULT_FG;
+    return s->palette[i];
 }
 
 /* Parse one OSC 4 colour spec: "#RGB" / "#RRGGBB" / "#RRRRGGGGBBBB"
@@ -404,8 +410,8 @@ static void sgr(Screen *s) {
     for (int i = 0; i < n; i++) {
         int p = s->param_set[i] ? s->params[i] : 0;
         if (p == 0) {
-            s->cur_attr.fg = DEFAULT_FG;
-            s->cur_attr.bg = DEFAULT_BG;
+            s->cur_attr.fg = s->default_fg;
+            s->cur_attr.bg = s->default_bg;
             s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
         } else if (p == 1)  s->cur_attr.attrs |= ATTR_BOLD;
         else if (p == 2)    s->cur_attr.attrs |= ATTR_DIM;
@@ -428,7 +434,7 @@ static void sgr(Screen *s) {
             s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_FG) | ATTR_FG_INDEX);
         }
         else if (p == 39) {
-            s->cur_attr.fg = DEFAULT_FG;
+            s->cur_attr.fg = s->default_fg;
             s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_FG) & ~ATTR_FG_INDEX);
         }
         else if (p >= 40 && p <= 47) {
@@ -436,7 +442,7 @@ static void sgr(Screen *s) {
             s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
         }
         else if (p == 49) {
-            s->cur_attr.bg = DEFAULT_BG;
+            s->cur_attr.bg = s->default_bg;
             s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_BG) & ~ATTR_BG_INDEX);
         }
         else if (p >= 90 && p <= 97) {
@@ -479,7 +485,7 @@ static void sgr(Screen *s) {
     }
 }
 
-uint32_t screen_palette(int i) { return pal(i); }
+uint32_t screen_palette(const Screen *s, int i) { return pal(s, i); }
 
 /* ---------- Erase ---------- */
 
@@ -676,8 +682,8 @@ static void finish_osc(Screen *s) {
         return;
     }
     if (ps == 4) {
-        /* OSC 4;N;spec[;N;spec...] — set one or more palette entries. */
-        palette_init_once();
+        /* OSC 4;N;spec[;N;spec...] — set one or more palette entries
+           on this screen only. */
         while (*p) {
             int idx = 0; bool any = false;
             while (*p >= '0' && *p <= '9') { idx = idx * 10 + (*p - '0'); any = true; p++; }
@@ -688,7 +694,7 @@ static void finish_osc(Screen *s) {
             spec[si] = 0;
             uint32_t col;
             if (idx >= 0 && idx < 256 && parse_color_spec(spec, &col)) {
-                g_palette[idx] = col;
+                s->palette[idx] = col;
             }
             if (*p == ';') p++; else break;
         }
@@ -726,9 +732,9 @@ static void finish_osc(Screen *s) {
     if (ps == 10 || ps == 11 || ps == 12) {
         /* OSC 10/11/12 — default fg / bg / cursor colour. `?` queries;
            anything else sets. */
-        uint32_t *slot = (ps == 10) ? &g_default_fg
-                       : (ps == 11) ? &g_default_bg
-                                    : &g_cursor_color;
+        uint32_t *slot = (ps == 10) ? &s->default_fg
+                       : (ps == 11) ? &s->default_bg
+                                    : &s->cursor_color;
         if (*p == '?') {
             char buf[80];
             uint32_t c = *slot;
@@ -800,23 +806,21 @@ static void finish_osc(Screen *s) {
         return;
     }
     if (ps == 104) {
-        /* OSC 104 — reset palette entries (all if no arg; otherwise listed). */
-        palette_init_once();
+        /* OSC 104 — reset palette entries on this screen (all if no
+           arg; otherwise listed). */
         if (!*p) {
-            palette_reset_defaults();
+            palette_fill_defaults(s->palette);
             return;
         }
+        /* Per-entry reset: rebuild the default table once and copy
+           only the requested index back into this screen. */
+        uint32_t defaults[256];
+        palette_fill_defaults(defaults);
         while (*p) {
             int idx = 0; bool any = false;
             while (*p >= '0' && *p <= '9') { idx = idx * 10 + (*p - '0'); any = true; p++; }
             if (any && idx >= 0 && idx < 256) {
-                /* Reset single entry by recomputing its default. */
-                uint32_t saved[256];
-                memcpy(saved, g_palette, sizeof(saved));
-                palette_reset_defaults();
-                uint32_t restored = g_palette[idx];
-                memcpy(g_palette, saved, sizeof(saved));
-                g_palette[idx] = restored;
+                s->palette[idx] = defaults[idx];
             }
             if (*p == ';') p++; else break;
         }
@@ -848,7 +852,7 @@ static void handle_esc(Screen *s, uint8_t b) {
         // RIS: reset
         s->cx = 0; s->cy = 0; s->cursor_visible = true; s->autowrap = true;
         s->scroll_top = 0; s->scroll_bot = s->rows - 1;
-        s->cur_attr.fg = DEFAULT_FG; s->cur_attr.bg = DEFAULT_BG;
+        s->cur_attr.fg = s->default_fg; s->cur_attr.bg = s->default_bg;
         s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
         s->charset_g0 = 'B'; s->charset_g1 = 'B'; s->charset_active = 0;
         for (int y = 0; y < s->rows; y++) clear_row(s, y);
@@ -974,8 +978,13 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     s->scroll_bot = rows - 1;
     s->cursor_visible = true;
     s->autowrap = true;
-    s->cur_attr.fg = DEFAULT_FG;
-    s->cur_attr.bg = DEFAULT_BG;
+    /* Seed the per-screen defaults + palette first — cur_attr reads from them. */
+    s->default_fg   = SEED_DEFAULT_FG;
+    s->default_bg   = SEED_DEFAULT_BG;
+    s->cursor_color = SEED_CURSOR_COLOR;
+    palette_fill_defaults(s->palette);
+    s->cur_attr.fg = s->default_fg;
+    s->cur_attr.bg = s->default_bg;
     s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
     s->charset_g0 = 'B';
     s->charset_g1 = 'B';
@@ -1117,17 +1126,23 @@ void screen_resize(Screen *s, int cols, int rows) {
         }
         s->sb_head = s->sb_len % s->sb_cap;
     }
-    /* Push overflow to scrollback by writing into nsb directly. */
+    /* Push overflow to scrollback by writing into nsb directly. We
+       temporarily point s->sb at the new buffer (and s->cols at the
+       new width) so push_scrollback writes into nsb with the right
+       stride. **Both must be restored before the teardown below
+       free()s s->sb** — otherwise we'd free the new buffer, then
+       reinstall the freed pointer, and screen_free would later
+       double-free it. */
     if (s->sb_cap > 0 && start_row > 0) {
         Cell *saved_sb_was = s->sb;
         int saved_cols = s->cols;
         s->sb = nsb;
-        s->cols = cols;   /* temporarily switch so push_scrollback writes with new width */
+        s->cols = cols;
         for (int r = 0; r < start_row; r++) {
             push_scrollback(s, scratch + (size_t)r * cols);
         }
         s->cols = saved_cols;
-        (void)saved_sb_was;
+        s->sb = saved_sb_was;
     }
     int copy_count = emit - start_row;
     if (copy_count > rows) copy_count = rows;
@@ -1213,7 +1228,7 @@ void screen_scroll_reset(Screen *s) { s->view_off = 0; }
 
 Cell screen_view_cell(const Screen *s, int col, int vy) {
     if (col < 0 || col >= s->cols || vy < 0 || vy >= s->rows) {
-        Cell e = {0, DEFAULT_FG, DEFAULT_BG, ATTR_DEFAULT_FG | ATTR_DEFAULT_BG};
+        Cell e = {0, s->default_fg, s->default_bg, ATTR_DEFAULT_FG | ATTR_DEFAULT_BG};
         return e;
     }
     // view_off rows from the bottom of scrollback replace the top rows of the live screen

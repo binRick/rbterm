@@ -11,6 +11,7 @@ typedef struct {
     int font_delta;    // -1,0,+1 ; 100 = unset
     bool copy;         // Ctrl+Shift+C
     bool paste;        // Ctrl+Shift+V
+    bool select_all;   // Cmd+A / Ctrl+Shift+A — select the active pane
     int scroll_rows;   // viewport scroll (positive = up into history)
 } InputActions;
 
