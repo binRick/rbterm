@@ -45,8 +45,53 @@ set(RBTERM_SOURCES
     src/screen.c
     src/render.c
     src/input.c
+    src/theme.c
     src/pty_dispatch.c
 )
+
+# Embedded fonts (via .incbin). Skipped for emscripten — the wasm
+# assembler doesn't grok Mach-O section directives and the wasm bundle
+# is download-bandwidth-sensitive. main.c uses an empty stub when
+# PLATFORM_WEB is set so its references compile cleanly.
+if(NOT EMSCRIPTEN)
+    list(APPEND RBTERM_SOURCES src/fonts_embedded.S)
+endif()
+
+# Regenerate src/themes_embedded.h whenever any kfc/dark palette file
+# (or the generator script) changes. Theme.c #includes the header, so
+# this fires before it compiles.
+file(GLOB _THEME_SOURCES
+  "${CMAKE_SOURCE_DIR}/third_party/pal/palettes/kfc/dark/*")
+add_custom_command(
+  OUTPUT  ${CMAKE_SOURCE_DIR}/src/themes_embedded.h
+  COMMAND ${CMAKE_SOURCE_DIR}/tools/gen_themes.sh
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen_themes.sh ${_THEME_SOURCES}
+  COMMENT "Regenerating src/themes_embedded.h from pal/palettes/kfc/dark"
+  VERBATIM)
+add_custom_target(rbterm_themes DEPENDS ${CMAKE_SOURCE_DIR}/src/themes_embedded.h)
+
+# Regenerate src/fonts_embedded.{h,S} whenever a font in assets/fonts/
+# (or the generator script) changes. fonts_embedded.S is then linked
+# directly into the executable so the binary carries the font data.
+# .incbin keeps the per-font assembler input tiny — compile is instant
+# even with ~13 MB of font payload.
+file(GLOB _FONT_SOURCES
+  "${CMAKE_SOURCE_DIR}/assets/fonts/*.ttf"
+  "${CMAKE_SOURCE_DIR}/assets/fonts/*.otf"
+  "${CMAKE_SOURCE_DIR}/assets/fonts/*.ttc")
+add_custom_command(
+  OUTPUT  ${CMAKE_SOURCE_DIR}/src/fonts_embedded.h
+          ${CMAKE_SOURCE_DIR}/src/fonts_embedded.S
+  COMMAND ${CMAKE_SOURCE_DIR}/tools/gen_fonts.sh
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen_fonts.sh ${_FONT_SOURCES}
+  COMMENT "Regenerating src/fonts_embedded.{h,S} from assets/fonts/"
+  VERBATIM)
+add_custom_target(rbterm_fonts
+  DEPENDS ${CMAKE_SOURCE_DIR}/src/fonts_embedded.h
+          ${CMAKE_SOURCE_DIR}/src/fonts_embedded.S)
+enable_language(ASM)
 
 # Platform-specific backends: local PTY + emoji rasterizer.
 if(RBTERM_WEB)
@@ -107,6 +152,7 @@ if(WIN32)
 endif()
 
 add_executable(rbterm ${RBTERM_SOURCES})
+add_dependencies(rbterm rbterm_themes rbterm_fonts)
 target_include_directories(rbterm PRIVATE src)
 target_link_libraries(rbterm PRIVATE raylib)
 if(RBTERM_SSH)
@@ -138,6 +184,9 @@ if(EMSCRIPTEN)
     "SHELL:-s INITIAL_MEMORY=64MB"
     "SHELL:-s STACK_SIZE=8MB"
     "SHELL:-s FORCE_FILESYSTEM=1"
+    # Wasm doesn't link the embedded-fonts .S (Mach-O syntax + bundle
+    # bloat), so preload assets/fonts into MEMFS at /fonts/ so
+    # renderer_find_default_font can still locate a startup font.
     "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/assets/fonts@fonts"
     "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/web/shell.html"
   )

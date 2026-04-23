@@ -12,6 +12,12 @@ typedef struct {
     float bg_alpha;       /* default-background opacity, 0..1 */
     char font_path[1024];
     void *font_data;      // Font* (opaque)
+    /* Cache of the embedded blob the current font came from (NULL when
+       it was loaded from a disk path). renderer_set_font_size can
+       re-load from this without revisiting the filesystem. */
+    const unsigned char *cur_data;
+    int cur_data_size;
+    char cur_ext[8];
 } Renderer;
 
 typedef struct {
@@ -24,11 +30,22 @@ typedef struct {
 } Selection;
 
 bool renderer_init(Renderer *r, const char *font_path, int font_size);
+bool renderer_init_with_data(Renderer *r, const unsigned char *data,
+                             int data_size, const char *ext,
+                             const char *display_path, int font_size);
 void renderer_shutdown(Renderer *r);
 
 // Reload font at a new size. Returns true on success.
 bool renderer_set_font_size(Renderer *r, int font_size);
 bool renderer_set_font_path(Renderer *r, const char *path);
+// Load a font straight from a memory buffer (e.g. one of the
+// .incbin-bundled assets). `ext` is "ttf" / "otf" / "ttc" so raylib
+// picks the right loader. `display_path` is what we record as the
+// renderer's `font_path` — typically "embedded:<NAME>" so save/load
+// roundtrips, but any string that uniquely identifies the font is OK.
+bool renderer_set_font_data(Renderer *r, const unsigned char *data,
+                            int data_size, const char *ext,
+                            const char *display_path);
 // Set extra pixels between cells horizontally (0..32). Updates cell_w in
 // place; no atlas rebuild needed. The caller still owns reflowing tabs.
 void renderer_set_cell_spacing(Renderer *r, int extra_w);

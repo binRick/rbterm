@@ -29,14 +29,32 @@ endif
 # libssh: brew install libssh (macOS) / apt install libssh-dev (Linux).
 LDLIBS += -lssh
 
-SRCS := src/main.c src/screen.c src/render.c src/input.c \
+SRCS := src/main.c src/screen.c src/render.c src/input.c src/theme.c \
         src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c
-OBJS := $(SRCS:.c=.o) $(EMOJI_OBJ)
+OBJS := $(SRCS:.c=.o) $(EMOJI_OBJ) src/fonts_embedded.o
 
 all: rbterm
 
 rbterm: $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+# Embedded palette themes: regenerated whenever any kfc/dark file
+# changes. Declared as a prerequisite of theme.o so a fresh clone with
+# the submodule checked out picks them up automatically.
+src/themes_embedded.h: tools/gen_themes.sh $(wildcard third_party/pal/palettes/kfc/dark/*)
+	./tools/gen_themes.sh
+
+src/theme.o: src/themes_embedded.h
+
+# Embedded fonts: a tiny .S that .incbin's every file in assets/fonts/.
+# Header + asm regenerate whenever any font there changes.
+src/fonts_embedded.h src/fonts_embedded.S: tools/gen_fonts.sh $(wildcard assets/fonts/*.ttf assets/fonts/*.otf assets/fonts/*.ttc)
+	./tools/gen_fonts.sh
+
+src/fonts_embedded.o: src/fonts_embedded.S
+	$(CC) -c $< -o $@
+
+src/main.o: src/fonts_embedded.h
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -73,13 +91,12 @@ $(ICNS): assets/icon.png
 
 app: rbterm $(ICNS) Info.plist
 	rm -rf rbterm.app
-	mkdir -p rbterm.app/Contents/MacOS rbterm.app/Contents/Resources/fonts
+	mkdir -p rbterm.app/Contents/MacOS rbterm.app/Contents/Resources
 	cp rbterm rbterm.app/Contents/MacOS/rbterm
 	cp $(ICNS) rbterm.app/Contents/Resources/rbterm.icns
 	cp Info.plist rbterm.app/Contents/Info.plist
-	# Bundle the curated OSS fonts so the picker has choices out of the box
-	# regardless of what the user has installed system-wide.
-	-cp assets/fonts/*.ttf rbterm.app/Contents/Resources/fonts/ 2>/dev/null
+	# Fonts are embedded into the binary via tools/gen_fonts.sh +
+	# .incbin — no Resources/fonts/ folder needed at runtime.
 	# Ensure LaunchServices notices the bundle
 	touch rbterm.app
 

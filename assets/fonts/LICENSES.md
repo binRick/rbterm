@@ -13,6 +13,7 @@ see the linked repos for the full licence text.
 | Hack              | https://github.com/source-foundry/Hack               | MIT + Bitstream Vera  |
 | Inconsolata       | https://github.com/googlefonts/Inconsolata           | OFL-1.1               |
 | IBM Plex Mono     | https://github.com/IBM/plex                          | OFL-1.1               |
+| Monaspace (Argon, Krypton, Neon, Radon, Xenon — Nerd Font Regulars) | https://github.com/githubnext/monaspace | OFL-1.1 |
 
 None of the bundled files have been modified from upstream. If you
 redistribute rbterm you need to preserve the licence notices.

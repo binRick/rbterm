@@ -54,6 +54,26 @@ void    screen_free(Screen *s);
    Used when a Pane moves in memory (e.g. after a pane-0 close in a
    two-pane tab slides pane-1 into slot 0). */
 void    screen_set_io_user(Screen *s, void *user);
+
+/* Theme application lives in theme.c — exported here so screen.c
+   internals stay private. */
+void    screen_set_default_fg(Screen *s, uint32_t rgb);
+void    screen_set_default_bg(Screen *s, uint32_t rgb);
+void    screen_set_cursor_color(Screen *s, uint32_t rgb);
+void    screen_set_palette_entry(Screen *s, int i, uint32_t rgb);
+
+/* Cursor presentation. Per-Screen so a host's preferred shape can be
+   applied without affecting other tabs/panes. CURSOR_STYLE_DEFAULT
+   means "use the renderer's default" (a solid block). */
+typedef enum {
+    CURSOR_STYLE_DEFAULT = 0,
+    CURSOR_STYLE_BLOCK,
+    CURSOR_STYLE_UNDERLINE,
+    CURSOR_STYLE_BAR,
+    CURSOR_STYLE_BLOCK_BLINK
+} CursorStyle;
+void        screen_set_cursor_style(Screen *s, CursorStyle st);
+CursorStyle screen_cursor_style(const Screen *s);
 void    screen_resize(Screen *s, int cols, int rows);
 void    screen_feed(Screen *s, const uint8_t *data, size_t n);
 

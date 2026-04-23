@@ -91,6 +91,8 @@ struct Screen {
     uint32_t default_fg;
     uint32_t default_bg;
     uint32_t cursor_color;
+    /* Cursor presentation — mutable via screen_set_cursor_style. */
+    CursorStyle cursor_style;
 
     ScreenIO io;
 };
@@ -1013,6 +1015,17 @@ void screen_set_io_user(Screen *s, void *user) {
     if (!s) return;
     s->io.user = user;
 }
+
+void screen_set_default_fg(Screen *s, uint32_t rgb)   { if (s) s->default_fg = rgb; }
+void screen_set_default_bg(Screen *s, uint32_t rgb)   { if (s) s->default_bg = rgb; }
+void screen_set_cursor_color(Screen *s, uint32_t rgb) { if (s) s->cursor_color = rgb; }
+void screen_set_palette_entry(Screen *s, int i, uint32_t rgb) {
+    if (!s || i < 0 || i >= 256) return;
+    s->palette[i] = rgb;
+}
+
+void        screen_set_cursor_style(Screen *s, CursorStyle st) { if (s) s->cursor_style = st; }
+CursorStyle screen_cursor_style(const Screen *s) { return s ? s->cursor_style : CURSOR_STYLE_DEFAULT; }
 
 void screen_resize(Screen *s, int cols, int rows) {
     if (cols == s->cols && rows == s->rows) return;

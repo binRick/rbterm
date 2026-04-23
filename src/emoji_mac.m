@@ -7,10 +7,35 @@
  * Colour emoji fonts (SBIX) ignore the fill colour; vector fonts are
  * filled white so the caller can tint. */
 #include "emoji.h"
+#import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Strip the AppKit "Close Window" key equivalent so Cmd+W reaches our
+ * keyboard polling instead of closing the only window. Walks every
+ * top-level menu, blanking the keyEquivalent on items titled "Close"
+ * or "Close Window". Idempotent — safe to call after raylib has set
+ * up its own NSApp. */
+void mac_disable_close_menu_item(void) {
+    @autoreleasepool {
+        NSMenu *mainMenu = [NSApp mainMenu];
+        if (!mainMenu) return;
+        for (NSMenuItem *topItem in [mainMenu itemArray]) {
+            NSMenu *subMenu = [topItem submenu];
+            if (!subMenu) continue;
+            for (NSMenuItem *item in [subMenu itemArray]) {
+                NSString *title = [item title];
+                if ([title isEqualToString:@"Close"] ||
+                    [title isEqualToString:@"Close Window"]) {
+                    [item setKeyEquivalent:@""];
+                    [item setKeyEquivalentModifierMask:0];
+                }
+            }
+        }
+    }
+}
 
 bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
                   uint8_t **out_rgba, int *out_w, int *out_h,

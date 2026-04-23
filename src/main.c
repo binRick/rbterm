@@ -2,6 +2,7 @@
 #include "screen.h"
 #include "render.h"
 #include "input.h"
+#include "theme.h"
 #include "pty.h"
 
 #include <stdio.h>
@@ -25,6 +26,11 @@
 #else
   #include <strings.h>   /* strcasecmp */
   #include <dirent.h>
+  #include <unistd.h>    /* fork/exec/setsid/readlink */
+#endif
+#ifdef __APPLE__
+  #include <mach-o/dyld.h>  /* _NSGetExecutablePath */
+  void mac_disable_close_menu_item(void);   /* defined in emoji_mac.m */
 #endif
 
 #ifndef _WIN32
@@ -251,6 +257,14 @@ typedef struct {
     char  ssh_pass[256];
     char  ssh_key[PATH_MAX];
     int   ssh_port;
+    /* Appearance tied to the SSH host (applied to every pane of this
+       tab — splits inherit). Empty ssh_theme means "don't touch". */
+    char  ssh_theme[64];
+    int   ssh_cursor_style;
+    char  ssh_font[PATH_MAX];  /* empty = no per-host override */
+    int   ssh_font_size;       /* 0 = no override */
+    char  ssh_log_dir[PATH_MAX];
+    int   ssh_log_mode;        /* 0 = inherit, 1 = on, 2 = off */
 } Tab;
 
 #define MAX_TABS 16
@@ -260,6 +274,7 @@ typedef struct {
 #define TAB_CLOSE_W 22
 #define TAB_PLUS_W  30
 #define TAB_GEAR_W  30
+#define TAB_HELP_W  28
 #define TAB_SPLIT_W 28          /* one split button (two of them — vertical + horizontal) */
 #define TAB_SSH_W   48
 
@@ -271,18 +286,25 @@ static int g_active = 0;
    keystrokes edit form fields and mouse clicks focus them instead of
    going to the active tab. Layout is computed on the fly in
    ssh_form_layout() so draw and hit-test share one source of truth. */
-typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS } UiMode;
+typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP } UiMode;
 typedef enum {
-    F_HOST = 0, F_PORT, F_USER, F_PASS, F_KEY,
-    F_CONNECT, F_SAVE, F_CANCEL,
+    F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
+    F_NEW, F_CONNECT, F_DELETE, F_SAVE, F_CANCEL,
     F_COUNT
 } SshField;
-#define F_TEXT_FIELDS 5    /* host, port, user, pass, key */
+#define F_TEXT_FIELDS 6    /* name, host, port, user, pass, key */
 typedef struct {
+    char name[128];
     char host[256];
     char port[16];
     char user[96];
     char pass[256];
+    char theme[64];
+    int  cursor_style;
+    char font[PATH_MAX];     /* font path; empty = use default */
+    int  font_size;          /* 0 = use default */
+    char log_dir[PATH_MAX];
+    int  log_mode;           /* 0 = inherit, 1 = on, 2 = off */
     char key[512];
     int  focus;              /* SshField */
     bool sel_all;            /* focused text field's contents are fully selected */
@@ -301,6 +323,17 @@ typedef struct {
     char user[96];         /* User */
     char identity[PATH_MAX];
     int  port;
+    /* rbterm-specific fields. Stored in ~/.ssh/config as comments
+       (`# rbterm-theme:` / `# rbterm-cursor:` / `# rbterm-font:` /
+       `# rbterm-font-size:`) so plain ssh still sees a clean stanza but
+       rbterm picks them up. */
+    char theme[64];
+    int  cursor_style;     /* CursorStyle enum, 0 = default */
+    char font[PATH_MAX];
+    int  font_size;        /* 0 = default */
+    char log_dir[PATH_MAX];
+    /* 0 = inherit app setting, 1 = force on, 2 = force off. */
+    int  log_mode;
 } SshProfile;
 
 #define SSH_PROFILES_MAX 128
@@ -312,11 +345,90 @@ static int        g_ssh_list_selected = -1; /* highlighted row, -1 = none */
 typedef struct {
     Rect modal;
     Rect list;                  /* saved-hosts sidebar */
-    Rect field[F_TEXT_FIELDS];  /* host, port, user, pass, key */
+    Rect field[F_TEXT_FIELDS];  /* name, host, port, user, pass, key */
+    Rect theme_list;            /* scrollable per-host theme picker */
+    Rect font_list;             /* scrollable per-host font picker */
+    Rect fs_val;                /* font-size value + -/+ buttons */
+    Rect fs_dec;
+    Rect fs_inc;
+    Rect cur_block;             /* cursor style picker: block / underline / bar / blink */
+    Rect cur_under;
+    Rect cur_bar;
+    Rect cur_blink;
+    Rect log_inherit;           /* per-host logging: inherit / on / off + dir */
+    Rect log_on;
+    Rect log_off;
+    Rect log_dir;
+    Rect newbtn;
     Rect connect;
+    Rect delbtn;                /* zero-sized when not deletable */
     Rect save;
     Rect cancel;
 } SshFormLayout;
+
+/* Per-list scroll state for the SSH form (independent of the Settings
+   modal's scrolls so each picker remembers its own position). */
+static int g_form_theme_scroll = 0;
+static int g_form_font_scroll  = 0;
+
+/* True for one frame after the help modal opens, so the same click
+   that triggered the open doesn't immediately dismiss it via the
+   "click outside" check. */
+static bool g_help_just_opened = false;
+
+/* True when the per-host log-dir text input is focused (so character
+   keys edit the path instead of cycling fields). */
+static bool g_form_logdir_focus = false;
+
+/* Renderer is owned by main() but the SSH form and per-host connect
+   path need to apply font / font-size globally when a host is selected. */
+static Renderer *g_renderer = NULL;
+
+/* Forward decl — definition lives down by the pane-layout code. */
+static void tabs_resize_all(const Renderer *r, int win_w, int win_h);
+
+/* Pull in the embedded fonts table early so tab_open_ssh's appearance
+   apply path can resolve "embedded:NAME" references. The wasm build
+   skips this — the .S file isn't linked there to keep the bundle
+   small, so we provide an empty table instead. */
+#ifdef PLATFORM_WEB
+typedef struct {
+    const char *name;
+    const char *ext;
+    const unsigned char *data;
+    unsigned int data_size;
+} EmbeddedFont;
+static const EmbeddedFont k_embedded_fonts[1] = { {"", "", 0, 0} };
+static const int k_embedded_font_count = 0;
+#else
+#include "fonts_embedded.h"
+#endif
+static const EmbeddedFont *embedded_font_lookup(const char *path_or_name);
+/* font_preview_load is defined later (after FontEntry's full def) but
+   the SSH form picker needs to call it; forward-declare it here. */
+typedef struct FontEntry FontEntry;
+static Font font_preview_load(const FontEntry *fe, int size);
+
+/* Enumerated monospace fonts. Populated by scan_bundled_fonts() before
+   any UI opens; read by both the SSH form's per-host font picker and
+   the Settings modal's font picker. `data` is non-null for fonts
+   embedded into the binary via tools/gen_fonts.sh — load them with
+   LoadFontFromMemory; otherwise fall back to LoadFontEx(path). */
+typedef struct FontEntry {
+    char name[128];
+    char path[512];        /* For embedded fonts: "embedded:<name>" sentinel. */
+    void *preview;         /* Font *, loaded lazily when the row is first visible. */
+    bool  load_failed;
+    const unsigned char *data;
+    unsigned int          data_size;
+    char ext[8];           /* "ttf" / "otf" / "ttc" — needed for LoadFontFromMemory. */
+} FontEntry;
+
+#define MAX_FONTS 256
+static FontEntry g_fonts[MAX_FONTS];
+static int       g_font_count = 0;
+static int       g_font_list_scroll = 0;
+static int       g_font_list_selected = -1;
 
 static char g_form_status[192];   /* positive status line (e.g. "saved") */
 
@@ -328,13 +440,20 @@ static Tab *active_tab(void) {
 }
 
 /* Open a fresh per-pane log file under the current log directory. Silent
-   on failure so the user's session isn't derailed by a bad path. */
+   on failure so the user's session isn't derailed by a bad path. SSH
+   tabs may override the directory + on/off via ssh_log_dir +
+   ssh_log_mode (1=force on, 2=force off). */
 static void pane_log_open(Tab *t, Pane *p, int pane_idx) {
     if (!t || !p || p->log_fp) return;
-    if (!g_app_settings.log_enabled) return;
-    if (!g_app_settings.log_dir[0]) return;
+    bool enabled = g_app_settings.log_enabled;
+    if (t->ssh_log_mode == 1) enabled = true;
+    else if (t->ssh_log_mode == 2) enabled = false;
+    if (!enabled) return;
+    const char *dir_pref = (t->ssh_log_dir[0]) ? t->ssh_log_dir
+                                               : g_app_settings.log_dir;
+    if (!dir_pref || !*dir_pref) return;
     char dir[PATH_MAX];
-    expand_home_path(g_app_settings.log_dir, dir, sizeof(dir));
+    expand_home_path(dir_pref, dir, sizeof(dir));
     mkdir_p(dir);
     time_t now = time(NULL);
     struct tm tm_buf;
@@ -475,8 +594,13 @@ static Tab *tab_open(int cols, int rows) {
     return t;
 }
 
+static void pane_apply_tab_appearance(const Tab *t, Pane *p);
+
 static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const char *password, const char *keyfile,
+                         const char *theme, int cursor_style,
+                         const char *font, int font_size,
+                         const char *log_dir, int log_mode,
                          int cols, int rows,
                          char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
@@ -502,11 +626,44 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     if (user) { strncpy(t->ssh_user, user, sizeof(t->ssh_user) - 1); t->ssh_user[sizeof(t->ssh_user) - 1] = 0; }
     if (password) { strncpy(t->ssh_pass, password, sizeof(t->ssh_pass) - 1); t->ssh_pass[sizeof(t->ssh_pass) - 1] = 0; }
     if (keyfile)  { strncpy(t->ssh_key,  keyfile,  sizeof(t->ssh_key) - 1);  t->ssh_key[sizeof(t->ssh_key) - 1] = 0; }
+    if (theme)    { strncpy(t->ssh_theme, theme, sizeof(t->ssh_theme) - 1);  t->ssh_theme[sizeof(t->ssh_theme) - 1] = 0; }
+    t->ssh_cursor_style = cursor_style;
+    if (font)     { strncpy(t->ssh_font, font, sizeof(t->ssh_font) - 1); t->ssh_font[sizeof(t->ssh_font) - 1] = 0; }
+    t->ssh_font_size = font_size;
+    if (log_dir)  { strncpy(t->ssh_log_dir, log_dir, sizeof(t->ssh_log_dir) - 1); t->ssh_log_dir[sizeof(t->ssh_log_dir) - 1] = 0; }
+    t->ssh_log_mode = log_mode;
     t->ssh_port = port;
     snprintf(t->panes[0].title, sizeof(t->panes[0].title), "%s", t->ssh_target);
     if (!pane_open_ssh(&t->panes[0], user, host, port, password, keyfile,
                        cols, rows, err, errsz)) {
         free(t); return NULL;
+    }
+    pane_apply_tab_appearance(t, &t->panes[0]);
+    /* Per-host font / font-size applied globally when we connect. Windows
+       runs a single renderer so this affects every pane for the rest of
+       the session — the user can override via Settings. */
+    if (g_renderer) {
+        bool resized = false;
+        if (t->ssh_font[0]) {
+            const EmbeddedFont *ef = embedded_font_lookup(t->ssh_font);
+            bool ok = false;
+            if (ef) {
+                ok = renderer_set_font_data(g_renderer, ef->data,
+                                            (int)ef->data_size,
+                                            ef->ext, t->ssh_font);
+            } else {
+                ok = renderer_set_font_path(g_renderer, t->ssh_font);
+            }
+            if (ok) resized = true;
+        }
+        if (t->ssh_font_size > 0) {
+            if (renderer_set_font_size(g_renderer, t->ssh_font_size)) resized = true;
+        }
+        if (resized) {
+            tabs_resize_all(g_renderer, GetScreenWidth(), GetScreenHeight());
+            SetWindowMinSize(g_renderer->cell_w * 20 + 2 * g_renderer->pad_x,
+                             g_renderer->cell_h * 5 + TAB_BAR_H + 2 * g_renderer->pad_y);
+        }
     }
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
@@ -533,6 +690,19 @@ static inline Pane *active_pane_of(Tab *t) {
     if (!t) return NULL;
     if (t->active_pane < 0 || t->active_pane >= t->num_panes) t->active_pane = 0;
     return &t->panes[t->active_pane];
+}
+
+/* Apply the tab's stashed appearance (theme + cursor style) to a fresh
+   pane. Used by tab_open_ssh after the first pane opens, and by
+   tab_split for the second pane so the split inherits the look. */
+static void pane_apply_tab_appearance(const Tab *t, Pane *p) {
+    if (!t || !p || !p->scr) return;
+    if (t->ssh_theme[0]) {
+        const Theme *th = theme_find_by_name(t->ssh_theme);
+        if (th) screen_apply_theme(p->scr, th);
+    }
+    if (t->ssh_cursor_style != CURSOR_STYLE_DEFAULT)
+        screen_set_cursor_style(p->scr, (CursorStyle)t->ssh_cursor_style);
 }
 
 /* Split the active tab. If the tab was opened via SSH, re-dial the same
@@ -564,6 +734,7 @@ static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
         memset(np, 0, sizeof(*np));
         return false;
     }
+    pane_apply_tab_appearance(t, np);
     t->split = mode;
     t->split_ratio = 0.5f;
     t->num_panes = 2;
@@ -742,7 +913,11 @@ static const char *tab_label(const Tab *t) {
    window-pixel coords. For an unsplit tab, pane 0 fills the whole area.
    For a split, the splitter itself is SPLITTER_PX thick and sits
    between the two panes. */
-#define SPLITTER_PX 4
+/* Visual thickness of the splitter line. Kept thin so split panes
+   feel adjacent; the drag hit-test below pads it with SPLITTER_GRAB
+   so it's still easy to grab. */
+#define SPLITTER_PX   2
+#define SPLITTER_GRAB 6
 
 typedef struct {
     int x, y, w, h;
@@ -884,6 +1059,7 @@ typedef struct {
     bool on_plus;
     bool on_ssh;
     bool on_gear;
+    bool on_help;
     bool on_split_v;       /* side-by-side split button */
     bool on_split_h;       /* top/bottom split button */
 } TabBarHit;
@@ -898,7 +1074,7 @@ static bool split_buttons_visible(void) {
 
 static int tab_width_for(int win_w) {
     int split_w = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
-    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - split_w - TAB_SSH_W;
+    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - TAB_HELP_W - split_w - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -906,22 +1082,24 @@ static int tab_width_for(int win_w) {
     return w;
 }
 
-/* Layout: [ssh] | tab1 | tab2 | ... | [split-v] [split-h] [gear] | [+]
+/* Layout: [ssh] | tab1 | tab2 | ... | [gear] [split-v] [split-h] [?] | [+]
    The split pair disappears entirely when the active tab is split. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false, false, false, false };
+    TabBarHit h = { -1, false, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     bool show_splits = split_buttons_visible();
     int plus_x    = win_w - TAB_PLUS_W;
-    int gear_x    = plus_x - TAB_GEAR_W;
-    int split_h_x = show_splits ? gear_x - TAB_SPLIT_W     : gear_x;
-    int split_v_x = show_splits ? split_h_x - TAB_SPLIT_W  : gear_x;
+    int help_x    = plus_x - TAB_HELP_W;
+    int split_h_x = show_splits ? help_x - TAB_SPLIT_W     : help_x;
+    int split_v_x = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
+    int gear_x    = split_v_x - TAB_GEAR_W;
     int tab_start = TAB_SSH_W;
     if (mx < TAB_SSH_W)     { h.on_ssh     = true; return h; }
     if (mx >= plus_x)       { h.on_plus    = true; return h; }
-    if (mx >= gear_x)       { h.on_gear    = true; return h; }
+    if (mx >= help_x)       { h.on_help    = true; return h; }
     if (show_splits && mx >= split_h_x) { h.on_split_h = true; return h; }
     if (show_splits && mx >= split_v_x) { h.on_split_v = true; return h; }
+    if (mx >= gear_x)       { h.on_gear    = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
     if (idx < 0 || idx >= g_num_tabs) return h;
@@ -999,8 +1177,24 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                           (TAB_BAR_H - psz.y) / 2.0f },
                18, 0, (Color){230, 240, 255, 255});
 
-    /* Gear (settings) button, immediately left of the "+" button. */
-    int gear_x = plus_x - TAB_GEAR_W;
+    /* Help button (?) sits immediately left of the "+" button. */
+    int help_x = plus_x - TAB_HELP_W;
+    {
+        Color help_bg = (Color){38, 48, 66, 255};
+        DrawRectangle(help_x, 0, TAB_HELP_W, TAB_BAR_H, help_bg);
+        DrawRectangleLines(help_x, 2, TAB_HELP_W - 1, TAB_BAR_H - 4,
+                           (Color){125, 207, 255, 200});
+        Vector2 hsz = MeasureTextEx(*f, "?", 18, 0);
+        DrawTextEx(*f, "?",
+                   (Vector2){ help_x + (TAB_HELP_W - hsz.x) / 2.0f,
+                              (TAB_BAR_H - hsz.y) / 2.0f },
+                   18, 0, (Color){220, 235, 255, 255});
+    }
+
+    /* Gear (settings) button — leftmost of the right-cluster (left of
+       the split pair when shown, otherwise left of the help button). */
+    int gear_x = split_buttons_visible() ? (help_x - 2 * TAB_SPLIT_W - TAB_GEAR_W)
+                                         : (help_x - TAB_GEAR_W);
     Color gear_bg = (Color){38, 48, 66, 255};
     DrawRectangle(gear_x, 0, TAB_GEAR_W, TAB_BAR_H, gear_bg);
     DrawRectangleLines(gear_x, 2, TAB_GEAR_W - 1, TAB_BAR_H - 4,
@@ -1009,11 +1203,11 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                    TAB_BAR_H * 0.55f, (Color){220, 235, 255, 255}, gear_bg);
 
     /* Split buttons — vertical (side-by-side) then horizontal (top/bottom),
-       left of the gear. Icon pair hints at the resulting layout. Hidden
-       once the active tab is already split (clicking them would no-op). */
+       between gear and help. Hidden once the active tab is already
+       split (clicking them would no-op). */
     if (split_buttons_visible()) {
-        int split_h_x = gear_x - TAB_SPLIT_W;
-        int split_v_x = split_h_x - TAB_SPLIT_W;
+        int split_v_x = gear_x + TAB_GEAR_W;
+        int split_h_x = split_v_x + TAB_SPLIT_W;
         Color split_bg = (Color){38, 48, 66, 255};
         Color split_outline = (Color){125, 207, 255, 200};
         Color split_icon = (Color){220, 235, 255, 255};
@@ -1104,7 +1298,62 @@ static void ssh_profiles_load(void) {
     while (fgets(line, sizeof(line), fp)) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || *p == 0 || *p == '\r') continue;
+        if (*p == '\n' || *p == 0 || *p == '\r') continue;
+        /* rbterm-specific comment directives — only meaningful inside
+           a Host stanza (cur != NULL). Plain ssh ignores them. */
+        if (*p == '#' && cur) {
+            char *q = p + 1;
+            while (*q == ' ' || *q == '\t') q++;
+            const char *theme_pfx  = "rbterm-theme:";
+            const char *cursor_pfx = "rbterm-cursor:";
+            const char *font_pfx   = "rbterm-font:";
+            const char *fsize_pfx  = "rbterm-font-size:";
+            if (strncmp(q, theme_pfx, strlen(theme_pfx)) == 0) {
+                q += strlen(theme_pfx);
+                while (*q == ' ' || *q == '\t') q++;
+                trim_end(q);
+                strncpy(cur->theme, q, sizeof(cur->theme) - 1);
+                cur->theme[sizeof(cur->theme) - 1] = 0;
+            } else if (strncmp(q, cursor_pfx, strlen(cursor_pfx)) == 0) {
+                q += strlen(cursor_pfx);
+                while (*q == ' ' || *q == '\t') q++;
+                trim_end(q);
+                if      (!strcmp(q, "block"))      cur->cursor_style = CURSOR_STYLE_BLOCK;
+                else if (!strcmp(q, "underline"))  cur->cursor_style = CURSOR_STYLE_UNDERLINE;
+                else if (!strcmp(q, "bar") || !strcmp(q, "vertical"))
+                                                   cur->cursor_style = CURSOR_STYLE_BAR;
+                else if (!strcmp(q, "blink") || !strcmp(q, "block-blink"))
+                                                   cur->cursor_style = CURSOR_STYLE_BLOCK_BLINK;
+            } else if (strncmp(q, fsize_pfx, strlen(fsize_pfx)) == 0) {
+                q += strlen(fsize_pfx);
+                while (*q == ' ' || *q == '\t') q++;
+                cur->font_size = atoi(q);
+            } else if (strncmp(q, font_pfx, strlen(font_pfx)) == 0) {
+                q += strlen(font_pfx);
+                while (*q == ' ' || *q == '\t') q++;
+                trim_end(q);
+                strncpy(cur->font, q, sizeof(cur->font) - 1);
+                cur->font[sizeof(cur->font) - 1] = 0;
+            } else {
+                const char *ldir_pfx = "rbterm-log-dir:";
+                const char *log_pfx  = "rbterm-log:";
+                if (strncmp(q, ldir_pfx, strlen(ldir_pfx)) == 0) {
+                    q += strlen(ldir_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    strncpy(cur->log_dir, q, sizeof(cur->log_dir) - 1);
+                    cur->log_dir[sizeof(cur->log_dir) - 1] = 0;
+                } else if (strncmp(q, log_pfx, strlen(log_pfx)) == 0) {
+                    q += strlen(log_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    if      (!strcmp(q, "on"))  cur->log_mode = 1;
+                    else if (!strcmp(q, "off")) cur->log_mode = 2;
+                }
+            }
+            continue;
+        }
+        if (*p == '#') continue;
         trim_end(p);
 
         int k = ci_prefix(p, "host");
@@ -1161,7 +1410,11 @@ static void ssh_profiles_load(void) {
 
 static void ssh_form_apply_profile(const SshProfile *prof) {
     if (!prof) return;
-    /* HostName falls back to the alias itself (ssh(1) does the same). */
+    /* Name is the ssh_config alias ("Host <name>"); Host is the real
+       destination (HostName). When a stanza has no HostName line, ssh
+       treats the alias itself as the hostname, so mirror that here. */
+    strncpy(g_form.name, prof->name, sizeof(g_form.name) - 1);
+    g_form.name[sizeof(g_form.name) - 1] = 0;
     const char *hostname = prof->hostname[0] ? prof->hostname : prof->name;
     strncpy(g_form.host, hostname, sizeof(g_form.host) - 1);
     g_form.host[sizeof(g_form.host) - 1] = 0;
@@ -1177,15 +1430,27 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     } else {
         g_form.key[0] = 0;
     }
+    strncpy(g_form.theme, prof->theme, sizeof(g_form.theme) - 1);
+    g_form.theme[sizeof(g_form.theme) - 1] = 0;
+    g_form.cursor_style = prof->cursor_style;
+    strncpy(g_form.font, prof->font, sizeof(g_form.font) - 1);
+    g_form.font[sizeof(g_form.font) - 1] = 0;
+    g_form.font_size = prof->font_size;
+    strncpy(g_form.log_dir, prof->log_dir, sizeof(g_form.log_dir) - 1);
+    g_form.log_dir[sizeof(g_form.log_dir) - 1] = 0;
+    g_form.log_mode = prof->log_mode;
     g_form.sel_all = false;
     g_form.error[0] = 0;
 }
 
-static void ssh_form_open(void) {
-    g_ui_mode = UI_SSH_FORM;
-    g_form_status[0] = 0;
+/* Blank every field and reset selection — used by the "New" button and
+   the initial form open. Port and username keep their sensible defaults;
+   theme/font/cursor/log fields reset to "inherit". */
+static void ssh_form_clear(void) {
     memset(&g_form, 0, sizeof(g_form));
     strncpy(g_form.port, "22", sizeof(g_form.port) - 1);
+    g_form_theme_scroll = 0;
+    g_form_font_scroll  = 0;
     const char *u = getenv("USER");
 #ifdef _WIN32
     if (!u || !*u) u = getenv("USERNAME");
@@ -1194,26 +1459,41 @@ static void ssh_form_open(void) {
         strncpy(g_form.user, u, sizeof(g_form.user) - 1);
         g_form.user[sizeof(g_form.user) - 1] = 0;
     }
-    g_form.focus = F_HOST;
+    g_form.focus = F_NAME;
+    g_ssh_list_selected = -1;
+    g_form_status[0] = 0;
+    g_form_logdir_focus = false;
+}
+
+static void fonts_load(const char *current_path);
+
+static void ssh_form_open(void) {
+    g_ui_mode = UI_SSH_FORM;
+    ssh_form_clear();
     /* Refresh the saved-hosts list every time the modal opens so edits
        to ~/.ssh/config show up without restarting rbterm. */
     ssh_profiles_load();
+    /* Ensure g_fonts is populated so the per-host font picker has
+       entries even if Settings hasn't been opened yet. */
+    if (g_font_count == 0)
+        fonts_load(g_renderer ? g_renderer->font_path : NULL);
 }
 
 static char *form_buf(int field, size_t *cap) {
     switch (field) {
-    case F_HOST: *cap = sizeof(g_form.host); return g_form.host;
-    case F_PORT: *cap = sizeof(g_form.port); return g_form.port;
-    case F_USER: *cap = sizeof(g_form.user); return g_form.user;
-    case F_PASS: *cap = sizeof(g_form.pass); return g_form.pass;
-    case F_KEY:  *cap = sizeof(g_form.key);  return g_form.key;
+    case F_NAME:  *cap = sizeof(g_form.name);  return g_form.name;
+    case F_HOST:  *cap = sizeof(g_form.host);  return g_form.host;
+    case F_PORT:  *cap = sizeof(g_form.port);  return g_form.port;
+    case F_USER:  *cap = sizeof(g_form.user);  return g_form.user;
+    case F_PASS:  *cap = sizeof(g_form.pass);  return g_form.pass;
+    case F_KEY:   *cap = sizeof(g_form.key);   return g_form.key;
     default: *cap = 0; return NULL;
     }
 }
 
 static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     SshFormLayout L = {0};
-    int w = 800, h = 380;
+    int w = 860, h = 780;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -1245,18 +1525,70 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
         y += field_h + 8;
     }
 
+    /* Theme + font pickers sit side-by-side below the text fields. */
+    int picker_h = 130;
+    int picker_gap = 12;
+    int picker_w = (field_w - picker_gap) / 2;
+    int picker_y = y + 4;
+    L.theme_list = (Rect){ field_x,                    picker_y, picker_w, picker_h };
+    L.font_list  = (Rect){ field_x + picker_w + picker_gap, picker_y, picker_w, picker_h };
+
+    /* Font-size row: number display + -/+ buttons below the pickers. */
+    int fs_row_y = picker_y + picker_h + 10;
+    int fs_btn = 28;
+    L.fs_val = (Rect){ field_x,                fs_row_y, 66, fs_btn };
+    L.fs_dec = (Rect){ field_x + 74,           fs_row_y, fs_btn, fs_btn };
+    L.fs_inc = (Rect){ field_x + 74 + fs_btn + 6, fs_row_y, fs_btn, fs_btn };
+
+    /* Cursor-style picker: four equal buttons below the font size. */
+    int cur_row_y = fs_row_y + fs_btn + 10;
+    {
+        int btn_h_sty = 30;
+        int gap_sty = 6;
+        int bw = (field_w - 3 * gap_sty) / 4;
+        L.cur_block = (Rect){ field_x,                           cur_row_y, bw, btn_h_sty };
+        L.cur_under = (Rect){ field_x + (bw + gap_sty),           cur_row_y, bw, btn_h_sty };
+        L.cur_bar   = (Rect){ field_x + 2 * (bw + gap_sty),       cur_row_y, bw, btn_h_sty };
+        L.cur_blink = (Rect){ field_x + 3 * (bw + gap_sty),       cur_row_y, bw, btn_h_sty };
+    }
+
+    /* Logging row: 3-state pill (Inherit / On / Off) followed by a
+       second row with the per-host log directory text input. */
+    int log_row_y = cur_row_y + 30 + 10;
+    {
+        int log_btn_h = 28;
+        int gap_log = 6;
+        int bw = (field_w - 2 * gap_log) / 3;
+        L.log_inherit = (Rect){ field_x,                       log_row_y, bw, log_btn_h };
+        L.log_on      = (Rect){ field_x + (bw + gap_log),       log_row_y, bw, log_btn_h };
+        L.log_off     = (Rect){ field_x + 2 * (bw + gap_log),   log_row_y, bw, log_btn_h };
+    }
+    int logdir_row_y = log_row_y + 28 + 8;
+    L.log_dir = (Rect){ field_x, logdir_row_y, field_w, 28 };
+
+    /* Buttons: [New] ... [Connect] [Delete] [Save] [Cancel].
+       Delete has zero size when no saved host is selected so it can't
+       receive clicks; everything else keeps its position. */
     int btn_h = 32;
     int btn_y = L.modal.y + L.modal.h - btn_h - pad - (g_form.error[0] ? 24 : 0);
-    int connect_w = 110, save_w = 90, cancel_w = 96;
+    int new_w = 70, connect_w = 110, del_w = 80, save_w = 90, cancel_w = 96;
     int gap = 8;
+    bool has_del = (g_ssh_list_selected >= 0 && g_form.name[0]);
     int right_edge = L.modal.x + L.modal.w - pad;
     L.cancel.w  = cancel_w;  L.cancel.h  = btn_h;
     L.save.w    = save_w;    L.save.h    = btn_h;
     L.connect.w = connect_w; L.connect.h = btn_h;
+    L.newbtn.w  = new_w;     L.newbtn.h  = btn_h;
+    L.delbtn.w  = has_del ? del_w : 0;  L.delbtn.h = btn_h;
     L.cancel.x  = right_edge - cancel_w;
     L.save.x    = L.cancel.x - gap - save_w;
-    L.connect.x = L.save.x - gap - connect_w;
-    L.cancel.y = L.save.y = L.connect.y = btn_y;
+    L.delbtn.x  = has_del ? (L.save.x - gap - del_w) : 0;
+    L.connect.x = (has_del ? L.delbtn.x : L.save.x) - gap - connect_w;
+    L.newbtn.x  = L.modal.x + pad + list_w + (list_w > 0 ? 14 : 0);
+    /* "New" floats one row above the main button bar so it reads as a
+       form-level reset, not a commit-style action. */
+    L.newbtn.y  = btn_y - btn_h - 10;
+    L.cancel.y = L.save.y = L.connect.y = L.delbtn.y = btn_y;
     return L;
 }
 
@@ -1290,6 +1622,12 @@ static void ssh_form_submit(int cols, int rows) {
         port,
         g_form.pass[0] ? g_form.pass : NULL,
         g_form.key[0]  ? g_form.key  : NULL,
+        g_form.theme[0] ? g_form.theme : NULL,
+        g_form.cursor_style,
+        g_form.font[0]    ? g_form.font    : NULL,
+        g_form.font_size,
+        g_form.log_dir[0] ? g_form.log_dir : NULL,
+        g_form.log_mode,
         cols, rows, err, sizeof(err));
     if (t) {
         /* Clear the password from memory as soon as we no longer need it. */
@@ -1304,15 +1642,170 @@ static void ssh_form_submit(int cols, int rows) {
 }
 
 static void ssh_form_advance_focus(int delta) {
-    g_form.focus = (g_form.focus + delta + F_COUNT) % F_COUNT;
+    /* Skip F_DELETE while the button is hidden (no host selected). */
+    bool can_del = (g_ssh_list_selected >= 0 && g_form.name[0]);
+    for (int i = 0; i < F_COUNT; i++) {
+        g_form.focus = (g_form.focus + delta + F_COUNT) % F_COUNT;
+        if (g_form.focus == F_DELETE && !can_del) continue;
+        break;
+    }
     g_form.sel_all = false;
 }
 
-/* Append the form's current values as a `Host` stanza to ~/.ssh/config.
-   Refuses to overwrite an existing alias. The alias we save under is the
-   Host field — convenient because after saving, clicking the new entry
-   in the sidebar re-populates identical values. */
+/* Write every directive the form owns (HostName / User / Port /
+   IdentityFile + # rbterm-* comments) for the current g_form values.
+   Shared by the append-new path and the rewrite-existing path. Lines
+   are emitted with four-space indent so they read consistently with
+   whatever the user or openssh wrote. */
+static void emit_form_managed_lines(FILE *fp) {
+    fprintf(fp, "    HostName %s\n", g_form.host);
+    if (g_form.user[0])
+        fprintf(fp, "    User %s\n", g_form.user);
+    int port = atoi(g_form.port);
+    if (port > 0 && port != 22)
+        fprintf(fp, "    Port %d\n", port);
+    if (g_form.key[0])
+        fprintf(fp, "    IdentityFile %s\n", g_form.key);
+    if (g_form.theme[0])
+        fprintf(fp, "    # rbterm-theme: %s\n", g_form.theme);
+    if (g_form.cursor_style != CURSOR_STYLE_DEFAULT) {
+        const char *css = NULL;
+        switch (g_form.cursor_style) {
+        case CURSOR_STYLE_BLOCK:       css = "block"; break;
+        case CURSOR_STYLE_UNDERLINE:   css = "underline"; break;
+        case CURSOR_STYLE_BAR:         css = "bar"; break;
+        case CURSOR_STYLE_BLOCK_BLINK: css = "blink"; break;
+        default: break;
+        }
+        if (css) fprintf(fp, "    # rbterm-cursor: %s\n", css);
+    }
+    if (g_form.font[0])
+        fprintf(fp, "    # rbterm-font: %s\n", g_form.font);
+    if (g_form.font_size > 0)
+        fprintf(fp, "    # rbterm-font-size: %d\n", g_form.font_size);
+    if (g_form.log_dir[0])
+        fprintf(fp, "    # rbterm-log-dir: %s\n", g_form.log_dir);
+    if (g_form.log_mode == 1)
+        fprintf(fp, "    # rbterm-log: on\n");
+    else if (g_form.log_mode == 2)
+        fprintf(fp, "    # rbterm-log: off\n");
+}
+
+/* Returns true if `line` (leading whitespace already skipped) is a
+   directive we manage. Comparison is case-insensitive for directive
+   keywords (per ssh_config(5)); our `# rbterm-*` comments are
+   exact-match since we emit them ourselves. */
+static bool line_is_managed_directive(const char *p) {
+    if (ci_prefix(p, "hostname"))     return true;
+    if (ci_prefix(p, "user"))         return true;
+    if (ci_prefix(p, "port"))         return true;
+    if (ci_prefix(p, "identityfile")) return true;
+    if (*p == '#') {
+        const char *q = p + 1;
+        while (*q == ' ' || *q == '\t') q++;
+        if (strncmp(q, "rbterm-",        7) == 0) return true;
+    }
+    return false;
+}
+
+/* Rewrite ~/.ssh/config so the `Host <name>` stanza reflects the
+   form's current values. Unmanaged directives (anything outside our
+   known set) are preserved verbatim in their original order. */
+static bool ssh_form_update_in_config(const char *name) {
+    char path[PATH_MAX];
+    expand_home_path("~/.ssh/config", path, sizeof(path));
+    FILE *in = fopen(path, "r");
+    if (!in) {
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "Can't open %s: %s", path, strerror(errno));
+        return false;
+    }
+    char tmp_path[PATH_MAX];
+    int np = snprintf(tmp_path, sizeof(tmp_path), "%s.rbterm.tmp", path);
+    if (np <= 0 || np >= (int)sizeof(tmp_path)) {
+        fclose(in);
+        strncpy(g_form.error, "path too long", sizeof(g_form.error) - 1);
+        return false;
+    }
+    FILE *out = fopen(tmp_path, "w");
+    if (!out) {
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "Can't open %s: %s", tmp_path, strerror(errno));
+        fclose(in);
+        return false;
+    }
+
+    bool in_target = false;
+    bool emitted = false;
+    bool found = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), in)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        int k = ci_prefix(p, "host");
+        if (k) {
+            /* Entering a new stanza. If we were mid-target, flush our
+               managed lines now so they come before the next Host
+               directive. */
+            if (in_target && !emitted) {
+                emit_form_managed_lines(out);
+                emitted = true;
+            }
+            const char *rest = p + k;
+            while (*rest == ' ' || *rest == '\t' || *rest == '=') rest++;
+            char alias[128]; size_t ni = 0;
+            while (*rest && *rest != ' ' && *rest != '\t' &&
+                   *rest != '\r' && *rest != '\n' && ni + 1 < sizeof(alias))
+                alias[ni++] = *rest++;
+            alias[ni] = 0;
+            in_target = (strcmp(alias, name) == 0);
+            if (in_target) { found = true; emitted = false; }
+            fputs(line, out);
+            continue;
+        }
+        if (!in_target) { fputs(line, out); continue; }
+        /* Inside the target stanza: drop our managed lines, keep all
+           others verbatim so custom directives the user hand-rolled
+           survive. */
+        if (line_is_managed_directive(p)) continue;
+        fputs(line, out);
+    }
+    if (in_target && !emitted) emit_form_managed_lines(out);
+    fclose(in);
+    fclose(out);
+
+    if (!found) {
+        remove(tmp_path);
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "No stanza named '%s' in %s", name, path);
+        return false;
+    }
+    if (rename(tmp_path, path) != 0) {
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "Can't replace %s: %s", path, strerror(errno));
+        remove(tmp_path);
+        return false;
+    }
+#ifndef _WIN32
+    chmod(path, 0600);
+#endif
+    snprintf(g_form_status, sizeof(g_form_status),
+             "Updated '%s' in %s", name, path);
+    g_form.error[0] = 0;
+    ssh_profiles_load();
+    return true;
+}
+
+/* Append the form's current values as a new `Host` stanza, or, if the
+   alias already exists, delegate to ssh_form_update_in_config which
+   rewrites that stanza in place. */
 static bool ssh_form_save_to_config(void) {
+    if (!g_form.name[0]) {
+        strncpy(g_form.error, "Name is required before saving",
+                sizeof(g_form.error) - 1);
+        g_form.focus = F_NAME;
+        return false;
+    }
     if (!g_form.host[0]) {
         strncpy(g_form.error, "Host is required before saving",
                 sizeof(g_form.error) - 1);
@@ -1329,13 +1822,14 @@ static bool ssh_form_save_to_config(void) {
     chmod(ssh_dir, 0700);
 #endif
 
-    /* Refuse to clobber an existing stanza with the same alias. */
+    /* If the alias already exists, rewrite that stanza in place:
+       preserve unmanaged lines verbatim, replace only the fields we
+       own (HostName / User / Port / IdentityFile + our # rbterm-*
+       comments). Blank form values cause the matching line to
+       disappear, so the user can clear a field and re-save. */
     for (int i = 0; i < g_ssh_profile_count; i++) {
-        if (strcmp(g_ssh_profiles[i].name, g_form.host) == 0) {
-            snprintf(g_form.error, sizeof(g_form.error),
-                     "Host '%s' already exists in ~/.ssh/config — edit manually to overwrite",
-                     g_form.host);
-            return false;
+        if (strcmp(g_ssh_profiles[i].name, g_form.name) == 0) {
+            return ssh_form_update_in_config(g_form.name);
         }
     }
 
@@ -1347,38 +1841,122 @@ static bool ssh_form_save_to_config(void) {
     }
     /* Leading blank line in case the previous content doesn't end with one. */
     fputc('\n', fp);
-    fprintf(fp, "Host %s\n", g_form.host);
-    fprintf(fp, "    HostName %s\n", g_form.host);
-    if (g_form.user[0])
-        fprintf(fp, "    User %s\n", g_form.user);
-    int port = atoi(g_form.port);
-    if (port > 0 && port != 22)
-        fprintf(fp, "    Port %d\n", port);
-    if (g_form.key[0])
-        fprintf(fp, "    IdentityFile %s\n", g_form.key);
+    fprintf(fp, "Host %s\n", g_form.name);
+    emit_form_managed_lines(fp);
     fclose(fp);
 #ifndef _WIN32
     chmod(path, 0600);
 #endif
 
     snprintf(g_form_status, sizeof(g_form_status),
-             "Saved '%s' to %s", g_form.host, path);
+             "Saved '%s' to %s", g_form.name, path);
     g_form.error[0] = 0;
     /* Refresh the sidebar so the new entry shows immediately. */
     ssh_profiles_load();
     return true;
 }
 
-static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
-    /* Wheel-scroll the hosts list whenever the pointer is over it. */
-    if (L.list.w > 0) {
-        Vector2 mp = GetMousePosition();
-        if (rect_hit(L.list, (int)mp.x, (int)mp.y)) {
-            float wheel = GetMouseWheelMove();
-            if (wheel != 0.0f) {
-                g_ssh_list_scroll -= (int)(wheel * 3.0f);
-                if (g_ssh_list_scroll < 0) g_ssh_list_scroll = 0;
+/* Remove a Host stanza from ~/.ssh/config. Rewrites the file atomically
+   via a temp sibling + rename so a crash mid-write can't corrupt the
+   original. The block to drop runs from `Host <alias>` up to (but not
+   including) the next top-level `Host` line, or EOF. Other stanzas +
+   comments + global directives are preserved verbatim. */
+static bool ssh_form_delete_from_config(const char *name) {
+    if (!name || !*name) return false;
+    char path[PATH_MAX];
+    expand_home_path("~/.ssh/config", path, sizeof(path));
+    FILE *in = fopen(path, "r");
+    if (!in) {
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "Can't open %s: %s", path, strerror(errno));
+        return false;
+    }
+    char tmp_path[PATH_MAX];
+    int np = snprintf(tmp_path, sizeof(tmp_path), "%s.rbterm.tmp", path);
+    if (np <= 0 || np >= (int)sizeof(tmp_path)) {
+        fclose(in);
+        strncpy(g_form.error, "path too long", sizeof(g_form.error) - 1);
+        return false;
+    }
+    FILE *out = fopen(tmp_path, "w");
+    if (!out) {
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "Can't open %s: %s", tmp_path, strerror(errno));
+        fclose(in);
+        return false;
+    }
+    char line[1024];
+    bool skipping = false;
+    bool found = false;
+    while (fgets(line, sizeof(line), in)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        int k = ci_prefix(p, "host");
+        if (k) {
+            /* First token after Host is the alias. */
+            const char *rest = skip_ws(p + k);
+            char alias[128]; size_t ni = 0;
+            while (*rest && *rest != ' ' && *rest != '\t' &&
+                   *rest != '\r' && *rest != '\n' && ni + 1 < sizeof(alias))
+                alias[ni++] = *rest++;
+            alias[ni] = 0;
+            if (strcmp(alias, name) == 0) {
+                skipping = true;
+                found = true;
+                continue;
             }
+            skipping = false;
+        }
+        if (!skipping) fputs(line, out);
+    }
+    fclose(in);
+    fclose(out);
+    if (!found) {
+        remove(tmp_path);
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "No stanza named '%s' in %s", name, path);
+        return false;
+    }
+    if (rename(tmp_path, path) != 0) {
+        snprintf(g_form.error, sizeof(g_form.error),
+                 "Can't replace %s: %s", path, strerror(errno));
+        remove(tmp_path);
+        return false;
+    }
+#ifndef _WIN32
+    chmod(path, 0600);
+#endif
+    snprintf(g_form_status, sizeof(g_form_status),
+             "Deleted '%s' from %s", name, path);
+    g_form.error[0] = 0;
+    ssh_profiles_load();
+    ssh_form_clear();
+    return true;
+}
+
+static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
+    /* Wheel-scroll whichever list the pointer is over. */
+    Vector2 mph = GetMousePosition();
+    int mhx = (int)mph.x, mhy = (int)mph.y;
+    if (L.list.w > 0 && rect_hit(L.list, mhx, mhy)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_ssh_list_scroll -= (int)(wheel * 3.0f);
+            if (g_ssh_list_scroll < 0) g_ssh_list_scroll = 0;
+        }
+    }
+    if (rect_hit(L.theme_list, mhx, mhy)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_form_theme_scroll -= (int)(wheel * 3.0f);
+            if (g_form_theme_scroll < 0) g_form_theme_scroll = 0;
+        }
+    }
+    if (rect_hit(L.font_list, mhx, mhy)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_form_font_scroll -= (int)(wheel * 3.0f);
+            if (g_form_font_scroll < 0) g_form_font_scroll = 0;
         }
     }
 
@@ -1414,9 +1992,79 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     for (int i = 0; i < F_TEXT_FIELDS; i++) {
         if (rect_hit(L.field[i], mx, my)) { g_form.focus = i; g_form.sel_all = false; return; }
     }
+    /* Cursor-style buttons act as radio: clicking one sets the form's
+       cursor_style. The choice takes effect on Connect (or Save). */
+    if (rect_hit(L.cur_block, mx, my)) { g_form.cursor_style = CURSOR_STYLE_BLOCK;       return; }
+    if (rect_hit(L.cur_under, mx, my)) { g_form.cursor_style = CURSOR_STYLE_UNDERLINE;   return; }
+    if (rect_hit(L.cur_bar,   mx, my)) { g_form.cursor_style = CURSOR_STYLE_BAR;         return; }
+    if (rect_hit(L.cur_blink, mx, my)) { g_form.cursor_style = CURSOR_STYLE_BLOCK_BLINK; return; }
+
+    /* Per-host logging: tri-state (0 = inherit app default, 1 = force
+       on, 2 = force off) and a directory text field. */
+    if (rect_hit(L.log_inherit, mx, my)) { g_form.log_mode = 0; return; }
+    if (rect_hit(L.log_on,      mx, my)) { g_form.log_mode = 1; return; }
+    if (rect_hit(L.log_off,     mx, my)) { g_form.log_mode = 2; return; }
+    if (rect_hit(L.log_dir,     mx, my)) {
+        g_form_logdir_focus = true;
+        return;
+    }
+    if (g_form_logdir_focus) g_form_logdir_focus = false;
+
+    /* Per-host theme/font pickers. Empty-top-row blanks the selection. */
+    if (rect_hit(L.theme_list, mx, my)) {
+        int row_h = 22;
+        int idx = (my - L.theme_list.y) / row_h + g_form_theme_scroll;
+        /* idx 0 is the synthetic "(none)" row; real themes start at idx 1. */
+        if (idx == 0) {
+            g_form.theme[0] = 0;
+        } else if (idx > 0 && idx - 1 < themes_count()) {
+            const Theme *th = &themes_all()[idx - 1];
+            strncpy(g_form.theme, th->name, sizeof(g_form.theme) - 1);
+            g_form.theme[sizeof(g_form.theme) - 1] = 0;
+        }
+        return;
+    }
+    if (rect_hit(L.font_list, mx, my)) {
+        int row_h = 22;
+        int idx = (my - L.font_list.y) / row_h + g_form_font_scroll;
+        if (idx == 0) {
+            g_form.font[0] = 0;
+        } else if (idx > 0 && idx - 1 < g_font_count) {
+            strncpy(g_form.font, g_fonts[idx - 1].path, sizeof(g_form.font) - 1);
+            g_form.font[sizeof(g_form.font) - 1] = 0;
+        }
+        return;
+    }
+    if (rect_hit(L.fs_dec, mx, my)) {
+        if (g_form.font_size == 0) g_form.font_size = 20; /* start from a sane default */
+        g_form.font_size -= 1;
+        if (g_form.font_size < 6) g_form.font_size = 6;
+        return;
+    }
+    if (rect_hit(L.fs_inc, mx, my)) {
+        if (g_form.font_size == 0) g_form.font_size = 20;
+        g_form.font_size += 1;
+        if (g_form.font_size > 96) g_form.font_size = 96;
+        return;
+    }
+    if (rect_hit(L.fs_val, mx, my)) {
+        /* Click on the number zeros it back to "inherit". */
+        g_form.font_size = 0;
+        return;
+    }
+    if (rect_hit(L.newbtn, mx, my)) {
+        g_form.focus = F_NEW;
+        ssh_form_clear();
+        return;
+    }
     if (rect_hit(L.connect, mx, my)) {
         g_form.focus = F_CONNECT;
         ssh_form_submit(cols, rows);
+        return;
+    }
+    if (L.delbtn.w > 0 && rect_hit(L.delbtn, mx, my)) {
+        g_form.focus = F_DELETE;
+        ssh_form_delete_from_config(g_form.name);
         return;
     }
     if (rect_hit(L.save, mx, my)) {
@@ -1439,9 +2087,32 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     bool cmd   = false;
 #endif
     bool mod   = ctrl || cmd;
-    bool is_text_field = (g_form.focus >= F_HOST && g_form.focus <= F_KEY);
+    bool is_text_field = (g_form.focus >= F_NAME && g_form.focus <= F_KEY);
 
     if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
+
+    /* Per-host log-dir text input. Click-focused via the form's mouse
+       handler; we own the keyboard while it has focus. */
+    if (g_form_logdir_focus) {
+        size_t len = strlen(g_form.log_dir);
+        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+            if (len > 0) g_form.log_dir[len - 1] = 0;
+        }
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) ||
+            IsKeyPressed(KEY_TAB)) {
+            g_form_logdir_focus = false;
+            return;
+        }
+        int cp;
+        while ((cp = GetCharPressed()) != 0) {
+            if (mod) continue;
+            if (cp < 32 || cp >= 127) continue;
+            if (len + 1 >= sizeof(g_form.log_dir)) continue;
+            g_form.log_dir[len++] = (char)cp;
+            g_form.log_dir[len] = 0;
+        }
+        return;
+    }
 
     /* Select-all (Ctrl+A / Cmd+A). */
     if (mod && IsKeyPressed(KEY_A)) {
@@ -1456,6 +2127,8 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
         if (g_form.focus == F_CANCEL) { g_ui_mode = UI_NORMAL; return; }
+        if (g_form.focus == F_NEW)    { ssh_form_clear(); return; }
+        if (g_form.focus == F_DELETE) { ssh_form_delete_from_config(g_form.name); return; }
         if (g_form.focus == F_SAVE) {
             ssh_form_save_to_config();
             return;
@@ -1473,9 +2146,15 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
         g_form.sel_all = false;
     }
 
-    /* Space on Connect / Cancel acts as a click. */
+    /* Space on a button behaves as a click. */
+    if (g_form.focus == F_NEW && IsKeyPressed(KEY_SPACE)) {
+        ssh_form_clear(); return;
+    }
     if (g_form.focus == F_CONNECT && IsKeyPressed(KEY_SPACE)) {
         ssh_form_submit(cols, rows); return;
+    }
+    if (g_form.focus == F_DELETE && IsKeyPressed(KEY_SPACE)) {
+        ssh_form_delete_from_config(g_form.name); return;
     }
     if (g_form.focus == F_SAVE && IsKeyPressed(KEY_SPACE)) {
         ssh_form_save_to_config(); return;
@@ -1537,15 +2216,15 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
 
     /* Fields. */
     const char *labels[F_TEXT_FIELDS] = {
-        "Host", "Port", "Username", "Password", "Key file"
+        "Name", "Host", "Port", "Username", "Password", "Key file"
     };
     const char *hints[F_TEXT_FIELDS]  = {
-        "example.com", "22", getenv("USER"),
+        "(ssh_config alias, e.g. mia)", "example.com", "22", getenv("USER"),
         "(leave blank to use key)",
         "(default: ssh-agent + ~/.ssh/id_*)"
     };
     const char *values[F_TEXT_FIELDS] = {
-        g_form.host, g_form.port, g_form.user, g_form.pass, g_form.key
+        g_form.name, g_form.host, g_form.port, g_form.user, g_form.pass, g_form.key
     };
 
     /* Saved-hosts sidebar. */
@@ -1652,7 +2331,279 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
         EndScissorMode();
     }
 
+    /* Theme picker. First row is a synthetic "(none)" to clear the
+       override; real entries follow, each with an 8-colour swatch. */
+    DrawTextEx(*f, "Theme",
+               (Vector2){L.theme_list.x - 104, L.theme_list.y + 6},
+               13, 0, (Color){180, 185, 200, 255});
+    DrawRectangle(L.theme_list.x, L.theme_list.y, L.theme_list.w, L.theme_list.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.theme_list.x, L.theme_list.y, L.theme_list.w, L.theme_list.h,
+                       (Color){70, 74, 90, 255});
+    {
+        int row_h = 22;
+        int total = 1 + themes_count();   /* +1 for "(none)" */
+        int visible = L.theme_list.h / row_h;
+        int max_scroll = total - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (g_form_theme_scroll > max_scroll) g_form_theme_scroll = max_scroll;
+        if (g_form_theme_scroll < 0) g_form_theme_scroll = 0;
+        BeginScissorMode(L.theme_list.x + 2, L.theme_list.y + 2,
+                         L.theme_list.w - 4, L.theme_list.h - 4);
+        const Theme *ts = themes_all();
+        for (int i = 0; i < total; i++) {
+            int ry = L.theme_list.y + (i - g_form_theme_scroll) * row_h;
+            if (ry + row_h < L.theme_list.y ||
+                ry > L.theme_list.y + L.theme_list.h) continue;
+            bool sel = (i == 0 && !g_form.theme[0]) ||
+                       (i > 0 && strcmp(ts[i-1].name, g_form.theme) == 0);
+            if (sel) {
+                DrawRectangle(L.theme_list.x + 2, ry,
+                              L.theme_list.w - 4, row_h,
+                              (Color){46, 62, 90, 220});
+            }
+            if (i == 0) {
+                DrawTextEx(*f, "(inherit default)",
+                           (Vector2){L.theme_list.x + 10, ry + 4},
+                           13, 0, (Color){150, 155, 170, 255});
+            } else {
+                int swatch_w = 8, swatch_h = 11, swatch_gap = 1;
+                int swatches_w = 8 * (swatch_w + swatch_gap);
+                int sx = L.theme_list.x + L.theme_list.w - 6 - swatches_w;
+                int sy = ry + (row_h - swatch_h) / 2;
+                for (int k = 0; k < 8; k++) {
+                    uint32_t c = ts[i-1].palette[k];
+                    Color col = { (unsigned char)((c >> 16) & 0xff),
+                                  (unsigned char)((c >> 8)  & 0xff),
+                                  (unsigned char)( c        & 0xff), 255 };
+                    DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
+                                  swatch_w, swatch_h, col);
+                }
+                DrawTextEx(*f, ts[i-1].name,
+                           (Vector2){L.theme_list.x + 10, ry + 4},
+                           13, 0,
+                           sel ? (Color){230, 232, 240, 255}
+                               : (Color){200, 205, 220, 255});
+            }
+        }
+        EndScissorMode();
+        if (total > visible) {
+            int track_x = L.theme_list.x + L.theme_list.w - 5;
+            int bar_h = L.theme_list.h * visible / total;
+            if (bar_h < 24) bar_h = 24;
+            int bar_y = L.theme_list.y +
+                        (L.theme_list.h - bar_h) * g_form_theme_scroll /
+                        (max_scroll > 0 ? max_scroll : 1);
+            DrawRectangle(track_x, L.theme_list.y, 3, L.theme_list.h,
+                          (Color){40, 45, 58, 255});
+            DrawRectangle(track_x, bar_y, 3, bar_h,
+                          (Color){110, 130, 170, 255});
+        }
+    }
+
+    /* Font picker — same layout pattern as the theme list. */
+    DrawTextEx(*f, "Font",
+               (Vector2){L.font_list.x, L.font_list.y - 18},
+               11, 0, (Color){140, 145, 160, 255});
+    DrawRectangle(L.font_list.x, L.font_list.y, L.font_list.w, L.font_list.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.font_list.x, L.font_list.y, L.font_list.w, L.font_list.h,
+                       (Color){70, 74, 90, 255});
+    {
+        int row_h = 22;
+        int total = 1 + g_font_count;
+        int visible = L.font_list.h / row_h;
+        int max_scroll = total - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (g_form_font_scroll > max_scroll) g_form_font_scroll = max_scroll;
+        if (g_form_font_scroll < 0) g_form_font_scroll = 0;
+        BeginScissorMode(L.font_list.x + 2, L.font_list.y + 2,
+                         L.font_list.w - 4, L.font_list.h - 4);
+        for (int i = 0; i < total; i++) {
+            int ry = L.font_list.y + (i - g_form_font_scroll) * row_h;
+            if (ry + row_h < L.font_list.y ||
+                ry > L.font_list.y + L.font_list.h) continue;
+            bool sel = (i == 0 && !g_form.font[0]) ||
+                       (i > 0 && strcmp(g_fonts[i-1].path, g_form.font) == 0);
+            if (sel) {
+                DrawRectangle(L.font_list.x + 2, ry,
+                              L.font_list.w - 4, row_h,
+                              (Color){46, 62, 90, 220});
+            }
+            if (i == 0) {
+                DrawTextEx(*f, "(inherit default)",
+                           (Vector2){L.font_list.x + 10, ry + 4},
+                           13, 0, (Color){150, 155, 170, 255});
+            } else {
+                /* Lazy-load a small preview the first time the row
+                   scrolls into view so the name renders in its own
+                   typeface. Failures are sticky so we don't retry
+                   each frame. */
+                FontEntry *fe = &g_fonts[i - 1];
+                if (!fe->preview && !fe->load_failed) {
+                    Font fprev = font_preview_load(fe, 14);
+                    if (fprev.texture.id == 0) {
+                        fe->load_failed = true;
+                    } else {
+                        SetTextureFilter(fprev.texture, TEXTURE_FILTER_BILINEAR);
+                        fe->preview = malloc(sizeof(Font));
+                        *(Font *)fe->preview = fprev;
+                    }
+                }
+                Font *row_font = fe->preview ? (Font *)fe->preview : f;
+                DrawTextEx(*row_font, fe->name,
+                           (Vector2){L.font_list.x + 10, ry + 4},
+                           14, 0,
+                           sel ? (Color){230, 232, 240, 255}
+                               : (Color){200, 205, 220, 255});
+            }
+        }
+        EndScissorMode();
+        if (total > visible) {
+            int track_x = L.font_list.x + L.font_list.w - 5;
+            int bar_h = L.font_list.h * visible / total;
+            if (bar_h < 24) bar_h = 24;
+            int bar_y = L.font_list.y +
+                        (L.font_list.h - bar_h) * g_form_font_scroll /
+                        (max_scroll > 0 ? max_scroll : 1);
+            DrawRectangle(track_x, L.font_list.y, 3, L.font_list.h,
+                          (Color){40, 45, 58, 255});
+            DrawRectangle(track_x, bar_y, 3, bar_h,
+                          (Color){110, 130, 170, 255});
+        }
+    }
+
+    /* Font-size row. Zero means "inherit"; -/+ clamps to [6, 96]. */
+    DrawTextEx(*f, "Font size",
+               (Vector2){L.fs_val.x - 104, L.fs_val.y + 6},
+               13, 0, (Color){180, 185, 200, 255});
+    {
+        char fsb[16];
+        if (g_form.font_size > 0) snprintf(fsb, sizeof(fsb), "%d", g_form.font_size);
+        else                      snprintf(fsb, sizeof(fsb), "(—)");
+        DrawRectangle(L.fs_val.x, L.fs_val.y, L.fs_val.w, L.fs_val.h,
+                      (Color){22, 25, 34, 255});
+        DrawRectangleLines(L.fs_val.x, L.fs_val.y, L.fs_val.w, L.fs_val.h,
+                           (Color){70, 74, 90, 255});
+        Vector2 vsz2 = MeasureTextEx(*f, fsb, 14, 0);
+        DrawTextEx(*f, fsb,
+                   (Vector2){L.fs_val.x + (L.fs_val.w - vsz2.x) / 2,
+                             L.fs_val.y + (L.fs_val.h - vsz2.y) / 2},
+                   14, 0, (Color){230, 232, 240, 255});
+        DrawRectangle(L.fs_dec.x, L.fs_dec.y, L.fs_dec.w, L.fs_dec.h, (Color){46, 52, 70, 255});
+        DrawRectangleLines(L.fs_dec.x, L.fs_dec.y, L.fs_dec.w, L.fs_dec.h, (Color){125, 207, 255, 180});
+        Vector2 mss = MeasureTextEx(*f, "-", 18, 0);
+        DrawTextEx(*f, "-",
+                   (Vector2){L.fs_dec.x + (L.fs_dec.w - mss.x) / 2,
+                             L.fs_dec.y + (L.fs_dec.h - mss.y) / 2},
+                   18, 0, (Color){230, 232, 240, 255});
+        DrawRectangle(L.fs_inc.x, L.fs_inc.y, L.fs_inc.w, L.fs_inc.h, (Color){46, 52, 70, 255});
+        DrawRectangleLines(L.fs_inc.x, L.fs_inc.y, L.fs_inc.w, L.fs_inc.h, (Color){125, 207, 255, 180});
+        Vector2 pss = MeasureTextEx(*f, "+", 18, 0);
+        DrawTextEx(*f, "+",
+                   (Vector2){L.fs_inc.x + (L.fs_inc.w - pss.x) / 2,
+                             L.fs_inc.y + (L.fs_inc.h - pss.y) / 2},
+                   18, 0, (Color){230, 232, 240, 255});
+    }
+
+    /* Cursor-style picker row. Each of the four buttons is a tiny
+       button with a text label; the currently-selected one fills in
+       blue. */
+    {
+        struct { Rect r; const char *label; int style; } opts[] = {
+            { L.cur_block, "Block",     CURSOR_STYLE_BLOCK },
+            { L.cur_under, "Underline", CURSOR_STYLE_UNDERLINE },
+            { L.cur_bar,   "Vertical",  CURSOR_STYLE_BAR },
+            { L.cur_blink, "Blink",     CURSOR_STYLE_BLOCK_BLINK },
+        };
+        DrawTextEx(*f, "Cursor",
+                   (Vector2){L.cur_block.x - 104, L.cur_block.y + 7},
+                   13, 0, (Color){180, 185, 200, 255});
+        for (int i = 0; i < 4; i++) {
+            Rect rr = opts[i].r;
+            bool on = (g_form.cursor_style == opts[i].style);
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h,
+                          on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255});
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               (Color){125, 207, 255, on ? 255 : 150});
+            Vector2 tsz = MeasureTextEx(*f, opts[i].label, 13, 0);
+            DrawTextEx(*f, opts[i].label,
+                       (Vector2){rr.x + (rr.w - tsz.x) / 2,
+                                 rr.y + (rr.h - tsz.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+        }
+    }
+
+    /* Logging tri-state pill — Inherit (use Settings → Log session),
+       On (force on for this host), Off (force off). */
+    {
+        struct { Rect r; const char *label; int mode; } opts[] = {
+            { L.log_inherit, "Inherit", 0 },
+            { L.log_on,      "On",      1 },
+            { L.log_off,     "Off",     2 },
+        };
+        DrawTextEx(*f, "Logging",
+                   (Vector2){L.log_inherit.x - 104, L.log_inherit.y + 7},
+                   13, 0, (Color){180, 185, 200, 255});
+        for (int i = 0; i < 3; i++) {
+            Rect rr = opts[i].r;
+            bool on = (g_form.log_mode == opts[i].mode);
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h,
+                          on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255});
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               (Color){125, 207, 255, on ? 255 : 150});
+            Vector2 tsz = MeasureTextEx(*f, opts[i].label, 13, 0);
+            DrawTextEx(*f, opts[i].label,
+                       (Vector2){rr.x + (rr.w - tsz.x) / 2,
+                                 rr.y + (rr.h - tsz.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+        }
+    }
+
+    /* Per-host log-directory text input. Empty = use Settings'
+       global log_dir. Click to focus, type to edit. */
+    {
+        DrawTextEx(*f, "Log dir",
+                   (Vector2){L.log_dir.x - 104, L.log_dir.y + 7},
+                   13, 0, (Color){180, 185, 200, 255});
+        DrawRectangle(L.log_dir.x, L.log_dir.y, L.log_dir.w, L.log_dir.h,
+                      (Color){22, 25, 34, 255});
+        DrawRectangleLines(L.log_dir.x, L.log_dir.y, L.log_dir.w, L.log_dir.h,
+                           g_form_logdir_focus ? (Color){125, 207, 255, 255}
+                                               : (Color){70, 74, 90, 255});
+        const char *shown = g_form.log_dir[0]
+                            ? g_form.log_dir
+                            : "(blank = use Settings → Log session dir)";
+        Color tc = g_form.log_dir[0]
+                   ? (Color){230, 232, 240, 255}
+                   : (Color){110, 115, 130, 255};
+        BeginScissorMode(L.log_dir.x + 6, L.log_dir.y,
+                         L.log_dir.w - 12, L.log_dir.h);
+        DrawTextEx(*f, shown,
+                   (Vector2){L.log_dir.x + 8, L.log_dir.y + 7},
+                   14, 0, tc);
+        if (g_form_logdir_focus && g_form.log_dir[0] &&
+            ((long long)(GetTime() * 2.0) & 1) == 0) {
+            Vector2 vsz = MeasureTextEx(*f, g_form.log_dir, 14, 0);
+            DrawRectangle(L.log_dir.x + 8 + (int)vsz.x + 1,
+                          L.log_dir.y + 6, 8, 16,
+                          (Color){125, 207, 255, 255});
+        }
+        EndScissorMode();
+    }
+
     /* Buttons. */
+    bool nf = g_form.focus == F_NEW;
+    DrawRectangle(L.newbtn.x, L.newbtn.y, L.newbtn.w, L.newbtn.h,
+                  nf ? (Color){72, 76, 96, 255} : (Color){48, 52, 66, 255});
+    DrawRectangleLines(L.newbtn.x, L.newbtn.y, L.newbtn.w, L.newbtn.h,
+                       (Color){150, 155, 170, nf ? 255 : 150});
+    Vector2 nsz = MeasureTextEx(*f, "New", 14, 0);
+    DrawTextEx(*f, "New",
+               (Vector2){L.newbtn.x + (L.newbtn.w - nsz.x) / 2,
+                         L.newbtn.y + (L.newbtn.h - nsz.y) / 2},
+               14, 0, (Color){210, 215, 230, 255});
+
     bool cf = g_form.focus == F_CONNECT;
     DrawRectangle(L.connect.x, L.connect.y, L.connect.w, L.connect.h,
                   cf ? (Color){64, 132, 210, 255} : (Color){46, 92, 150, 255});
@@ -1663,6 +2614,19 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                (Vector2){L.connect.x + (L.connect.w - csz.x) / 2,
                          L.connect.y + (L.connect.h - csz.y) / 2},
                14, 0, (Color){240, 245, 255, 255});
+
+    if (L.delbtn.w > 0) {
+        bool df = g_form.focus == F_DELETE;
+        DrawRectangle(L.delbtn.x, L.delbtn.y, L.delbtn.w, L.delbtn.h,
+                      df ? (Color){170, 60, 60, 255} : (Color){110, 40, 40, 255});
+        DrawRectangleLines(L.delbtn.x, L.delbtn.y, L.delbtn.w, L.delbtn.h,
+                           (Color){240, 140, 140, df ? 255 : 180});
+        Vector2 dsz = MeasureTextEx(*f, "Delete", 14, 0);
+        DrawTextEx(*f, "Delete",
+                   (Vector2){L.delbtn.x + (L.delbtn.w - dsz.x) / 2,
+                             L.delbtn.y + (L.delbtn.h - dsz.y) / 2},
+                   14, 0, (Color){250, 225, 225, 255});
+    }
 
     bool sf = g_form.focus == F_SAVE;
     DrawRectangle(L.save.x, L.save.y, L.save.w, L.save.h,
@@ -1727,6 +2691,11 @@ typedef struct {
     Rect font_val;   /* current font size display */
     Rect dec, inc;   /* font -/+ buttons */
     Rect font_list;  /* scrollable list of monospace fonts */
+    Rect theme_list; /* scrollable list of palette themes */
+    Rect cur_block;  /* cursor-style picker: block / underline / bar / blink */
+    Rect cur_under;
+    Rect cur_bar;
+    Rect cur_blink;
     Rect pad_val;
     Rect pad_dec, pad_inc;
     Rect spc_val;
@@ -1737,23 +2706,16 @@ typedef struct {
     Rect close;
 } SettingsLayout;
 
+/* Theme picker state — modal-local since the picker is transient UI. */
+static int g_theme_list_scroll = 0;
+static int g_theme_list_selected = -1;
+
 /* Available-fonts enumeration for the settings modal. Scans system + user
    font directories for monospace .ttf / .otf / .ttc files; only those whose
    filename hints at a monospace face (contains "Mono", "Code", "Fira", etc.)
-   are included — scrolling through every font on disk would be noisy. */
-typedef struct {
-    char name[128];
-    char path[512];
-    void *preview;       /* Font *, loaded lazily the first time the row
-                            is visible in the settings font list. */
-    bool  load_failed;   /* Set once LoadFontEx fails so we don't retry. */
-} FontEntry;
-
-#define MAX_FONTS 256
-static FontEntry g_fonts[MAX_FONTS];
-static int       g_font_count = 0;
-static int       g_font_list_scroll = 0;
-static int       g_font_list_selected = -1;
+   are included — scrolling through every font on disk would be noisy.
+   FontEntry + g_fonts + scroll state are declared near the top of the
+   file so the SSH form can read the same list for its per-host picker. */
 
 static bool looks_monospace(const char *name) {
     /* Anything whose filename contains one of these fragments is shown
@@ -1799,15 +2761,30 @@ static void scan_font_dir(const char *dir) {
         if (!(ends_with_ci(name, ".ttf") || ends_with_ci(name, ".otf") ||
               ends_with_ci(name, ".ttc"))) continue;
         if (!looks_monospace(name)) continue;
+        /* Skip duplicates by display name — the same font often shows
+           up in both ~/Library/Fonts and the bundled assets/fonts. */
+        char trimmed_w[256];
+        strncpy(trimmed_w, name, sizeof(trimmed_w) - 1);
+        trimmed_w[sizeof(trimmed_w) - 1] = 0;
+        int tlw = (int)strlen(trimmed_w);
+        if (tlw > 4 && (ends_with_ci(trimmed_w, ".ttf") ||
+                        ends_with_ci(trimmed_w, ".otf") ||
+                        ends_with_ci(trimmed_w, ".ttc"))) {
+            trimmed_w[tlw - 4] = 0;
+            tlw -= 4;
+        }
+        /* Strip the -Regular suffix so disk + embedded entries dedup
+           on the same display name. */
+        if (tlw > 8 && strcmp(trimmed_w + tlw - 8, "-Regular") == 0)
+            trimmed_w[tlw - 8] = 0;
+        bool dup_w = false;
+        for (int j = 0; j < g_font_count; j++)
+            if (strcmp(g_fonts[j].name, trimmed_w) == 0) { dup_w = true; break; }
+        if (dup_w) continue;
         FontEntry *f = &g_fonts[g_font_count++];
         snprintf(f->path, sizeof(f->path), "%s/%s", dir, name);
-        strncpy(f->name, name, sizeof(f->name) - 1);
+        strncpy(f->name, trimmed_w, sizeof(f->name) - 1);
         f->name[sizeof(f->name) - 1] = 0;
-        int nl = (int)strlen(f->name);
-        if (nl > 4 && (ends_with_ci(f->name, ".ttf") ||
-                       ends_with_ci(f->name, ".otf") ||
-                       ends_with_ci(f->name, ".ttc")))
-            f->name[nl - 4] = 0;
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
@@ -1819,15 +2796,40 @@ static void scan_font_dir(const char *dir) {
         if (!(ends_with_ci(name, ".ttf") || ends_with_ci(name, ".otf") ||
               ends_with_ci(name, ".ttc"))) continue;
         if (!looks_monospace(name)) continue;
+        /* Skip duplicates by display name. */
+        char trimmed[256];
+        strncpy(trimmed, name, sizeof(trimmed) - 1);
+        trimmed[sizeof(trimmed) - 1] = 0;
+        int tl = (int)strlen(trimmed);
+        if (tl > 4) { trimmed[tl - 4] = 0; tl -= 4; }
+        if (tl > 8 && strcmp(trimmed + tl - 8, "-Regular") == 0)
+            trimmed[tl - 8] = 0;
+        bool dup = false;
+        for (int j = 0; j < g_font_count; j++)
+            if (strcmp(g_fonts[j].name, trimmed) == 0) { dup = true; break; }
+        if (dup) continue;
         FontEntry *f = &g_fonts[g_font_count++];
         snprintf(f->path, sizeof(f->path), "%s/%s", dir, name);
-        strncpy(f->name, name, sizeof(f->name) - 1);
+        strncpy(f->name, trimmed, sizeof(f->name) - 1);
         f->name[sizeof(f->name) - 1] = 0;
-        int nl = (int)strlen(f->name);
-        if (nl > 4) f->name[nl - 4] = 0;
     }
     closedir(dp);
 #endif
+}
+
+/* Load a small preview Font for one entry — embedded blob if present,
+   otherwise the disk path. Caller stores the returned Font in
+   fe->preview (heap-allocated copy). Returns 0-textured Font on
+   failure. */
+static Font font_preview_load(const FontEntry *fe, int size) {
+    if (fe->data && fe->data_size > 0) {
+        char ft[8] = ".";
+        const char *ext = (fe->ext[0]) ? fe->ext : "ttf";
+        strncat(ft, ext, sizeof(ft) - 2);
+        return LoadFontFromMemory(ft, fe->data, (int)fe->data_size,
+                                  size, NULL, 0);
+    }
+    return LoadFontEx(fe->path, size, NULL, 0);
 }
 
 /* Release every loaded preview-font texture. Called whenever we re-scan
@@ -1841,6 +2843,38 @@ static void fonts_free_previews(void) {
         }
         g_fonts[i].load_failed = false;
     }
+}
+
+/* Append every font baked into the binary by gen_fonts.sh as a
+   FontEntry. These take precedence over identically-named system
+   fonts (because they get added first and the disk scan dedupes by
+   display name). path is set to "embedded:<NAME>" so save/load
+   roundtrip cleanly. */
+static void scan_embedded_fonts(void) {
+    for (int i = 0; i < k_embedded_font_count && g_font_count < MAX_FONTS; i++) {
+        FontEntry *f = &g_fonts[g_font_count++];
+        memset(f, 0, sizeof(*f));
+        strncpy(f->name, k_embedded_fonts[i].name, sizeof(f->name) - 1);
+        f->name[sizeof(f->name) - 1] = 0;
+        snprintf(f->path, sizeof(f->path), "embedded:%s", f->name);
+        f->data      = k_embedded_fonts[i].data;
+        f->data_size = k_embedded_fonts[i].data_size;
+        strncpy(f->ext, k_embedded_fonts[i].ext, sizeof(f->ext) - 1);
+        f->ext[sizeof(f->ext) - 1] = 0;
+    }
+}
+
+/* Find an embedded font by either its name or its `embedded:NAME`
+   path. Returns NULL if not found. */
+static const EmbeddedFont *embedded_font_lookup(const char *path_or_name) {
+    if (!path_or_name || !*path_or_name) return NULL;
+    const char *name = path_or_name;
+    if (strncmp(name, "embedded:", 9) == 0) name += 9;
+    for (int i = 0; i < k_embedded_font_count; i++) {
+        if (strcmp(k_embedded_fonts[i].name, name) == 0)
+            return &k_embedded_fonts[i];
+    }
+    return NULL;
 }
 
 /* Scan rbterm's own bundled fonts directory in every plausible location
@@ -1874,6 +2908,10 @@ static void fonts_load(const char *current_path) {
     g_font_list_scroll = 0;
     g_font_list_selected = -1;
 
+    /* Embedded fonts first so the disk-scan dedupe makes them
+       authoritative — a system-installed Hack.ttf shouldn't shadow
+       the version baked into the binary. */
+    scan_embedded_fonts();
     scan_bundled_fonts();
 #ifdef _WIN32
     scan_font_dir("C:/Windows/Fonts");
@@ -1916,7 +2954,14 @@ static void fonts_load(const char *current_path) {
 
 static void settings_apply_font(Renderer *r, const FontEntry *fe) {
     if (!fe) return;
-    if (!renderer_set_font_path(r, fe->path)) return;
+    bool ok;
+    if (fe->data && fe->data_size > 0) {
+        ok = renderer_set_font_data(r, fe->data, (int)fe->data_size,
+                                    fe->ext, fe->path);
+    } else {
+        ok = renderer_set_font_path(r, fe->path);
+    }
+    if (!ok) return;
     tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
     SetWindowMinSize(r->cell_w * 20 + 2 * r->pad_x,
                      r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
@@ -1944,7 +2989,7 @@ static bool g_settings_dir_sel_all = false;
 
 static SettingsLayout settings_layout(int win_w, int win_h) {
     SettingsLayout L = {0};
-    int w = 600, h = 580;
+    int w = 600, h = 790;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -1961,7 +3006,24 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     int font_list_y = font_row_y + btn + 16;
     L.font_list = (Rect){ L.modal.x + 140, font_list_y, w - 140 - 22, 140 };
 
-    int pad_row_y = font_list_y + L.font_list.h + 16;
+    int theme_list_y = font_list_y + L.font_list.h + 16;
+    L.theme_list = (Rect){ L.modal.x + 140, theme_list_y, w - 140 - 22, 140 };
+
+    /* Cursor-style row. Four equal buttons aligned with the list width. */
+    int cur_row_y = theme_list_y + L.theme_list.h + 12;
+    {
+        int bwidth = L.theme_list.w;
+        int gap_sty = 6;
+        int bw = (bwidth - 3 * gap_sty) / 4;
+        int bx = L.modal.x + 140;
+        int bh = 30;
+        L.cur_block = (Rect){ bx,                           cur_row_y, bw, bh };
+        L.cur_under = (Rect){ bx + (bw + gap_sty),           cur_row_y, bw, bh };
+        L.cur_bar   = (Rect){ bx + 2 * (bw + gap_sty),       cur_row_y, bw, bh };
+        L.cur_blink = (Rect){ bx + 3 * (bw + gap_sty),       cur_row_y, bw, bh };
+    }
+
+    int pad_row_y = cur_row_y + 30 + 16;
     L.pad_val  = (Rect){ L.modal.x + w - 214, pad_row_y, 66, btn };
     L.pad_dec  = (Rect){ L.modal.x + w - 138, pad_row_y, btn, btn };
     L.pad_inc  = (Rect){ L.modal.x + w - 60,  pad_row_y, btn, btn };
@@ -1995,6 +3057,13 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             if (g_font_list_scroll < 0) g_font_list_scroll = 0;
         }
     }
+    if (rect_hit(L.theme_list, mx, my)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_theme_list_scroll -= (int)(wheel * 3.0f);
+            if (g_theme_list_scroll < 0) g_theme_list_scroll = 0;
+        }
+    }
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
     if (rect_hit(L.dec, mx, my))   { settings_apply_font_size(r, r->font_size - 1); return; }
     if (rect_hit(L.inc, mx, my))   { settings_apply_font_size(r, r->font_size + 1); return; }
@@ -2010,6 +3079,33 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             settings_apply_font(r, &g_fonts[idx]);
         }
         return;
+    }
+    if (rect_hit(L.theme_list, mx, my)) {
+        int row_h = 22;
+        int idx = (my - L.theme_list.y) / row_h + g_theme_list_scroll;
+        if (idx >= 0 && idx < themes_count()) {
+            g_theme_list_selected = idx;
+            /* Apply the clicked theme to the active pane only. */
+            Tab *t = active_tab();
+            Pane *p = t ? active_pane_of(t) : NULL;
+            if (p && p->scr) screen_apply_theme(p->scr, &themes_all()[idx]);
+        }
+        return;
+    }
+    /* Cursor-style buttons: apply to the active pane. */
+    {
+        Tab *t = active_tab();
+        Pane *p = t ? active_pane_of(t) : NULL;
+        CursorStyle st = CURSOR_STYLE_DEFAULT;
+        bool hit = false;
+        if      (rect_hit(L.cur_block, mx, my)) { st = CURSOR_STYLE_BLOCK;       hit = true; }
+        else if (rect_hit(L.cur_under, mx, my)) { st = CURSOR_STYLE_UNDERLINE;   hit = true; }
+        else if (rect_hit(L.cur_bar,   mx, my)) { st = CURSOR_STYLE_BAR;         hit = true; }
+        else if (rect_hit(L.cur_blink, mx, my)) { st = CURSOR_STYLE_BLOCK_BLINK; hit = true; }
+        if (hit) {
+            if (p && p->scr) screen_set_cursor_style(p->scr, st);
+            return;
+        }
     }
     if (rect_hit(L.log_toggle, mx, my)) {
         g_app_settings.log_enabled = !g_app_settings.log_enabled;
@@ -2102,6 +3198,130 @@ static void settings_handle_keys(Renderer *r) {
     }
 }
 
+/* Help modal — a static cheatsheet of every chord wired up in main.c.
+   When you add or change a binding, update this list too: it's the
+   user-facing source of truth. */
+static void draw_help_modal(Renderer *r, int win_w, int win_h) {
+#if defined(__APPLE__)
+    const char *MOD = "Cmd";
+#else
+    const char *MOD = "Ctrl";
+#endif
+    /* Each row is { chord, description } — two entries per visible row,
+       so size to 2 × max-rows (with headroom for future bindings).
+       After building, every "Cmd" in a chord cell is rewritten to MOD
+       so Linux + Windows show "Ctrl+T" instead of "Cmd+T". */
+    char buf[128][128];
+    int n = 0;
+    #define ROW(C, D) do { \
+        snprintf(buf[n*2],     sizeof(buf[0]), "%s", C); \
+        snprintf(buf[n*2 + 1], sizeof(buf[0]), "%s", D); \
+        n++; \
+    } while (0)
+    #define ROW_END() do { \
+        if (strcmp(MOD, "Cmd") != 0) { \
+            for (int _i = 0; _i < n; _i++) { \
+                char *_p = buf[_i*2]; \
+                char *_m = strstr(_p, "Cmd"); \
+                if (_m) { \
+                    char _tmp[128]; \
+                    snprintf(_tmp, sizeof(_tmp), "%.*s%s%s", \
+                             (int)(_m - _p), _p, MOD, _m + 3); \
+                    snprintf(_p, sizeof(buf[0]), "%s", _tmp); \
+                } \
+            } \
+        } \
+    } while (0)
+    ROW("",                          "Tabs");
+    ROW("Cmd+T",                     "New tab (local shell)");
+    ROW("Cmd+Shift+T",               "New tab via SSH (open the connect form)");
+    ROW("Cmd+W",                     "Close active tab (or pane if split)");
+    ROW("Cmd+1..9",                  "Jump to tab N");
+    ROW("Cmd+Left / Cmd+Right",      "Cycle to previous / next tab");
+    ROW("Cmd+[ / Cmd+]",             "Cycle to previous / next tab (alt)");
+    ROW("Cmd+Shift+Left/Right",      "Move active tab left / right");
+    ROW("Cmd+N",                     "New rbterm window (separate process — Mission Control groups them)");
+    ROW("",                          "Splits");
+    ROW("Cmd+D",                     "Split active tab vertically (side-by-side)");
+    ROW("Cmd+Shift+D",               "Split horizontally (top / bottom)");
+    ROW("Cmd+Shift+W",               "Close active pane (collapses to single)");
+    ROW("Click a pane",              "Focus that pane");
+    ROW("Drag the splitter",         "Resize panes");
+    ROW("",                          "Selection + clipboard");
+    ROW("Cmd+A",                     "Select all visible text in active pane");
+    ROW("Cmd+C",                     "Copy selection");
+    ROW("Cmd+V",                     "Paste");
+    ROW("Click + drag",              "Select text");
+    ROW("Double-click / triple-click", "Select word / line");
+    ROW("",                          "Scroll + view");
+    ROW("Mouse wheel",               "Scroll into history (when not in app cursor mode)");
+    ROW("Ctrl+Shift+Up/Down",        "Scroll one row");
+    ROW("Shift+PageUp/PageDown",     "Scroll one screen");
+    ROW("Cmd+= / Cmd+-",             "Font size up / down");
+    ROW("Cmd+0",                     "Reset font size to 20pt");
+    ROW("",                          "Modals");
+    ROW("Cmd+,",                     "Settings");
+    ROW("Cmd+Shift+T",               "SSH connect form");
+    ROW("Esc / click outside",       "Dismiss the active modal");
+    ROW("",                          "");
+    ROW("Note",                      "Cmd shows on macOS; Ctrl is the modifier on Linux + Windows.");
+    ROW_END();
+    #undef ROW
+    #undef ROW_END
+
+    int row_h = 22;
+    int header_h = 50;
+    int side_pad = 28;
+    int top_pad  = 18;
+    int footer_h = 32;        /* room for the "Esc or click outside…" hint */
+    int needed_h = header_h + n * row_h + top_pad + footer_h;
+    int w = 720, h = needed_h;
+    if (w > win_w - 40) w = win_w - 40;
+    if (h > win_h - 40) h = win_h - 40;
+    int mx = (win_w - w) / 2;
+    int my = (win_h - h) / 2;
+
+    DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
+    DrawRectangle(mx, my, w, h, (Color){30, 34, 46, 255});
+    DrawRectangleLines(mx, my, w, h, (Color){125, 207, 255, 220});
+    DrawRectangle(mx + 1, my + 1, w - 2, 38, (Color){38, 42, 58, 255});
+
+    Font *f = (Font *)r->font_data;
+    char title[64];
+    snprintf(title, sizeof(title), "Keyboard shortcuts (modifier = %s)", MOD);
+    DrawTextEx(*f, title,
+               (Vector2){ mx + 20, my + 11 },
+               16, 0, (Color){230, 232, 240, 255});
+
+    int chord_w = 220;
+    BeginScissorMode(mx + 8, my + header_h, w - 16,
+                     h - header_h - footer_h);
+    int y = my + header_h;
+    for (int i = 0; i < n; i++) {
+        const char *chord = buf[i*2];
+        const char *desc  = buf[i*2 + 1];
+        if (!chord[0]) {
+            /* Section header. */
+            DrawTextEx(*f, desc,
+                       (Vector2){ mx + side_pad, y + 3 },
+                       14, 0, (Color){140, 200, 255, 255});
+        } else {
+            DrawTextEx(*f, chord,
+                       (Vector2){ mx + side_pad, y + 4 },
+                       13, 0, (Color){200, 230, 255, 255});
+            DrawTextEx(*f, desc,
+                       (Vector2){ mx + side_pad + chord_w, y + 4 },
+                       13, 0, (Color){200, 205, 220, 255});
+        }
+        y += row_h;
+    }
+    EndScissorMode();
+
+    DrawTextEx(*f, "Esc or click outside the panel to close",
+               (Vector2){ mx + 20, my + h - 22 },
+               11, 0, (Color){110, 115, 130, 255});
+}
+
 static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
     DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
@@ -2182,7 +3402,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                row scrolls into view so each name renders in its own
                typeface. Failures are sticky so we don't retry each frame. */
             if (!g_fonts[i].preview && !g_fonts[i].load_failed) {
-                Font fprev = LoadFontEx(g_fonts[i].path, 14, NULL, 0);
+                Font fprev = font_preview_load(&g_fonts[i], 14);
                 if (fprev.texture.id == 0) {
                     g_fonts[i].load_failed = true;
                 } else {
@@ -2212,6 +3432,111 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                           (Color){40, 45, 58, 255});
             DrawRectangle(track_x, bar_y, 3, bar_h,
                           (Color){110, 130, 170, 255});
+        }
+    }
+
+    /* Theme list. Clicking a row applies that palette + default fg/bg/
+       cursor to the *active* pane only; other panes keep their state. */
+    DrawTextEx(*f, "Theme",
+               (Vector2){L.modal.x + 22, L.theme_list.y + 6},
+               14, 0, (Color){200, 205, 220, 255});
+    DrawRectangle(L.theme_list.x, L.theme_list.y,
+                  L.theme_list.w, L.theme_list.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.theme_list.x, L.theme_list.y,
+                       L.theme_list.w, L.theme_list.h,
+                       (Color){70, 74, 90, 255});
+    int tcount = themes_count();
+    if (tcount == 0) {
+        DrawTextEx(*f, "(no themes baked into this build)",
+                   (Vector2){L.theme_list.x + 10, L.theme_list.y + 10},
+                   12, 0, (Color){140, 145, 160, 255});
+    } else {
+        int trow_h = 22;
+        int tvisible = L.theme_list.h / trow_h;
+        int tmax_scroll = tcount - tvisible;
+        if (tmax_scroll < 0) tmax_scroll = 0;
+        if (g_theme_list_scroll > tmax_scroll) g_theme_list_scroll = tmax_scroll;
+        if (g_theme_list_scroll < 0) g_theme_list_scroll = 0;
+        BeginScissorMode(L.theme_list.x + 2, L.theme_list.y + 2,
+                         L.theme_list.w - 4, L.theme_list.h - 4);
+        const Theme *ts = themes_all();
+        for (int i = 0; i < tcount; i++) {
+            int ry = L.theme_list.y + (i - g_theme_list_scroll) * trow_h;
+            if (ry + trow_h < L.theme_list.y ||
+                ry > L.theme_list.y + L.theme_list.h) continue;
+            bool sel = (i == g_theme_list_selected);
+            if (sel) {
+                DrawRectangle(L.theme_list.x + 2, ry,
+                              L.theme_list.w - 4, trow_h,
+                              (Color){46, 62, 90, 220});
+            }
+            /* Little colour swatches on the right so the name isn't
+               the only clue to what the theme actually looks like. */
+            int swatch_w = 10, swatch_h = 12, swatch_gap = 1;
+            int swatches_w = 8 * (swatch_w + swatch_gap);
+            int sx = L.theme_list.x + L.theme_list.w - 8 - swatches_w;
+            int sy = ry + (trow_h - swatch_h) / 2;
+            for (int k = 0; k < 8; k++) {
+                uint32_t c = ts[i].palette[k];
+                Color col = { (unsigned char)((c >> 16) & 0xff),
+                              (unsigned char)((c >> 8)  & 0xff),
+                              (unsigned char)( c        & 0xff), 255 };
+                DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
+                              swatch_w, swatch_h, col);
+            }
+            DrawTextEx(*f, ts[i].name,
+                       (Vector2){L.theme_list.x + 10, ry + 4},
+                       14, 0,
+                       sel ? (Color){230, 232, 240, 255}
+                           : (Color){200, 205, 220, 255});
+        }
+        EndScissorMode();
+        if (tcount > tvisible) {
+            int track_x = L.theme_list.x + L.theme_list.w - 5;
+            int bar_h = L.theme_list.h * tvisible / tcount;
+            if (bar_h < 24) bar_h = 24;
+            int bar_y = L.theme_list.y +
+                        (L.theme_list.h - bar_h) * g_theme_list_scroll /
+                        (tmax_scroll > 0 ? tmax_scroll : 1);
+            DrawRectangle(track_x, L.theme_list.y, 3, L.theme_list.h,
+                          (Color){40, 45, 58, 255});
+            DrawRectangle(track_x, bar_y, 3, bar_h,
+                          (Color){110, 130, 170, 255});
+        }
+    }
+
+    /* Cursor-style row. Shows the currently-selected style of the
+       *active* pane so the picker reflects state; clicking a button
+       changes just that pane. */
+    {
+        DrawTextEx(*f, "Cursor",
+                   (Vector2){L.modal.x + 22, L.cur_block.y + 8},
+                   14, 0, (Color){200, 205, 220, 255});
+        Tab *t = active_tab();
+        Pane *p = t ? active_pane_of(t) : NULL;
+        CursorStyle cur = (p && p->scr) ? screen_cursor_style(p->scr)
+                                        : CURSOR_STYLE_DEFAULT;
+        struct { Rect r; const char *label; int style; } opts[] = {
+            { L.cur_block, "Block",     CURSOR_STYLE_BLOCK },
+            { L.cur_under, "Underline", CURSOR_STYLE_UNDERLINE },
+            { L.cur_bar,   "Vertical",  CURSOR_STYLE_BAR },
+            { L.cur_blink, "Blink",     CURSOR_STYLE_BLOCK_BLINK },
+        };
+        for (int i = 0; i < 4; i++) {
+            Rect rr = opts[i].r;
+            bool on = ((int)cur == opts[i].style ||
+                       ((int)cur == CURSOR_STYLE_DEFAULT &&
+                        opts[i].style == CURSOR_STYLE_BLOCK_BLINK));
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h,
+                          on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255});
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               (Color){125, 207, 255, on ? 255 : 150});
+            Vector2 tsz = MeasureTextEx(*f, opts[i].label, 13, 0);
+            DrawTextEx(*f, opts[i].label,
+                       (Vector2){rr.x + (rr.w - tsz.x) / 2,
+                                 rr.y + (rr.h - tsz.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
         }
     }
 
@@ -2413,6 +3738,7 @@ int main(int argc, char **argv) {
     if (init_rows < 5)  init_rows = 5;
 
     app_settings_init();
+    themes_load_builtins();
     /* Apply ~/.config/rbterm/config.ini before we commit to font path,
        size, padding, etc. CLI flags the user passed on the command line
        still win — they were parsed before this. */
@@ -2455,7 +3781,43 @@ int main(int argc, char **argv) {
     SetExitKey(KEY_NULL);
 
     Renderer r;
-    if (!renderer_init(&r, font_path, font_size)) {
+    g_renderer = &r;
+#ifdef __APPLE__
+    /* Strip Cmd+W from AppKit's File > Close Window menu item so our
+       in-app handler can use the chord to close just the active tab. */
+    mac_disable_close_menu_item();
+#endif
+    /* Resolve the font:
+         1. "embedded:NAME" → look up in the embedded table.
+         2. an existing disk path → load directly.
+         3. anything else (NULL or stale path from a deleted file) →
+            try the system defaults, then fall through to the first
+            embedded font. The fallback keeps a stripped-down install
+            (no fonts/ folder, no system fonts) bootable. */
+    bool inited = false;
+    if (font_path && strncmp(font_path, "embedded:", 9) == 0) {
+        const EmbeddedFont *ef = embedded_font_lookup(font_path);
+        if (ef) {
+            inited = renderer_init_with_data(&r, ef->data, (int)ef->data_size,
+                                             ef->ext, font_path, font_size);
+        }
+    }
+    if (!inited && font_path && font_path[0]) {
+        FILE *probe = fopen(font_path, "rb");
+        if (probe) {
+            fclose(probe);
+            inited = renderer_init(&r, font_path, font_size);
+        }
+    }
+    if (!inited) inited = renderer_init(&r, NULL, font_size);
+    if (!inited && k_embedded_font_count > 0) {
+        const EmbeddedFont *ef = &k_embedded_fonts[0];
+        char dpath[128];
+        snprintf(dpath, sizeof(dpath), "embedded:%s", ef->name);
+        inited = renderer_init_with_data(&r, ef->data, (int)ef->data_size,
+                                         ef->ext, dpath, font_size);
+    }
+    if (!inited) {
         CloseWindow();
         return 1;
     }
@@ -2595,13 +3957,27 @@ int main(int argc, char **argv) {
         Tab *cur = active_tab();
         Vector2 mp = GetMousePosition();
         bool in_tab_bar = (mp.y < TAB_BAR_H);
+        /* Modal UI owns all clicks. Without this gate, a click on a
+           form button in the SSH or Settings modal also reaches the
+           terminal-area handler below, starting a phantom selection
+           on the pane drawn behind the modal. */
+        bool modal_open = (g_ui_mode != UI_NORMAL);
 
-        if (in_tab_bar) {
+        if (modal_open) {
+            /* Skip both the tab-bar handler (modal hides the bar's
+               affordances) and the terminal mouse handler. The modal's
+               own ssh_form_handle_mouse / settings_handle_mouse runs
+               below and consumes the click cleanly. */
+        } else if (in_tab_bar) {
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 TabBarHit h = tab_bar_hit_test(win_w_now, (int)mp.x, (int)mp.y);
                 if (h.on_plus) tab_open(content_cols, content_rows);
                 else if (h.on_ssh) ssh_form_open();
                 else if (h.on_gear) settings_open(&r);
+                else if (h.on_help) {
+                    g_ui_mode = UI_HELP;
+                    g_help_just_opened = true;
+                }
                 else if (h.on_split_v || h.on_split_h) {
                     if (cur) {
                         SplitMode m = h.on_split_v ? SPLIT_VERTICAL : SPLIT_HORIZONTAL;
@@ -2618,12 +3994,25 @@ int main(int argc, char **argv) {
                 cur = active_tab();
             }
         } else if (cur) {
-            /* Splitter drag takes priority over pane input when active. */
+            /* Splitter drag takes priority over pane input when active.
+               The grab zone is padded by SPLITTER_GRAB on each side of
+               the visual line so the cursor can find it without
+               pixel-perfect aim. */
             PaneRect sp;
             bool has_split = splitter_rect(cur, win_w_now, win_h_now, &sp);
-            bool on_splitter = has_split &&
-                mp.x >= sp.x && mp.x < sp.x + sp.w &&
-                mp.y >= sp.y && mp.y < sp.y + sp.h;
+            bool on_splitter = false;
+            if (has_split) {
+                int gx = sp.x, gy = sp.y, gw = sp.w, gh = sp.h;
+                if (cur->split == SPLIT_VERTICAL) {
+                    gx -= SPLITTER_GRAB;
+                    gw += 2 * SPLITTER_GRAB;
+                } else {
+                    gy -= SPLITTER_GRAB;
+                    gh += 2 * SPLITTER_GRAB;
+                }
+                on_splitter = mp.x >= gx && mp.x < gx + gw &&
+                              mp.y >= gy && mp.y < gy + gh;
+            }
             if (on_splitter && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 cur->splitter_drag = true;
             }
@@ -2817,6 +4206,40 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Help modal — read-only keyboard cheatsheet, dismissed on Esc
+           or by clicking outside the modal panel. (A click anywhere
+           would dismiss the modal on the same frame the ? button
+           opened it, since the tab-bar handler runs first.) */
+        if (g_ui_mode == UI_HELP) {
+            cur = active_tab();
+            if (!cur) break;
+            int hw = 720, hh = 800;
+            if (hw > win_w_now - 40) hw = win_w_now - 40;
+            if (hh > win_h_now - 40) hh = win_h_now - 40;
+            int hmx = (win_w_now - hw) / 2;
+            int hmy = (win_h_now - hh) / 2;
+            Vector2 mp_help = GetMousePosition();
+            bool inside = (mp_help.x >= hmx && mp_help.x < hmx + hw &&
+                           mp_help.y >= hmy && mp_help.y < hmy + hh);
+            if (g_help_just_opened) {
+                /* Eat the press from the same frame that opened the
+                   modal — the help button sits outside the modal
+                   panel, so the click-outside check would otherwise
+                   close it instantly. */
+                g_help_just_opened = false;
+            } else if (IsKeyPressed(KEY_ESCAPE) ||
+                       (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !inside)) {
+                g_ui_mode = UI_NORMAL;
+            }
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
+            draw_help_modal(&r, win_w_now, win_h_now);
+            EndDrawing();
+            continue;
+        }
+
         /* Tab shortcuts (pre-input so Cmd/Ctrl+T/W/digit don't slip into the shell). */
         bool shift_held = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         if (ui_key_down()) {
@@ -2827,6 +4250,38 @@ int main(int argc, char **argv) {
                 ssh_form_open();
             }
             else if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
+            /* Cmd+W closes the active tab. macOS's AppKit ordinarily
+               eats this for "Close Window" — disable_close_menu_item()
+               (called at startup) clears the menu binding so the chord
+               reaches us. Falls through to closing the window when the
+               last tab is gone. */
+            else if (IsKeyPressed(KEY_W)) {
+                tab_close(g_active);
+                if (g_num_tabs == 0) break;
+                cur = active_tab();
+            }
+            /* Cmd+N opens an entirely new rbterm window: fork+exec the
+               same binary that's running. macOS resolves it via
+               _NSGetExecutablePath (gives the .app's MacOS/rbterm
+               path); Linux via /proc/self/exe. The child detaches with
+               setsid() so closing either window won't affect the other. */
+            else if (IsKeyPressed(KEY_N)) {
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+                char self_path[PATH_MAX] = {0};
+#if defined(__APPLE__)
+                uint32_t _plen = (uint32_t)sizeof(self_path);
+                _NSGetExecutablePath(self_path, &_plen);
+#else
+                ssize_t _n = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+                if (_n > 0) self_path[_n] = 0;
+#endif
+                if (self_path[0] && fork() == 0) {
+                    setsid();
+                    execl(self_path, self_path, (char *)NULL);
+                    _exit(127);
+                }
+#endif
+            }
             /* Cmd+Shift+W closes the active pane (or the tab if only one
                pane). We intentionally don't bind plain Cmd+W: macOS
                intercepts it at the AppKit layer for "Close Window",
@@ -2850,6 +4305,29 @@ int main(int argc, char **argv) {
             }
             else if (IsKeyPressed(KEY_LEFT_BRACKET))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
             else if (IsKeyPressed(KEY_RIGHT_BRACKET)) { g_active = (g_active + 1) % g_num_tabs; cur = active_tab(); }
+            /* Cmd+Shift+Left/Right reorders the active tab, sliding it
+               past its neighbour (with wrap-around). Cmd+Left/Right
+               (no Shift) just cycles which tab is active — same as
+               Cmd+[ / Cmd+]. The shift_held check has to come first
+               so the no-shift branch doesn't swallow the Shift case. */
+            else if (shift_held && IsKeyPressed(KEY_LEFT) && g_num_tabs > 1) {
+                int dst = (g_active - 1 + g_num_tabs) % g_num_tabs;
+                Tab *swap = g_tabs[g_active];
+                g_tabs[g_active] = g_tabs[dst];
+                g_tabs[dst] = swap;
+                g_active = dst;
+                cur = active_tab();
+            }
+            else if (shift_held && IsKeyPressed(KEY_RIGHT) && g_num_tabs > 1) {
+                int dst = (g_active + 1) % g_num_tabs;
+                Tab *swap = g_tabs[g_active];
+                g_tabs[g_active] = g_tabs[dst];
+                g_tabs[dst] = swap;
+                g_active = dst;
+                cur = active_tab();
+            }
+            else if (IsKeyPressed(KEY_LEFT))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
+            else if (IsKeyPressed(KEY_RIGHT)) { g_active = (g_active + 1) % g_num_tabs; cur = active_tab(); }
             else {
                 for (int k = 0; k < 9; k++) {
                     if (IsKeyPressed(KEY_ONE + k)) {

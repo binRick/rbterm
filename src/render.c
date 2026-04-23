@@ -267,19 +267,9 @@ void renderer_set_cell_spacing(Renderer *r, int extra_w) {
     r->cell_w = r->cell_w_base + extra_w;
 }
 
-static bool load_font_into(Renderer *r, const char *path, int size) {
-    int cp_count;
-    int *cps = build_codepoints(&cp_count);
-    /* Rasterise the atlas at 2× the display size and downsample at draw
-       time. The extra glyph resolution survives the bilinear filter so
-       strokes look brighter / less washed out — without this the default
-       white text reads as gray-ish because sRGB blending eats the edges. */
-    int atlas_size = size * 2;
-    if (atlas_size > 96) atlas_size = 96;   /* atlas size cap */
-    Font f = LoadFontEx(path, atlas_size, cps, cp_count);
-    free(cps);
-    if (f.texture.id == 0) return false;
-    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+/* Install a freshly-loaded Font into the renderer, replacing whatever
+   was loaded before. Shared by load_font_into / load_font_data_into. */
+static void install_font(Renderer *r, Font f, int size, const char *path) {
     if (r->font_data) {
         UnloadFont(*as_font(r));
     } else {
@@ -291,6 +281,62 @@ static bool load_font_into(Renderer *r, const char *path, int size) {
     r->font_path[sizeof(r->font_path) - 1] = 0;
     measure_cell(r);
     missing_set_build(&f);
+}
+
+/* Forget any cached embedded blob — call after switching back to a
+   disk-loaded font so a subsequent size change re-reads from path. */
+static void forget_embedded_blob(Renderer *r) {
+    r->cur_data = NULL;
+    r->cur_data_size = 0;
+    r->cur_ext[0] = 0;
+}
+
+static bool load_font_into(Renderer *r, const char *path, int size) {
+    int cp_count;
+    int *cps = build_codepoints(&cp_count);
+    /* Rasterise the atlas at 2× the display size and downsample at draw
+       time. The extra glyph resolution survives the bilinear filter so
+       strokes look brighter / less washed out — without this the default
+       white text reads as gray-ish because sRGB blending eats the edges. */
+    int atlas_size = size * 2;
+    if (atlas_size > 96) atlas_size = 96;
+    Font f = LoadFontEx(path, atlas_size, cps, cp_count);
+    free(cps);
+    if (f.texture.id == 0) return false;
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+    install_font(r, f, size, path);
+    forget_embedded_blob(r);
+    return true;
+}
+
+static bool load_font_data_into(Renderer *r, const unsigned char *data,
+                                int data_size, const char *ext, int size,
+                                const char *display_path) {
+    int cp_count;
+    int *cps = build_codepoints(&cp_count);
+    int atlas_size = size * 2;
+    if (atlas_size > 96) atlas_size = 96;
+    char file_type[8] = ".";
+    if (ext && *ext) {
+        strncat(file_type, ext, sizeof(file_type) - 2);
+    } else {
+        strncat(file_type, "ttf", sizeof(file_type) - 2);
+    }
+    Font f = LoadFontFromMemory(file_type, data, data_size,
+                                atlas_size, cps, cp_count);
+    free(cps);
+    if (f.texture.id == 0) return false;
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+    install_font(r, f, size, display_path);
+    /* Cache the blob so size changes don't need the embedded table. */
+    r->cur_data = data;
+    r->cur_data_size = data_size;
+    if (ext && *ext) {
+        strncpy(r->cur_ext, ext, sizeof(r->cur_ext) - 1);
+        r->cur_ext[sizeof(r->cur_ext) - 1] = 0;
+    } else {
+        r->cur_ext[0] = 0;
+    }
     return true;
 }
 
@@ -305,6 +351,19 @@ bool renderer_init(Renderer *r, const char *font_path, int font_size) {
     }
     fprintf(stderr, "rbterm: using font %s @ %dpt\n", font_path, font_size);
     return load_font_into(r, font_path, font_size);
+}
+
+bool renderer_init_with_data(Renderer *r, const unsigned char *data,
+                             int data_size, const char *ext,
+                             const char *display_path, int font_size) {
+    memset(r, 0, sizeof(*r));
+    if (font_size < 6) font_size = 14;
+    r->bg_alpha = 1.0f;
+    if (!data || data_size <= 0) return false;
+    fprintf(stderr, "rbterm: using embedded font %s @ %dpt\n",
+            display_path ? display_path : "embedded:font", font_size);
+    return load_font_data_into(r, data, data_size, ext, font_size,
+                               display_path ? display_path : "embedded:font");
 }
 
 void renderer_shutdown(Renderer *r) {
@@ -322,6 +381,12 @@ bool renderer_set_font_size(Renderer *r, int font_size) {
     if (font_size < 6) font_size = 6;
     if (font_size > 96) font_size = 96;
     emoji_cache_clear();
+    /* Re-load from the cached embedded blob if the current font came
+       from memory; otherwise re-read from disk. */
+    if (r->cur_data && r->cur_data_size > 0) {
+        return load_font_data_into(r, r->cur_data, r->cur_data_size,
+                                   r->cur_ext, font_size, r->font_path);
+    }
     return load_font_into(r, r->font_path, font_size);
 }
 
@@ -329,6 +394,15 @@ bool renderer_set_font_path(Renderer *r, const char *path) {
     if (!path || !*path) return false;
     if (!file_exists(path)) return false;
     return load_font_into(r, path, r->font_size);
+}
+
+bool renderer_set_font_data(Renderer *r, const unsigned char *data,
+                            int data_size, const char *ext,
+                            const char *display_path) {
+    if (!data || data_size <= 0) return false;
+    emoji_cache_clear();
+    return load_font_data_into(r, data, data_size, ext, r->font_size,
+                               display_path ? display_path : "embedded:font");
 }
 
 static Color col_from_rgb(uint32_t v, float alpha) {
@@ -428,13 +502,37 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
         }
     }
 
-    // Cursor background (block)
+    // Cursor background. Shape comes from the per-Screen cursor style;
+    // BLOCK_BLINK and DEFAULT toggle on/off at ~2Hz, the others are
+    // steady. Unfocused windows get a hollow block regardless of style.
     if (show_cursor) {
-        bool blink_on = ((long long)(time_sec * 2.0) & 1) == 0;
+        Color cc = col_from_rgb(screen_cursor_color(s), 1.0f);
         if (!focused) {
-            DrawRectangleLines(cursor_vx * cw, cursor_vy * ch, cw, ch, col_from_rgb(screen_cursor_color(s), 1.0f));
-        } else if (blink_on) {
-            DrawRectangle(cursor_vx * cw, cursor_vy * ch, cw, ch, col_from_rgb(screen_cursor_color(s), 1.0f));
+            DrawRectangleLines(cursor_vx * cw, cursor_vy * ch, cw, ch, cc);
+        } else {
+            CursorStyle cstyle = screen_cursor_style(s);
+            bool blink_on = ((long long)(time_sec * 2.0) & 1) == 0;
+            switch (cstyle) {
+            case CURSOR_STYLE_BLOCK:
+                DrawRectangle(cursor_vx * cw, cursor_vy * ch, cw, ch, cc);
+                break;
+            case CURSOR_STYLE_UNDERLINE: {
+                int uh = ch / 6; if (uh < 2) uh = 2;
+                DrawRectangle(cursor_vx * cw, cursor_vy * ch + ch - uh, cw, uh, cc);
+                break;
+            }
+            case CURSOR_STYLE_BAR: {
+                int bw = cw / 5; if (bw < 2) bw = 2;
+                DrawRectangle(cursor_vx * cw, cursor_vy * ch, bw, ch, cc);
+                break;
+            }
+            case CURSOR_STYLE_BLOCK_BLINK:
+            case CURSOR_STYLE_DEFAULT:
+            default:
+                if (blink_on)
+                    DrawRectangle(cursor_vx * cw, cursor_vy * ch, cw, ch, cc);
+                break;
+            }
         }
     }
 
@@ -452,8 +550,16 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
 
             uint32_t fg = (c.attrs & ATTR_REVERSE) ? resolve_bg(s, c) : resolve_fg(s, c);
 
-            bool at_cursor = (show_cursor && x == cursor_vx && y == cursor_vy
-                              && ((long long)(time_sec * 2.0) & 1) == 0 && focused);
+            /* Invert the glyph under the cursor only when the cursor
+               actually covers it (block, blinking-block-on-tick).
+               Underline and bar leave the glyph untouched. */
+            CursorStyle cs_style = screen_cursor_style(s);
+            bool covers_glyph =
+                cs_style == CURSOR_STYLE_BLOCK ||
+                ((cs_style == CURSOR_STYLE_BLOCK_BLINK || cs_style == CURSOR_STYLE_DEFAULT)
+                 && ((long long)(time_sec * 2.0) & 1) == 0);
+            bool at_cursor = (show_cursor && focused && covers_glyph &&
+                              x == cursor_vx && y == cursor_vy);
             if (at_cursor) fg = screen_default_bg(s);
 
             float alpha = (c.attrs & ATTR_DIM) ? 0.6f : 1.0f;
