@@ -8,6 +8,7 @@ typedef struct {
     uint32_t fg;     // 0xRRGGBB
     uint32_t bg;     // 0xRRGGBB
     uint16_t attrs;  // ATTR_*
+    uint16_t link_id;// 0 = no hyperlink; else index into screen's URL pool
 } Cell;
 
 enum {
@@ -116,6 +117,10 @@ int                   screen_image_anchor_row(const ScreenImage *img);
 int                   screen_image_anchor_col(const ScreenImage *img);
 uint64_t              screen_image_generation(const ScreenImage *img);
 bool                  screen_image_on_alt(const ScreenImage *img);
+
+/* OSC 8 hyperlinks. Cells carry a 16-bit link_id that indexes into a
+   per-Screen string pool. 0 means "no link". */
+const char *screen_link_url(const Screen *s, uint16_t link_id);
 /* Renderer tells the screen its cell pixel height so scroll accounting
    can translate pixel-heighted images into cell rows. Call from the
    renderer whenever cell_h changes (font size change, init). */

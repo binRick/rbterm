@@ -132,6 +132,18 @@ struct Screen {
     size_t         kpending_cap;
     bool           kpending_active;
 
+    /* OSC 8 hyperlink URL pool. Cells reference a URL via a 16-bit
+       link_id (1-based; 0 = no link). Interning keeps Cell at 16 bytes
+       and scrollback size bounded even with many links. Max 65535
+       unique URLs per screen; new entries past that recycle slot 1
+       (oldest) — cheap, effectively unbounded for real use. */
+    char   **urls;
+    uint16_t urls_count;
+    uint32_t urls_cap;
+
+    /* Active OSC 8 link the next put_cp will stamp into cells. */
+    uint16_t cur_link_id;
+
     /* Per-screen palette (mutable via OSC 4/104). Kept per-screen so
        a tab/pane rewriting its colours doesn't bleed into the others. */
     uint32_t palette[256];
@@ -496,6 +508,7 @@ static void put_cp(Screen *s, uint32_t cp) {
     c->fg = s->cur_attr.fg;
     c->bg = s->cur_attr.bg;
     c->attrs = s->cur_attr.attrs | (wide ? ATTR_WIDE : 0);
+    c->link_id = s->cur_link_id;
     if (wide) {
         Cell *c2 = row + s->cx + 1;
         c2->cp = 0;
@@ -615,6 +628,40 @@ static void sgr(Screen *s) {
 }
 
 uint32_t screen_palette(const Screen *s, int i) { return pal(s, i); }
+
+/* ---------- OSC 8 URL intern pool ---------- */
+
+/* Find an existing URL or add a new one. Returns the 1-based id or 0
+   on failure / empty URL. Strings are owned by the pool. */
+static uint16_t url_intern(Screen *s, const char *url) {
+    if (!url || !*url) return 0;
+    for (uint16_t i = 0; i < s->urls_count; i++) {
+        if (s->urls[i] && strcmp(s->urls[i], url) == 0) return (uint16_t)(i + 1);
+    }
+    if (s->urls_count >= 65535) {
+        /* Recycle slot 0 rather than refusing; keeps runaway link
+           spam from silently dropping after 64K distinct URLs. */
+        free(s->urls[0]);
+        s->urls[0] = strdup(url);
+        return 1;
+    }
+    if (s->urls_count + 1 > s->urls_cap) {
+        uint32_t nc = s->urls_cap ? s->urls_cap * 2 : 16;
+        char **nb = realloc(s->urls, nc * sizeof(char *));
+        if (!nb) return 0;
+        s->urls = nb;
+        s->urls_cap = nc;
+    }
+    char *dup = strdup(url);
+    if (!dup) return 0;
+    s->urls[s->urls_count++] = dup;
+    return s->urls_count;   /* 1-based — links_count after increment */
+}
+
+const char *screen_link_url(const Screen *s, uint16_t link_id) {
+    if (!s || link_id == 0 || link_id > s->urls_count) return NULL;
+    return s->urls[link_id - 1];
+}
 
 /* ---------- Erase ---------- */
 
@@ -839,6 +886,25 @@ static void finish_osc(Screen *s) {
                 s->palette[idx] = col;
             }
             if (*p == ';') p++; else break;
+        }
+        return;
+    }
+    if (ps == 8) {
+        /* OSC 8 ; <params> ; <URL> — start or end a hyperlink. An
+           empty URL closes the current link. Params (e.g. id=foo) are
+           ignored; we just set cur_link_id so subsequent put_cp stamps
+           cells with the link. */
+        /* p currently points just past the first ';'. Skip params,
+           find the second ';' — whatever follows it (possibly empty)
+           is the URL. */
+        const char *q = p;
+        while (*q && *q != ';') q++;
+        if (*q == ';') q++;
+        const char *url = q;
+        if (!*url) {
+            s->cur_link_id = 0;
+        } else {
+            s->cur_link_id = url_intern(s, url);
         }
         return;
     }
@@ -1323,6 +1389,8 @@ void screen_free(Screen *s) {
     images_free_all(s);
     free(s->dpayload);
     free(s->kpending);
+    for (uint16_t i = 0; i < s->urls_count; i++) free(s->urls[i]);
+    free(s->urls);
     free(s->main); free(s->alt); free(s->sb); free(s->main_wrap);
     free(s);
 }
@@ -1574,7 +1642,7 @@ void screen_scroll_reset(Screen *s) { s->view_off = 0; }
 
 Cell screen_view_cell(const Screen *s, int col, int vy) {
     if (col < 0 || col >= s->cols || vy < 0 || vy >= s->rows) {
-        Cell e = {0, s->default_fg, s->default_bg, ATTR_DEFAULT_FG | ATTR_DEFAULT_BG};
+        Cell e = {0, s->default_fg, s->default_bg, ATTR_DEFAULT_FG | ATTR_DEFAULT_BG, 0};
         return e;
     }
     // view_off rows from the bottom of scrollback replace the top rows of the live screen

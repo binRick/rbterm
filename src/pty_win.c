@@ -76,7 +76,7 @@ static void pick_shell(wchar_t *cmdline, size_t cap) {
     _snwprintf(cmdline, cap, L"%s", L"powershell.exe");
 }
 
-void *local_open_impl(int cols, int rows) {
+void *local_open_impl(int cols, int rows, const char *cwd) {
     LocalPty *p = (LocalPty *)calloc(1, sizeof(*p));
     if (!p) return NULL;
     p->ring = (unsigned char *)malloc(RING_CAP);
@@ -113,8 +113,20 @@ void *local_open_impl(int cols, int rows) {
     wchar_t cmdline[512];
     pick_shell(cmdline, sizeof(cmdline)/sizeof(cmdline[0]));
 
-    const wchar_t *start_dir = _wgetenv(L"USERPROFILE");
-    if (!start_dir || !*start_dir) start_dir = NULL;
+    /* ConPTY's CreateProcessW uses `lpCurrentDirectory` for the
+       child's CWD; convert the UTF-8 `cwd` to wide and use it if set,
+       otherwise fall back to USERPROFILE. */
+    wchar_t cwd_w[1024];
+    const wchar_t *start_dir = NULL;
+    if (cwd && *cwd) {
+        int wn = MultiByteToWideChar(CP_UTF8, 0, cwd, -1,
+                                     cwd_w, (int)(sizeof(cwd_w)/sizeof(cwd_w[0])));
+        if (wn > 0) start_dir = cwd_w;
+    }
+    if (!start_dir) {
+        start_dir = _wgetenv(L"USERPROFILE");
+        if (!start_dir || !*start_dir) start_dir = NULL;
+    }
 
     BOOL ok = CreateProcessW(
         NULL, cmdline, NULL, NULL, FALSE,

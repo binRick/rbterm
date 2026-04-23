@@ -21,7 +21,7 @@ struct Pty {
 };
 
 /* Local backend (src/pty_unix.c on macOS/Linux, src/pty_win.c on Windows). */
-void *local_open_impl(int cols, int rows);
+void *local_open_impl(int cols, int rows, const char *cwd);
 void  local_close_impl(void *impl);
 bool  local_alive_impl(void *impl);
 int   local_read_impl(void *impl, uint8_t *buf, size_t cap);

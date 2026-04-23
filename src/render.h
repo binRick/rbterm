@@ -62,8 +62,12 @@ void renderer_set_cell_spacing(Renderer *r, int extra_w);
 // from the top-left of the window where the pane's top-left should land
 // (y_offset leaves space for a tab bar; x_offset lets two panes share
 // the window side-by-side).
+// `hover_col` / `hover_row` identify the cell the mouse is over in
+// viewport coordinates (or -1 / -1 to mean "no hover") — used to
+// brighten OSC 8 hyperlink runs under the cursor.
 void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
-                   const Selection *sel, int x_offset, int y_offset);
+                   const Selection *sel, int x_offset, int y_offset,
+                   int hover_col, int hover_row);
 
 // Find a default system monospace font. Returns static buffer.
 const char *renderer_find_default_font(void);

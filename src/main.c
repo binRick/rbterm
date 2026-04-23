@@ -85,6 +85,8 @@ static bool ini_split(char *line, char **k_out, char **v_out) {
 typedef struct {
     bool log_enabled;
     char log_dir[PATH_MAX];
+    int  key_repeat_initial_ms;  /* delay before first repeat fires (held key) */
+    int  key_repeat_rate_ms;     /* period between subsequent repeats */
 } AppSettings;
 static AppSettings g_app_settings;
 static char        g_settings_status[160]; /* status line in the settings modal */
@@ -130,6 +132,12 @@ static void config_load_into_defaults(void) {
         } else if (strcmp(k, "log_dir") == 0) {
             strncpy(g_app_settings.log_dir, v, sizeof(g_app_settings.log_dir) - 1);
             g_app_settings.log_dir[sizeof(g_app_settings.log_dir) - 1] = 0;
+        } else if (strcmp(k, "key_repeat_initial_ms") == 0) {
+            int vi = atoi(v);
+            if (vi >= 0 && vi <= 2000) g_app_settings.key_repeat_initial_ms = vi;
+        } else if (strcmp(k, "key_repeat_rate_ms") == 0) {
+            int vi = atoi(v);
+            if (vi >= 0 && vi <= 500) g_app_settings.key_repeat_rate_ms = vi;
         }
     }
     fclose(fp);
@@ -151,6 +159,8 @@ static bool config_save(Renderer *r) {
     fprintf(fp, "cell_spacing=%d\n", r->cell_extra_w);
     fprintf(fp, "log_enabled=%s\n",  g_app_settings.log_enabled ? "true" : "false");
     if (g_app_settings.log_dir[0]) fprintf(fp, "log_dir=%s\n", g_app_settings.log_dir);
+    fprintf(fp, "key_repeat_initial_ms=%d\n", g_app_settings.key_repeat_initial_ms);
+    fprintf(fp, "key_repeat_rate_ms=%d\n",    g_app_settings.key_repeat_rate_ms);
     fclose(fp);
 #ifndef _WIN32
     chmod(path, 0600);
@@ -160,6 +170,8 @@ static bool config_save(Renderer *r) {
 
 static void app_settings_init(void) {
     g_app_settings.log_enabled = false;
+    g_app_settings.key_repeat_initial_ms = 300;
+    g_app_settings.key_repeat_rate_ms    = 25;
     const char *home = getenv("HOME");
 #ifdef _WIN32
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -569,12 +581,16 @@ static ScreenIO pane_io(Pane *p) {
     return io;
 }
 
-static bool pane_open_local(Pane *p, int cols, int rows) {
+static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
     pane_init_click_state(p);
     strncpy(p->title, "shell", sizeof(p->title) - 1);
-    p->pty = pty_open(cols, rows);
+    p->pty = pty_open(cols, rows, cwd);
     if (!p->pty) return false;
     p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    if (cwd && *cwd) {
+        strncpy(p->cwd, cwd, sizeof(p->cwd) - 1);
+        p->cwd[sizeof(p->cwd) - 1] = 0;
+    }
     return true;
 }
 
@@ -598,12 +614,25 @@ static void pane_free(Pane *p) {
 
 static Tab *tab_open(int cols, int rows) {
     if (g_num_tabs >= MAX_TABS) return NULL;
+    /* Inherit cwd from the currently-active pane so Cmd+T drops a new
+       shell in the same directory the user is working in. Falls back
+       to whatever the shell defaults to (HOME on Unix) for the first
+       tab of the session or when OSC 7 never fired. */
+    const char *inherit_cwd = NULL;
+    if (g_num_tabs > 0) {
+        Tab *cur_t = g_tabs[g_active];
+        if (cur_t && cur_t->active_pane >= 0
+            && cur_t->active_pane < cur_t->num_panes) {
+            const Pane *cp = &cur_t->panes[cur_t->active_pane];
+            if (cp->cwd[0]) inherit_cwd = cp->cwd;
+        }
+    }
     Tab *t = calloc(1, sizeof(Tab));
     t->num_panes = 1;
     t->active_pane = 0;
     t->split = SPLIT_NONE;
     t->split_ratio = 0.5f;
-    if (!pane_open_local(&t->panes[0], cols, rows)) { free(t); return NULL; }
+    if (!pane_open_local(&t->panes[0], cols, rows, inherit_cwd)) { free(t); return NULL; }
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
     g_num_tabs++;
@@ -745,7 +774,9 @@ static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
                            cols, rows, err, errsz);
         if (ok) snprintf(np->title, sizeof(np->title), "%s", t->ssh_target);
     } else {
-        ok = pane_open_local(np, cols, rows);
+        /* New split pane inherits cwd from the other pane in the same tab. */
+        const char *split_cwd = t->panes[0].cwd[0] ? t->panes[0].cwd : NULL;
+        ok = pane_open_local(np, cols, rows, split_cwd);
     }
     if (!ok) {
         memset(np, 0, sizeof(*np));
@@ -854,12 +885,88 @@ static bool cell_is_word(Screen *s, int col, int row) {
     return true;
 }
 
+/* Intelligent double-click trim rules.
+ *
+ * Naive word-select grabs any run of non-whitespace, which pulls in
+ * trailing punctuation (`--bold,` instead of `--bold`). We post-process
+ * the span to shave off boundary chars that are almost never part of
+ * what the user meant to copy:
+ *
+ *   - trailing   , . ; : ! ?   — sentence punctuation
+ *   - trailing   ) ] } > "     — closing delimiters (iff unmatched on left)
+ *   - leading    ( [ { < "     — opening delimiters (iff unmatched on right)
+ *
+ * The leading/trailing symmetric delimiters are only trimmed when
+ * unmatched, so `(x)` double-clicks to `(x)` but `foo)` trims to `foo`.
+ * Keep internal `-` `_` `/` `.` etc. — they're genuinely part of
+ * flags / paths / identifiers. Extend this list as new cases come in. */
+static bool is_trailing_trim(uint32_t cp) {
+    return cp == ',' || cp == ';' || cp == ':'
+        || cp == '.' || cp == '!' || cp == '?';
+}
+static bool is_close_delim(uint32_t cp) {
+    return cp == ')' || cp == ']' || cp == '}' || cp == '>' || cp == '"';
+}
+static bool is_open_delim(uint32_t cp) {
+    return cp == '(' || cp == '[' || cp == '{' || cp == '<' || cp == '"';
+}
+static uint32_t matching_open(uint32_t close_cp) {
+    switch (close_cp) {
+    case ')': return '(';
+    case ']': return '[';
+    case '}': return '{';
+    case '>': return '<';
+    case '"': return '"';
+    default:  return 0;
+    }
+}
+
 static void select_word(Screen *s, Selection *sel, int col, int row) {
     int cols = screen_cols(s);
     if (!cell_is_word(s, col, row)) { sel->active = false; return; }
     int c1 = col, c2 = col;
     while (c1 > 0 && cell_is_word(s, c1 - 1, row)) c1--;
     while (c2 < cols - 1 && cell_is_word(s, c2 + 1, row)) c2++;
+
+    /* Trim trailing sentence punctuation, but only if the click itself
+       wasn't on that punctuation — clicking the comma in "a,b" should
+       still select the comma. */
+    while (c2 > c1 && c2 != col) {
+        uint32_t cp = screen_view_cell(s, c2, row).cp;
+        if (is_trailing_trim(cp)) { c2--; continue; }
+        break;
+    }
+
+    /* Drop unmatched closing delimiter on the right (`foo)` → `foo`). */
+    if (c2 > c1 && c2 != col) {
+        uint32_t cp = screen_view_cell(s, c2, row).cp;
+        if (is_close_delim(cp)) {
+            uint32_t want = matching_open(cp);
+            bool matched = false;
+            for (int k = c1; k < c2; k++) {
+                if (screen_view_cell(s, k, row).cp == want) { matched = true; break; }
+            }
+            if (!matched) c2--;
+        }
+    }
+    /* Drop unmatched opening delimiter on the left (`(foo` → `foo`). */
+    if (c1 < c2 && c1 != col) {
+        uint32_t cp = screen_view_cell(s, c1, row).cp;
+        if (is_open_delim(cp)) {
+            /* Find the corresponding close. "" is self-matched. */
+            uint32_t want = (cp == '"') ? '"'
+                          : (cp == '(') ? ')'
+                          : (cp == '[') ? ']'
+                          : (cp == '{') ? '}'
+                          : (cp == '<') ? '>' : 0;
+            bool matched = false;
+            for (int k = c1 + 1; k <= c2; k++) {
+                if (screen_view_cell(s, k, row).cp == want) { matched = true; break; }
+            }
+            if (!matched) c1++;
+        }
+    }
+
     sel->active = true;
     sel->dragging = false;
     sel->a_col = c1; sel->a_row = row;
@@ -1033,13 +1140,28 @@ static int pane_at(const Tab *t, int win_w, int win_h, int mx, int my) {
 static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                               double time_sec, bool focused) {
     if (!t) return;
+    Vector2 mpos = GetMousePosition();
     for (int pi = 0; pi < t->num_panes; pi++) {
         Pane *p = &t->panes[pi];
         if (!p->scr) continue;
         PaneRect pr;
         pane_rect(t, pi, win_w, win_h, &pr);
         bool pane_focused = focused && (pi == t->active_pane);
-        renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel, pr.x, pr.y);
+        /* Hover coords in viewport cells for this pane. -1 when the
+           cursor is outside the pane so OSC 8 highlight doesn't leak. */
+        int hcol = -1, hrow = -1;
+        int rel_x = (int)mpos.x - pr.x - r->pad_x;
+        int rel_y = (int)mpos.y - pr.y - r->pad_y;
+        if (rel_x >= 0 && rel_y >= 0 && r->cell_w > 0 && r->cell_h > 0) {
+            int c = rel_x / r->cell_w;
+            int rr = rel_y / r->cell_h;
+            if (c >= 0 && c < screen_cols(p->scr)
+                && rr >= 0 && rr < screen_rows(p->scr)) {
+                hcol = c; hrow = rr;
+            }
+        }
+        renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
+                      pr.x, pr.y, hcol, hrow);
     }
     PaneRect sp;
     if (splitter_rect(t, win_w, win_h, &sp)) {
@@ -2814,6 +2936,8 @@ typedef struct {
     Rect spc_dec, spc_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
+    Rect repeat_initial; /* slider track — initial repeat delay */
+    Rect repeat_rate;    /* slider track — per-repeat period */
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -3151,6 +3275,18 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     int log_row2_y = log_row1_y + btn + 10;
     L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
 
+    /* Key-repeat sliders: two compact rows below logging. Value
+       readout eats a few px of track width so numbers don't collide
+       with the modal's right edge. */
+    int slider_track_h = 8;
+    int row_pitch = 22;
+    int kr1_y = log_row2_y + btn + 8;
+    L.repeat_initial = (Rect){ L.modal.x + 140, kr1_y, w - 140 - 22 - 60,
+                               slider_track_h };
+    int kr2_y = kr1_y + row_pitch;
+    L.repeat_rate    = (Rect){ L.modal.x + 140, kr2_y, w - 140 - 22 - 60,
+                               slider_track_h };
+
     int close_w = 90, close_h = 32, save_def_w = 150;
     int row_y = L.modal.y + h - 22 - close_h;
     L.close = (Rect){ L.modal.x + w - 22 - close_w, row_y, close_w, close_h };
@@ -3158,9 +3294,40 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     return L;
 }
 
+/* Map a slider track's mouse-x to a clamped int value. `vmin..vmax` is
+   the usable range. Inclusive endpoints; thumb drawing and hit-test
+   share this formula so they line up exactly. */
+static int slider_value_from_x(Rect track, int mx, int vmin, int vmax) {
+    float t = (float)(mx - track.x) / (float)track.w;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return vmin + (int)(t * (float)(vmax - vmin) + 0.5f);
+}
+
+/* Per-session slider drag state. Keyed by track rect since tracks are
+   stable rects; we only drag one slider at a time so one slot is enough. */
+static Rect g_slider_drag_track;  /* w==0 when no drag active */
+static int *g_slider_drag_target;
+static int  g_slider_drag_min;
+static int  g_slider_drag_max;
+
 static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
+    /* Continue an in-progress slider drag before anything else so the
+       thumb can overshoot the track and the value still follows the
+       mouse. Released? End the drag. */
+    if (g_slider_drag_track.w > 0 && g_slider_drag_target) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            *g_slider_drag_target = slider_value_from_x(
+                g_slider_drag_track, mx, g_slider_drag_min, g_slider_drag_max);
+            input_set_repeat(g_app_settings.key_repeat_initial_ms,
+                             g_app_settings.key_repeat_rate_ms);
+            return;
+        }
+        g_slider_drag_track.w = 0;
+        g_slider_drag_target = NULL;
+    }
     /* Wheel-scroll the font list whenever the pointer is over it. */
     if (rect_hit(L.font_list, mx, my)) {
         float wheel = GetMouseWheelMove();
@@ -3225,6 +3392,34 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         g_app_settings.log_enabled = !g_app_settings.log_enabled;
         refresh_tab_logs();
         return;
+    }
+    /* Key-repeat sliders. Press inside the track begins a drag; the
+       value follows the mouse until release. We extend each track's
+       hit-test a few px vertically so clicking the drawn thumb (which
+       may overflow the track) still starts the drag. */
+    {
+        Rect r_init_hit = { L.repeat_initial.x, L.repeat_initial.y - 6,
+                             L.repeat_initial.w, L.repeat_initial.h + 12 };
+        Rect r_rate_hit = { L.repeat_rate.x,    L.repeat_rate.y    - 6,
+                             L.repeat_rate.w,    L.repeat_rate.h    + 12 };
+        if (rect_hit(r_init_hit, mx, my)) {
+            g_slider_drag_track  = L.repeat_initial;
+            g_slider_drag_target = &g_app_settings.key_repeat_initial_ms;
+            g_slider_drag_min = 0; g_slider_drag_max = 1000;
+            *g_slider_drag_target = slider_value_from_x(L.repeat_initial, mx, 0, 1000);
+            input_set_repeat(g_app_settings.key_repeat_initial_ms,
+                             g_app_settings.key_repeat_rate_ms);
+            return;
+        }
+        if (rect_hit(r_rate_hit, mx, my)) {
+            g_slider_drag_track  = L.repeat_rate;
+            g_slider_drag_target = &g_app_settings.key_repeat_rate_ms;
+            g_slider_drag_min = 5; g_slider_drag_max = 200;
+            *g_slider_drag_target = slider_value_from_x(L.repeat_rate, mx, 5, 200);
+            input_set_repeat(g_app_settings.key_repeat_initial_ms,
+                             g_app_settings.key_repeat_rate_ms);
+            return;
+        }
     }
     if (rect_hit(L.log_dir, mx, my)) {
         g_settings_dir_focus = true;
@@ -3809,6 +4004,51 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     }
     EndScissorMode();
 
+    /* Key-repeat sliders. Two rows: initial delay, then per-repeat
+       period. Track is a thin inset bar; the thumb is a tall pill
+       overlapping the track. Current value renders to the right. */
+    {
+        struct SliderSpec {
+            Rect        track;
+            const char *label;
+            int         val, vmin, vmax;
+            const char *unit;
+        } rows[2] = {
+            { L.repeat_initial, "Repeat delay",
+              g_app_settings.key_repeat_initial_ms, 0, 1000, "ms" },
+            { L.repeat_rate,    "Repeat rate",
+              g_app_settings.key_repeat_rate_ms,    5, 200, "ms" },
+        };
+        for (int i = 0; i < 2; i++) {
+            Rect tr = rows[i].track;
+            /* Label. */
+            DrawTextEx(*f, rows[i].label,
+                       (Vector2){L.modal.x + 22, tr.y - 3},
+                       14, 0, (Color){200, 205, 220, 255});
+            /* Track. */
+            DrawRectangle(tr.x, tr.y + tr.h / 2 - 2, tr.w, 4,
+                          (Color){46, 52, 70, 255});
+            /* Filled portion up to the thumb. */
+            float t = (float)(rows[i].val - rows[i].vmin)
+                    / (float)(rows[i].vmax - rows[i].vmin);
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+            int tx = tr.x + (int)(t * (float)tr.w + 0.5f);
+            DrawRectangle(tr.x, tr.y + tr.h / 2 - 2, tx - tr.x, 4,
+                          (Color){125, 207, 255, 220});
+            /* Thumb. */
+            DrawRectangle(tx - 5, tr.y - 4, 10, tr.h + 8,
+                          (Color){220, 228, 245, 255});
+            DrawRectangleLines(tx - 5, tr.y - 4, 10, tr.h + 8,
+                               (Color){125, 207, 255, 220});
+            /* Value readout right of the track. */
+            char vbuf[32];
+            snprintf(vbuf, sizeof(vbuf), "%d %s", rows[i].val, rows[i].unit);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){tr.x + tr.w + 8, tr.y - 3},
+                       13, 0, (Color){180, 190, 210, 255});
+        }
+    }
+
     /* Save-as-Default button. */
     DrawRectangle(L.save_default.x, L.save_default.y,
                   L.save_default.w, L.save_default.h,
@@ -3852,6 +4092,36 @@ static bool ui_key_down(void) {
     return IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
 #else
     return IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#endif
+}
+
+/* Platform-independent "open this URL in the user's default handler".
+   Fork+execvp on Unix so the URL is passed as argv (no shell injection).
+   Windows uses ShellExecuteW which launches the registered protocol
+   handler directly. */
+static void open_url(const char *url) {
+    if (!url || !*url) return;
+#ifdef _WIN32
+    wchar_t wurl[2048];
+    int n = MultiByteToWideChar(CP_UTF8, 0, url, -1,
+                                wurl, (int)(sizeof(wurl)/sizeof(wurl[0])));
+    if (n <= 0) return;
+    ShellExecuteW(NULL, L"open", wurl, NULL, NULL, SW_SHOWNORMAL);
+#else
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Detach from the rbterm process group so Ctrl-C etc. don't
+           hit the browser. */
+        setsid();
+        #ifdef __APPLE__
+            execlp("open", "open", url, (char *)NULL);
+        #else
+            execlp("xdg-open", "xdg-open", url, (char *)NULL);
+        #endif
+        _exit(127);
+    }
+    /* We don't want to wait() — if the user clicks many links we'd
+       accumulate children. SIGCHLD handler in main.c already reaps. */
 #endif
 }
 
@@ -3930,6 +4200,8 @@ int main(int argc, char **argv) {
     if (g_persisted.has_font_path && !font_path) font_path = g_persisted.font_path;
     if (g_persisted.has_font_size) font_size = g_persisted.font_size;
     if (g_persisted.has_padding)   init_padding = g_persisted.padding;
+    input_set_repeat(g_app_settings.key_repeat_initial_ms,
+                     g_app_settings.key_repeat_rate_ms);
 
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -4328,6 +4600,17 @@ int main(int argc, char **argv) {
                         #undef MOUSE_EMIT
                     } else {
                         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                            /* Cmd/Ctrl+click on an OSC 8 hyperlink opens
+                               it in the system default handler and
+                               doesn't start a selection. */
+                            if (ui_key_down()) {
+                                Cell cc = screen_view_cell(p->scr, mcol, mrow);
+                                const char *u = screen_link_url(p->scr, cc.link_id);
+                                if (u && *u) {
+                                    open_url(u);
+                                    goto pane_click_done;
+                                }
+                            }
                             double tnow = GetTime();
                             bool fast = (tnow - p->last_click_time < 0.45);
                             bool same = (mcol == p->last_click_col && mrow == p->last_click_row);
@@ -4356,6 +4639,7 @@ int main(int argc, char **argv) {
                                 }
                             }
                         }
+                        pane_click_done: ;
                     }
                 }
             }
@@ -4550,7 +4834,21 @@ int main(int argc, char **argv) {
         InputActions acts;
         size_t in_n = ap ? input_poll(ap->scr, inputbuf, sizeof(inputbuf), &acts)
                          : 0;
-        if (ap && acts.scroll_rows != 0) screen_scroll_view(ap->scr, acts.scroll_rows);
+        if (ap && acts.scroll_rows != 0) {
+            /* Keep the selection anchored to the content it started on
+               while the user scrolls through history. screen_scroll_view
+               clamps at the scrollback bounds, so we read the before/
+               after view_offset to know how much the viewport actually
+               moved and shift the selection rows by the same amount. */
+            int before = screen_view_offset(ap->scr);
+            screen_scroll_view(ap->scr, acts.scroll_rows);
+            int after  = screen_view_offset(ap->scr);
+            int delta  = after - before;
+            if (delta != 0 && ap->sel.active && !ap->sel.dragging) {
+                ap->sel.a_row += delta;
+                ap->sel.b_row += delta;
+            }
+        }
         if (ap && acts.select_all) {
             int cols = screen_cols(ap->scr);
             int rows = screen_rows(ap->scr);

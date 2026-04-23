@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-Pty *pty_open(int cols, int rows) {
-    void *impl = local_open_impl(cols, rows);
+Pty *pty_open(int cols, int rows, const char *cwd) {
+    void *impl = local_open_impl(cols, rows, cwd);
     if (!impl) return NULL;
     Pty *p = calloc(1, sizeof(*p));
     if (!p) { local_close_impl(impl); return NULL; }

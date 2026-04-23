@@ -131,6 +131,40 @@ cmake --build build
 - Cmd vs Ctrl are *separate* — `ctrl_down()` is real Ctrl only.
   Otherwise Cmd+C eats Ctrl+C and you can't send SIGINT.
 
+### Intelligent double-click (selection)
+
+Double-click uses a naive "run of non-whitespace" as the starting word
+span, then post-processes it to shave off boundary chars that almost
+never belong to what the user meant to copy. Lives in `select_word`
+in `src/main.c`.
+
+Current rules (in order of application):
+
+| Input (click on `^`)    | Naive span       | Trimmed      |
+|-------------------------|------------------|--------------|
+| `--bold,`<br>`   ^`     | `--bold,`        | `--bold`     |
+| `foo.` `foo,` `foo!`    | `foo.` etc.      | `foo`        |
+| `foo)`                  | `foo)`           | `foo`        |
+| `(x)`                   | `(x)`            | `(x)`        |
+| `(foo`                  | `(foo`           | `foo`        |
+| `"hello"`               | `"hello"`        | `"hello"`    |
+| `hello"`                | `hello"`         | `hello`      |
+
+Trim classes:
+- **Trailing sentence punctuation**: `, ; : . ! ?` stripped from the
+  right unless the user clicked directly on it.
+- **Unmatched closing delimiter**: `) ] } > "` stripped from the right
+  if the matching opener isn't inside the span.
+- **Unmatched opening delimiter**: `( [ { < "` stripped from the left
+  if the matching closer isn't inside the span.
+
+Kept as-is (treated as part of the word): `- _ / @ = . + #` interior,
+hyphens at the start (for `--flag`), digits, letters, most UTF-8.
+
+When adding a new case, extend the predicate helpers or add another
+post-trim pass in `select_word`. The guarded `c2 != col` / `c1 != col`
+checks ensure clicking directly on punctuation still selects it.
+
 ### Tab ordering
 - Tabs live in a `Tab *g_tabs[MAX_TABS]` pointer array. `tab_close`
   shifts remaining slots down. Each `Screen`'s `io.user` is the stable

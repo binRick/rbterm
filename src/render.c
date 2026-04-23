@@ -583,7 +583,8 @@ static bool sel_contains(const Selection *sel, int col, int row) {
 }
 
 void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
-                   const Selection *sel, int x_offset, int y_offset) {
+                   const Selection *sel, int x_offset, int y_offset,
+                   int hover_col, int hover_row) {
     Font *f = as_font(r);
     int cols = screen_cols(s);
     int rows = screen_rows(s);
@@ -794,6 +795,21 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             }
             if (c.attrs & ATTR_STRIKE) {
                 DrawRectangle(x * cw, y * ch + ch / 2, cw * span, 1, col_from_rgb(fg, alpha));
+            }
+            /* OSC 8 hyperlink: always draw a thin underline under any
+               cell with a link_id. When the mouse hovers over a cell
+               that shares the same link_id, paint all cells in the
+               hovered run thicker + accent so the whole link lights up. */
+            if (c.link_id) {
+                bool hot = false;
+                if (hover_col >= 0 && hover_row >= 0) {
+                    Cell hc = screen_view_cell(s, hover_col, hover_row);
+                    if (hc.link_id == c.link_id) hot = true;
+                }
+                Color lc = hot ? (Color){120, 200, 255, 255}
+                               : col_from_rgb(fg, alpha);
+                int th = hot ? 2 : 1;
+                DrawRectangle(x * cw, y * ch + ch - th, cw * span, th, lc);
             }
         }
     }

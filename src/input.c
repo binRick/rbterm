@@ -55,6 +55,74 @@ struct SpecialKey {
     const char *app;
 };
 
+/* Custom auto-repeat for backspace + arrows. raylib's IsKeyPressedRepeat
+   fires at the OS rate, which is fine for most, but users want a faster
+   feel for terminal editing. We time each tracked key ourselves: after
+   a down-edge emits once, a second emit fires `initial_ms` later, and
+   subsequent emits fire every `rate_ms` after that. */
+#define REPEAT_TRACK_MAX 16
+typedef struct {
+    int    key;          /* 0 = slot free */
+    double down_at;      /* GetTime() when the key first went down */
+    double last_emit_at; /* GetTime() of last emit for this hold */
+} RepeatState;
+
+static RepeatState g_repeat_state[REPEAT_TRACK_MAX];
+static int  g_repeat_initial_ms = 300;
+static int  g_repeat_rate_ms    = 25;
+
+void input_set_repeat(int initial_ms, int rate_ms) {
+    g_repeat_initial_ms = initial_ms;
+    g_repeat_rate_ms    = rate_ms;
+}
+
+/* Return true if this key should emit a byte this frame. Handles both
+   the initial down-edge and subsequent held-down repeats. Disables
+   auto-repeat when either configured value is <= 0 (falls back to a
+   one-shot press). */
+static bool repeat_fire(int key) {
+    if (IsKeyPressed(key)) {
+        double now = GetTime();
+        for (int i = 0; i < REPEAT_TRACK_MAX; i++) {
+            if (g_repeat_state[i].key == key) {
+                g_repeat_state[i].down_at = now;
+                g_repeat_state[i].last_emit_at = now;
+                return true;
+            }
+        }
+        for (int i = 0; i < REPEAT_TRACK_MAX; i++) {
+            if (g_repeat_state[i].key == 0) {
+                g_repeat_state[i].key = key;
+                g_repeat_state[i].down_at = now;
+                g_repeat_state[i].last_emit_at = now;
+                return true;
+            }
+        }
+        /* Table full — emit and forget (no repeat tracking). */
+        return true;
+    }
+    if (!IsKeyDown(key)) {
+        for (int i = 0; i < REPEAT_TRACK_MAX; i++) {
+            if (g_repeat_state[i].key == key) { g_repeat_state[i].key = 0; break; }
+        }
+        return false;
+    }
+    if (g_repeat_initial_ms <= 0 || g_repeat_rate_ms <= 0) return false;
+    double now = GetTime();
+    for (int i = 0; i < REPEAT_TRACK_MAX; i++) {
+        if (g_repeat_state[i].key != key) continue;
+        double since_down = now - g_repeat_state[i].down_at;
+        if (since_down < (double)g_repeat_initial_ms / 1000.0) return false;
+        double since_emit = now - g_repeat_state[i].last_emit_at;
+        if (since_emit >= (double)g_repeat_rate_ms / 1000.0) {
+            g_repeat_state[i].last_emit_at = now;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 static const struct SpecialKey special_keys[] = {
     { KEY_UP,    "\x1b[A", "\x1bOA" },
     { KEY_DOWN,  "\x1b[B", "\x1bOB" },
@@ -175,8 +243,9 @@ size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions) {
         if (shift) n = app(out, cap, n, "\x1b[Z");
         else { if (alt) n = app_byte(out, cap, n, 0x1b); n = app_byte(out, cap, n, '\t'); }
     }
-    // Backspace — send DEL (0x7f); Ctrl+Backspace -> BS (0x08) (word-erase in some shells)
-    if (IsKeyPressed(KEY_BACKSPACE)) {
+    // Backspace — send DEL (0x7f); Ctrl+Backspace -> BS (0x08) (word-erase in some shells).
+    // Uses our own repeat_fire() so the rate is user-configurable.
+    if (repeat_fire(KEY_BACKSPACE)) {
         if (alt) n = app_byte(out, cap, n, 0x1b);
         n = app_byte(out, cap, n, ctrl ? 0x08 : 0x7f);
     }
@@ -187,17 +256,15 @@ size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions) {
 
     bool app_cursor = screen_app_cursor(s);
     for (size_t i = 0; i < sizeof(special_keys)/sizeof(special_keys[0]); i++) {
-        if (IsKeyPressed(special_keys[i].key)) {
+        /* Same user-tunable repeat for arrows — matters for holding Left
+           to walk back along a long command line or Up to scrub shell
+           history. */
+        if (repeat_fire(special_keys[i].key)) {
             const char *seq = app_cursor ? special_keys[i].app : special_keys[i].normal;
             if (alt) n = app_byte(out, cap, n, 0x1b);
             n = app(out, cap, n, seq);
         }
     }
-
-    // Held-down repeat for arrows and backspace (raylib supplies IsKeyPressedRepeat in 5.x)
-#if defined(IsKeyPressedRepeat)
-    // noop: use built-in if available
-#endif
 
     return n;
 }

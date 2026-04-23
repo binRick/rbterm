@@ -16,3 +16,10 @@ typedef struct {
 } InputActions;
 
 size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions);
+
+/* Tune the backspace / arrow auto-repeat behaviour. `initial_ms` is the
+   delay before the first repeat fires after a key goes down; `rate_ms`
+   is the period between subsequent repeats. Values <= 0 fall back to
+   the OS-level raylib IsKeyPressedRepeat behaviour. Defaults are
+   initial=300, rate=25. */
+void input_set_repeat(int initial_ms, int rate_ms);

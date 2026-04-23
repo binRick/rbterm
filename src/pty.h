@@ -13,8 +13,9 @@
 typedef struct Pty Pty;
 
 /* Spawn the user's default shell inside a PTY sized `cols`x`rows`.
-   Returns NULL on failure. */
-Pty *pty_open(int cols, int rows);
+   `cwd` selects the child's initial working directory; NULL or ""
+   falls back to $HOME. Returns NULL on failure. */
+Pty *pty_open(int cols, int rows, const char *cwd);
 
 /* Connect a PTY to a remote shell over SSH.
  *   user:     NULL/"" → $USER / $USERNAME.

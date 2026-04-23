@@ -68,7 +68,7 @@ static void *local_reader(void *arg) {
     return NULL;
 }
 
-void *local_open_impl(int cols, int rows) {
+void *local_open_impl(int cols, int rows, const char *cwd) {
     struct winsize ws = { .ws_row = (unsigned short)rows,
                           .ws_col = (unsigned short)cols };
     int master;
@@ -96,14 +96,24 @@ void *local_open_impl(int cols, int rows) {
             setenv("LANG", "en_US.UTF-8", 1);
         }
 
-        const char *home = getenv("HOME");
-        if (!home || !*home) {
-            struct passwd *pw = getpwuid(getuid());
-            if (pw && pw->pw_dir) home = pw->pw_dir;
+        const char *start_dir = (cwd && *cwd) ? cwd : NULL;
+        if (!start_dir) {
+            const char *home = getenv("HOME");
+            if (!home || !*home) {
+                struct passwd *pw = getpwuid(getuid());
+                if (pw && pw->pw_dir) home = pw->pw_dir;
+            }
+            start_dir = (home && *home) ? home : NULL;
         }
-        if (home && *home) {
-            (void)chdir(home);
-            setenv("PWD", home, 1);
+        if (start_dir) {
+            /* chdir can fail (deleted dir, permissions) — fall back to
+               HOME rather than surprising the user with "/" as cwd. */
+            if (chdir(start_dir) != 0) {
+                const char *home = getenv("HOME");
+                if (home && *home) (void)chdir(home);
+                else start_dir = NULL;
+            }
+            if (start_dir) setenv("PWD", start_dir, 1);
         }
 
         const char *shell = getenv("SHELL");
