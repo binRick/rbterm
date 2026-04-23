@@ -335,13 +335,10 @@ A running list of things competing terminals do that rbterm doesn't.
 Not a roadmap — a shopping list to prioritise from.
 
 ### Window / layout
-- **Split panes** (horizontal + vertical, recursive) — iTerm2, kitty.
-  rbterm is tabs-only.
-- **Multiple windows** of the same process — all three.
 - **Broadcast input** to all panes / tabs (iTerm2: Cmd+Shift+I) — useful
   for fleet-of-ssh sessions.
-- **Tab reordering** by drag — iTerm2, kitty. rbterm tabs are fixed
-  in open order.
+- **Recursive splits** — rbterm has 2-pane splits (horiz + vert) but
+  not N-way recursion.
 - **Per-tab / per-pane title override** that survives shell rewrites.
 - **Tab bar styles** (top/bottom/left, powerline separators) — kitty.
 - **Hotkey window** — system-wide drop-down terminal (iTerm2).
@@ -368,8 +365,8 @@ Not a roadmap — a shopping list to prioritise from.
 
 ### Shell integration
 - **OSC 133 prompt marks** so jumping prompt-to-prompt works.
-- **OSC 7 cwd** is parsed already on Unix; **per-tab cwd inheritance
-  on new tab** (open new tab in same dir as current) is missing.
+- **Per-tab cwd inheritance on new tab** (open new tab in same dir
+  as current) — OSC 7 is parsed but not used for this.
 - **Command status badges** (success/fail glyph next to each prompt) —
   iTerm2 with shell integration.
 - **Notify on long-running command finish** (iTerm2, kitty
@@ -379,10 +376,11 @@ Not a roadmap — a shopping list to prioritise from.
 - **Bracketed paste actually working** (already on the TODO above).
 
 ### Graphics / fonts
-- **Inline images** (iTerm2 protocol, kitty graphics protocol, sixel) —
-  none in rbterm.
+- **iTerm2 inline-image protocol** (`OSC 1337 ; File=…`) — rbterm
+  supports sixel + kitty but not this one yet.
 - **Ligatures** (already on TODO).
-- **Variable / per-tab font size** — kitty.
+- **Per-local-tab font size** — rbterm has per-SSH-host font size
+  but not per-local-tab override.
 - **Background image / blur / transparency** — iTerm2, kitty.
 - **Cursor trail / smooth cursor animation** — kitty.
 - **Minimum-contrast adjustment** — iTerm2 (auto-bumps fg lightness so
@@ -396,11 +394,9 @@ Not a roadmap — a shopping list to prioritise from.
 - **Config file** (TOML / conf / Lua) — Alacritty, kitty, iTerm2 all
   have one. rbterm has only the modal.
 - **Live config reload** on file change — Alacritty, kitty.
-- **Profiles** (named bundles of font/colors/shell/cwd) — iTerm2, kitty.
-- **Per-host / per-cwd profile auto-switching** — iTerm2 dynamic
-  profiles.
-- **Themes / built-in colour schemes** picker (rbterm has `pal` but no
-  bundled list).
+- **Per-local-tab profiles** — rbterm has per-SSH-host profile
+  overrides (theme/font/cursor/log), but not per-local-tab profiles.
+- **Per-cwd profile auto-switching** — iTerm2 dynamic profiles.
 
 ### Input / keys
 - **User-definable keybindings** in config — all three.
