@@ -1,4 +1,6 @@
 #include "screen.h"
+#include "sixel.h"
+#include "kitty.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -14,6 +16,10 @@ enum {
     ST_CHARSET,      /* ESC * X or ESC + X — G2/G3, we ignore the payload */
     ST_CHARSET_G0,   /* ESC ( X — pick G0 charset */
     ST_CHARSET_G1,   /* ESC ) X — pick G1 charset */
+    ST_DCS,          /* ESC P … ST  — sixel lives here */
+    ST_DCS_ESC,      /* saw ESC while collecting DCS, waiting for \ */
+    ST_APC,          /* ESC _ … ST  — kitty graphics lives here */
+    ST_APC_ESC,      /* saw ESC while collecting APC, waiting for \ */
 };
 
 #define MAX_PARAMS 16
@@ -24,6 +30,22 @@ enum {
 #define SEED_DEFAULT_FG    0xFFFFFFu   /* pure white — was 0xEAEAEA, felt gray */
 #define SEED_DEFAULT_BG    0x111111u
 #define SEED_CURSOR_COLOR  0xFFFFFFu
+
+/* Forward declaration; full definition lives below. */
+typedef struct ScreenImage ScreenImage_t;
+
+/* Max concurrent images per screen. When a new image pushes us over,
+   the oldest is evicted (FIFO). 32 is generous — most sessions show
+   one image at a time and discard it on scroll. */
+#define SCREEN_IMAGE_CAP 32
+
+struct ScreenImage {
+    unsigned char *rgba;       /* owned; w*h*4 bytes */
+    int px_w, px_h;
+    int anchor_row;            /* viewport row (0 = top); may go < 0 off-screen */
+    int anchor_col;
+    uint64_t gen;              /* unique id; never reused across the run */
+};
 
 struct Screen {
     int cols, rows;
@@ -81,6 +103,31 @@ struct Screen {
     // OSC
     char osc[512];
     int osc_len;
+
+    /* Graphics — sixel / kitty images anchored to viewport rows. */
+    ScreenImage *images[SCREEN_IMAGE_CAP];
+    int          nimages;
+    uint64_t     next_image_gen;
+    /* Renderer tells the screen its cell pixel height so scroll
+       accounting can translate pixel-heighted images into cell-rows.
+       Seed at 20 so things work before any draw call. */
+    int          cell_h_px;
+
+    /* DCS/APC payload buffer for sixel (DCS) and kitty (APC). Grown
+       as needed so we don't blow the stack on large images. */
+    unsigned char *dpayload;
+    size_t         dpayload_len;
+    size_t         dpayload_cap;
+
+    /* Kitty chunked-message accumulator. Each chunk arrives as a
+       separate APC; we stitch them together here and decode on the
+       final chunk (m=0 or m absent). The buffer holds a synthetic
+       "G<keys-from-chunk-1>;<accumulated-base64>" blob so kitty_decode
+       doesn't need to know about chunking. */
+    unsigned char *kpending;
+    size_t         kpending_len;
+    size_t         kpending_cap;
+    bool           kpending_active;
 
     /* Per-screen palette (mutable via OSC 4/104). Kept per-screen so
        a tab/pane rewriting its colours doesn't bleed into the others. */
@@ -245,6 +292,66 @@ static Cell blank_cell(Screen *s) {
 
 static Cell *active(Screen *s) { return s->on_alt ? s->alt : s->main; }
 
+/* ---------- Images ---------- */
+
+static void image_free_one(ScreenImage *img) {
+    if (!img) return;
+    free(img->rgba);
+    free(img);
+}
+
+static void images_free_all(Screen *s) {
+    for (int i = 0; i < s->nimages; i++) image_free_one(s->images[i]);
+    s->nimages = 0;
+}
+
+/* Take ownership of rgba (caller must not free). anchor_row/col are
+   viewport coordinates (row 0 = top of visible grid). Returns the
+   new image on success, NULL if we're full or out of memory. When
+   we're at capacity, drop the oldest to make room. */
+static ScreenImage *image_append(Screen *s, unsigned char *rgba,
+                                 int px_w, int px_h,
+                                 int anchor_row, int anchor_col) {
+    if (!rgba || px_w <= 0 || px_h <= 0) { free(rgba); return NULL; }
+    if (s->nimages >= SCREEN_IMAGE_CAP) {
+        image_free_one(s->images[0]);
+        memmove(s->images, s->images + 1,
+                sizeof(s->images[0]) * (SCREEN_IMAGE_CAP - 1));
+        s->nimages = SCREEN_IMAGE_CAP - 1;
+    }
+    ScreenImage *img = calloc(1, sizeof(*img));
+    if (!img) { free(rgba); return NULL; }
+    img->rgba = rgba;
+    img->px_w = px_w;
+    img->px_h = px_h;
+    img->anchor_row = anchor_row;
+    img->anchor_col = anchor_col;
+    img->gen = ++s->next_image_gen;
+    s->images[s->nimages++] = img;
+    return img;
+}
+
+/* Move every image's anchor_row by -dy rows (viewport scrolled up).
+   When an image fully scrolls above row 0 it's dropped — rbterm
+   doesn't persist images into scrollback (v1 simplification). */
+static void images_scroll(Screen *s, int dy) {
+    if (dy == 0 || s->nimages == 0) return;
+    int ch = s->cell_h_px > 0 ? s->cell_h_px : 20;
+    for (int i = 0; i < s->nimages; ) {
+        ScreenImage *img = s->images[i];
+        img->anchor_row -= dy;
+        int h_rows = (img->px_h + ch - 1) / ch;
+        if (img->anchor_row + h_rows <= 0) {
+            image_free_one(img);
+            memmove(s->images + i, s->images + i + 1,
+                    sizeof(s->images[0]) * (s->nimages - i - 1));
+            s->nimages--;
+            continue;
+        }
+        i++;
+    }
+}
+
 static Cell *row_ptr(Screen *s, int y) { return active(s) + y * s->cols; }
 
 static void clear_row(Screen *s, int y) {
@@ -271,6 +378,7 @@ static void scroll_up_region(Screen *s, int top, int bot, int n) {
     Cell *base = active(s);
     if (!s->on_alt && top == 0) {
         for (int i = 0; i < n; i++) push_scrollback(s, base + (top + i) * s->cols);
+        images_scroll(s, n);
     }
     if (span - n > 0) {
         memmove(base + top * s->cols,
@@ -658,7 +766,10 @@ static void handle_csi(Screen *s, uint8_t b) {
             /* Intentionally silent — xterm responds with a DCS id which
                some shells also mis-parse. */
         } else {
-            const char *resp = "\x1b[?65;1;9c";
+            /* Advertise sixel support via "4" so img2sixel / ranger /
+               gnuplot pick rbterm as a sixel-capable terminal:
+               65 = VT525, 1 = 132-col, 4 = sixel, 9 = NRCS. */
+            const char *resp = "\x1b[?65;1;4;9c";
             s->io.write(s->io.user, (const uint8_t *)resp, strlen(resp));
         }
         break;
@@ -830,10 +941,148 @@ static void finish_osc(Screen *s) {
     }
 }
 
+/* Forward decls for DCS/APC dispatch (payload decoders live below). */
+static void dispatch_dcs(Screen *s, const unsigned char *p, size_t n);
+static void dispatch_apc(Screen *s, const unsigned char *p, size_t n);
+static void advance_cursor_past_image(Screen *s, int h_px);
+
+/* DCS payload dispatcher. Sixel payloads start with optional
+   numeric params and a `q`. Other DCS types (DECRQSS response,
+   xterm termcap queries) we ignore silently. */
+static void dispatch_dcs(Screen *s, const unsigned char *p, size_t n) {
+    if (!p || n == 0) return;
+    /* A sixel payload's header is digits/semicolons then 'q'. Skip
+       digits/semicolons and check: if we land on 'q' it's sixel. */
+    size_t i = 0;
+    while (i < n && ((p[i] >= '0' && p[i] <= '9') || p[i] == ';')) i++;
+    if (i >= n || p[i] != 'q') return;
+    int w = 0, h = 0;
+    unsigned char *rgba = sixel_decode(p, n, &w, &h);
+    if (!rgba) return;
+    if (image_append(s, rgba, w, h, s->cy, s->cx) == NULL) return;
+    /* rgba ownership transferred to image_append on success. */
+    advance_cursor_past_image(s, h);
+}
+
+/* Append `n` bytes to the kitty chunk accumulator, growing as needed. */
+static void kpending_append(Screen *s, const unsigned char *buf, size_t n) {
+    if (s->kpending_len + n > (1u << 26)) return;   /* 64MB safety cap */
+    if (s->kpending_len + n > s->kpending_cap) {
+        size_t nc = s->kpending_cap ? s->kpending_cap * 2 : 4096;
+        while (nc < s->kpending_len + n) nc *= 2;
+        unsigned char *nb = realloc(s->kpending, nc);
+        if (!nb) return;
+        s->kpending = nb;
+        s->kpending_cap = nc;
+    }
+    memcpy(s->kpending + s->kpending_len, buf, n);
+    s->kpending_len += n;
+}
+
+static void kpending_reset(Screen *s) {
+    s->kpending_len = 0;
+    s->kpending_active = false;
+}
+
+/* Find the `m=` value in a kitty keys block. Returns 0 (m=0, "last
+   chunk") when absent — that matches spec's default and also the
+   single-message case. */
+static int kitty_m_value(const unsigned char *keys, size_t klen) {
+    for (size_t i = 0; i + 1 < klen; i++) {
+        if (keys[i] == 'm' && keys[i + 1] == '=') {
+            size_t j = i + 2;
+            if (j < klen && keys[j] >= '0' && keys[j] <= '9')
+                return keys[j] - '0';
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* APC payload dispatcher. Kitty graphics start with 'G' then
+   key=value pairs. Supports chunked (m=1/m=0) multi-message transfer
+   by buffering bytes across APC calls until the final chunk arrives. */
+static void dispatch_apc(Screen *s, const unsigned char *p, size_t n) {
+    if (!p || n == 0) return;
+    if (p[0] != 'G') return;
+
+    /* Locate the ';' that splits keys from the base64 payload. */
+    size_t sep = 1;
+    while (sep < n && p[sep] != ';') sep++;
+    const unsigned char *keys = p + 1;
+    size_t klen = sep - 1;
+    const unsigned char *pload = (sep < n) ? p + sep + 1 : p + n;
+    size_t plen = (sep < n) ? n - sep - 1 : 0;
+
+    int m = kitty_m_value(keys, klen);
+
+    /* First chunk (no pending yet): save the full "G<keys>;<payload>"
+       prefix so the decoder sees the metadata from the first message
+       only. Subsequent chunks contribute only their payload bytes. */
+    if (!s->kpending_active) {
+        /* Include the full "G<keys>;" header plus this chunk's payload. */
+        kpending_append(s, p, (size_t)(pload - p));  /* G<keys>; */
+        kpending_append(s, pload, plen);
+        s->kpending_active = true;
+    } else {
+        /* Mid/last chunk — append only the payload bytes, discarding
+           the (minimal) keys section that tails like `m=0;`. */
+        kpending_append(s, pload, plen);
+    }
+
+    if (m == 1) return;   /* more chunks follow */
+
+    /* Final chunk — decode and clear. */
+    int w = 0, h = 0;
+    unsigned char *rgba = kitty_decode(s->kpending, s->kpending_len, &w, &h);
+    kpending_reset(s);
+    if (!rgba) return;
+    if (image_append(s, rgba, w, h, s->cy, s->cx) == NULL) return;
+    advance_cursor_past_image(s, h);
+}
+
+/* Advance the cursor past an image that occupies `h_px` vertical
+   pixels, anchored at the current cursor position. The cursor lands
+   on a fresh row below the image so subsequent text doesn't draw on
+   top. Triggers scroll if the image extends past the bottom. */
+static void advance_cursor_past_image(Screen *s, int h_px) {
+    int ch = s->cell_h_px > 0 ? s->cell_h_px : 20;
+    int h_rows = (h_px + ch - 1) / ch;
+    if (h_rows < 1) h_rows = 1;
+    s->cx = 0;
+    for (int i = 0; i < h_rows; i++) {
+        if (s->cy >= s->scroll_bot) {
+            scroll_up_region(s, s->scroll_top, s->scroll_bot, 1);
+        } else {
+            s->cy++;
+        }
+    }
+    s->wrap_next = false;
+}
+
+/* Append a single byte to the DCS/APC payload buffer, growing if needed.
+   Caps at 16MB — sixels bigger than that are almost certainly a bug. */
+static void dpayload_push(Screen *s, uint8_t b) {
+    if (s->dpayload_len >= (1u << 24)) return;
+    if (s->dpayload_len + 1 > s->dpayload_cap) {
+        size_t nc = s->dpayload_cap ? s->dpayload_cap * 2 : 4096;
+        if (nc < s->dpayload_len + 1) nc = s->dpayload_len + 1;
+        unsigned char *nb = realloc(s->dpayload, nc);
+        if (!nb) return;
+        s->dpayload = nb;
+        s->dpayload_cap = nc;
+    }
+    s->dpayload[s->dpayload_len++] = b;
+}
+
+static void dpayload_reset(Screen *s) { s->dpayload_len = 0; }
+
 static void handle_esc(Screen *s, uint8_t b) {
     switch (b) {
     case '[': s->pstate = ST_CSI; reset_params(s); return;
     case ']': s->pstate = ST_OSC; s->osc_len = 0; return;
+    case 'P': s->pstate = ST_DCS; dpayload_reset(s); return;
+    case '_': s->pstate = ST_APC; dpayload_reset(s); return;
     case '7': s->saved_cx = s->cx; s->saved_cy = s->cy;
               s->saved_fg = s->cur_attr.fg; s->saved_bg = s->cur_attr.bg;
               s->saved_attrs_flags = s->cur_attr.attrs;
@@ -912,6 +1161,40 @@ static void feed_byte(Screen *s, uint8_t b) {
     if (s->pstate == ST_OSC_ESC) {
         if (b == '\\') { finish_osc(s); s->pstate = ST_GROUND; return; }
         s->pstate = ST_OSC; return;
+    }
+    /* DCS — sixel and DECRQSS live here. Terminated by ESC \ or BEL. */
+    if (s->pstate == ST_DCS) {
+        if (b == 0x1b) { s->pstate = ST_DCS_ESC; return; }
+        if (b == 0x07) { dispatch_dcs(s, s->dpayload, s->dpayload_len);
+                         dpayload_reset(s); s->pstate = ST_GROUND; return; }
+        dpayload_push(s, b);
+        return;
+    }
+    if (s->pstate == ST_DCS_ESC) {
+        if (b == '\\') { dispatch_dcs(s, s->dpayload, s->dpayload_len);
+                         dpayload_reset(s); s->pstate = ST_GROUND; return; }
+        /* Bogus ESC inside DCS — treat as literal ESC in payload and
+           resume collection. Matches xterm leniency for broken senders. */
+        dpayload_push(s, 0x1b);
+        dpayload_push(s, b);
+        s->pstate = ST_DCS;
+        return;
+    }
+    /* APC — kitty graphics payloads. Same ESC \ termination. */
+    if (s->pstate == ST_APC) {
+        if (b == 0x1b) { s->pstate = ST_APC_ESC; return; }
+        if (b == 0x07) { dispatch_apc(s, s->dpayload, s->dpayload_len);
+                         dpayload_reset(s); s->pstate = ST_GROUND; return; }
+        dpayload_push(s, b);
+        return;
+    }
+    if (s->pstate == ST_APC_ESC) {
+        if (b == '\\') { dispatch_apc(s, s->dpayload, s->dpayload_len);
+                         dpayload_reset(s); s->pstate = ST_GROUND; return; }
+        dpayload_push(s, 0x1b);
+        dpayload_push(s, b);
+        s->pstate = ST_APC;
+        return;
     }
     if (s->pstate == ST_CHARSET) { s->pstate = ST_GROUND; return; }
     if (s->pstate == ST_CHARSET_G0) { s->charset_g0 = (char)b; s->pstate = ST_GROUND; return; }
@@ -1001,14 +1284,33 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     }
     s->sb_cap = scrollback;
     if (scrollback > 0) s->sb = calloc((size_t)scrollback * cols, sizeof(Cell));
+    s->cell_h_px = 20;   /* best-effort until renderer sets the real value */
     s->io = io;
     return s;
 }
 
 void screen_free(Screen *s) {
     if (!s) return;
+    images_free_all(s);
+    free(s->dpayload);
+    free(s->kpending);
     free(s->main); free(s->alt); free(s->sb); free(s->main_wrap);
     free(s);
+}
+
+int screen_image_count(const Screen *s) { return s ? s->nimages : 0; }
+const ScreenImage *screen_image_at(const Screen *s, int i) {
+    if (!s || i < 0 || i >= s->nimages) return NULL;
+    return s->images[i];
+}
+const unsigned char *screen_image_rgba(const ScreenImage *img) { return img ? img->rgba : NULL; }
+int screen_image_px_w(const ScreenImage *img)       { return img ? img->px_w : 0; }
+int screen_image_px_h(const ScreenImage *img)       { return img ? img->px_h : 0; }
+int screen_image_anchor_row(const ScreenImage *img) { return img ? img->anchor_row : 0; }
+int screen_image_anchor_col(const ScreenImage *img) { return img ? img->anchor_col : 0; }
+uint64_t screen_image_generation(const ScreenImage *img) { return img ? img->gen : 0; }
+void screen_set_cell_h_px(Screen *s, int cell_h_px) {
+    if (s && cell_h_px > 0) s->cell_h_px = cell_h_px;
 }
 
 void screen_set_io_user(Screen *s, void *user) {

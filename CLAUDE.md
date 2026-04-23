@@ -278,6 +278,44 @@ the exclusion first before re-copying:
 ssh win 'powershell -NoProfile -Command "Add-MpPreference -ExclusionPath \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\""'
 ```
 
+## Graphics (sixel + kitty)
+
+rbterm advertises sixel support in its Primary-DA response
+(`CSI ? 65 ; 1 ; 4 ; 9 c`) so tools like `img2sixel`, `chafa -f sixel`,
+`ranger` and `gnuplot` auto-select sixel output.
+
+Pipeline:
+
+1. **Parser** (`screen.c`): DCS (`ESC P ... ESC \`) and APC
+   (`ESC _ ... ESC \`) payloads are collected into a growable buffer.
+   On terminator the first byte of payload picks the decoder — DCS
+   beginning with `<digits>;<...>q` → sixel; APC beginning with `G` →
+   kitty.
+2. **Decoders** (`sixel.c`, `kitty.c`): return a heap RGBA8 bitmap.
+   Sixel does two passes (scan extents, then rasterise). Kitty v1
+   only supports `f=100` (PNG) single-message payloads, decoded via
+   raylib's `LoadImageFromMemory`.
+3. **Storage** (`screen.c`): images attach to the `Screen` with an
+   anchor row+col (viewport coords). When the terminal scrolls up,
+   every image's anchor row decrements; images that pass row 0 are
+   dropped (no scrollback persistence in v1). Cap of 32 concurrent
+   images per screen; oldest evicted on overflow.
+4. **Blit** (`render.c`): per-frame cache keyed by
+   `(ScreenImage*, generation)`. New images upload to a `Texture2D`
+   once; stale entries (image no longer in the screen's list) are
+   evicted. Images draw over text — the cursor advances past the
+   image when it's ingested so normal output doesn't overlap.
+
+v1 limitations / intentional gaps:
+- Sixel: no background-fill mode (P1=0), no stretched aspect (P3),
+  no custom color-register widths.
+- Kitty: raw RGBA (f=24/32), chunked (m=1), animation (a=a), delete
+  commands (a=d) and the response protocol (q=) are all ignored.
+- No selection or copy over images.
+- No reflow for images on resize — they keep their original pixel size.
+
+Test: inside an rbterm pane, `img2sixel some.png` (libsixel).
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt
@@ -285,12 +323,115 @@ ssh win 'powershell -NoProfile -Command "Add-MpPreference -ExclusionPath \"$env:
 - Async SSH connect so the UI doesn't freeze during the handshake.
 - Saved SSH profiles / a connect history.
 - DirectWrite emoji for Windows.
-- Sixel / kitty graphics protocol.
 - Ligatures (needs shaping — HarfBuzz).
-- Mouse reporting modes (DECSET 1000 / 1002 / 1006) — parser accepts
-  them but doesn't actually send mouse events to the PTY.
 - Bracketed paste (DECSET 2004 accepted, no effect yet).
-- Windows icon resource (currently no icon on the .exe).
 - Scrollback reflow on resize (only the main screen reflows today; the
   existing scrollback is just re-bucketed at the new width).
 - Linux `.desktop` file + icon install path.
+
+## Missing features (vs iTerm2 / Alacritty / kitty)
+
+A running list of things competing terminals do that rbterm doesn't.
+Not a roadmap — a shopping list to prioritise from.
+
+### Window / layout
+- **Split panes** (horizontal + vertical, recursive) — iTerm2, kitty.
+  rbterm is tabs-only.
+- **Multiple windows** of the same process — all three.
+- **Broadcast input** to all panes / tabs (iTerm2: Cmd+Shift+I) — useful
+  for fleet-of-ssh sessions.
+- **Tab reordering** by drag — iTerm2, kitty. rbterm tabs are fixed
+  in open order.
+- **Per-tab / per-pane title override** that survives shell rewrites.
+- **Tab bar styles** (top/bottom/left, powerline separators) — kitty.
+- **Hotkey window** — system-wide drop-down terminal (iTerm2).
+- **Quake-style fullscreen toggle** with animation (iTerm2).
+- **Session restore** on relaunch (iTerm2: restore tabs + scrollback).
+
+### Scrollback / search
+- **Find in scrollback** (Cmd+F, regex, highlight all matches) — all
+  three. rbterm has no search.
+- **Vi mode for scrollback** navigation (Alacritty, kitty) — keyboard
+  scrolling + visual selection without mouse.
+- **Jump to prompt / previous command** (iTerm2 + shell integration,
+  kitty marks) — needs OSC 133.
+- **Clickable URL detection** (Cmd/Ctrl+click to open) — all three.
+  rbterm currently has none.
+- **Hints / hyperlinks-by-keyboard** (kitty `hints` kitten) — label
+  every URL with a keystroke and open with one keypress.
+- **OSC 8 hyperlinks** (`\e]8;;url\e\\text\e]8;;\e\\`) — kitty,
+  iTerm2, recent Alacritty.
+- **Smart selection** (regex-defined word boundaries) — iTerm2.
+- **Triple-click selects line; quad-click selects paragraph** —
+  iTerm2.
+- **Rectangular / column selection** (Alt+drag) — all three.
+
+### Shell integration
+- **OSC 133 prompt marks** so jumping prompt-to-prompt works.
+- **OSC 7 cwd** is parsed already on Unix; **per-tab cwd inheritance
+  on new tab** (open new tab in same dir as current) is missing.
+- **Command status badges** (success/fail glyph next to each prompt) —
+  iTerm2 with shell integration.
+- **Notify on long-running command finish** (iTerm2, kitty
+  `notify-on-cmd-finish`).
+- **Paste guards** for multi-line / sudo / newline-containing pastes
+  (iTerm2, kitty `paste_actions confirm`).
+- **Bracketed paste actually working** (already on the TODO above).
+
+### Graphics / fonts
+- **Inline images** (iTerm2 protocol, kitty graphics protocol, sixel) —
+  none in rbterm.
+- **Ligatures** (already on TODO).
+- **Variable / per-tab font size** — kitty.
+- **Background image / blur / transparency** — iTerm2, kitty.
+- **Cursor trail / smooth cursor animation** — kitty.
+- **Minimum-contrast adjustment** — iTerm2 (auto-bumps fg lightness so
+  text never disappears against close-coloured bg).
+- **Dim inactive panes** — iTerm2.
+- **True-color background gradients** per pane.
+
+### Configuration
+- **Persisted settings** (rbterm's `AppSettings` is in-memory only —
+  already noted).
+- **Config file** (TOML / conf / Lua) — Alacritty, kitty, iTerm2 all
+  have one. rbterm has only the modal.
+- **Live config reload** on file change — Alacritty, kitty.
+- **Profiles** (named bundles of font/colors/shell/cwd) — iTerm2, kitty.
+- **Per-host / per-cwd profile auto-switching** — iTerm2 dynamic
+  profiles.
+- **Themes / built-in colour schemes** picker (rbterm has `pal` but no
+  bundled list).
+
+### Input / keys
+- **User-definable keybindings** in config — all three.
+- **Chord / leader-key bindings** — kitty.
+- **macOS native key remap** (Option-as-Meta, Left-Option vs
+  Right-Option distinct) — iTerm2.
+- **Unicode input kitten / compose key** — kitty.
+- **Password manager autofill** — iTerm2.
+
+### Extensibility / scripting
+- **Remote control protocol** (`kitty @ ls`, `kitty @ send-text`) —
+  kitten ecosystem, scriptable from outside the terminal.
+- **Triggers** — regex on output runs an action (iTerm2: ring bell,
+  highlight, run script, capture into variable).
+- **Watchers / event hooks** (kitty: Python scripts invoked on
+  window/tab events).
+- **Status bar** with custom segments (iTerm2, kitty `tab_bar_style`
+  with active indicators).
+- **ssh kitten**-equivalent — auto-ship terminfo and dotfiles to the
+  remote host on connect (kitty). rbterm's SSH backend currently
+  inherits whatever terminfo the remote has for `xterm-256color`.
+
+### Bell / notifications
+- **Visual bell** (flash window/tab) — all three. rbterm ignores BEL.
+- **Audible bell** toggle.
+- **OSC 9 / OSC 777 desktop notifications** — kitty, iTerm2.
+- **Per-tab unread / activity / silence indicators** — iTerm2, kitty.
+
+### Performance / rendering
+- **Damage-tracked redraw** (only redraw changed cells) — Alacritty,
+  kitty. rbterm currently redraws the full grid each frame.
+- **Vsync / frame-rate cap when idle** to drop GPU/CPU use.
+- **Headless / daemon mode** for one-process-many-windows (Alacritty
+  `--daemon`, kitty single-instance).

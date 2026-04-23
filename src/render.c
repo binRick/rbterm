@@ -32,6 +32,81 @@ typedef struct {
 static GlyphCache g_emoji    = { .font_name = "Apple Color Emoji" };
 static GlyphCache g_fallback = { .font_name = "Menlo" };
 
+/* --- Image texture cache ---
+ *
+ * Sixel + kitty images arrive as RGBA8 bitmaps attached to a Screen.
+ * Uploading to a GPU texture every frame is wasteful, so we keep a
+ * small cache keyed by (ScreenImage*, generation). `generation` is a
+ * counter that never repeats within a run, so when an image is freed
+ * and a new one is allocated at the same address it still misses
+ * the cache. */
+typedef struct {
+    const ScreenImage *key;
+    uint64_t gen;
+    Texture2D tex;
+    bool in_use;
+    bool ok;
+} ImgEntry;
+
+#define IMG_CACHE_CAP 128
+static ImgEntry g_img_cache[IMG_CACHE_CAP];
+
+static ImgEntry *img_cache_get_or_upload(const ScreenImage *img) {
+    uint64_t g = screen_image_generation(img);
+    for (int i = 0; i < IMG_CACHE_CAP; i++) {
+        if (g_img_cache[i].ok && g_img_cache[i].key == img
+            && g_img_cache[i].gen == g) {
+            g_img_cache[i].in_use = true;
+            return &g_img_cache[i];
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < IMG_CACHE_CAP; i++) {
+        if (!g_img_cache[i].ok) { slot = i; break; }
+    }
+    if (slot < 0) {
+        /* Cache full — evict the first entry not marked in use this frame.
+           If every slot is in use (unlikely with cap=128), overwrite 0. */
+        for (int i = 0; i < IMG_CACHE_CAP; i++) {
+            if (!g_img_cache[i].in_use) { slot = i; break; }
+        }
+        if (slot < 0) slot = 0;
+        if (g_img_cache[slot].ok) UnloadTexture(g_img_cache[slot].tex);
+        memset(&g_img_cache[slot], 0, sizeof(g_img_cache[slot]));
+    }
+    int w = screen_image_px_w(img);
+    int h = screen_image_px_h(img);
+    const unsigned char *rgba = screen_image_rgba(img);
+    if (w <= 0 || h <= 0 || !rgba) return NULL;
+    Image im = { 0 };
+    im.data = (void *)rgba;           /* shared; LoadTextureFromImage copies */
+    im.width = w; im.height = h;
+    im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    im.mipmaps = 1;
+    Texture2D tex = LoadTextureFromImage(im);
+    if (tex.id == 0) return NULL;
+    SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+    g_img_cache[slot].key    = img;
+    g_img_cache[slot].gen    = g;
+    g_img_cache[slot].tex    = tex;
+    g_img_cache[slot].in_use = true;
+    g_img_cache[slot].ok     = true;
+    return &g_img_cache[slot];
+}
+
+static void img_cache_prune_frame(void) {
+    for (int i = 0; i < IMG_CACHE_CAP; i++) {
+        if (g_img_cache[i].ok && !g_img_cache[i].in_use) {
+            UnloadTexture(g_img_cache[i].tex);
+            memset(&g_img_cache[i], 0, sizeof(g_img_cache[i]));
+        }
+    }
+}
+
+static void img_cache_begin_frame(void) {
+    for (int i = 0; i < IMG_CACHE_CAP; i++) g_img_cache[i].in_use = false;
+}
+
 static void glyph_cache_clear(GlyphCache *c) {
     for (int i = 0; i < c->count; i++) {
         if (c->items[i].ok) UnloadTexture(c->items[i].tex);
@@ -514,6 +589,10 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     int rows = screen_rows(s);
     int cw = r->cell_w, ch = r->cell_h;
     int px = r->pad_x, py = r->pad_y;
+    /* Let the screen know our current cell height so scroll accounting
+       for pixel-heighted graphics lands on the right row. */
+    screen_set_cell_h_px(s, ch);
+    img_cache_begin_frame();
     float bga = r->bg_alpha;
     if (bga < 0.0f) bga = 0.0f;
     if (bga > 1.0f) bga = 1.0f;
@@ -718,6 +797,30 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             }
         }
     }
+
+    /* Image pass — blit sixel / kitty bitmaps on top of text. Images
+       occupy the rows they anchor to, so overlapping glyphs (if any)
+       end up underneath the picture. Scroll offset shifts them up. */
+    {
+        int nimg = screen_image_count(s);
+        int vo = screen_view_offset(s);
+        for (int i = 0; i < nimg; i++) {
+            const ScreenImage *img = screen_image_at(s, i);
+            if (!img) continue;
+            ImgEntry *e = img_cache_get_or_upload(img);
+            if (!e) continue;
+            int row = screen_image_anchor_row(img) + vo;
+            int col = screen_image_anchor_col(img);
+            int dx = col * cw;
+            int dy = row * ch;
+            int w = screen_image_px_w(img);
+            int h = screen_image_px_h(img);
+            Rectangle src = { 0, 0, (float)w, (float)h };
+            Rectangle dst = { (float)dx, (float)dy, (float)w, (float)h };
+            DrawTexturePro(e->tex, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+        }
+    }
+    img_cache_prune_frame();
 
     // Scrollback indicator
     if (screen_view_offset(s) > 0) {

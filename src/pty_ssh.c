@@ -142,12 +142,36 @@ void *ssh_open_impl(const char *user, const char *host, int port,
        actually accepts — lets us skip auth types the server rejects. */
     (void)ssh_userauth_none(p->session, NULL);
 
-    /* 1. Password (if provided). */
+    /* 1. Password (if provided). Try plain "password" auth first; if the
+          server only accepts keyboard-interactive (common with PAM),
+          fall through and answer every prompt with the same password.
+          If the server demands a 2FA code this will fail; that's fine
+          for v1 — user can still fall back to pubkey. */
     if (password && *password) {
         TRIED("password");
         auth = ssh_userauth_password(p->session, NULL, password);
         fprintf(stderr, "rbterm: ssh password auth => %s\n",
                 auth == SSH_AUTH_SUCCESS ? "ok" : ssh_get_error(p->session));
+
+        if (auth != SSH_AUTH_SUCCESS) {
+            TRIED("keyboard-interactive");
+            int rc = ssh_userauth_kbdint(p->session, NULL, NULL);
+            /* Bail out early if the server doesn't even offer kbdint so
+               we don't spin on SSH_AUTH_DENIED. */
+            int spins = 0;
+            while (rc == SSH_AUTH_INFO && spins++ < 8) {
+                int n = ssh_userauth_kbdint_getnprompts(p->session);
+                for (int i = 0; i < n; i++) {
+                    char echo = 0;
+                    (void)ssh_userauth_kbdint_getprompt(p->session, i, &echo);
+                    ssh_userauth_kbdint_setanswer(p->session, i, password);
+                }
+                rc = ssh_userauth_kbdint(p->session, NULL, NULL);
+            }
+            auth = rc;
+            fprintf(stderr, "rbterm: ssh kbd-interactive auth => %s\n",
+                    auth == SSH_AUTH_SUCCESS ? "ok" : ssh_get_error(p->session));
+        }
     }
 
     /* 2. Explicit private key path. If the user typed a `.pub` path by

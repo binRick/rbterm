@@ -46,6 +46,8 @@ set(RBTERM_SOURCES
     src/render.c
     src/input.c
     src/theme.c
+    src/sixel.c
+    src/kitty.c
     src/pty_dispatch.c
 )
 

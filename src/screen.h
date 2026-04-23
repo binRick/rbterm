@@ -96,3 +96,25 @@ bool    screen_focus_report(const Screen *s);
 bool    screen_bracketed_paste(const Screen *s);
 int     screen_mouse_mode(const Screen *s);   /* 0, 1000, 1002, 1003 */
 bool    screen_mouse_sgr(const Screen *s);    /* true when DECSET 1006 active */
+
+/* --- Graphics (sixel / kitty) -------------------------------------------
+ *
+ * Images are decoded at the parser and attached to the Screen with an
+ * anchor row+col (in viewport row coordinates). When the viewport
+ * scrolls, anchors move with the content; images that fall above the
+ * live grid (anchor_row + img_rows <= 0) are dropped. The Renderer
+ * reads the list each frame and uploads RGBA buffers to textures
+ * lazily (generation-number cache). */
+typedef struct ScreenImage ScreenImage;
+int                   screen_image_count(const Screen *s);
+const ScreenImage    *screen_image_at(const Screen *s, int i);
+const unsigned char  *screen_image_rgba(const ScreenImage *img);
+int                   screen_image_px_w(const ScreenImage *img);
+int                   screen_image_px_h(const ScreenImage *img);
+int                   screen_image_anchor_row(const ScreenImage *img);
+int                   screen_image_anchor_col(const ScreenImage *img);
+uint64_t              screen_image_generation(const ScreenImage *img);
+/* Renderer tells the screen its cell pixel height so scroll accounting
+   can translate pixel-heighted images into cell rows. Call from the
+   renderer whenever cell_h changes (font size change, init). */
+void                  screen_set_cell_h_px(Screen *s, int cell_h_px);

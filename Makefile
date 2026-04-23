@@ -30,7 +30,7 @@ endif
 LDLIBS += -lssh
 
 SRCS := src/main.c src/screen.c src/render.c src/input.c src/theme.c \
-        src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c
+        src/sixel.c src/kitty.c src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c
 OBJS := $(SRCS:.c=.o) $(EMOJI_OBJ) src/fonts_embedded.o
 
 all: rbterm

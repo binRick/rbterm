@@ -2206,6 +2206,32 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
         return;
     }
 
+    /* Paste (Ctrl+V / Cmd+V) into whichever text field has focus. The
+       GetCharPressed loop below ignores modified chords, so we inject
+       clipboard bytes here explicitly. */
+    if (mod && IsKeyPressed(KEY_V) && is_text_field) {
+        const char *clip = GetClipboardText();
+        if (clip && *clip) {
+            size_t cap;
+            char *buf = form_buf(g_form.focus, &cap);
+            if (buf) {
+                if (g_form.sel_all) { memset(buf, 0, cap); g_form.sel_all = false; }
+                size_t len = strlen(buf);
+                for (const char *q = clip; *q; q++) {
+                    unsigned char c = (unsigned char)*q;
+                    if (c == '\r' || c == '\n' || c == '\t') continue;
+                    if (c < 32 || c >= 127) continue;
+                    if (g_form.focus == F_PORT && !(c >= '0' && c <= '9')) continue;
+                    if (len + 1 >= cap) break;
+                    buf[len++] = (char)c;
+                }
+                buf[len] = 0;
+                g_form.error[0] = 0;
+            }
+        }
+        return;
+    }
+
     if (IsKeyPressed(KEY_TAB) || IsKeyPressedRepeat(KEY_TAB)) {
         ssh_form_advance_focus(shift ? -1 : +1);
         return;
@@ -3256,6 +3282,11 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     if (g_settings_dir_focus) {
         /* Text input on the log directory. */
         if (mod && IsKeyPressed(KEY_A)) { g_settings_dir_sel_all = true; return; }
+        if (mod && IsKeyPressed(KEY_C) && g_settings_dir_sel_all
+                && g_app_settings.log_dir[0]) {
+            SetClipboardText(g_app_settings.log_dir);
+            return;
+        }
         size_t len = strlen(g_app_settings.log_dir);
         if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
             if (g_settings_dir_sel_all) {
