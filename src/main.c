@@ -3913,6 +3913,15 @@ int main(int argc, char **argv) {
        rects computed from GetScreenWidth() then sit in one coord
        system, mouse clicks in another, and every button misses. */
     unsigned int cfg_flags = FLAG_VSYNC_HINT;
+#elif defined(_WIN32)
+    /* Windows: HIGHDPI makes raylib size the OpenGL framebuffer to
+       physical pixels while GetScreenWidth() returns logical pixels.
+       When the DPI scale is non-1 (especially inside VMs + Parallels)
+       the two coordinate systems diverge and the right-cluster tab
+       buttons land outside the visible viewport. Stick with 1:1
+       pixel mapping — slightly less crisp on HiDPI panels but the
+       layout is always correct. */
+    unsigned int cfg_flags = FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT;
 #else
     unsigned int cfg_flags = FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT
                            | FLAG_WINDOW_HIGHDPI;
