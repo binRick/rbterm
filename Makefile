@@ -56,6 +56,17 @@ src/fonts_embedded.o: src/fonts_embedded.S
 
 src/main.o: src/fonts_embedded.h
 
+# Header dependencies (kept manual — small project, easy to maintain).
+# Touch screen.h and the world rebuilds, which prevents Cell-struct
+# layout mismatches between translation units after a struct change.
+SCREEN_H_DEPS := src/main.o src/screen.o src/render.o src/input.o \
+                 src/theme.o src/sixel.o src/kitty.o
+$(SCREEN_H_DEPS): src/screen.h
+src/render.o src/main.o: src/render.h
+src/main.o src/render.o src/input.o: src/input.h
+src/main.o src/pty_dispatch.o src/pty_unix.o src/pty_ssh.o: src/pty.h
+src/pty_dispatch.o src/pty_unix.o src/pty_ssh.o: src/pty_internal.h
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 

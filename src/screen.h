@@ -4,11 +4,12 @@
 #include <stddef.h>
 
 typedef struct {
-    uint32_t cp;     // Unicode code point (0 = blank)
-    uint32_t fg;     // 0xRRGGBB
-    uint32_t bg;     // 0xRRGGBB
-    uint16_t attrs;  // ATTR_*
-    uint16_t link_id;// 0 = no hyperlink; else index into screen's URL pool
+    uint32_t cp;       // Unicode code point (0 = blank)
+    uint32_t fg;       // 0xRRGGBB
+    uint32_t bg;       // 0xRRGGBB
+    uint32_t ul_color; // 0 = inherit fg; else 0xRRGGBB explicit underline color (SGR 58)
+    uint16_t attrs;    // ATTR_* + 3-bit underline style at bits 11..13
+    uint16_t link_id;  // 0 = no hyperlink; else index into screen's URL pool
 } Cell;
 
 enum {
@@ -23,9 +24,23 @@ enum {
     ATTR_WIDE_CONT = 1u << 8,   /* right-hand continuation of a wide char  */
     ATTR_FG_INDEX  = 1u << 9,   /* fg holds a palette index (0..255), not RGB */
     ATTR_BG_INDEX  = 1u << 10,  /* bg holds a palette index (0..255), not RGB */
+    /* Bits 11..13: underline style. Read with UL_STYLE_GET; written via
+       ATTR_UL_STYLE_SHIFT. 0 = single (default when ATTR_UNDERLINE set). */
+    ATTR_UL_STYLE_MASK  = 7u << 11,
     ATTR_DEFAULT_FG = 1u << 14,
     ATTR_DEFAULT_BG = 1u << 15,
 };
+#define ATTR_UL_STYLE_SHIFT 11
+typedef enum {
+    UL_STYLE_SINGLE = 0,
+    UL_STYLE_DOUBLE = 1,
+    UL_STYLE_CURLY  = 2,
+    UL_STYLE_DOTTED = 3,
+    UL_STYLE_DASHED = 4,
+} UlStyle;
+#define UL_STYLE_GET(attrs) (((attrs) >> ATTR_UL_STYLE_SHIFT) & 7u)
+/* Backwards-compat alias used by the SGR 21 path. */
+#define ATTR_DOUBLE_UNDERLINE  (UL_STYLE_DOUBLE << ATTR_UL_STYLE_SHIFT)
 
 typedef struct Screen Screen;
 
@@ -47,6 +62,7 @@ typedef struct {
     void (*bell)(void *user);
     void (*set_clipboard)(void *user, const char *utf8);   /* OSC 52 */
     void (*set_cwd)(void *user, const char *path);         /* OSC 7 */
+    void (*notify)(void *user, const char *body);          /* OSC 9 / OSC 777 */
 } ScreenIO;
 
 Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io);

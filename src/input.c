@@ -238,8 +238,9 @@ size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions) {
         if (alt) n = app_byte(out, cap, n, 0x1b);
         n = app_byte(out, cap, n, '\r');
     }
-    // Tab
-    if (IsKeyPressed(KEY_TAB)) {
+    // Tab — Ctrl+Tab is reserved by main.c for cycling rbterm tabs,
+    // so suppress it here. Ctrl+Shift+Tab likewise.
+    if (IsKeyPressed(KEY_TAB) && !ctrl) {
         if (shift) n = app(out, cap, n, "\x1b[Z");
         else { if (alt) n = app_byte(out, cap, n, 0x1b); n = app_byte(out, cap, n, '\t'); }
     }

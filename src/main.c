@@ -31,6 +31,8 @@
 #ifdef __APPLE__
   #include <mach-o/dyld.h>  /* _NSGetExecutablePath */
   void mac_disable_close_menu_item(void);   /* defined in emoji_mac.m */
+  void mac_install_ctrl_tab_monitor(void);
+  int  mac_consume_ctrl_tab(void);
 #endif
 
 #ifndef _WIN32
@@ -87,6 +89,7 @@ typedef struct {
     char log_dir[PATH_MAX];
     int  key_repeat_initial_ms;  /* delay before first repeat fires (held key) */
     int  key_repeat_rate_ms;     /* period between subsequent repeats */
+    int  cursor_style;           /* CursorStyle enum — default for new panes */
 } AppSettings;
 static AppSettings g_app_settings;
 static char        g_settings_status[160]; /* status line in the settings modal */
@@ -138,6 +141,11 @@ static void config_load_into_defaults(void) {
         } else if (strcmp(k, "key_repeat_rate_ms") == 0) {
             int vi = atoi(v);
             if (vi >= 0 && vi <= 500) g_app_settings.key_repeat_rate_ms = vi;
+        } else if (strcmp(k, "cursor_style") == 0) {
+            if      (!strcmp(v, "block"))     g_app_settings.cursor_style = CURSOR_STYLE_BLOCK;
+            else if (!strcmp(v, "underline")) g_app_settings.cursor_style = CURSOR_STYLE_UNDERLINE;
+            else if (!strcmp(v, "bar"))       g_app_settings.cursor_style = CURSOR_STYLE_BAR;
+            else if (!strcmp(v, "blink"))     g_app_settings.cursor_style = CURSOR_STYLE_BLOCK_BLINK;
         }
     }
     fclose(fp);
@@ -161,6 +169,17 @@ static bool config_save(Renderer *r) {
     if (g_app_settings.log_dir[0]) fprintf(fp, "log_dir=%s\n", g_app_settings.log_dir);
     fprintf(fp, "key_repeat_initial_ms=%d\n", g_app_settings.key_repeat_initial_ms);
     fprintf(fp, "key_repeat_rate_ms=%d\n",    g_app_settings.key_repeat_rate_ms);
+    {
+        const char *cs = NULL;
+        switch (g_app_settings.cursor_style) {
+        case CURSOR_STYLE_BLOCK:       cs = "block";     break;
+        case CURSOR_STYLE_UNDERLINE:   cs = "underline"; break;
+        case CURSOR_STYLE_BAR:         cs = "bar";       break;
+        case CURSOR_STYLE_BLOCK_BLINK: cs = "blink";     break;
+        default: break;
+        }
+        if (cs) fprintf(fp, "cursor_style=%s\n", cs);
+    }
     fclose(fp);
 #ifndef _WIN32
     chmod(path, 0600);
@@ -172,6 +191,7 @@ static void app_settings_init(void) {
     g_app_settings.log_enabled = false;
     g_app_settings.key_repeat_initial_ms = 300;
     g_app_settings.key_repeat_rate_ms    = 25;
+    g_app_settings.cursor_style          = CURSOR_STYLE_DEFAULT;
     const char *home = getenv("HOME");
 #ifdef _WIN32
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -291,6 +311,14 @@ typedef struct {
 #define TAB_SSH_W   48
 
 static Tab *g_tabs[MAX_TABS];
+
+/* Tab-reorder-by-drag state. Set on left-press over a tab's body (not
+   the close 'x'); cleared on release. Once the cursor moves past a
+   threshold, `g_tab_dragging` flips on and subsequent mouse movement
+   swaps the tab into whichever slot the cursor is over. */
+static int  g_tab_press_idx = -1;
+static int  g_tab_press_mx  = 0;
+static bool g_tab_dragging  = false;
 static int g_num_tabs = 0;
 static int g_active = 0;
 
@@ -567,6 +595,59 @@ static void io_set_cwd_cb(void *u, const char *path) {
     p->title_dirty = true;
 }
 
+/* OSC 9 / OSC 777 — desktop notification. Shell out to the platform's
+   native notifier so we don't depend on a daemon library. fork+execvp
+   so the message arrives as argv[N], no shell escaping needed. */
+static void io_notify_cb(void *u, const char *body) {
+    (void)u;
+    if (!body || !*body) return;
+#ifdef _WIN32
+    /* PowerShell toast via BurntToast-ish one-liner. Falls back to a
+       MessageBox if the WinRT classes aren't available — at least
+       something pops. Quoted with single-quotes; embedded apostrophes
+       are escaped by doubling. Best-effort. */
+    char esc[1024]; size_t bj = 0;
+    for (const char *q = body; *q && bj + 2 < sizeof(esc); q++) {
+        if (*q == '\'') { esc[bj++] = '\''; esc[bj++] = '\''; }
+        else            esc[bj++] = *q;
+    }
+    esc[bj] = 0;
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+        "powershell -NoProfile -Command "
+        "\"[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;"
+        "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+        "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+        "$t.GetElementsByTagName('text')[0].AppendChild($t.CreateTextNode('rbterm'))>$null;"
+        "$t.GetElementsByTagName('text')[1].AppendChild($t.CreateTextNode('%s'))>$null;"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('rbterm').Show("
+        "[Windows.UI.Notifications.ToastNotification]::new($t))\"",
+        esc);
+    system(cmd);
+#else
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        #ifdef __APPLE__
+            char script[1024];
+            /* AppleScript single-quotes need to be doubled. */
+            char esc[768]; size_t bj = 0;
+            for (const char *q = body; *q && bj + 2 < sizeof(esc); q++) {
+                if (*q == '"' || *q == '\\') esc[bj++] = '\\';
+                esc[bj++] = *q;
+            }
+            esc[bj] = 0;
+            snprintf(script, sizeof(script),
+                "display notification \"%s\" with title \"rbterm\"", esc);
+            execlp("osascript", "osascript", "-e", script, (char *)NULL);
+        #else
+            execlp("notify-send", "notify-send", "rbterm", body, (char *)NULL);
+        #endif
+        _exit(127);
+    }
+#endif
+}
+
 static void pane_init_click_state(Pane *p) {
     p->last_click_time = -1.0;
     p->last_click_col = p->last_click_row = -1;
@@ -577,7 +658,8 @@ static ScreenIO pane_io(Pane *p) {
     ScreenIO io = { .user = p, .write = io_write_cb,
                     .set_title = io_set_title_cb, .bell = io_bell_cb,
                     .set_clipboard = io_set_clipboard_cb,
-                    .set_cwd = io_set_cwd_cb };
+                    .set_cwd = io_set_cwd_cb,
+                    .notify = io_notify_cb };
     return io;
 }
 
@@ -587,6 +669,12 @@ static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
     p->pty = pty_open(cols, rows, cwd);
     if (!p->pty) return false;
     p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    /* Seed the cursor style from the rbterm-wide default. DECSCUSR
+       sequences from the shell (or programs that set their own style)
+       overwrite this on the per-Screen level later. */
+    if (g_app_settings.cursor_style != CURSOR_STYLE_DEFAULT) {
+        screen_set_cursor_style(p->scr, (CursorStyle)g_app_settings.cursor_style);
+    }
     if (cwd && *cwd) {
         strncpy(p->cwd, cwd, sizeof(p->cwd) - 1);
         p->cwd[sizeof(p->cwd) - 1] = 0;
@@ -981,16 +1069,20 @@ static void select_line(Screen *s, Selection *sel, int row) {
     sel->b_col = cols - 1; sel->b_row = row;
 }
 
-/* Label shown on a tab: prefer the shell's current working directory
-   (shortened to a basename, with $HOME / %USERPROFILE% rewritten to "~")
-   over any OSC title the shell set. Falls back to title, then "shell". */
+/* Label shown on a tab. Preference order:
+ *   1. p->title (OSC 0 / OSC 2 from the running program) if set
+ *   2. p->cwd basename with HOME rewritten to "~"
+ *   3. "shell"
+ *
+ * Most shell prompts write OSC 0/2 with the cwd on every prompt, so
+ * title-first still shows the cwd at an idle prompt. Programs that
+ * explicitly set a title (tmux, vim, ssh foo, `ansi --title=wow`)
+ * surface until the shell's next prompt rewrites it. */
 static const char *tab_label(const Tab *t) {
-    /* Derive from the *active* pane: that's whatever the user is
-       currently looking at in that tab, split or not. */
     const Pane *p = &t->panes[t->active_pane];
-    /* SSH tabs: "user@host[:port] [basename]". Buffer is a rotating
-       set of per-tab statics so multiple tabs can be drawn in one
-       frame without overwriting each other. */
+    /* SSH tabs: prefix with the target so two remote hosts don't look
+       identical in the bar. Show "user@host title" when a title has
+       been set, or "user@host cwd-basename" otherwise. */
     if (t->is_ssh) {
         static char buf[MAX_TABS][320];
         static int  slot = 0;
@@ -998,17 +1090,21 @@ static const char *tab_label(const Tab *t) {
         for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { idx = i; break; }
         if (idx < 0) idx = slot++ % MAX_TABS;
         char *out = buf[idx];
+        if (p->title[0]) {
+            snprintf(out, sizeof(buf[0]), "%s %s", t->ssh_target, p->title);
+            return out;
+        }
         if (!p->cwd[0]) {
             return t->ssh_target;
         }
-        /* Basename of the remote path, with "~" or "/" shortcuts. */
         const char *dir_label = p->cwd;
         const char *b = strrchr(p->cwd, '/');
         if (strcmp(p->cwd, "/") == 0) dir_label = "/";
-        else if (b) dir_label = (*(b + 1) ? b + 1 : b);   /* trailing slash → "/" */
+        else if (b) dir_label = (*(b + 1) ? b + 1 : b);
         snprintf(out, sizeof(buf[0]), "%s %s", t->ssh_target, dir_label);
         return out;
     }
+    if (p->title[0]) return p->title;
     if (p->cwd[0]) {
         const char *home = getenv("HOME");
 #ifdef _WIN32
@@ -1028,7 +1124,7 @@ static const char *tab_label(const Tab *t) {
         if (base) return base + 1;
         return p->cwd;
     }
-    return p->title[0] ? p->title : "shell";
+    return "shell";
 }
 
 /* ---------- Pane layout ---------- */
@@ -3384,6 +3480,11 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         else if (rect_hit(L.cur_bar,   mx, my)) { st = CURSOR_STYLE_BAR;         hit = true; }
         else if (rect_hit(L.cur_blink, mx, my)) { st = CURSOR_STYLE_BLOCK_BLINK; hit = true; }
         if (hit) {
+            /* Pick this style as the new default for fresh panes AND
+               apply it immediately to the currently-focused pane.
+               DECSCUSR (CSI N SP q) from running programs still wins
+               on the pane it targets — this just sets the baseline. */
+            g_app_settings.cursor_style = st;
             if (p && p->scr) screen_set_cursor_style(p->scr, st);
             return;
         }
@@ -4251,6 +4352,10 @@ int main(int argc, char **argv) {
     /* Strip Cmd+W from AppKit's File > Close Window menu item so our
        in-app handler can use the chord to close just the active tab. */
     mac_disable_close_menu_item();
+    /* AppKit intercepts Ctrl+Tab before GLFW can see it. A local
+       NSEvent monitor swallows the key and latches a flag we read
+       each frame via mac_consume_ctrl_tab(). */
+    mac_install_ctrl_tab_monitor();
 #endif
     /* Resolve the font:
          1. "embedded:NAME" → look up in the embedded table.
@@ -4467,11 +4572,58 @@ int main(int argc, char **argv) {
                 }
                 else if (h.tab_idx >= 0) {
                     if (h.on_close) tab_close(h.tab_idx);
-                    else g_active = h.tab_idx;
+                    else {
+                        g_active = h.tab_idx;
+                        /* Arm a potential drag — the hold-handler below
+                           promotes this to a real drag once the cursor
+                           moves past the threshold. */
+                        g_tab_press_idx = h.tab_idx;
+                        g_tab_press_mx  = (int)mp.x;
+                        g_tab_dragging  = false;
+                    }
                 }
                 cur = active_tab();
             }
-        } else if (cur) {
+        }
+
+        /* Tab-reorder drag. Handled outside the in_tab_bar guard so
+           the drag survives the cursor leaving the bar briefly (e.g.
+           user overshoots vertically). Released anywhere ends it. */
+        if (!modal_open && g_tab_press_idx >= 0) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                int mx = (int)mp.x;
+                if (!g_tab_dragging && (mx - g_tab_press_mx > 6
+                                     || g_tab_press_mx - mx > 6)) {
+                    g_tab_dragging = true;
+                }
+                if (g_tab_dragging) {
+                    int tw = tab_width_for(win_w_now);
+                    int tab_start = TAB_SSH_W;
+                    int target = (mx - tab_start) / tw;
+                    if (target < 0) target = 0;
+                    if (target >= g_num_tabs) target = g_num_tabs - 1;
+                    if (target != g_tab_press_idx && target >= 0) {
+                        Tab *moving = g_tabs[g_tab_press_idx];
+                        if (target > g_tab_press_idx) {
+                            for (int i = g_tab_press_idx; i < target; i++)
+                                g_tabs[i] = g_tabs[i + 1];
+                        } else {
+                            for (int i = g_tab_press_idx; i > target; i--)
+                                g_tabs[i] = g_tabs[i - 1];
+                        }
+                        g_tabs[target] = moving;
+                        g_tab_press_idx = target;
+                        g_active = target;
+                        cur = active_tab();
+                    }
+                }
+            } else {
+                g_tab_press_idx = -1;
+                g_tab_dragging  = false;
+            }
+        }
+
+        if (!modal_open && !in_tab_bar && cur) {
             /* Splitter drag takes priority over pane input when active.
                The grab zone is padded by SPLITTER_GRAB on each side of
                the visual line so the cursor can find it without
@@ -4826,6 +4978,30 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+        }
+
+        /* Ctrl+Tab / Ctrl+Shift+Tab cycles tabs. Real Ctrl — Cmd+Tab
+           stays the macOS app switcher. On Linux/Windows GLFW
+           delivers Ctrl+Tab to IsKeyPressed normally; on macOS AppKit
+           swallows it, so an NSEvent monitor (installed at startup)
+           latches a flag we drain here each frame. */
+        int cycle_dir = 0;   /* +1 forward, -1 backward */
+#ifdef __APPLE__
+        int mct = mac_consume_ctrl_tab();
+        if (mct == 1) cycle_dir = +1;
+        else if (mct == 2) cycle_dir = -1;
+#else
+        if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))
+            && IsKeyPressed(KEY_TAB)) {
+            cycle_dir = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
+                        ? -1 : +1;
+        }
+#endif
+        if (cycle_dir != 0 && g_num_tabs > 1) {
+            g_active = (cycle_dir > 0)
+                       ? (g_active + 1) % g_num_tabs
+                       : (g_active - 1 + g_num_tabs) % g_num_tabs;
+            cur = active_tab();
         }
 
         if (!cur) break;

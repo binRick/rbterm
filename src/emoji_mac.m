@@ -37,6 +37,41 @@ void mac_disable_close_menu_item(void) {
     }
 }
 
+/* AppKit eats Ctrl+Tab in GLFW-backed windows (it's routed to the
+   standard "selectNextTabViewItem:" / focus-switching machinery
+   before our keyDown: override can see it). We install a local
+   NSEvent monitor that inspects every NSEventTypeKeyDown, returns
+   nil for Ctrl+Tab (swallowing it), and latches a flag the main
+   loop polls each frame.
+   Return values of mac_consume_ctrl_tab:
+     0 = nothing happened
+     1 = Ctrl+Tab (cycle forward)
+     2 = Ctrl+Shift+Tab (cycle backward) */
+static volatile int g_ctrl_tab_pending = 0;
+
+void mac_install_ctrl_tab_monitor(void) {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    @autoreleasepool {
+        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                              handler:^NSEvent *(NSEvent *ev) {
+            /* Tab's virtual key code is 0x30 on macOS. */
+            if ([ev keyCode] != 0x30) return ev;
+            NSEventModifierFlags m = [ev modifierFlags];
+            if (!(m & NSEventModifierFlagControl)) return ev;
+            g_ctrl_tab_pending = (m & NSEventModifierFlagShift) ? 2 : 1;
+            return nil;   /* swallow — don't let AppKit / GLFW see it */
+        }];
+    }
+}
+
+int mac_consume_ctrl_tab(void) {
+    int v = g_ctrl_tab_pending;
+    g_ctrl_tab_pending = 0;
+    return v;
+}
+
 bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
                   uint8_t **out_rgba, int *out_w, int *out_h,
                   bool *out_colored) {

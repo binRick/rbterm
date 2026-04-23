@@ -201,53 +201,60 @@ static bool is_emoji_cp(uint32_t cp) {
     return false;
 }
 
-/* Set of codepoints the main font failed to rasterize (stb_truetype leaves
-   image.width == 0 for glyphs the font doesn't define). Built after every
-   font load so the draw loop knows when to fall back to the emoji font. */
+/* Sorted set of codepoints the main font CAN render (loaded with a
+   non-empty bitmap). Codepoints not present here are considered
+   "missing" — even those that were never loaded into the atlas at
+   all (e.g. CJK ideographs, since build_codepoints doesn't list
+   them). Without this distinction, raylib's DrawTextCodepoint would
+   draw the font's `.notdef` glyph (a tofu box or a literal "?"). */
 typedef struct {
     uint32_t *cps;
     int count, cap;
-} MissingSet;
+} CodepointSet;
 
-static MissingSet g_missing;
+static CodepointSet g_present;
 
 static int cmp_u32(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return (x > y) - (x < y);
 }
 
-static void missing_set_clear(void) {
-    free(g_missing.cps);
-    g_missing.cps = NULL;
-    g_missing.count = g_missing.cap = 0;
+static void present_set_clear(void) {
+    free(g_present.cps);
+    g_present.cps = NULL;
+    g_present.count = g_present.cap = 0;
 }
 
-static void missing_set_build(Font *f) {
-    missing_set_clear();
+static void present_set_build(Font *f) {
+    present_set_clear();
     if (!f || !f->glyphs) return;
     for (int i = 0; i < f->glyphCount; i++) {
         uint32_t cp = (uint32_t)f->glyphs[i].value;
-        if (cp == ' ' || cp == 0) continue;
-        if (f->glyphs[i].image.width > 0 && f->glyphs[i].image.height > 0) continue;
-        if (g_missing.count == g_missing.cap) {
-            g_missing.cap = g_missing.cap ? g_missing.cap * 2 : 64;
-            g_missing.cps = realloc(g_missing.cps, g_missing.cap * sizeof(uint32_t));
+        /* Skip glyphs raylib loaded but couldn't rasterize. */
+        if (f->glyphs[i].image.width <= 0 || f->glyphs[i].image.height <= 0)
+            continue;
+        if (g_present.count == g_present.cap) {
+            g_present.cap = g_present.cap ? g_present.cap * 2 : 256;
+            g_present.cps = realloc(g_present.cps, g_present.cap * sizeof(uint32_t));
         }
-        g_missing.cps[g_missing.count++] = cp;
+        g_present.cps[g_present.count++] = cp;
     }
-    qsort(g_missing.cps, g_missing.count, sizeof(uint32_t), cmp_u32);
-    fprintf(stderr, "rbterm: %d codepoint(s) missing from main font\n",
-            g_missing.count);
+    qsort(g_present.cps, g_present.count, sizeof(uint32_t), cmp_u32);
+    fprintf(stderr, "rbterm: %d codepoint(s) present in main font\n",
+            g_present.count);
 }
 
 static bool font_missing(uint32_t cp) {
-    int lo = 0, hi = g_missing.count - 1;
+    /* Space + control chars: nothing to draw, treat as "present" so
+       the renderer doesn't burn cycles trying to substitute them. */
+    if (cp == 0 || cp == ' ' || cp < 0x20) return false;
+    int lo = 0, hi = g_present.count - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
-        if (g_missing.cps[mid] == cp) return true;
-        if (g_missing.cps[mid] < cp) lo = mid + 1; else hi = mid - 1;
+        if (g_present.cps[mid] == cp) return false;
+        if (g_present.cps[mid] < cp) lo = mid + 1; else hi = mid - 1;
     }
-    return false;
+    return true;
 }
 
 /* Curated codepoint set: ASCII, Latin-1, Latin Ext-A/B, punctuation,
@@ -360,7 +367,7 @@ static void install_font(Renderer *r, Font f, int size, const char *path) {
     strncpy(r->font_path, path, sizeof(r->font_path) - 1);
     r->font_path[sizeof(r->font_path) - 1] = 0;
     measure_cell(r);
-    missing_set_build(&f);
+    present_set_build(&f);
     int atlas_size = size * 2;
     if (atlas_size > 96) atlas_size = 96;
     backup_font_ensure(atlas_size);
@@ -509,7 +516,7 @@ void renderer_shutdown(Renderer *r) {
     emoji_cache_clear();
     free(g_emoji.items);    g_emoji.items = NULL;    g_emoji.cap = 0;
     free(g_fallback.items); g_fallback.items = NULL; g_fallback.cap = 0;
-    missing_set_clear();
+    present_set_clear();
     backup_font_unload();
     if (!r || !r->font_data) return;
     UnloadFont(*as_font(r));
@@ -690,8 +697,11 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
         for (int x = 0; x < cols; x++) {
             Cell c = screen_view_cell(s, x, y);
             if (c.attrs & ATTR_WIDE_CONT) continue;  /* drawn as part of the head cell */
-            if (c.cp == 0 || c.cp == ' ') continue;
             if (c.attrs & ATTR_HIDDEN) continue;
+            /* Blank/space cells skip glyph drawing but still get
+               underline / strike / link decorations so an underlined
+               "foo bar" doesn't drop the underline under the space. */
+            bool blank = (c.cp == 0 || c.cp == ' ');
 
             uint32_t fg = (c.attrs & ATTR_REVERSE) ? resolve_bg(s, c) : resolve_fg(s, c);
 
@@ -709,6 +719,11 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
 
             float alpha = (c.attrs & ATTR_DIM) ? 0.6f : 1.0f;
             int span = (c.attrs & ATTR_WIDE) ? 2 : 1;
+
+            /* Skip glyph rendering for blank cells; jump straight to the
+               decoration pass below so underlines / strike / hyperlink
+               markers still draw. pos isn't needed for the decorations. */
+            if (blank) goto glyph_drawn;
 
             bool main_has_glyph = !font_missing(c.cp);
 
@@ -791,7 +806,43 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                 DrawTextCodepoint(*f, (int)c.cp, p2, (float)r->font_size, col_from_rgb(fg, alpha));
             }
             if (c.attrs & ATTR_UNDERLINE) {
-                DrawRectangle(x * cw, y * ch + ch - 2, cw * span, 1, col_from_rgb(fg, alpha));
+                /* Underline color: SGR 58 stores an explicit RGB in
+                   ul_color; falls back to the cell's fg when 0. */
+                uint32_t ulrgb = c.ul_color ? c.ul_color : fg;
+                Color ulc = col_from_rgb(ulrgb, alpha);
+                int ux  = x * cw;
+                int uy  = y * ch + ch - 2;
+                int uw  = cw * span;
+                switch (UL_STYLE_GET(c.attrs)) {
+                case UL_STYLE_DOUBLE:
+                    DrawRectangle(ux, uy,     uw, 1, ulc);
+                    DrawRectangle(ux, uy - 2, uw, 1, ulc);
+                    break;
+                case UL_STYLE_CURLY: {
+                    /* Two-pixel-tall sine-ish wave — draw 1px squares
+                       alternating between the upper and lower row. */
+                    for (int dx = 0; dx < uw; dx++) {
+                        int yy = uy + (((dx / 2) & 1) ? 1 : 0) - 1;
+                        DrawRectangle(ux + dx, yy, 1, 1, ulc);
+                    }
+                    break;
+                }
+                case UL_STYLE_DOTTED:
+                    for (int dx = 0; dx < uw; dx += 2) {
+                        DrawRectangle(ux + dx, uy, 1, 1, ulc);
+                    }
+                    break;
+                case UL_STYLE_DASHED:
+                    for (int dx = 0; dx < uw; dx += 4) {
+                        int seg = (dx + 2 <= uw) ? 2 : (uw - dx);
+                        DrawRectangle(ux + dx, uy, seg, 1, ulc);
+                    }
+                    break;
+                case UL_STYLE_SINGLE:
+                default:
+                    DrawRectangle(ux, uy, uw, 1, ulc);
+                    break;
+                }
             }
             if (c.attrs & ATTR_STRIKE) {
                 DrawRectangle(x * cw, y * ch + ch / 2, cw * span, 1, col_from_rgb(fg, alpha));

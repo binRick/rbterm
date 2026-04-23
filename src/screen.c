@@ -88,10 +88,16 @@ struct Screen {
     int pstate;
     int params[MAX_PARAMS];
     bool param_set[MAX_PARAMS];
+    /* True when params[i] was introduced by a ':' (sub-parameter of
+       the previous param), false when it was a normal ';' separator.
+       Used by the SGR handler to distinguish e.g. 4:3 (curly underline)
+       from 4;3 (underline + italic). */
+    bool param_colon[MAX_PARAMS];
     int param_cnt;
     bool priv;       // '?' seen
     bool inter_gt;   // '>' seen  (secondary DA etc.)
     bool inter_eq;   // '=' seen  (tertiary DA)
+    bool inter_sp;   // ' ' seen  (DECSCUSR cursor-style, `CSI Ps SP q`)
 
     /* Charset state for DEC Special Graphics / Line Drawing. tmux
        selects this via `ESC ( 0` (G0 = line drawing) and then prints
@@ -143,6 +149,8 @@ struct Screen {
 
     /* Active OSC 8 link the next put_cp will stamp into cells. */
     uint16_t cur_link_id;
+    /* Active SGR 58 underline color (0 = inherit fg). */
+    uint32_t cur_ul_color;
 
     /* Per-screen palette (mutable via OSC 4/104). Kept per-screen so
        a tab/pane rewriting its colours doesn't bleed into the others. */
@@ -509,12 +517,15 @@ static void put_cp(Screen *s, uint32_t cp) {
     c->bg = s->cur_attr.bg;
     c->attrs = s->cur_attr.attrs | (wide ? ATTR_WIDE : 0);
     c->link_id = s->cur_link_id;
+    c->ul_color = s->cur_ul_color;
     if (wide) {
         Cell *c2 = row + s->cx + 1;
         c2->cp = 0;
         c2->fg = s->cur_attr.fg;
         c2->bg = s->cur_attr.bg;
         c2->attrs = s->cur_attr.attrs | ATTR_WIDE_CONT;
+        c2->link_id = s->cur_link_id;
+        c2->ul_color = s->cur_ul_color;
     }
     int advance = wide ? 2 : 1;
     int next = s->cx + advance;
@@ -532,11 +543,16 @@ static int clamp(int v, int lo, int hi) {
 }
 
 static void reset_params(Screen *s) {
-    for (int i = 0; i < MAX_PARAMS; i++) { s->params[i] = 0; s->param_set[i] = false; }
+    for (int i = 0; i < MAX_PARAMS; i++) {
+        s->params[i] = 0;
+        s->param_set[i] = false;
+        s->param_colon[i] = false;
+    }
     s->param_cnt = 0;
     s->priv = false;
     s->inter_gt = false;
     s->inter_eq = false;
+    s->inter_sp = false;
     s->osc_len = 0;
 }
 
@@ -547,24 +563,63 @@ static int pget(Screen *s, int i, int dflt) {
 
 /* ---------- SGR ---------- */
 
+/* Helper for sub-param consumption — returns true and fills *out_sub
+   when params[i+1] is a colon-introduced sub-param. */
+static bool sgr_has_sub(Screen *s, int i, int n, int *out_sub) {
+    if (i + 1 >= n) return false;
+    if (!s->param_colon[i + 1]) return false;
+    *out_sub = s->params[i + 1];
+    return true;
+}
+
+static void set_underline_style(Screen *s, UlStyle st) {
+    s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_UL_STYLE_MASK)
+                                   | ((uint16_t)st << ATTR_UL_STYLE_SHIFT));
+}
+
 static void sgr(Screen *s) {
     int n = s->param_cnt ? s->param_cnt : 1;
     for (int i = 0; i < n; i++) {
         int p = s->param_set[i] ? s->params[i] : 0;
+        /* If this entry is itself a colon sub-param, it was consumed
+           by the previous iteration — skip. (Only relevant when the
+           sub-param wasn't recognised; else the consumer already
+           advanced past it.) */
+        if (s->param_colon[i]) continue;
         if (p == 0) {
             s->cur_attr.fg = s->default_fg;
             s->cur_attr.bg = s->default_bg;
             s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
+            s->cur_ul_color = 0;
         } else if (p == 1)  s->cur_attr.attrs |= ATTR_BOLD;
         else if (p == 2)    s->cur_attr.attrs |= ATTR_DIM;
         else if (p == 3)    s->cur_attr.attrs |= ATTR_ITALIC;
-        else if (p == 4)    s->cur_attr.attrs |= ATTR_UNDERLINE;
+        else if (p == 4) {
+            /* SGR 4 — plain underline OR 4:N for style variant. */
+            int sub;
+            if (sgr_has_sub(s, i, n, &sub)) {
+                if (sub == 0) {
+                    s->cur_attr.attrs &= ~(ATTR_UNDERLINE | ATTR_UL_STYLE_MASK);
+                } else {
+                    UlStyle st = (sub >= 1 && sub <= 5) ? (UlStyle)(sub - 1)
+                                                        : UL_STYLE_SINGLE;
+                    s->cur_attr.attrs |= ATTR_UNDERLINE;
+                    set_underline_style(s, st);
+                }
+                /* Consume any colon-trailing extras (e.g. 4:3:something). */
+                while (i + 1 < n && s->param_colon[i + 1]) i++;
+            } else {
+                s->cur_attr.attrs |= ATTR_UNDERLINE;
+                set_underline_style(s, UL_STYLE_SINGLE);
+            }
+        }
+        else if (p == 21) { s->cur_attr.attrs |= ATTR_UNDERLINE; set_underline_style(s, UL_STYLE_DOUBLE); }
         else if (p == 7)    s->cur_attr.attrs |= ATTR_REVERSE;
         else if (p == 8)    s->cur_attr.attrs |= ATTR_HIDDEN;
         else if (p == 9)    s->cur_attr.attrs |= ATTR_STRIKE;
         else if (p == 22)   s->cur_attr.attrs &= ~(ATTR_BOLD | ATTR_DIM);
         else if (p == 23)   s->cur_attr.attrs &= ~ATTR_ITALIC;
-        else if (p == 24)   s->cur_attr.attrs &= ~ATTR_UNDERLINE;
+        else if (p == 24)   s->cur_attr.attrs &= ~(ATTR_UNDERLINE | ATTR_UL_STYLE_MASK);
         else if (p == 27)   s->cur_attr.attrs &= ~ATTR_REVERSE;
         else if (p == 28)   s->cur_attr.attrs &= ~ATTR_HIDDEN;
         else if (p == 29)   s->cur_attr.attrs &= ~ATTR_STRIKE;
@@ -594,6 +649,32 @@ static void sgr(Screen *s) {
         else if (p >= 100 && p <= 107) {
             s->cur_attr.bg = (uint32_t)(p - 100 + 8);
             s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
+        }
+        else if (p == 58) {
+            /* SGR 58 — explicit underline color. Accept both
+               58:2:R:G:B / 58;2;R;G;B (truecolor) and 58:5:N / 58;5;N
+               (256-palette). Sub-params come either via colon (modern,
+               kitty/ish) or via semicolons (legacy xterm-style). */
+            if (i + 1 < n && s->params[i + 1] == 2 && i + 4 < n) {
+                uint32_t r = s->params[i + 2] & 0xff;
+                uint32_t g = s->params[i + 3] & 0xff;
+                uint32_t b = s->params[i + 4] & 0xff;
+                s->cur_ul_color = (r << 16) | (g << 8) | b;
+                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u; /* avoid sentinel */
+                i += 4;
+            } else if (i + 1 < n && s->params[i + 1] == 5 && i + 2 < n) {
+                int idx = s->params[i + 2] & 0xff;
+                s->cur_ul_color = pal(s, idx);
+                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u;
+                i += 2;
+            }
+            /* Skip any further colon-tied params (older format with
+               extra fields like color space). */
+            while (i + 1 < n && s->param_colon[i + 1]) i++;
+        }
+        else if (p == 59) {
+            /* Reset underline color — fall back to fg. */
+            s->cur_ul_color = 0;
         }
         else if (p == 38 || p == 48) {
             bool is_fg = (p == 38);
@@ -750,9 +831,19 @@ static void handle_csi(Screen *s, uint8_t b) {
         return;
     }
     if (b == ';' || b == ':') {
-        if (s->param_cnt < MAX_PARAMS) s->param_cnt++;
+        if (s->param_cnt < MAX_PARAMS) {
+            s->param_cnt++;
+            /* The new (currently empty) param's colon flag tells the
+               SGR handler "this is a sub-param of the previous one". */
+            if (b == ':' && s->param_cnt > 0) {
+                s->param_colon[s->param_cnt - 1] = true;
+            }
+        }
         return;
     }
+    /* Track ' ' (0x20) as a DECSCUSR intermediate so the `q` final byte
+       below can distinguish "cursor style" from other 'q' semantics. */
+    if (b == ' ') { s->inter_sp = true; return; }
     if (b < 0x40) return; // other intermediate bytes: ignore for now
     // Final byte.
     int p0 = pget(s, 0, 0);
@@ -852,6 +943,27 @@ static void handle_csi(Screen *s, uint8_t b) {
     }
     case 's': s->saved_cx = s->cx; s->saved_cy = s->cy; break;
     case 'u': s->cx = s->saved_cx; s->cy = s->saved_cy; break;
+    case 'q':
+        /* DECSCUSR — "CSI Ps SP q" sets the cursor style. We only
+           accept the form with a SPACE intermediate so plain `q`
+           (reserved) doesn't misfire. Values follow xterm:
+             0 / 1 = blinking block (our DEFAULT)
+             2     = steady block
+             3     = blinking underline
+             4     = steady underline  (same as 3 for us — no blink distinction yet)
+             5     = blinking bar
+             6     = steady bar        (same as 5 similarly) */
+        if (s->inter_sp) {
+            CursorStyle st = CURSOR_STYLE_DEFAULT;
+            switch (p0) {
+            case 0: case 1: st = CURSOR_STYLE_BLOCK_BLINK; break;
+            case 2:         st = CURSOR_STYLE_BLOCK;       break;
+            case 3: case 4: st = CURSOR_STYLE_UNDERLINE;   break;
+            case 5: case 6: st = CURSOR_STYLE_BAR;         break;
+            }
+            s->cursor_style = st;
+        }
+        break;
     default: break;
     }
     s->pstate = ST_GROUND;
@@ -956,6 +1068,29 @@ static void finish_osc(Screen *s) {
         } else {
             uint32_t col;
             if (parse_color_spec(p, &col)) *slot = col;
+        }
+        return;
+    }
+    if (ps == 9) {
+        /* OSC 9 — iTerm2-style desktop notification. The whole tail
+           after the first ';' is the message body (no title). */
+        if (s->io.notify && *p) s->io.notify(s->io.user, p);
+        return;
+    }
+    if (ps == 777) {
+        /* OSC 777 — urxvt notification. Format: notify;<title>;<body>.
+           We collapse to "<title>: <body>" for the OS handler. */
+        if (s->io.notify && strncmp(p, "notify;", 7) == 0) {
+            const char *q = p + 7;
+            const char *semi = strchr(q, ';');
+            char buf[512];
+            if (semi) {
+                int tlen = (int)(semi - q);
+                snprintf(buf, sizeof(buf), "%.*s: %s", tlen, q, semi + 1);
+            } else {
+                snprintf(buf, sizeof(buf), "%s", q);
+            }
+            s->io.notify(s->io.user, buf);
         }
         return;
     }
@@ -1642,7 +1777,7 @@ void screen_scroll_reset(Screen *s) { s->view_off = 0; }
 
 Cell screen_view_cell(const Screen *s, int col, int vy) {
     if (col < 0 || col >= s->cols || vy < 0 || vy >= s->rows) {
-        Cell e = {0, s->default_fg, s->default_bg, ATTR_DEFAULT_FG | ATTR_DEFAULT_BG, 0};
+        Cell e = {0, s->default_fg, s->default_bg, 0, ATTR_DEFAULT_FG | ATTR_DEFAULT_BG, 0};
         return e;
     }
     // view_off rows from the bottom of scrollback replace the top rows of the live screen
