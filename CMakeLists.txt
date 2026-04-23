@@ -49,17 +49,18 @@ set(RBTERM_SOURCES
     src/pty_dispatch.c
 )
 
-# Embedded fonts (via .incbin). Skipped for emscripten + Windows —
-# the wasm assembler doesn't grok Mach-O section directives, and
-# MSVC's assembler doesn't understand .incbin at all. main.c uses an
-# empty stub when RBTERM_NO_EMBEDDED_FONTS is set so the references
-# compile cleanly. Windows + wasm builds ship the fonts via the
-# packaging layer (Resources/fonts in the wasm preload, fonts/ folder
-# in the release zip).
-if(NOT EMSCRIPTEN AND NOT WIN32)
-    list(APPEND RBTERM_SOURCES src/fonts_embedded.S)
-else()
+# Embedded fonts. Three platform paths share one fonts_embedded.h:
+#   * Mac/Linux  → fonts_embedded.S (.incbin into __TEXT/.rodata).
+#   * Windows    → fonts_embedded.rc (RCDATA) + fonts_embedded_win.c
+#                  (runtime FindResource/LoadResource fill).
+#   * Web        → no embed; assets/fonts is preloaded into MEMFS
+#                  and main.c uses an empty stub via PLATFORM_WEB.
+if(EMSCRIPTEN)
     add_compile_definitions(RBTERM_NO_EMBEDDED_FONTS=1)
+elseif(WIN32)
+    list(APPEND RBTERM_SOURCES src/fonts_embedded.rc src/fonts_embedded_win.c)
+else()
+    list(APPEND RBTERM_SOURCES src/fonts_embedded.S)
 endif()
 
 # Regenerate src/themes_embedded.h whenever any kfc/dark palette file
@@ -85,18 +86,32 @@ file(GLOB _FONT_SOURCES
   "${CMAKE_SOURCE_DIR}/assets/fonts/*.ttf"
   "${CMAKE_SOURCE_DIR}/assets/fonts/*.otf"
   "${CMAKE_SOURCE_DIR}/assets/fonts/*.ttc")
+
+# Invoke the generator via bash explicitly — Git Bash on Windows
+# runners doesn't honour the .sh shebang otherwise.
+find_program(BASH_EXE bash)
+if(NOT BASH_EXE)
+    set(BASH_EXE bash)
+endif()
+
 add_custom_command(
   OUTPUT  ${CMAKE_SOURCE_DIR}/src/fonts_embedded.h
           ${CMAKE_SOURCE_DIR}/src/fonts_embedded.S
-  COMMAND ${CMAKE_SOURCE_DIR}/tools/gen_fonts.sh
+          ${CMAKE_SOURCE_DIR}/src/fonts_embedded.rc
+          ${CMAKE_SOURCE_DIR}/src/fonts_embedded_win.c
+  COMMAND ${BASH_EXE} ${CMAKE_SOURCE_DIR}/tools/gen_fonts.sh
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen_fonts.sh ${_FONT_SOURCES}
-  COMMENT "Regenerating src/fonts_embedded.{h,S} from assets/fonts/"
+  COMMENT "Regenerating src/fonts_embedded.{h,S,rc} + _win.c from assets/fonts/"
   VERBATIM)
 add_custom_target(rbterm_fonts
   DEPENDS ${CMAKE_SOURCE_DIR}/src/fonts_embedded.h
-          ${CMAKE_SOURCE_DIR}/src/fonts_embedded.S)
-enable_language(ASM)
+          ${CMAKE_SOURCE_DIR}/src/fonts_embedded.S
+          ${CMAKE_SOURCE_DIR}/src/fonts_embedded.rc
+          ${CMAKE_SOURCE_DIR}/src/fonts_embedded_win.c)
+if(NOT WIN32)
+    enable_language(ASM)
+endif()
 
 # Platform-specific backends: local PTY + emoji rasterizer.
 if(RBTERM_WEB)
@@ -158,7 +173,7 @@ endif()
 
 add_executable(rbterm ${RBTERM_SOURCES})
 add_dependencies(rbterm rbterm_themes)
-if(NOT EMSCRIPTEN AND NOT WIN32)
+if(NOT EMSCRIPTEN)
     add_dependencies(rbterm rbterm_fonts)
 endif()
 target_include_directories(rbterm PRIVATE src)

@@ -403,12 +403,10 @@ static void tabs_resize_all(const Renderer *r, int win_w, int win_h);
 /* Forward decl — definition near the Settings modal. */
 static void list_scroll_to(int *scroll, int selected, int total, int row_h, int list_h);
 
-/* Pull in the embedded fonts table early so tab_open_ssh's appearance
-   apply path can resolve "embedded:NAME" references. Wasm and Windows
-   skip the .incbin payload (the wasm assembler doesn't grok Mach-O
-   section directives, and MSVC's assembler doesn't understand .incbin
-   at all). When RBTERM_NO_EMBEDDED_FONTS is defined we provide an
-   empty table so the rest of the code compiles cleanly. */
+/* Pull in the embedded fonts table. Mac/Linux gets the bytes via
+   .incbin in fonts_embedded.S; Windows gets them via the .rc resource
+   compiler + embedded_fonts_init() at startup. Wasm has no embed
+   path — assets/fonts is preloaded into MEMFS instead. */
 #if defined(PLATFORM_WEB) || defined(RBTERM_NO_EMBEDDED_FONTS)
 typedef struct {
     const char *name;
@@ -418,6 +416,7 @@ typedef struct {
 } EmbeddedFont;
 static const EmbeddedFont k_embedded_fonts[1] = { {"", "", 0, 0} };
 static const int k_embedded_font_count = 0;
+static inline void embedded_fonts_init(void) {}
 #else
 #include "fonts_embedded.h"
 #endif
@@ -3877,6 +3876,10 @@ int main(int argc, char **argv) {
 
     app_settings_init();
     themes_load_builtins();
+    /* Windows fills the embedded font table from compiled-in .rc
+       resources at this point; Mac/Linux is a no-op (the table is
+       already populated at link time). */
+    embedded_fonts_init();
     /* Hand the renderer a broad-coverage backup font so glyphs the
        primary font lacks (box-drawing, arrows, less common Unicode)
        fall through to it instead of rendering as "?". DejaVu Sans
@@ -4011,6 +4014,14 @@ int main(int argc, char **argv) {
         int x = (int)mp.x + (mw - win_w) / 2;
         int y = (int)mp.y + (mh - win_h) / 2;
         if (y < (int)mp.y + 40) y = (int)mp.y + 40; /* stay below menu bar */
+        if (x < (int)mp.x) x = (int)mp.x;
+        /* Keep the right + bottom edges visible — Windows + VM
+           configurations can otherwise leave the title bar / right-
+           side tab buttons off-screen. */
+        if (x + win_w > (int)mp.x + mw) x = (int)mp.x + mw - win_w;
+        if (y + win_h > (int)mp.y + mh) y = (int)mp.y + mh - win_h;
+        if (x < (int)mp.x) x = (int)mp.x;
+        if (y < (int)mp.y) y = (int)mp.y;
         SetWindowPosition(x, y);
     }
 

@@ -53,12 +53,14 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Stage binary + fonts
+      - name: Stage binary
         shell: bash
         run: |
           mkdir -p pkg out
           cp "${{ matrix.build_subdir }}/${{ matrix.binary_name }}" "pkg/${{ matrix.binary_name }}"
-          cp -R assets/fonts pkg/fonts
+          # Fonts are embedded into the binary (.incbin on Linux,
+          # RCDATA resources on Windows) so no fonts/ folder ships
+          # alongside the exe.
 
       - name: Self-sign Windows binary
         if: matrix.os == 'windows-latest'
