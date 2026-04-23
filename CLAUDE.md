@@ -324,7 +324,6 @@ Test: inside an rbterm pane, `img2sixel some.png` (libsixel).
 - Saved SSH profiles / a connect history.
 - DirectWrite emoji for Windows.
 - Ligatures (needs shaping — HarfBuzz).
-- Bracketed paste (DECSET 2004 accepted, no effect yet).
 - Scrollback reflow on resize (only the main screen reflows today; the
   existing scrollback is just re-bucketed at the new width).
 - Linux `.desktop` file + icon install path.
@@ -373,7 +372,6 @@ Not a roadmap — a shopping list to prioritise from.
   `notify-on-cmd-finish`).
 - **Paste guards** for multi-line / sudo / newline-containing pastes
   (iTerm2, kitty `paste_actions confirm`).
-- **Bracketed paste actually working** (already on the TODO above).
 
 ### Graphics / fonts
 - **iTerm2 inline-image protocol** (`OSC 1337 ; File=…`) — rbterm

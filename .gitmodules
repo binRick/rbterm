@@ -4,3 +4,6 @@
 [submodule "third_party/pal"]
 	path = third_party/pal
 	url = git@github.com:binRick/pal.git
+[submodule "third_party/ansi"]
+	path = third_party/ansi
+	url = https://github.com/fidian/ansi.git
