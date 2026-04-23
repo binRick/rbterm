@@ -4009,21 +4009,26 @@ int main(int argc, char **argv) {
     SetWindowSize(win_w, win_h);
     SetWindowMinSize(r.cell_w * 20 + 2 * r.pad_x, r.cell_h * 5 + TAB_BAR_H + 2 * r.pad_y);
 
+    /* Windows + VMs can report wildly wrong monitor dimensions through
+       GetMonitorWidth() (DPI scaling, virtual desktops, Parallels's
+       extra chrome), so trying to centre the window ourselves
+       reliably places it partly off-screen. Let the OS pick its own
+       default position on Windows; on macOS / Linux the monitor
+       metrics are trustworthy enough to use. */
+#ifndef _WIN32
     if (mw > 0 && mh > 0) {
         Vector2 mp = GetMonitorPosition(mi);
         int x = (int)mp.x + (mw - win_w) / 2;
         int y = (int)mp.y + (mh - win_h) / 2;
         if (y < (int)mp.y + 40) y = (int)mp.y + 40; /* stay below menu bar */
         if (x < (int)mp.x) x = (int)mp.x;
-        /* Keep the right + bottom edges visible — Windows + VM
-           configurations can otherwise leave the title bar / right-
-           side tab buttons off-screen. */
         if (x + win_w > (int)mp.x + mw) x = (int)mp.x + mw - win_w;
         if (y + win_h > (int)mp.y + mh) y = (int)mp.y + mh - win_h;
         if (x < (int)mp.x) x = (int)mp.x;
         if (y < (int)mp.y) y = (int)mp.y;
         SetWindowPosition(x, y);
     }
+#endif
 
     if (!tab_open(init_cols, init_rows)) {
         renderer_shutdown(&r);
