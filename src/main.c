@@ -376,6 +376,20 @@ static int g_form_font_scroll  = 0;
    "click outside" check. */
 static bool g_help_just_opened = false;
 
+/* Which scrollable list owns Up/Down keyboard nav while the modal is
+   open. Set when the user clicks a list row, cleared when clicking
+   elsewhere or closing the modal. */
+typedef enum { SETTINGS_FOCUS_NONE, SETTINGS_FOCUS_FONT, SETTINGS_FOCUS_THEME } SettingsListFocus;
+static SettingsListFocus g_settings_focused_list = SETTINGS_FOCUS_NONE;
+typedef enum { FORM_FOCUS_NONE, FORM_FOCUS_THEME, FORM_FOCUS_FONT } SshFormListFocus;
+static SshFormListFocus g_form_focused_list = FORM_FOCUS_NONE;
+/* Selected row in each picker (for SSH form). The Settings font list
+   already has g_font_list_selected; the theme list has g_theme_list_selected.
+   These two mirror them for the SSH form's lists, where selection
+   reflects what's currently in g_form.font / g_form.theme. */
+static int g_form_theme_idx = -1;       /* -1 = "(inherit default)" row */
+static int g_form_font_idx  = -1;
+
 /* True when the per-host log-dir text input is focused (so character
    keys edit the path instead of cycling fields). */
 static bool g_form_logdir_focus = false;
@@ -386,6 +400,8 @@ static Renderer *g_renderer = NULL;
 
 /* Forward decl — definition lives down by the pane-layout code. */
 static void tabs_resize_all(const Renderer *r, int win_w, int win_h);
+/* Forward decl — definition near the Settings modal. */
+static void list_scroll_to(int *scroll, int selected, int total, int row_h, int list_h);
 
 /* Pull in the embedded fonts table early so tab_open_ssh's appearance
    apply path can resolve "embedded:NAME" references. Wasm and Windows
@@ -1443,6 +1459,24 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     g_form.log_mode = prof->log_mode;
     g_form.sel_all = false;
     g_form.error[0] = 0;
+    /* Sync the selection indices used by Up/Down nav so the cursor
+       starts on the loaded host's choices rather than the top row. */
+    g_form_theme_idx = -1;
+    if (g_form.theme[0]) {
+        for (int i = 0; i < themes_count(); i++) {
+            if (strcmp(themes_all()[i].name, g_form.theme) == 0) {
+                g_form_theme_idx = i; break;
+            }
+        }
+    }
+    g_form_font_idx = -1;
+    if (g_form.font[0]) {
+        for (int i = 0; i < g_font_count; i++) {
+            if (strcmp(g_fonts[i].path, g_form.font) == 0) {
+                g_form_font_idx = i; break;
+            }
+        }
+    }
 }
 
 /* Blank every field and reset selection — used by the "New" button and
@@ -1465,6 +1499,9 @@ static void ssh_form_clear(void) {
     g_ssh_list_selected = -1;
     g_form_status[0] = 0;
     g_form_logdir_focus = false;
+    g_form_focused_list = FORM_FOCUS_NONE;
+    g_form_theme_idx = -1;
+    g_form_font_idx = -1;
 }
 
 static void fonts_load(const char *current_path);
@@ -2012,18 +2049,21 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     }
     if (g_form_logdir_focus) g_form_logdir_focus = false;
 
-    /* Per-host theme/font pickers. Empty-top-row blanks the selection. */
+    /* Per-host theme/font pickers. Empty-top-row blanks the selection.
+       Click also focuses the list for keyboard nav (Up/Down). */
     if (rect_hit(L.theme_list, mx, my)) {
         int row_h = 22;
         int idx = (my - L.theme_list.y) / row_h + g_form_theme_scroll;
-        /* idx 0 is the synthetic "(none)" row; real themes start at idx 1. */
         if (idx == 0) {
             g_form.theme[0] = 0;
+            g_form_theme_idx = -1;
         } else if (idx > 0 && idx - 1 < themes_count()) {
             const Theme *th = &themes_all()[idx - 1];
             strncpy(g_form.theme, th->name, sizeof(g_form.theme) - 1);
             g_form.theme[sizeof(g_form.theme) - 1] = 0;
+            g_form_theme_idx = idx - 1;
         }
+        g_form_focused_list = FORM_FOCUS_THEME;
         return;
     }
     if (rect_hit(L.font_list, mx, my)) {
@@ -2031,12 +2071,18 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
         int idx = (my - L.font_list.y) / row_h + g_form_font_scroll;
         if (idx == 0) {
             g_form.font[0] = 0;
+            g_form_font_idx = -1;
         } else if (idx > 0 && idx - 1 < g_font_count) {
             strncpy(g_form.font, g_fonts[idx - 1].path, sizeof(g_form.font) - 1);
             g_form.font[sizeof(g_form.font) - 1] = 0;
+            g_form_font_idx = idx - 1;
         }
+        g_form_focused_list = FORM_FOCUS_FONT;
         return;
     }
+    /* Click anywhere else inside the form drops keyboard nav focus
+       (so other shortcuts like Tab cycle through fields normally). */
+    g_form_focused_list = FORM_FOCUS_NONE;
     if (rect_hit(L.fs_dec, mx, my)) {
         if (g_form.font_size == 0) g_form.font_size = 20; /* start from a sane default */
         g_form.font_size -= 1;
@@ -2092,6 +2138,45 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     bool is_text_field = (g_form.focus >= F_NAME && g_form.focus <= F_KEY);
 
     if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
+
+    /* Up/Down arrow navigation when a picker list has keyboard focus.
+       Index of -1 represents the synthetic "(inherit default)" row at
+       the top of the rendered list, so the visible row index is
+       `idx + 1`. Auto-scroll keeps the selection inside the panel. */
+    bool form_up   = IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP);
+    bool form_down = IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN);
+    if (g_form_focused_list == FORM_FOCUS_THEME && (form_up || form_down)) {
+        int total = themes_count();
+        int next = g_form_theme_idx + (form_up ? -1 : +1);
+        if (next < -1) next = -1;
+        if (next >= total) next = total - 1;
+        g_form_theme_idx = next;
+        if (next == -1) {
+            g_form.theme[0] = 0;
+        } else {
+            strncpy(g_form.theme, themes_all()[next].name, sizeof(g_form.theme) - 1);
+            g_form.theme[sizeof(g_form.theme) - 1] = 0;
+        }
+        list_scroll_to(&g_form_theme_scroll, g_form_theme_idx + 1,
+                       total + 1, 22, L.theme_list.h);
+        return;
+    }
+    if (g_form_focused_list == FORM_FOCUS_FONT && (form_up || form_down)) {
+        int total = g_font_count;
+        int next = g_form_font_idx + (form_up ? -1 : +1);
+        if (next < -1) next = -1;
+        if (next >= total) next = total - 1;
+        g_form_font_idx = next;
+        if (next == -1) {
+            g_form.font[0] = 0;
+        } else {
+            strncpy(g_form.font, g_fonts[next].path, sizeof(g_form.font) - 1);
+            g_form.font[sizeof(g_form.font) - 1] = 0;
+        }
+        list_scroll_to(&g_form_font_scroll, g_form_font_idx + 1,
+                       total + 1, 22, L.font_list.h);
+        return;
+    }
 
     /* Per-host log-dir text input. Click-focused via the form's mouse
        handler; we own the keyboard while it has focus. */
@@ -3080,6 +3165,7 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             g_font_list_selected = idx;
             settings_apply_font(r, &g_fonts[idx]);
         }
+        g_settings_focused_list = SETTINGS_FOCUS_FONT;
         return;
     }
     if (rect_hit(L.theme_list, mx, my)) {
@@ -3092,6 +3178,7 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             Pane *p = t ? active_pane_of(t) : NULL;
             if (p && p->scr) screen_apply_theme(p->scr, &themes_all()[idx]);
         }
+        g_settings_focused_list = SETTINGS_FOCUS_THEME;
         return;
     }
     /* Cursor-style buttons: apply to the active pane. */
@@ -3130,12 +3217,26 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         }
         return;
     }
-    if (rect_hit(L.close, mx, my)) { g_ui_mode = UI_NORMAL; g_settings_dir_focus = false; return; }
-    /* Click elsewhere drops focus from the text input. */
+    if (rect_hit(L.close, mx, my)) { g_ui_mode = UI_NORMAL; g_settings_dir_focus = false; g_settings_focused_list = SETTINGS_FOCUS_NONE; return; }
+    /* Click elsewhere drops focus from the text input + list. */
     g_settings_dir_focus = false;
+    g_settings_focused_list = SETTINGS_FOCUS_NONE;
 }
 
-static void settings_handle_keys(Renderer *r) {
+/* Keep the selected list row visible by adjusting the scroll offset
+   when the selection moves outside [scroll, scroll + visible). */
+static void list_scroll_to(int *scroll, int selected, int total, int row_h, int list_h) {
+    int visible = list_h / row_h;
+    if (visible < 1) visible = 1;
+    if (selected < *scroll) *scroll = selected;
+    else if (selected >= *scroll + visible) *scroll = selected - visible + 1;
+    int max = total - visible;
+    if (max < 0) max = 0;
+    if (*scroll > max) *scroll = max;
+    if (*scroll < 0) *scroll = 0;
+}
+
+static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
 #if defined(__APPLE__)
     bool cmd  = IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
@@ -3146,6 +3247,10 @@ static void settings_handle_keys(Renderer *r) {
 
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (g_settings_dir_focus) { g_settings_dir_focus = false; return; }
+        if (g_settings_focused_list != SETTINGS_FOCUS_NONE) {
+            g_settings_focused_list = SETTINGS_FOCUS_NONE;
+            return;
+        }
         g_ui_mode = UI_NORMAL; return;
     }
 
@@ -3186,12 +3291,43 @@ static void settings_handle_keys(Renderer *r) {
         return;
     }
 
-    /* Not editing the path — keyboard shortcuts adjust font size. */
-    if (IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP) ||
-        IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD))
+    /* If a picker list has keyboard focus (last clicked), Up/Down
+       moves selection within that list — applying immediately just
+       like a click. Falls back to font-size +/- when no list is
+       focused so the existing chord still works. */
+    bool up   = IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP);
+    bool down = IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN);
+    if (g_settings_focused_list == SETTINGS_FOCUS_FONT && (up || down)) {
+        int next = g_font_list_selected + (up ? -1 : +1);
+        if (next < 0) next = 0;
+        if (next >= g_font_count) next = g_font_count - 1;
+        if (next != g_font_list_selected && next >= 0) {
+            g_font_list_selected = next;
+            settings_apply_font(r, &g_fonts[next]);
+        }
+        list_scroll_to(&g_font_list_scroll, g_font_list_selected,
+                       g_font_count, 22, L.font_list.h);
+        return;
+    }
+    if (g_settings_focused_list == SETTINGS_FOCUS_THEME && (up || down)) {
+        int total = themes_count();
+        int next = g_theme_list_selected + (up ? -1 : +1);
+        if (next < 0) next = 0;
+        if (next >= total) next = total - 1;
+        if (next != g_theme_list_selected && next >= 0) {
+            g_theme_list_selected = next;
+            Tab *t = active_tab();
+            Pane *p = t ? active_pane_of(t) : NULL;
+            if (p && p->scr) screen_apply_theme(p->scr, &themes_all()[next]);
+        }
+        list_scroll_to(&g_theme_list_scroll, g_theme_list_selected,
+                       total, 22, L.theme_list.h);
+        return;
+    }
+    /* No list focused — Up/Down (and = / -) adjust font size. */
+    if (up || IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD))
         settings_apply_font_size(r, r->font_size + 1);
-    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN) ||
-        IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT))
+    if (down || IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT))
         settings_apply_font_size(r, r->font_size - 1);
     /* Space toggles logging when not editing the path. */
     if (IsKeyPressed(KEY_SPACE)) {
@@ -3741,6 +3877,18 @@ int main(int argc, char **argv) {
 
     app_settings_init();
     themes_load_builtins();
+    /* Hand the renderer a broad-coverage backup font so glyphs the
+       primary font lacks (box-drawing, arrows, less common Unicode)
+       fall through to it instead of rendering as "?". DejaVu Sans
+       Mono is the right tool — bundled, generous Unicode coverage. */
+    {
+        const EmbeddedFont *backup = embedded_font_lookup("DejaVuSansMono");
+        if (!backup) backup = embedded_font_lookup("DejaVuSansMono.ttf");
+        if (backup) {
+            renderer_set_backup_font_data(backup->data, (int)backup->data_size,
+                                          backup->ext);
+        }
+    }
     /* Apply ~/.config/rbterm/config.ini before we commit to font path,
        size, padding, etc. CLI flags the user passed on the command line
        still win — they were parsed before this. */
@@ -4194,7 +4342,7 @@ int main(int argc, char **argv) {
         if (g_ui_mode == UI_SETTINGS) {
             SettingsLayout L = settings_layout(win_w_now, win_h_now);
             settings_handle_mouse(&r, L);
-            settings_handle_keys(&r);
+            settings_handle_keys(&r, L);
             cur = active_tab();
             if (!cur) break;
             BeginDrawing();

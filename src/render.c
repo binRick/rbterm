@@ -267,8 +267,13 @@ void renderer_set_cell_spacing(Renderer *r, int extra_w) {
     r->cell_w = r->cell_w_base + extra_w;
 }
 
+/* Forward decl — definition follows install_font. */
+static void backup_font_ensure(int atlas_size);
+
 /* Install a freshly-loaded Font into the renderer, replacing whatever
-   was loaded before. Shared by load_font_into / load_font_data_into. */
+   was loaded before. Shared by load_font_into / load_font_data_into.
+   Also reloads the broad backup font at the matching atlas size so
+   missing-glyph fallback rasterises at the right resolution. */
 static void install_font(Renderer *r, Font f, int size, const char *path) {
     if (r->font_data) {
         UnloadFont(*as_font(r));
@@ -281,6 +286,65 @@ static void install_font(Renderer *r, Font f, int size, const char *path) {
     r->font_path[sizeof(r->font_path) - 1] = 0;
     measure_cell(r);
     missing_set_build(&f);
+    int atlas_size = size * 2;
+    if (atlas_size > 96) atlas_size = 96;
+    backup_font_ensure(atlas_size);
+}
+
+/* Broad-coverage backup font. Loaded once from main.c (typically the
+   embedded DejaVu Sans Mono blob). When the primary font lacks a
+   glyph, we draw it from this font instead of falling straight through
+   to the emoji rasterizer / "?" placeholder. */
+static const unsigned char *g_backup_data = NULL;
+static int g_backup_data_size = 0;
+static char g_backup_ext[8] = {0};
+static Font g_backup_font = {0};
+static int  g_backup_loaded_size = 0;     /* 0 = not yet loaded */
+
+static void backup_font_unload(void) {
+    if (g_backup_loaded_size > 0) {
+        UnloadFont(g_backup_font);
+        memset(&g_backup_font, 0, sizeof(g_backup_font));
+        g_backup_loaded_size = 0;
+    }
+}
+
+static void backup_font_ensure(int atlas_size) {
+    if (!g_backup_data || g_backup_data_size <= 0) return;
+    if (g_backup_loaded_size == atlas_size) return;
+    backup_font_unload();
+    int cp_count;
+    int *cps = build_codepoints(&cp_count);
+    char ft[8] = ".";
+    strncat(ft, g_backup_ext[0] ? g_backup_ext : "ttf", sizeof(ft) - 2);
+    g_backup_font = LoadFontFromMemory(ft, g_backup_data, g_backup_data_size,
+                                       atlas_size, cps, cp_count);
+    free(cps);
+    if (g_backup_font.texture.id == 0) return;
+    SetTextureFilter(g_backup_font.texture, TEXTURE_FILTER_BILINEAR);
+    g_backup_loaded_size = atlas_size;
+}
+
+void renderer_set_backup_font_data(const unsigned char *data, int data_size,
+                                   const char *ext) {
+    g_backup_data = data;
+    g_backup_data_size = data_size;
+    if (ext && *ext) {
+        strncpy(g_backup_ext, ext, sizeof(g_backup_ext) - 1);
+        g_backup_ext[sizeof(g_backup_ext) - 1] = 0;
+    } else {
+        g_backup_ext[0] = 0;
+    }
+    backup_font_unload();   /* lazy reload at next size change */
+}
+
+/* Returns true if the backup font has a non-empty glyph for `cp`. */
+static bool backup_font_has(uint32_t cp) {
+    if (g_backup_loaded_size == 0 || !g_backup_font.glyphs) return false;
+    int idx = GetGlyphIndex(g_backup_font, (int)cp);
+    if (idx < 0 || idx >= g_backup_font.glyphCount) return false;
+    GlyphInfo *gi = &g_backup_font.glyphs[idx];
+    return (gi->image.width > 0 && gi->image.height > 0);
 }
 
 /* Forget any cached embedded blob — call after switching back to a
@@ -371,6 +435,7 @@ void renderer_shutdown(Renderer *r) {
     free(g_emoji.items);    g_emoji.items = NULL;    g_emoji.cap = 0;
     free(g_fallback.items); g_fallback.items = NULL; g_fallback.cap = 0;
     missing_set_clear();
+    backup_font_unload();
     if (!r || !r->font_data) return;
     UnloadFont(*as_font(r));
     free(r->font_data);
@@ -593,8 +658,20 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             if (c.cp >= 0x1F000 || !main_has_glyph) {
                 DRAW_GLYPH(g_emoji);
             }
-            /* Try Menlo fallback for anything the main font doesn't have. */
+            /* Anything the main font lacks falls through to: (1) the
+               broad backup font baked into the binary (DejaVu Sans
+               Mono — wide Unicode coverage, works on every platform),
+               then (2) the Core Text "Menlo" rasterizer on macOS,
+               and finally (3) a "?" placeholder. */
             if (!main_has_glyph) {
+                if (backup_font_has(c.cp)) {
+                    pos.x = (float)(x * cw + r->cell_extra_w / 2);
+                    pos.y = (float)(y * ch + glyph_y_offset);
+                    DrawTextCodepoint(g_backup_font, (int)c.cp, pos,
+                                      (float)r->font_size,
+                                      col_from_rgb(fg, alpha));
+                    goto glyph_drawn;
+                }
                 DRAW_GLYPH(g_fallback);
                 /* Nothing in any font: visible placeholder. */
                 pos.x = (float)(x * cw + r->cell_extra_w / 2);

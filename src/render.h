@@ -46,6 +46,14 @@ bool renderer_set_font_path(Renderer *r, const char *path);
 bool renderer_set_font_data(Renderer *r, const unsigned char *data,
                             int data_size, const char *ext,
                             const char *display_path);
+// Install a broad-coverage backup font. When the primary font lacks a
+// glyph for a codepoint, the renderer falls through to this font
+// before declaring the cell unrenderable. Call once at startup with a
+// font that covers a wide Unicode range (DejaVu Sans Mono is ideal).
+// The caller owns `data`; the renderer keeps the pointer alive for the
+// lifetime of the renderer.
+void renderer_set_backup_font_data(const unsigned char *data,
+                                   int data_size, const char *ext);
 // Set extra pixels between cells horizontally (0..32). Updates cell_w in
 // place; no atlas rebuild needed. The caller still owns reflowing tabs.
 void renderer_set_cell_spacing(Renderer *r, int extra_w);

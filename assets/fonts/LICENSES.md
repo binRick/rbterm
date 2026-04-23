@@ -14,6 +14,18 @@ see the linked repos for the full licence text.
 | Inconsolata       | https://github.com/googlefonts/Inconsolata           | OFL-1.1               |
 | IBM Plex Mono     | https://github.com/IBM/plex                          | OFL-1.1               |
 | Monaspace (Argon, Krypton, Neon, Radon, Xenon — Nerd Font Regulars) | https://github.com/githubnext/monaspace | OFL-1.1 |
+| DejaVu Sans Mono   | https://dejavu-fonts.github.io/                       | Bitstream Vera + DejaVu |
+| Caskaydia Cove Nerd Font | https://github.com/microsoft/cascadia-code     | OFL-1.1               |
+| Iosevka Nerd Font  | https://github.com/be5invis/Iosevka                  | OFL-1.1               |
+| Roboto Mono        | https://fonts.google.com/specimen/Roboto+Mono        | Apache-2.0            |
+| Space Mono         | https://fonts.google.com/specimen/Space+Mono         | OFL-1.1               |
+| Ubuntu Mono        | https://design.ubuntu.com/font/                       | Ubuntu Font Licence   |
+| ProFont Windows    | https://tobiasjung.name/profont/                      | MIT-style             |
+| Fantasque Sans Mono| https://github.com/belluzj/fantasque-sans            | OFL-1.1               |
+| Terminus           | https://terminus-font.sourceforge.net/                | OFL-1.1               |
+| SF Mono            | Apple system font                                     | Apple system font licence |
+| Noto Mono          | https://fonts.google.com/noto/specimen/Noto+Sans+Mono | OFL-1.1               |
+| Hybrid Mono Fonts (FiraCode + JetBrains Mono × Kawkab/Vazir Arabic + Persian) | https://github.com/ghazyami/hybrid-mono-fonts | OFL-1.1 |
 
 None of the bundled files have been modified from upstream. If you
 redistribute rbterm you need to preserve the licence notices.
