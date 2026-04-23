@@ -388,10 +388,12 @@ static Renderer *g_renderer = NULL;
 static void tabs_resize_all(const Renderer *r, int win_w, int win_h);
 
 /* Pull in the embedded fonts table early so tab_open_ssh's appearance
-   apply path can resolve "embedded:NAME" references. The wasm build
-   skips this — the .S file isn't linked there to keep the bundle
-   small, so we provide an empty table instead. */
-#ifdef PLATFORM_WEB
+   apply path can resolve "embedded:NAME" references. Wasm and Windows
+   skip the .incbin payload (the wasm assembler doesn't grok Mach-O
+   section directives, and MSVC's assembler doesn't understand .incbin
+   at all). When RBTERM_NO_EMBEDDED_FONTS is defined we provide an
+   empty table so the rest of the code compiles cleanly. */
+#if defined(PLATFORM_WEB) || defined(RBTERM_NO_EMBEDDED_FONTS)
 typedef struct {
     const char *name;
     const char *ext;

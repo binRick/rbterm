@@ -49,12 +49,17 @@ set(RBTERM_SOURCES
     src/pty_dispatch.c
 )
 
-# Embedded fonts (via .incbin). Skipped for emscripten — the wasm
-# assembler doesn't grok Mach-O section directives and the wasm bundle
-# is download-bandwidth-sensitive. main.c uses an empty stub when
-# PLATFORM_WEB is set so its references compile cleanly.
-if(NOT EMSCRIPTEN)
+# Embedded fonts (via .incbin). Skipped for emscripten + Windows —
+# the wasm assembler doesn't grok Mach-O section directives, and
+# MSVC's assembler doesn't understand .incbin at all. main.c uses an
+# empty stub when RBTERM_NO_EMBEDDED_FONTS is set so the references
+# compile cleanly. Windows + wasm builds ship the fonts via the
+# packaging layer (Resources/fonts in the wasm preload, fonts/ folder
+# in the release zip).
+if(NOT EMSCRIPTEN AND NOT WIN32)
     list(APPEND RBTERM_SOURCES src/fonts_embedded.S)
+else()
+    add_compile_definitions(RBTERM_NO_EMBEDDED_FONTS=1)
 endif()
 
 # Regenerate src/themes_embedded.h whenever any kfc/dark palette file
@@ -152,7 +157,10 @@ if(WIN32)
 endif()
 
 add_executable(rbterm ${RBTERM_SOURCES})
-add_dependencies(rbterm rbterm_themes rbterm_fonts)
+add_dependencies(rbterm rbterm_themes)
+if(NOT EMSCRIPTEN AND NOT WIN32)
+    add_dependencies(rbterm rbterm_fonts)
+endif()
 target_include_directories(rbterm PRIVATE src)
 target_link_libraries(rbterm PRIVATE raylib)
 if(RBTERM_SSH)
