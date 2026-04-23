@@ -804,9 +804,14 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     {
         int nimg = screen_image_count(s);
         int vo = screen_view_offset(s);
+        bool on_alt = screen_on_alt(s);
         for (int i = 0; i < nimg; i++) {
             const ScreenImage *img = screen_image_at(s, i);
             if (!img) continue;
+            /* Images are tagged at ingest with the screen they belong
+               to; skip the ones that aren't for the current screen so
+               tmux / less don't draw over each other's graphics. */
+            if (screen_image_on_alt(img) != on_alt) continue;
             ImgEntry *e = img_cache_get_or_upload(img);
             if (!e) continue;
             int row = screen_image_anchor_row(img) + vo;

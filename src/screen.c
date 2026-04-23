@@ -45,6 +45,9 @@ struct ScreenImage {
     int anchor_row;            /* viewport row (0 = top); may go < 0 off-screen */
     int anchor_col;
     uint64_t gen;              /* unique id; never reused across the run */
+    bool on_alt;               /* true when image was ingested on alt screen;
+                                  render skips images whose flag doesn't match
+                                  the current screen. tmux + less clear cleanly. */
 };
 
 struct Screen {
@@ -327,8 +330,24 @@ static ScreenImage *image_append(Screen *s, unsigned char *rgba,
     img->anchor_row = anchor_row;
     img->anchor_col = anchor_col;
     img->gen = ++s->next_image_gen;
+    img->on_alt = s->on_alt;
     s->images[s->nimages++] = img;
     return img;
+}
+
+/* Drop every image whose `on_alt` flag equals `which`. Used on alt/main
+   transitions and on CSI 2J / CSI 3J clears. */
+static void images_drop_where(Screen *s, bool which) {
+    for (int i = 0; i < s->nimages; ) {
+        if (s->images[i]->on_alt == which) {
+            image_free_one(s->images[i]);
+            memmove(s->images + i, s->images + i + 1,
+                    sizeof(s->images[0]) * (s->nimages - i - 1));
+            s->nimages--;
+            continue;
+        }
+        i++;
+    }
 }
 
 /* Move every image's anchor_row by -dy rows (viewport scrolled up).
@@ -612,6 +631,9 @@ static void erase_in_display(Screen *s, int mode) {
         for (int x = 0; x <= s->cx && x < s->cols; x++) row[x] = b;
     } else if (mode == 2 || mode == 3) {
         for (int y = 0; y < s->rows; y++) clear_row(s, y);
+        /* Ctrl-L / `clear` also wipes out any sixel/kitty images on
+           the current screen. Matches xterm/iTerm/kitty. */
+        images_drop_where(s, s->on_alt);
     }
 }
 
@@ -649,9 +671,16 @@ static void set_mode(Screen *s, int p, bool on) {
             s->on_alt = true;
             for (int y = 0; y < s->rows; y++) clear_row(s, y);
             s->cx = 0; s->cy = 0;
+            /* Entering alt — drop any stale alt-tagged images left
+               over from a previous fullscreen app (shouldn't exist
+               normally, but cheap insurance). */
+            images_drop_where(s, true);
         } else if (!on && s->on_alt) {
             s->on_alt = false;
             s->cx = s->saved_cx; s->cy = s->saved_cy;
+            /* Leaving alt — drop anything the alt-screen app drew.
+               Images tagged main survive and reappear automatically. */
+            images_drop_where(s, true);
         }
         s->wrap_next = false;
         break;
@@ -1309,6 +1338,8 @@ int screen_image_px_h(const ScreenImage *img)       { return img ? img->px_h : 0
 int screen_image_anchor_row(const ScreenImage *img) { return img ? img->anchor_row : 0; }
 int screen_image_anchor_col(const ScreenImage *img) { return img ? img->anchor_col : 0; }
 uint64_t screen_image_generation(const ScreenImage *img) { return img ? img->gen : 0; }
+bool screen_image_on_alt(const ScreenImage *img) { return img ? img->on_alt : false; }
+bool screen_on_alt(const Screen *s) { return s ? s->on_alt : false; }
 void screen_set_cell_h_px(Screen *s, int cell_h_px) {
     if (s && cell_h_px > 0) s->cell_h_px = cell_h_px;
 }

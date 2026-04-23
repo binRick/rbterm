@@ -96,6 +96,7 @@ bool    screen_focus_report(const Screen *s);
 bool    screen_bracketed_paste(const Screen *s);
 int     screen_mouse_mode(const Screen *s);   /* 0, 1000, 1002, 1003 */
 bool    screen_mouse_sgr(const Screen *s);    /* true when DECSET 1006 active */
+bool    screen_on_alt(const Screen *s);       /* true when alt screen is active */
 
 /* --- Graphics (sixel / kitty) -------------------------------------------
  *
@@ -114,6 +115,7 @@ int                   screen_image_px_h(const ScreenImage *img);
 int                   screen_image_anchor_row(const ScreenImage *img);
 int                   screen_image_anchor_col(const ScreenImage *img);
 uint64_t              screen_image_generation(const ScreenImage *img);
+bool                  screen_image_on_alt(const ScreenImage *img);
 /* Renderer tells the screen its cell pixel height so scroll accounting
    can translate pixel-heighted images into cell rows. Call from the
    renderer whenever cell_h changes (font size change, init). */
