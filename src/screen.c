@@ -1813,6 +1813,28 @@ Cell screen_view_cell(const Screen *s, int col, int vy) {
     return base[y * s->cols + col];
 }
 
+int screen_total_rows(const Screen *s) {
+    if (!s) return 0;
+    /* Alt screen has no scrollback; main screen walks scrollback then live. */
+    return s->on_alt ? s->rows : (s->sb_len + s->rows);
+}
+
+Cell screen_cell_abs(const Screen *s, int col, int abs_row) {
+    Cell e = {0, 0, 0, 0, 0, 0};
+    if (!s || col < 0 || col >= s->cols || abs_row < 0) return e;
+    if (s->on_alt) {
+        if (abs_row >= s->rows) return e;
+        return s->alt[abs_row * s->cols + col];
+    }
+    if (abs_row < s->sb_len) {
+        int ring = ((s->sb_head - s->sb_len + abs_row) % s->sb_cap + s->sb_cap) % s->sb_cap;
+        return s->sb[ring * s->cols + col];
+    }
+    int y = abs_row - s->sb_len;
+    if (y >= s->rows) return e;
+    return s->main[y * s->cols + col];
+}
+
 bool screen_view_row_wrapped(const Screen *s, int vy) {
     if (!s || vy < 0 || vy >= s->rows || s->on_alt) return false;
     int off = s->view_off;

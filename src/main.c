@@ -278,10 +278,29 @@ static void mkdir_p(const char *path) {
 
 /* A Pane is one PTY/Screen/Selection — i.e. one running shell. Tabs can
    host either one Pane (no split) or two (vertical or horizontal split). */
+/* In-pane search state. Cmd+F opens a one-line search bar docked
+   over the top of the pane. Matches are single-row substrings
+   (case-insensitive) across scrollback + live grid. Each match
+   stores (abs_row, col_start, col_end) in absolute-row coordinates
+   (see screen_cell_abs). The active "current" match gets brighter
+   highlighting and auto-scrolls into view. */
+typedef struct {
+    bool active;
+    bool sel_all;     /* query visually selected; next keystroke replaces it */
+    char query[128];
+    int *rows;        /* heap; length = count */
+    int *cols;
+    int *ends;
+    int  count;
+    int  cap;
+    int  current;     /* -1 when no matches */
+} Search;
+
 typedef struct {
     Pty *pty;
     Screen *scr;
     Selection sel;
+    Search  search;
     char title[256];
     bool title_dirty;
     int click_count;
@@ -724,6 +743,11 @@ static void pane_free(Pane *p) {
     pane_log_close(p);
     if (p->pty) { pty_close(p->pty); p->pty = NULL; }
     if (p->scr) { screen_free(p->scr); p->scr = NULL; }
+    free(p->search.rows);  p->search.rows = NULL;
+    free(p->search.cols);  p->search.cols = NULL;
+    free(p->search.ends);  p->search.ends = NULL;
+    p->search.count = p->search.cap = 0;
+    p->search.active = false;
 }
 
 static Tab *tab_open(int cols, int rows) {
@@ -1134,6 +1158,226 @@ static void select_line(Screen *s, Selection *sel, int row) {
     sel->b_col = cols - 1; sel->b_row = r2;
 }
 
+/* ---------- Per-pane in-grid search ---------- */
+
+static void search_clear_matches(Search *s) {
+    s->count = 0;
+    s->current = -1;
+}
+
+/* Lowercase a 7-bit ASCII byte; leave higher bytes untouched so we
+   don't accidentally collide unrelated UTF-8 bytes. Good enough for
+   v1 — proper Unicode folding is future work. */
+static inline uint32_t cp_fold(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + 32;
+    return cp;
+}
+
+/* Walk every absolute row of the screen, record match positions.
+   Matches are within a single row; cross-wrap matches are a v2
+   concern. cp_fold case-folds ASCII only. */
+static void search_recompute(Pane *p) {
+    Search *S = &p->search;
+    search_clear_matches(S);
+    if (!S->active || !S->query[0] || !p->scr) return;
+
+    int cols = screen_cols(p->scr);
+    int total_rows = screen_total_rows(p->scr);
+
+    /* Fold the query once into a codepoint array. */
+    uint32_t q[128];
+    int qlen = 0;
+    for (const char *qp = S->query; *qp && qlen < (int)(sizeof(q)/sizeof(q[0])); qp++) {
+        q[qlen++] = cp_fold((unsigned char)*qp);
+    }
+    if (qlen == 0) return;
+
+    for (int r = 0; r < total_rows; r++) {
+        /* Build a per-row codepoint array for substring matching. */
+        uint32_t row_cps[512];
+        int row_cols = cols < (int)(sizeof(row_cps)/sizeof(row_cps[0]))
+                           ? cols : (int)(sizeof(row_cps)/sizeof(row_cps[0]));
+        for (int c = 0; c < row_cols; c++) {
+            Cell cc = screen_cell_abs(p->scr, c, r);
+            /* Skip wide-char continuation cells so multi-col glyphs
+               don't create phantom positions inside the query space. */
+            if (cc.attrs & ATTR_WIDE_CONT) { row_cps[c] = 0; continue; }
+            row_cps[c] = cc.cp ? cp_fold(cc.cp) : ' ';
+        }
+        /* Scan for needle. */
+        for (int c = 0; c + qlen <= row_cols; c++) {
+            bool hit = true;
+            for (int k = 0; k < qlen; k++) {
+                if (row_cps[c + k] != q[k]) { hit = false; break; }
+            }
+            if (!hit) continue;
+            if (S->count == S->cap) {
+                int ncap = S->cap ? S->cap * 2 : 32;
+                S->rows = realloc(S->rows, sizeof(*S->rows) * ncap);
+                S->cols = realloc(S->cols, sizeof(*S->cols) * ncap);
+                S->ends = realloc(S->ends, sizeof(*S->ends) * ncap);
+                S->cap = ncap;
+            }
+            S->rows[S->count] = r;
+            S->cols[S->count] = c;
+            S->ends[S->count] = c + qlen;
+            S->count++;
+        }
+    }
+    if (S->count > 0) S->current = 0;
+}
+
+/* Scroll the screen view so match `idx` is visible, roughly centred.
+   abs_row indexes full history (scrollback + live). */
+static void search_scroll_to_match(Pane *p, int idx) {
+    Search *S = &p->search;
+    if (!p->scr || idx < 0 || idx >= S->count) return;
+    int abs_row = S->rows[idx];
+    int rows = screen_rows(p->scr);
+    int sb_len = screen_scrollback_len(p->scr);
+    /* view_off = rows of scrollback pulled into top of view.
+       abs_row = sb_len + vy - view_off  (derivation: view row vy
+       shows abs_row sb_len+vy when view_off==0; each extra view_off
+       shifts the whole window back by one row). Solve for view_off
+       with vy = rows/2 to centre. */
+    int want = sb_len + rows / 2 - abs_row;
+    if (want < 0) want = 0;
+    if (want > sb_len) want = sb_len;
+    /* If the match is already visible with view_off=0, leave it alone. */
+    int cur_off = screen_view_offset(p->scr);
+    int cur_vy = abs_row - sb_len + cur_off;
+    if (cur_vy >= 0 && cur_vy < rows) return;
+    /* Otherwise centre. */
+    screen_scroll_reset(p->scr);
+    if (want > 0) screen_scroll_view(p->scr, want);
+}
+
+static void search_next(Pane *p, int delta) {
+    Search *S = &p->search;
+    if (S->count == 0) return;
+    int n = S->count;
+    int i = S->current < 0 ? 0 : (S->current + delta) % n;
+    if (i < 0) i += n;
+    S->current = i;
+    search_scroll_to_match(p, i);
+}
+
+static void search_open(Pane *p) {
+    if (!p) return;
+    p->search.active = true;
+    p->search.query[0] = 0;
+    search_clear_matches(&p->search);
+}
+
+static void search_close(Pane *p) {
+    if (!p) return;
+    p->search.active = false;
+    p->search.query[0] = 0;
+    search_clear_matches(&p->search);
+    if (p->scr) screen_scroll_reset(p->scr);
+}
+
+/* Route a frame's worth of key input to the search bar. Called in
+   place of input_poll when the active pane's search bar is open so
+   keystrokes don't leak into the shell. */
+static void search_handle_input(Pane *p) {
+    if (!p || !p->search.active) return;
+    Search *S = &p->search;
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    bool mod   = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)
+#if defined(__APPLE__)
+              || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER)
+#endif
+              ;
+
+    /* Mouse-wheel and Ctrl+Shift+Up/Down/PageUp/PageDown scroll the
+       scrollback even while the search bar owns the keyboard — users
+       often want to glance at nearby context without closing search. */
+    if (p->scr) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) screen_scroll_view(p->scr, (int)(wheel * 3.0f));
+        bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        if (ctrl && shift && IsKeyPressed(KEY_UP))    screen_scroll_view(p->scr, +1);
+        if (ctrl && shift && IsKeyPressed(KEY_DOWN))  screen_scroll_view(p->scr, -1);
+        if (shift && IsKeyPressed(KEY_PAGE_UP))       screen_scroll_view(p->scr, +screen_rows(p->scr) - 1);
+        if (shift && IsKeyPressed(KEY_PAGE_DOWN))     screen_scroll_view(p->scr, -screen_rows(p->scr) + 1);
+    }
+
+    if (IsKeyPressed(KEY_ESCAPE)) { search_close(p); return; }
+    bool step_next = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) ||
+                     IsKeyPressed(KEY_DOWN)  || IsKeyPressed(KEY_F3);
+    if (step_next) { search_next(p, shift ? -1 : +1); return; }
+    if (IsKeyPressed(KEY_UP)) { search_next(p, -1); return; }
+
+    /* Cmd/Ctrl+A: select the whole query. Next printable keystroke
+       replaces it; backspace / Cmd+V consume the selection too. */
+    if (mod && IsKeyPressed(KEY_A)) {
+        if (S->query[0]) S->sel_all = true;
+        return;
+    }
+    /* Cmd/Ctrl+C: if the user has a mouse-drag selection on the
+       pane, that wins — they probably just highlighted something in
+       the grid to copy it, and the search bar shouldn't steal the
+       chord. Otherwise copy the query text. */
+    if (mod && IsKeyPressed(KEY_C)) {
+        if (p->sel.active && !p->sel.dragging) {
+            copy_selection(p->scr, &p->sel);
+        } else if (S->query[0]) {
+            SetClipboardText(S->query);
+        }
+        return;
+    }
+    /* Left/Right/Home/End clear the select-all marker the same way
+       typing into a caret would. */
+    if (S->sel_all && (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT) ||
+                       IsKeyPressed(KEY_HOME) || IsKeyPressed(KEY_END))) {
+        S->sel_all = false;
+    }
+
+    bool query_changed = false;
+    /* Cmd/Ctrl+V: paste clipboard into the query, filtered to printable
+       ASCII. Useful for searching long strings copied from elsewhere. */
+    if (mod && IsKeyPressed(KEY_V)) {
+        const char *clip = GetClipboardText();
+        if (clip && *clip) {
+            if (S->sel_all) { S->query[0] = 0; S->sel_all = false; }
+            size_t n = strlen(S->query);
+            for (const char *q = clip; *q; q++) {
+                unsigned char c = (unsigned char)*q;
+                if (c == '\r' || c == '\n' || c == '\t') continue;
+                if (c < 32 || c >= 127) continue;
+                if (n + 1 >= sizeof(S->query)) break;
+                S->query[n++] = (char)c;
+            }
+            S->query[n] = 0;
+            query_changed = true;
+        }
+    }
+    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+        if (S->sel_all) {
+            S->query[0] = 0; S->sel_all = false; query_changed = true;
+        } else {
+            size_t n = strlen(S->query);
+            if (n > 0) { S->query[n - 1] = 0; query_changed = true; }
+        }
+    }
+    int cp;
+    while ((cp = GetCharPressed()) != 0) {
+        if (mod) continue;                  /* ignore chars from chord presses */
+        if (cp < 32 || cp >= 127) continue; /* ASCII only for v1 */
+        if (S->sel_all) { S->query[0] = 0; S->sel_all = false; }
+        size_t n = strlen(S->query);
+        if (n + 1 >= sizeof(S->query)) continue;
+        S->query[n] = (char)cp;
+        S->query[n + 1] = 0;
+        query_changed = true;
+    }
+    if (query_changed) {
+        search_recompute(p);
+        if (S->count > 0) search_scroll_to_match(p, 0);
+    }
+}
+
 /* Label shown on a tab. Preference order:
  *   1. p->title (OSC 0 / OSC 2 from the running program) if set
  *   2. p->cwd basename with HOME rewritten to "~"
@@ -1323,6 +1567,81 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         }
         renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
                       pr.x, pr.y, hcol, hrow);
+
+        /* Search match highlights. Drawn after the grid so they sit
+           over glyphs; alpha is low enough that text reads through.
+           The current match gets a brighter fill to stand out. */
+        if (p->search.count > 0) {
+            int cols_p = screen_cols(p->scr);
+            int rows_p = screen_rows(p->scr);
+            int sb = screen_scrollback_len(p->scr);
+            int off = screen_view_offset(p->scr);
+            for (int i = 0; i < p->search.count; i++) {
+                int abs_row = p->search.rows[i];
+                int vy = abs_row - sb + off;
+                if (vy < 0 || vy >= rows_p) continue;
+                int c0 = p->search.cols[i];
+                int c1 = p->search.ends[i];
+                if (c0 < 0) c0 = 0;
+                if (c1 > cols_p) c1 = cols_p;
+                if (c1 <= c0) continue;
+                bool is_cur = (i == p->search.current);
+                Color col = is_cur ? (Color){255, 210, 0, 180}
+                                   : (Color){255, 210, 0, 100};
+                DrawRectangle(pr.x + r->pad_x + c0 * r->cell_w,
+                              pr.y + r->pad_y + vy * r->cell_h,
+                              (c1 - c0) * r->cell_w, r->cell_h, col);
+            }
+        }
+
+        /* Search bar (docked top of pane). */
+        if (p->search.active) {
+            int bh = 30;
+            int bw = pr.w - 16;
+            int bx = pr.x + 8;
+            int by = pr.y + 6;
+            DrawRectangle(bx, by, bw, bh, (Color){28, 32, 44, 240});
+            DrawRectangleLines(bx, by, bw, bh,
+                               pane_focused ? (Color){125, 207, 255, 220}
+                                            : (Color){90, 100, 120, 180});
+            Font *ff = (Font *)r->font_data;
+            DrawTextEx(*ff, "Find:",
+                       (Vector2){bx + 10, by + (bh - 13) / 2},
+                       13, 0, (Color){180, 190, 210, 255});
+            int tx = bx + 54;
+            if (p->search.sel_all && p->search.query[0]) {
+                Vector2 qsz = MeasureTextEx(*ff, p->search.query, 13, 0);
+                DrawRectangle(tx - 2, by + (bh - 16) / 2,
+                              (int)qsz.x + 4, 16,
+                              (Color){64, 100, 150, 200});
+            }
+            DrawTextEx(*ff, p->search.query,
+                       (Vector2){tx, by + (bh - 13) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+            /* Right-aligned count / status. */
+            char cbuf[40];
+            if (p->search.count > 0) {
+                snprintf(cbuf, sizeof(cbuf), "%d / %d",
+                         p->search.current + 1, p->search.count);
+            } else if (p->search.query[0]) {
+                snprintf(cbuf, sizeof(cbuf), "no matches");
+            } else {
+                cbuf[0] = 0;
+            }
+            if (cbuf[0]) {
+                Vector2 csz = MeasureTextEx(*ff, cbuf, 13, 0);
+                DrawTextEx(*ff, cbuf,
+                           (Vector2){bx + bw - 12 - csz.x, by + (bh - 13) / 2},
+                           13, 0, (Color){180, 190, 210, 255});
+            }
+            /* Blinking caret at the end of the query. */
+            if (((long long)(GetTime() * 2.0) & 1) == 0) {
+                Vector2 qsz = MeasureTextEx(*ff, p->search.query, 13, 0);
+                DrawRectangle(tx + (int)qsz.x + 1,
+                              by + (bh - 16) / 2, 8, 16,
+                              (Color){125, 207, 255, 255});
+            }
+        }
     }
     PaneRect sp;
     if (splitter_rect(t, win_w, win_h, &sp)) {
@@ -5268,6 +5587,15 @@ int main(int argc, char **argv) {
             if (IsKeyPressed(KEY_COMMA)) {
                 settings_open(&r);
             }
+            else if (IsKeyPressed(KEY_F)) {
+                /* Cmd/Ctrl+F: open the search bar on the active pane.
+                   Honest behaviour: inside tmux / vim / less rbterm
+                   is on the alt screen and has no scrollback, so
+                   search only covers the current screenful. */
+                Tab *_ct = active_tab();
+                Pane *_ap = _ct ? active_pane_of(_ct) : NULL;
+                if (_ap) search_open(_ap);
+            }
             else if (shift_held && IsKeyPressed(KEY_T)) {
                 ssh_form_open();
             }
@@ -5387,9 +5715,15 @@ int main(int argc, char **argv) {
         if (!cur) break;
 
         Pane *ap = active_pane_of(cur);
-        InputActions acts;
-        size_t in_n = ap ? input_poll(ap->scr, inputbuf, sizeof(inputbuf), &acts)
-                         : 0;
+        InputActions acts = {0};
+        size_t in_n = 0;
+        if (ap && ap->search.active) {
+            /* Search bar owns the keyboard — consume raylib's key
+               events here so they don't also land in the shell. */
+            search_handle_input(ap);
+        } else if (ap) {
+            in_n = input_poll(ap->scr, inputbuf, sizeof(inputbuf), &acts);
+        }
         if (ap && acts.scroll_rows != 0) {
             /* Keep the selection anchored to the content it started on
                while the user scrolls through history. screen_scroll_view

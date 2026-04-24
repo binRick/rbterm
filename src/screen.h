@@ -111,6 +111,12 @@ Cell    screen_view_cell(const Screen *s, int col, int vy);
    (as opposed to a natural line break). Covers both scrollback and
    live main-screen rows; always false on alt screen. */
 bool    screen_view_row_wrapped(const Screen *s, int vy);
+/* Absolute-row accessors used by features that need to walk the
+   whole buffer (search). abs_row 0 is the oldest scrollback row;
+   abs_row scrollback_len..scrollback_len+rows-1 covers the live
+   grid (or the alt screen, which has no scrollback). */
+int     screen_total_rows(const Screen *s);
+Cell    screen_cell_abs(const Screen *s, int col, int abs_row);
 bool    screen_app_cursor(const Screen *s);
 bool    screen_app_keypad(const Screen *s);
 bool    screen_focus_report(const Screen *s);
