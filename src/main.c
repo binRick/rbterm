@@ -1,4 +1,5 @@
 #include "raylib.h"
+#include <stdarg.h>
 #include "screen.h"
 #include "render.h"
 #include "input.h"
@@ -81,6 +82,27 @@ static bool ini_split(char *line, char **k_out, char **v_out) {
     *k_out = k;
     *v_out = v;
     return true;
+}
+
+/* Custom raylib trace-log callback. Swallows the glyph-bigger-than-
+   font-size warnings stb_truetype emits for box-drawing characters
+   (U+2502 etc. are *deliberately* over-height so vertical lines
+   connect across cells), while still forwarding everything else to
+   stderr so real problems aren't hidden. */
+static void rl_trace_log(int logType, const char *text, va_list args) {
+    char line[1024];
+    vsnprintf(line, sizeof(line), text, args);
+    if (strstr(line, "size is bigger than expected font size")) return;
+    const char *pfx = "INFO";
+    switch (logType) {
+    case LOG_DEBUG:   pfx = "DEBUG";   break;
+    case LOG_INFO:    pfx = "INFO";    break;
+    case LOG_WARNING: pfx = "WARNING"; break;
+    case LOG_ERROR:   pfx = "ERROR";   break;
+    case LOG_FATAL:   pfx = "FATAL";   break;
+    default:          pfx = "TRACE";   break;
+    }
+    fprintf(stderr, "%s: %s\n", pfx, line);
 }
 
 /* ---------- App-wide settings ---------- */
@@ -286,8 +308,12 @@ static void mkdir_p(const char *path) {
    highlighting and auto-scrolls into view. */
 typedef struct {
     bool active;
-    bool sel_all;     /* query visually selected; next keystroke replaces it */
     char query[128];
+    int  caret;       /* byte index into query where the cursor sits */
+    int  sel_anchor;  /* -1 = no selection; else the "other" end of the
+                         selection (selection spans [lo..hi) of
+                         min(caret, sel_anchor)..max(caret, sel_anchor)). */
+    bool mouse_down;  /* left button held inside the search bar */
     int *rows;        /* heap; length = count */
     int *cols;
     int *ends;
@@ -748,6 +774,9 @@ static void pane_free(Pane *p) {
     free(p->search.ends);  p->search.ends = NULL;
     p->search.count = p->search.cap = 0;
     p->search.active = false;
+    p->search.caret = 0;
+    p->search.sel_anchor = -1;
+    p->search.mouse_down = false;
 }
 
 static Tab *tab_open(int cols, int rows) {
@@ -1266,6 +1295,9 @@ static void search_open(Pane *p) {
     if (!p) return;
     p->search.active = true;
     p->search.query[0] = 0;
+    p->search.caret = 0;
+    p->search.sel_anchor = -1;
+    p->search.mouse_down = false;
     search_clear_matches(&p->search);
 }
 
@@ -1273,8 +1305,89 @@ static void search_close(Pane *p) {
     if (!p) return;
     p->search.active = false;
     p->search.query[0] = 0;
+    p->search.caret = 0;
+    p->search.sel_anchor = -1;
+    p->search.mouse_down = false;
     search_clear_matches(&p->search);
     if (p->scr) screen_scroll_reset(p->scr);
+}
+
+/* ----- Search-bar query-text helpers (caret / selection / editing) ----- */
+
+static bool search_has_sel(const Search *S) {
+    return S->sel_anchor >= 0 && S->sel_anchor != S->caret;
+}
+static int search_sel_lo(const Search *S) {
+    if (!search_has_sel(S)) return S->caret;
+    return S->sel_anchor < S->caret ? S->sel_anchor : S->caret;
+}
+static int search_sel_hi(const Search *S) {
+    if (!search_has_sel(S)) return S->caret;
+    return S->sel_anchor > S->caret ? S->sel_anchor : S->caret;
+}
+static void search_clear_sel(Search *S) { S->sel_anchor = -1; }
+static void search_delete_sel(Search *S) {
+    if (!search_has_sel(S)) return;
+    int lo = search_sel_lo(S), hi = search_sel_hi(S);
+    int len = (int)strlen(S->query);
+    memmove(S->query + lo, S->query + hi, (size_t)(len - hi));
+    S->query[len - (hi - lo)] = 0;
+    S->caret = lo;
+    search_clear_sel(S);
+}
+static bool search_insert_char(Search *S, char c) {
+    if (search_has_sel(S)) search_delete_sel(S);
+    int len = (int)strlen(S->query);
+    if (len + 1 >= (int)sizeof(S->query)) return false;
+    memmove(S->query + S->caret + 1, S->query + S->caret,
+            (size_t)(len - S->caret + 1));
+    S->query[S->caret] = c;
+    S->caret++;
+    return true;
+}
+
+/* Map a mouse-x (relative to the query's left edge) to a caret
+   position. We measure every possible prefix and snap to the nearest.
+   Query is short (<128), O(n²) work per click is fine. */
+static int search_x_to_caret(Font f, const char *q, int rel_x) {
+    if (rel_x <= 0) return 0;
+    int len = (int)strlen(q);
+    int best = 0;
+    float best_d = 1e9f;
+    char buf[128];
+    for (int i = 0; i <= len && i < (int)sizeof(buf); i++) {
+        memcpy(buf, q, (size_t)i);
+        buf[i] = 0;
+        Vector2 sz = MeasureTextEx(f, buf, 13, 0);
+        float d = sz.x - (float)rel_x; if (d < 0) d = -d;
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
+
+static int search_caret_to_x(Font f, const char *q, int caret) {
+    char buf[128];
+    int n = caret > 127 ? 127 : caret;
+    if (n < 0) n = 0;
+    memcpy(buf, q, (size_t)n);
+    buf[n] = 0;
+    Vector2 sz = MeasureTextEx(f, buf, 13, 0);
+    return (int)sz.x;
+}
+
+/* Search-bar screen-space rect for a pane. Kept in sync with the
+   drawing code in draw_tab_contents. */
+#define SEARCH_BAR_XPAD 8
+#define SEARCH_BAR_YPAD 6
+#define SEARCH_BAR_H    30
+#define SEARCH_TEXT_OFF 54   /* x offset from bar left to query text */
+
+static void search_bar_rect(int pane_x, int pane_y, int pane_w,
+                            int *out_x, int *out_y, int *out_w, int *out_h) {
+    *out_x = pane_x + SEARCH_BAR_XPAD;
+    *out_y = pane_y + SEARCH_BAR_YPAD;
+    *out_w = pane_w - 2 * SEARCH_BAR_XPAD;
+    *out_h = SEARCH_BAR_H;
 }
 
 /* Route a frame's worth of key input to the search bar. Called in
@@ -1309,68 +1422,90 @@ static void search_handle_input(Pane *p) {
     if (step_next) { search_next(p, shift ? -1 : +1); return; }
     if (IsKeyPressed(KEY_UP)) { search_next(p, -1); return; }
 
-    /* Cmd/Ctrl+A: select the whole query. Next printable keystroke
-       replaces it; backspace / Cmd+V consume the selection too. */
+    /* Cmd/Ctrl+A: select the whole query (anchor at 0, caret at end). */
     if (mod && IsKeyPressed(KEY_A)) {
-        if (S->query[0]) S->sel_all = true;
+        int len = (int)strlen(S->query);
+        if (len > 0) { S->sel_anchor = 0; S->caret = len; }
         return;
     }
-    /* Cmd/Ctrl+C: if the user has a mouse-drag selection on the
-       pane, that wins — they probably just highlighted something in
-       the grid to copy it, and the search bar shouldn't steal the
-       chord. Otherwise copy the query text. */
+    /* Cmd/Ctrl+C: a mouse-drag selection on the grid wins (the user
+       just highlighted terminal text). Else copy the search-bar
+       selection if there is one, else the whole query. */
     if (mod && IsKeyPressed(KEY_C)) {
         if (p->sel.active && !p->sel.dragging) {
             copy_selection(p->scr, &p->sel);
+        } else if (search_has_sel(S)) {
+            int lo = search_sel_lo(S), hi = search_sel_hi(S);
+            char buf[128];
+            int n = hi - lo;
+            if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+            memcpy(buf, S->query + lo, (size_t)n);
+            buf[n] = 0;
+            if (n > 0) SetClipboardText(buf);
         } else if (S->query[0]) {
             SetClipboardText(S->query);
         }
         return;
     }
-    /* Left/Right/Home/End clear the select-all marker the same way
-       typing into a caret would. */
-    if (S->sel_all && (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT) ||
-                       IsKeyPressed(KEY_HOME) || IsKeyPressed(KEY_END))) {
-        S->sel_all = false;
+    /* Caret movement. Shift isn't plumbed through to keyboard
+       selection in v1 — shift-click on the bar is the path for
+       partial selection. */
+    if (IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) {
+        if (search_has_sel(S)) { S->caret = search_sel_lo(S); search_clear_sel(S); }
+        else if (S->caret > 0) S->caret--;
+        return;
     }
+    if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) {
+        int len = (int)strlen(S->query);
+        if (search_has_sel(S)) { S->caret = search_sel_hi(S); search_clear_sel(S); }
+        else if (S->caret < len) S->caret++;
+        return;
+    }
+    if (IsKeyPressed(KEY_HOME)) { S->caret = 0; search_clear_sel(S); return; }
+    if (IsKeyPressed(KEY_END))  { S->caret = (int)strlen(S->query); search_clear_sel(S); return; }
 
     bool query_changed = false;
-    /* Cmd/Ctrl+V: paste clipboard into the query, filtered to printable
-       ASCII. Useful for searching long strings copied from elsewhere. */
+    /* Cmd/Ctrl+V: paste clipboard at caret (replacing any selection),
+       filtered to printable ASCII. */
     if (mod && IsKeyPressed(KEY_V)) {
         const char *clip = GetClipboardText();
         if (clip && *clip) {
-            if (S->sel_all) { S->query[0] = 0; S->sel_all = false; }
-            size_t n = strlen(S->query);
+            if (search_has_sel(S)) search_delete_sel(S);
             for (const char *q = clip; *q; q++) {
                 unsigned char c = (unsigned char)*q;
                 if (c == '\r' || c == '\n' || c == '\t') continue;
                 if (c < 32 || c >= 127) continue;
-                if (n + 1 >= sizeof(S->query)) break;
-                S->query[n++] = (char)c;
+                if (!search_insert_char(S, (char)c)) break;
             }
-            S->query[n] = 0;
             query_changed = true;
         }
     }
     if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
-        if (S->sel_all) {
-            S->query[0] = 0; S->sel_all = false; query_changed = true;
-        } else {
-            size_t n = strlen(S->query);
-            if (n > 0) { S->query[n - 1] = 0; query_changed = true; }
+        if (search_has_sel(S)) { search_delete_sel(S); query_changed = true; }
+        else if (S->caret > 0) {
+            int len = (int)strlen(S->query);
+            memmove(S->query + S->caret - 1, S->query + S->caret,
+                    (size_t)(len - S->caret + 1));
+            S->caret--;
+            query_changed = true;
+        }
+    }
+    if (IsKeyPressed(KEY_DELETE) || IsKeyPressedRepeat(KEY_DELETE)) {
+        if (search_has_sel(S)) { search_delete_sel(S); query_changed = true; }
+        else {
+            int len = (int)strlen(S->query);
+            if (S->caret < len) {
+                memmove(S->query + S->caret, S->query + S->caret + 1,
+                        (size_t)(len - S->caret));
+                query_changed = true;
+            }
         }
     }
     int cp;
     while ((cp = GetCharPressed()) != 0) {
         if (mod) continue;                  /* ignore chars from chord presses */
         if (cp < 32 || cp >= 127) continue; /* ASCII only for v1 */
-        if (S->sel_all) { S->query[0] = 0; S->sel_all = false; }
-        size_t n = strlen(S->query);
-        if (n + 1 >= sizeof(S->query)) continue;
-        S->query[n] = (char)cp;
-        S->query[n + 1] = 0;
-        query_changed = true;
+        if (search_insert_char(S, (char)cp)) query_changed = true;
     }
     if (query_changed) {
         search_recompute(p);
@@ -1594,12 +1729,58 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             }
         }
 
+        /* Match map: thin strip on the right edge of the pane showing
+           where every match sits in the full buffer (scrollback +
+           live). Ticks are positioned by abs_row / total_rows, and
+           the current viewport range is shaded so the user can see
+           where they are vs the hits. Only visible while search is
+           open. */
+        if (p->search.active && p->search.count > 0) {
+            int total = screen_total_rows(p->scr);
+            if (total > 0) {
+                int rows_p = screen_rows(p->scr);
+                int sb = screen_scrollback_len(p->scr);
+                int off = screen_view_offset(p->scr);
+                int strip_w = 8;
+                int strip_x = pr.x + pr.w - r->pad_x - strip_w;
+                int strip_y = pr.y + r->pad_y;
+                int strip_h = rows_p * r->cell_h;
+                DrawRectangle(strip_x, strip_y, strip_w, strip_h,
+                              (Color){24, 27, 36, 180});
+                /* Viewport range: translucent fill showing which
+                   abs_rows are currently on screen. */
+                int top_abs = sb - off;
+                int bot_abs = top_abs + rows_p;
+                if (top_abs < 0) top_abs = 0;
+                if (bot_abs > total) bot_abs = total;
+                int yt = strip_y + (int)((float)top_abs / (float)total * (float)strip_h);
+                int yb = strip_y + (int)((float)bot_abs / (float)total * (float)strip_h);
+                if (yb <= yt) yb = yt + 1;
+                DrawRectangle(strip_x, yt, strip_w, yb - yt,
+                              (Color){70, 100, 140, 110});
+                /* Match ticks. */
+                for (int i = 0; i < p->search.count; i++) {
+                    int abs_row = p->search.rows[i];
+                    int ty = strip_y + (int)((float)abs_row / (float)total
+                                             * (float)strip_h);
+                    bool is_cur = (i == p->search.current);
+                    Color col = is_cur ? (Color){255, 140, 0, 255}
+                                       : (Color){255, 210, 0, 200};
+                    int tick_h = is_cur ? 3 : 2;
+                    int tick_w = is_cur ? strip_w : strip_w - 2;
+                    DrawRectangle(strip_x + (strip_w - tick_w),
+                                  ty - tick_h / 2,
+                                  tick_w, tick_h, col);
+                }
+                DrawRectangleLines(strip_x, strip_y, strip_w, strip_h,
+                                   (Color){80, 90, 110, 200});
+            }
+        }
+
         /* Search bar (docked top of pane). */
         if (p->search.active) {
-            int bh = 30;
-            int bw = pr.w - 16;
-            int bx = pr.x + 8;
-            int by = pr.y + 6;
+            int bx, by, bw, bh;
+            search_bar_rect(pr.x, pr.y, pr.w, &bx, &by, &bw, &bh);
             DrawRectangle(bx, by, bw, bh, (Color){28, 32, 44, 240});
             DrawRectangleLines(bx, by, bw, bh,
                                pane_focused ? (Color){125, 207, 255, 220}
@@ -1608,12 +1789,18 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             DrawTextEx(*ff, "Find:",
                        (Vector2){bx + 10, by + (bh - 13) / 2},
                        13, 0, (Color){180, 190, 210, 255});
-            int tx = bx + 54;
-            if (p->search.sel_all && p->search.query[0]) {
-                Vector2 qsz = MeasureTextEx(*ff, p->search.query, 13, 0);
-                DrawRectangle(tx - 2, by + (bh - 16) / 2,
-                              (int)qsz.x + 4, 16,
-                              (Color){64, 100, 150, 200});
+            int tx = bx + SEARCH_TEXT_OFF;
+            /* Range selection highlight behind the query. */
+            if (search_has_sel(&p->search)) {
+                int lo = search_sel_lo(&p->search);
+                int hi = search_sel_hi(&p->search);
+                int xlo = tx + search_caret_to_x(*ff, p->search.query, lo);
+                int xhi = tx + search_caret_to_x(*ff, p->search.query, hi);
+                if (xhi > xlo) {
+                    DrawRectangle(xlo - 1, by + (bh - 16) / 2,
+                                  xhi - xlo + 2, 16,
+                                  (Color){64, 100, 150, 200});
+                }
             }
             DrawTextEx(*ff, p->search.query,
                        (Vector2){tx, by + (bh - 13) / 2},
@@ -1634,11 +1821,12 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                            (Vector2){bx + bw - 12 - csz.x, by + (bh - 13) / 2},
                            13, 0, (Color){180, 190, 210, 255});
             }
-            /* Blinking caret at the end of the query. */
-            if (((long long)(GetTime() * 2.0) & 1) == 0) {
-                Vector2 qsz = MeasureTextEx(*ff, p->search.query, 13, 0);
-                DrawRectangle(tx + (int)qsz.x + 1,
-                              by + (bh - 16) / 2, 8, 16,
+            /* Blinking caret at its current position. Hidden while a
+               range selection is active; it'd overlap the highlight. */
+            if (!search_has_sel(&p->search) &&
+                ((long long)(GetTime() * 2.0) & 1) == 0) {
+                int cx = tx + search_caret_to_x(*ff, p->search.query, p->search.caret);
+                DrawRectangle(cx, by + (bh - 16) / 2, 2, 16,
                               (Color){125, 207, 255, 255});
             }
         }
@@ -5014,6 +5202,7 @@ int main(int argc, char **argv) {
     if (init_opacity < 0.999f) cfg_flags |= FLAG_WINDOW_TRANSPARENT;
     if (init_undecorated)      cfg_flags |= FLAG_WINDOW_UNDECORATED;
     SetConfigFlags(cfg_flags);
+    SetTraceLogCallback(rl_trace_log);
     SetTraceLogLevel(LOG_WARNING);
 #ifdef __EMSCRIPTEN__
     /* Match the CSS size of the canvas in web/shell.html so that mouse
@@ -5450,6 +5639,45 @@ int main(int argc, char **argv) {
                         (void)prev_mouse_btn;
                         #undef MOUSE_EMIT
                     } else {
+                        /* Search bar mouse handling: click positions
+                           the caret, shift-click extends selection,
+                           drag selects a subset. Must run before the
+                           grid-select path or the click would also
+                           start a terminal selection. */
+                        if (p->search.active) {
+                            int bx, by, bw, bh;
+                            search_bar_rect(pr.x, pr.y, pr.w, &bx, &by, &bw, &bh);
+                            int mx = (int)mp.x, my = (int)mp.y;
+                            bool inside_bar = (mx >= bx && mx < bx + bw &&
+                                               my >= by && my < by + bh);
+                            Font *ff = (Font *)r.font_data;
+                            int text_left = bx + SEARCH_TEXT_OFF;
+                            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && inside_bar) {
+                                bool sh = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                                int rel_x = mx - text_left;
+                                int new_caret = search_x_to_caret(*ff, p->search.query, rel_x);
+                                if (sh) {
+                                    if (p->search.sel_anchor < 0) p->search.sel_anchor = p->search.caret;
+                                    p->search.caret = new_caret;
+                                } else {
+                                    p->search.sel_anchor = new_caret;  /* drag anchor */
+                                    p->search.caret = new_caret;
+                                }
+                                p->search.mouse_down = true;
+                                goto pane_click_done;
+                            }
+                            if (p->search.mouse_down && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                                int rel_x = mx - text_left;
+                                p->search.caret = search_x_to_caret(*ff, p->search.query, rel_x);
+                                goto pane_click_done;
+                            }
+                            if (p->search.mouse_down && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                                p->search.mouse_down = false;
+                                if (p->search.sel_anchor == p->search.caret)
+                                    p->search.sel_anchor = -1;
+                                goto pane_click_done;
+                            }
+                        }
                         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                             /* Cmd/Ctrl+click on an OSC 8 hyperlink opens
                                it in the system default handler and

@@ -240,8 +240,6 @@ static void present_set_build(Font *f) {
         g_present.cps[g_present.count++] = cp;
     }
     qsort(g_present.cps, g_present.count, sizeof(uint32_t), cmp_u32);
-    fprintf(stderr, "rbterm: %d codepoint(s) present in main font\n",
-            g_present.count);
 }
 
 static bool font_missing(uint32_t cp) {
