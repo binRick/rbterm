@@ -79,6 +79,10 @@ struct Screen {
 
     // Scrollback ring buffer: rows of `cols` cells
     Cell *sb;
+    uint8_t *sb_wrap; /* parallel ring, 1 byte per row: row ended by
+                         auto-wrap into the next row. Mirrors main_wrap
+                         so selection can cross wrap boundaries back
+                         into scrollback. */
     int sb_cap;
     int sb_len;
     int sb_head;     // next write slot
@@ -402,9 +406,10 @@ static void clear_row(Screen *s, int y) {
     if (!s->on_alt && s->main_wrap && y >= 0 && y < s->rows) s->main_wrap[y] = 0;
 }
 
-static void push_scrollback(Screen *s, const Cell *row) {
+static void push_scrollback(Screen *s, const Cell *row, bool wrapped) {
     if (s->on_alt || s->sb_cap == 0) return;
     memcpy(s->sb + s->sb_head * s->cols, row, sizeof(Cell) * s->cols);
+    if (s->sb_wrap) s->sb_wrap[s->sb_head] = wrapped ? 1 : 0;
     s->sb_head = (s->sb_head + 1) % s->sb_cap;
     if (s->sb_len < s->sb_cap) s->sb_len++;
     // Keep view anchored if we're at bottom; otherwise drift one row.
@@ -418,7 +423,10 @@ static void scroll_up_region(Screen *s, int top, int bot, int n) {
     if (n > span) n = span;
     Cell *base = active(s);
     if (!s->on_alt && top == 0) {
-        for (int i = 0; i < n; i++) push_scrollback(s, base + (top + i) * s->cols);
+        for (int i = 0; i < n; i++) {
+            bool w = s->main_wrap ? s->main_wrap[top + i] != 0 : false;
+            push_scrollback(s, base + (top + i) * s->cols, w);
+        }
         images_scroll(s, n);
     }
     if (span - n > 0) {
@@ -1515,7 +1523,10 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
         for (int x = 0; x < cols; x++) s->alt[y * cols + x] = b;
     }
     s->sb_cap = scrollback;
-    if (scrollback > 0) s->sb = calloc((size_t)scrollback * cols, sizeof(Cell));
+    if (scrollback > 0) {
+        s->sb = calloc((size_t)scrollback * cols, sizeof(Cell));
+        s->sb_wrap = calloc((size_t)scrollback, 1);
+    }
     s->cell_h_px = 20;   /* best-effort until renderer sets the real value */
     s->io = io;
     return s;
@@ -1528,7 +1539,7 @@ void screen_free(Screen *s) {
     free(s->kpending);
     for (uint16_t i = 0; i < s->urls_count; i++) free(s->urls[i]);
     free(s->urls);
-    free(s->main); free(s->alt); free(s->sb); free(s->main_wrap);
+    free(s->main); free(s->alt); free(s->sb); free(s->sb_wrap); free(s->main_wrap);
     free(s);
 }
 
@@ -1665,8 +1676,10 @@ void screen_resize(Screen *s, int cols, int rows) {
     /* Rebuild scrollback at new width (preserve its existing content; just
        re-bucket into the new col count). */
     Cell *nsb = NULL;
+    uint8_t *nsbw = NULL;
     if (s->sb_cap > 0) {
         nsb = calloc((size_t)s->sb_cap * cols, sizeof(Cell));
+        nsbw = calloc((size_t)s->sb_cap, 1);
         for (int y = 0; y < s->sb_cap; y++)
             for (int x = 0; x < cols; x++) nsb[y * cols + x] = blank;
         int ccols = (cols < old_cols) ? cols : old_cols;
@@ -1674,6 +1687,7 @@ void screen_resize(Screen *s, int cols, int rows) {
             int src = ((s->sb_head - s->sb_len + i) % s->sb_cap + s->sb_cap) % s->sb_cap;
             memcpy(nsb + (size_t)i * cols, s->sb + (size_t)src * old_cols,
                    sizeof(Cell) * ccols);
+            nsbw[i] = s->sb_wrap ? s->sb_wrap[src] : 0;
         }
         s->sb_head = s->sb_len % s->sb_cap;
     }
@@ -1686,14 +1700,18 @@ void screen_resize(Screen *s, int cols, int rows) {
        double-free it. */
     if (s->sb_cap > 0 && start_row > 0) {
         Cell *saved_sb_was = s->sb;
+        uint8_t *saved_sbw_was = s->sb_wrap;
         int saved_cols = s->cols;
         s->sb = nsb;
+        s->sb_wrap = nsbw;
         s->cols = cols;
         for (int r = 0; r < start_row; r++) {
-            push_scrollback(s, scratch + (size_t)r * cols);
+            push_scrollback(s, scratch + (size_t)r * cols,
+                            scratch_wrap[r] != 0);
         }
         s->cols = saved_cols;
         s->sb = saved_sb_was;
+        s->sb_wrap = saved_sbw_was;
     }
     int copy_count = emit - start_row;
     if (copy_count > rows) copy_count = rows;
@@ -1721,8 +1739,8 @@ void screen_resize(Screen *s, int cols, int rows) {
     free(line_lens);
     free(scratch);
     free(scratch_wrap);
-    free(s->main); free(s->alt); free(s->sb); free(s->main_wrap);
-    s->main = nmain; s->alt = nalt; s->sb = nsb; s->main_wrap = nwrap;
+    free(s->main); free(s->alt); free(s->sb); free(s->sb_wrap); free(s->main_wrap);
+    s->main = nmain; s->alt = nalt; s->sb = nsb; s->sb_wrap = nsbw; s->main_wrap = nwrap;
     s->cols = cols; s->rows = rows;
     s->scroll_top = 0;
     s->scroll_bot = rows - 1;
@@ -1793,4 +1811,18 @@ Cell screen_view_cell(const Screen *s, int col, int vy) {
     int y = vy - off;
     Cell *base = s->on_alt ? s->alt : s->main;
     return base[y * s->cols + col];
+}
+
+bool screen_view_row_wrapped(const Screen *s, int vy) {
+    if (!s || vy < 0 || vy >= s->rows || s->on_alt) return false;
+    int off = s->view_off;
+    if (vy < off) {
+        if (!s->sb_wrap || s->sb_cap == 0) return false;
+        int sb_index = s->sb_len - off + vy;
+        int ring = ((s->sb_head - s->sb_len + sb_index) % s->sb_cap + s->sb_cap) % s->sb_cap;
+        return s->sb_wrap[ring] != 0;
+    }
+    int y = vy - off;
+    if (!s->main_wrap) return false;
+    return s->main_wrap[y] != 0;
 }

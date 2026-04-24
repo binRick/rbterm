@@ -1011,62 +1011,101 @@ static uint32_t matching_open(uint32_t close_cp) {
 
 static void select_word(Screen *s, Selection *sel, int col, int row) {
     int cols = screen_cols(s);
+    int rows = screen_rows(s);
     if (!cell_is_word(s, col, row)) { sel->active = false; return; }
-    int c1 = col, c2 = col;
-    while (c1 > 0 && cell_is_word(s, c1 - 1, row)) c1--;
-    while (c2 < cols - 1 && cell_is_word(s, c2 + 1, row)) c2++;
+    int r1 = row, c1 = col;
+    int r2 = row, c2 = col;
 
-    /* Trim trailing sentence punctuation, but only if the click itself
-       wasn't on that punctuation — clicking the comma in "a,b" should
-       still select the comma. */
-    while (c2 > c1 && c2 != col) {
-        uint32_t cp = screen_view_cell(s, c2, row).cp;
-        if (is_trailing_trim(cp)) { c2--; continue; }
+    /* Scan left, crossing auto-wrap boundaries: if the click-row starts
+       with a word char and the previous row ended by auto-wrapping into
+       this one, the word continues from the last column of that row. */
+    for (;;) {
+        while (c1 > 0 && cell_is_word(s, c1 - 1, r1)) c1--;
+        if (c1 == 0 && r1 > 0 && screen_view_row_wrapped(s, r1 - 1)
+            && cell_is_word(s, cols - 1, r1 - 1)) {
+            r1--;
+            c1 = cols - 1;
+            continue;
+        }
+        break;
+    }
+    /* Symmetric scan right across wraps. */
+    for (;;) {
+        while (c2 < cols - 1 && cell_is_word(s, c2 + 1, r2)) c2++;
+        if (c2 == cols - 1 && r2 < rows - 1 && screen_view_row_wrapped(s, r2)
+            && cell_is_word(s, 0, r2 + 1)) {
+            r2++;
+            c2 = 0;
+            continue;
+        }
         break;
     }
 
-    /* Drop unmatched closing delimiter on the right (`foo)` → `foo`). */
-    if (c2 > c1 && c2 != col) {
-        uint32_t cp = screen_view_cell(s, c2, row).cp;
-        if (is_close_delim(cp)) {
-            uint32_t want = matching_open(cp);
-            bool matched = false;
-            for (int k = c1; k < c2; k++) {
-                if (screen_view_cell(s, k, row).cp == want) { matched = true; break; }
-            }
-            if (!matched) c2--;
-        }
+    /* Trim trailing sentence punctuation, but never through the click
+       cell itself. May walk back over a wrap boundary. */
+    for (;;) {
+        if (r2 == r1 && c2 == c1) break;
+        if (r2 == row && c2 == col) break;
+        uint32_t cp = screen_view_cell(s, c2, r2).cp;
+        if (!is_trailing_trim(cp)) break;
+        if (c2 > 0) c2--;
+        else if (r2 > 0 && screen_view_row_wrapped(s, r2 - 1)) { r2--; c2 = cols - 1; }
+        else break;
     }
-    /* Drop unmatched opening delimiter on the left (`(foo` → `foo`). */
-    if (c1 < c2 && c1 != col) {
-        uint32_t cp = screen_view_cell(s, c1, row).cp;
-        if (is_open_delim(cp)) {
-            /* Find the corresponding close. "" is self-matched. */
-            uint32_t want = (cp == '"') ? '"'
-                          : (cp == '(') ? ')'
-                          : (cp == '[') ? ']'
-                          : (cp == '{') ? '}'
-                          : (cp == '<') ? '>' : 0;
-            bool matched = false;
-            for (int k = c1 + 1; k <= c2; k++) {
-                if (screen_view_cell(s, k, row).cp == want) { matched = true; break; }
+
+    /* Matched-delimiter trim only for single-row spans — the span-scan
+       across wraps above is the dominant case we want to help, and
+       these trims need balanced-paren scans that aren't worth
+       generalising to multi-row. */
+    if (r1 == r2 && r1 == row) {
+        /* Drop unmatched closing delimiter on the right (`foo)` → `foo`). */
+        if (c2 > c1 && c2 != col) {
+            uint32_t cp = screen_view_cell(s, c2, r2).cp;
+            if (is_close_delim(cp)) {
+                uint32_t want = matching_open(cp);
+                bool matched = false;
+                for (int k = c1; k < c2; k++) {
+                    if (screen_view_cell(s, k, r2).cp == want) { matched = true; break; }
+                }
+                if (!matched) c2--;
             }
-            if (!matched) c1++;
+        }
+        /* Drop unmatched opening delimiter on the left (`(foo` → `foo`). */
+        if (c1 < c2 && c1 != col) {
+            uint32_t cp = screen_view_cell(s, c1, r1).cp;
+            if (is_open_delim(cp)) {
+                uint32_t want = (cp == '"') ? '"'
+                              : (cp == '(') ? ')'
+                              : (cp == '[') ? ']'
+                              : (cp == '{') ? '}'
+                              : (cp == '<') ? '>' : 0;
+                bool matched = false;
+                for (int k = c1 + 1; k <= c2; k++) {
+                    if (screen_view_cell(s, k, r1).cp == want) { matched = true; break; }
+                }
+                if (!matched) c1++;
+            }
         }
     }
 
     sel->active = true;
     sel->dragging = false;
-    sel->a_col = c1; sel->a_row = row;
-    sel->b_col = c2; sel->b_row = row;
+    sel->a_col = c1; sel->a_row = r1;
+    sel->b_col = c2; sel->b_row = r2;
 }
 
 static void select_line(Screen *s, Selection *sel, int row) {
     int cols = screen_cols(s);
+    int rows = screen_rows(s);
+    int r1 = row, r2 = row;
+    /* Extend up across rows that auto-wrapped into this one. */
+    while (r1 > 0 && screen_view_row_wrapped(s, r1 - 1)) r1--;
+    /* Extend down while this row auto-wrapped into the next. */
+    while (r2 < rows - 1 && screen_view_row_wrapped(s, r2)) r2++;
     sel->active = true;
     sel->dragging = false;
-    sel->a_col = 0; sel->a_row = row;
-    sel->b_col = cols - 1; sel->b_row = row;
+    sel->a_col = 0; sel->a_row = r1;
+    sel->b_col = cols - 1; sel->b_row = r2;
 }
 
 /* Label shown on a tab. Preference order:

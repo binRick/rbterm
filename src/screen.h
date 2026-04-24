@@ -107,6 +107,10 @@ void    screen_scroll_reset(Screen *s);
 /* Returns cell at viewport position (vy = 0 is top row of visible area).
    Takes current view offset into scrollback into account. */
 Cell    screen_view_cell(const Screen *s, int col, int vy);
+/* True when view row `vy` ended by auto-wrapping into row `vy+1`
+   (as opposed to a natural line break). Covers both scrollback and
+   live main-screen rows; always false on alt screen. */
+bool    screen_view_row_wrapped(const Screen *s, int vy);
 bool    screen_app_cursor(const Screen *s);
 bool    screen_app_keypad(const Screen *s);
 bool    screen_focus_report(const Screen *s);
