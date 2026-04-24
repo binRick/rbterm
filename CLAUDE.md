@@ -350,6 +350,90 @@ v1 limitations / intentional gaps:
 
 Test: inside an rbterm pane, `img2sixel some.png` (libsixel).
 
+## Multi-window (unfinished — future session)
+
+rbterm runs as one raylib window per OS process today. Cmd+N
+`fork+exec`s a fresh rbterm, which means each window gets its own
+macOS Dock icon and Cmd+` only cycles within a single process (i.e.
+never crosses rbterm windows). Goal: **same-process multi-window**
+with a single Dock entry and working Cmd+` / Windows taskbar group.
+
+### Validated approach (standalone POC only)
+
+- raylib built with `USE_EXTERNAL_GLFW=ON` + brew's `libglfw` = one
+  GLFW runtime instead of two. Without this, raylib's embedded GLFW
+  and brew's GLFW both register `GLFWApplicationDelegate` /
+  `GLFWContentView` / etc. as Objective-C classes → Cocoa warns
+  "may cause spurious casting failures and mysterious crashes".
+- After `InitWindow`, `glfwGetCurrentContext()` returns raylib's
+  `GLFWwindow *`. `glfwCreateWindow(..., share=<that>)` then makes
+  additional windows that share the GL context.
+- Per-frame: draw to raylib's window via the usual
+  `BeginDrawing/EndDrawing`. For each extra window:
+  `rlDrawRenderBatchActive()` → `glfwMakeContextCurrent(extra)` →
+  `rlViewport/rlMatrixMode/rlLoadIdentity/rlOrtho` →
+  `rlClearColor/rlClearScreenBuffers` → raylib draw primitives →
+  `rlDrawRenderBatchActive` → `glfwSwapBuffers(extra)` →
+  `glfwMakeContextCurrent(primary)`.
+- POC binary at `/tmp/multiwin_poc3` (source `/tmp/multiwin_poc2.c`)
+  opens two windows that render raylib primitives independently.
+  Confirmed: no class collisions when raylib is built with
+  `USE_EXTERNAL_GLFW=ON`; brew raylib bottle doesn't do this, so
+  CMake fetched raylib has to be used.
+
+### First integration attempt (reverted)
+
+Tried a minimal landing in `main.c`: switch CMakeLists to
+`USE_EXTERNAL_GLFW`, point `run.sh` at the CMake build, then create
+one extra `GLFWwindow` at startup and hand-render into it each
+frame. Looked fine compiling, but the first run was visually
+chaotic — some combination of context switching, raylib's internal
+rlgl state assuming its own window, and the main app's `BeginDrawing`
+interacting badly with mid-frame context swaps. Reverted all three
+files to the prior committed state; no code survived.
+
+### What the proper implementation actually needs
+
+This is ~8-12 focused hours and worth a dedicated session:
+
+1. **Build**: CMakeLists sets `USE_EXTERNAL_GLFW ON` + `find_package(glfw3)`.
+   Makefile can't use brew raylib anymore (it ships with embedded
+   GLFW); either rip out the Makefile shortcut or have it drive CMake
+   for the raylib sub-build.
+2. **Per-window state**: extract globals in `main.c` (tabs + active
+   + drag state + ui mode + SSH form + settings modal + pickers +
+   slider drag + hover) into a `Window` struct. Phase-1a sketch lived
+   briefly as a no-op macro layer (`#define g_tabs g_win->tabs`,
+   etc.); reverted with the rest.
+3. **Bootstrap**: replace `InitWindow` with explicit
+   `glfwInit + glfwCreateWindow + rlglInit(w, h) + rlLoadExtensions`
+   per window. First window creates; subsequent windows share
+   context.
+4. **Input wrapper**: raylib's `IsKeyPressed/IsKeyDown/IsMouseButton*/
+   GetMousePosition/GetCharPressed` all read from raylib's window.
+   Multi-window means per-window input state — simplest is to set
+   GLFW per-window callbacks that populate a `WindowInput` struct,
+   then keep a `IsKeyPressed`-style API that reads from "the focused
+   window's" input state. Hundreds of call sites; don't rewrite them,
+   just retarget the API.
+5. **Main loop**: iterate windows, make each context current,
+   dispatch input + draw + swap. Tear down on window close; process
+   exits when the last window dies.
+6. **Chords**: Cmd+N creates a new Window (clones settings); Cmd+`
+   is handled by macOS automatically once the app is single-process.
+   Windows counterpart: `SetCurrentProcessExplicitAppUserModelID`
+   + Alt+Tab / taskbar groups the windows.
+
+### What won't work (don't waste time on)
+
+- **Separate processes + shared Dock icon**: bundle-ID consolidation
+  merges the icon visually but Cmd+` stays per-process. macOS has no
+  hook for cross-process window cycling inside one app.
+- **Linking brew GLFW alongside brew raylib**: same Objective-C
+  class names defined in two libraries. Cocoa picks one at runtime,
+  the other's windows behave erratically. Has to be exactly one
+  GLFW runtime.
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt

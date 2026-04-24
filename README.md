@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="assets/icon.png" width="96" alt="rbterm icon"><br>
-  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary, ~250 themes and 16 monospace fonts baked in.</em>
+  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary with split panes, inline sixel + kitty graphics, OSC 8 hyperlinks, 252 themes and 31 monospace fonts baked in.</em>
 </p>
 
 <p align="center"><img src="docs/screenshot.png" alt="rbterm screenshot — two tabs, live CWD in the tab label, coloured ➜ prompt"></p>
@@ -33,12 +33,14 @@ at link time**:
 - **252 colour palette themes** baked in as `static const` C arrays
   via a tiny generator that walks the [`pal`](https://github.com/binRick/pal)
   submodule.
-- **16 monospace fonts** (JetBrains Mono, Fira Code, Hack, Monaspace
-  Argon/Krypton/Neon/Radon/Xenon ± Nerd Font icons, etc.) pulled in
-  with `.incbin` so the executable carries them as raw bytes — no
-  `fonts/` folder beside the binary, no runtime download. `make app`
-  on macOS produces a single self-contained `.app` you can drag and
-  drop; the Linux/Windows release zips are likewise standalone.
+- **31 monospace fonts** (JetBrains Mono, Fira Code, Hack, Monaspace
+  Argon/Krypton/Neon/Radon/Xenon ± Nerd Font icons, terroo mono
+  family, Arabic/Persian hybrid variants, etc.) pulled in with
+  `.incbin` on Unix and RCDATA resources on Windows, so the
+  executable carries them as raw bytes — no `fonts/` folder beside
+  the binary, no runtime download. `make app` on macOS produces a
+  single self-contained `.app` you can drag and drop; the
+  Linux/Windows release zips are likewise standalone.
 
 The result is a 13 MB single-file terminal that opens instantly,
 runs with one process per window, has zero non-system dependencies
@@ -83,6 +85,16 @@ The bundled fonts (Apache-2.0 / OFL-1.1):
   IBM Plex Mono.
 - Monaspace family — Argon / Krypton / Neon / Radon / Xenon, in both
   Static and Nerd Font Regulars (10 variants).
+- The [terroo](https://github.com/terroo/fonts) mono family (11
+  variants) and the [ghazyami hybrid](https://github.com/ghazyami/hybrid-mono-fonts)
+  Latin+Arabic / Latin+Persian fonts (4 variants).
+
+DejaVu Sans Mono ships as a **backup-glyph fallback**: any codepoint
+a user-picked primary font lacks (IBM Plex Mono's missing box-drawing
+chars, for example) falls through to DejaVu before landing on "?".
+On macOS there's one more layer — Core Text's
+`CTFontCreateForString` substitutes system fonts (Heiti, PingFang)
+for CJK / extended Unicode the main font doesn't cover.
 
 Only ~13 MB total — the entire bundled font payload is smaller than
 a single Electron framework dylib.
@@ -116,31 +128,69 @@ pixels on the GPU.
 
 - **Shell in a PTY** via `forkpty` on macOS/Linux and **ConPTY** on
   Windows 10+.
-- **VT500-style parser** — SGR (16 / 256 / truecolor), cursor movement,
-  scroll regions, erase-in-display / -line, alt screen, save/restore
-  cursor, OSC 0/2 window title, OSC 4 / 104 palette, UTF-8 text,
-  wide-char support via `ATTR_WIDE`/`ATTR_WIDE_CONT`.
+- **VT500-style parser** — SGR (16 / 256 / truecolor), full 4:N
+  underline style menagerie (single / double / curly / dotted /
+  dashed) with SGR 58 colored underlines, DECSCUSR cursor shapes
+  (CSI N SP q), cursor movement, scroll regions, erase-in-display /
+  -line, alt screen, save/restore cursor, UTF-8 text, wide-char
+  support, DEC line-drawing charset.
+- **OSC catalogue** — 0/2 title, 4/104 palette, 7 cwd, 8 hyperlinks,
+  10/11/12 default fg/bg/cursor colour (with queries), 52 clipboard,
+  9 + 777 desktop notifications (native via osascript /
+  notify-send / PowerShell toast).
 - **Tabs** — up to 16 concurrent shells, each with its own PTY,
   scrollback, selection and title. Background tabs stay live.
-- **Embedded SSH** — Cmd+Shift+T opens a modal, type `user@host[:port]`,
-  Enter and a new tab is an SSH session via libssh (no local shell in
-  the middle). Key auth via ssh-agent or `~/.ssh/id_*`; host keys
-  trust-on-first-use into `~/.ssh/known_hosts`.
+  Drag tabs to reorder; Ctrl+Tab / Cmd+1..9 to jump.
+- **Split panes** — Cmd+D splits vertically, Cmd+Shift+D horizontally
+  (max two panes per tab). Each pane owns its own PTY, screen state,
+  selection and palette so an OSC 4 applied in one doesn't leak.
+- **Inline images** — **sixel** (`img2sixel`, `chafa -f sixel`,
+  `timg -ps`, `gnuplot`, `ranger`) and the **kitty graphics
+  protocol** (PNGs over base64, single + chunked transfer). Images
+  are tied to their screen (main vs alt) so entering tmux hides
+  them and leaving restores them; Ctrl-L clears them too.
+- **OSC 8 hyperlinks** — underlined run cells with `ul_color` RGB.
+  Hovering highlights the whole link; Cmd+click opens the URL via
+  the OS default handler.
+- **Mouse reporting** — DECSET 1000 / 1002 / 1003 / 1006. tmux + vim
+  mouse integration work out of the box. Hold Shift to bypass and
+  let rbterm take the selection instead.
+- **Embedded SSH** — Cmd+Shift+T opens a PuTTY-ish form.
+  Key auth (ssh-agent / `~/.ssh/id_*`), password, and
+  keyboard-interactive (PAM) are all tried in order. Host keys
+  trust-on-first-use into `~/.ssh/known_hosts`. Per-host knobs
+  (theme, font, cursor style, font size, log dir, logging on/off)
+  survive as `# rbterm-*` comments inside `~/.ssh/config` that
+  plain ssh ignores.
 - **Tab label tracks `cd`** via `proc_pidinfo` (macOS) /
-  `/proc/<pid>/cwd` (Linux). `$HOME` shortens to `~`.
+  `/proc/<pid>/cwd` (Linux). `$HOME` shortens to `~`. Cmd+T opens
+  the new tab in the active pane's cwd; splits inherit too.
+- **Smart double-click** — selects the word then trims trailing
+  sentence punctuation (`, ; : . ! ?`) and unmatched opening or
+  closing delimiters (`( [ { < "` / `) ] } > "`), so `--bold,`
+  selects `--bold` and `foo)` selects `foo`. Selection stays
+  anchored to its content as you scroll history.
+- **Configurable key repeat** — settings-modal sliders tune the
+  initial delay and inter-repeat period for backspace + arrows,
+  replacing the OS-level key-repeat rate. Persisted to config.
 - **Reflow on resize** — widen the window and wrapped prompts
   un-wrap; narrow it and long lines re-wrap. Overflow goes to
   scrollback.
 - **Colour emoji** on macOS via Core Text + SBIX bitmap fonts.
   `CTFontCreateForString` handles font substitution, so glyphs the
-  primary font lacks (e.g. `➜` with SF Mono) still render — the
-  rasterizer inspects the output to tell colour bitmaps from white
-  vector masks and tints with the cell's `fg` for the latter.
-- **Mouse selection** — click-drag, double-click word, triple-click
-  row. Translucent overlay. Cmd+C copies, Cmd+V pastes.
+  primary font lacks (e.g. `➜` with SF Mono, or CJK ideographs)
+  still render — the rasterizer inspects the output to tell colour
+  bitmaps from white vector masks and tints with the cell's `fg`
+  for the latter.
+- **Selection** — click-drag, double-click word, triple-click row.
+  Cmd+A selects the visible pane. Cmd+C copies, Cmd+V pastes
+  (bracketed-paste aware when apps opt in via DECSET 2004). Shift-
+  scroll keeps the selection glued to its original content.
 - **Scrollback** — 5000 lines per tab, Shift+PgUp/PgDn or mouse wheel.
   Right-hand indicator shows position.
 - **Live font resize** — Cmd + `+` / `-` / `0`. Reflows every tab.
+- **Desktop notifications** — `printf '\e]9;build finished\e\\'`
+  fires a real macOS / Linux / Windows notification.
 - **OSC palette** works with the
   [`pal`](https://github.com/binRick/pal) CLI.
 
@@ -150,19 +200,29 @@ pixels on the GPU.
 
 | Shortcut | Action |
 |----------|--------|
-| Cmd+T | New tab (local shell) |
+| Cmd+T | New tab (local shell, inherits cwd) |
 | Cmd+Shift+T | New tab over SSH (PuTTY-style form) |
-| Cmd+W | Close tab |
-| Cmd+, | Settings (font size, session logging) |
+| Cmd+N | New rbterm window (new process) |
+| Cmd+W | Close active tab (or pane, if split) |
+| Cmd+, | Settings (font, theme, cursor style, logging, key repeat) |
 | Cmd+1..9 | Jump to tab N |
 | Cmd+[ / Cmd+] | Prev / next tab |
+| Cmd+Left / Cmd+Right | Prev / next tab |
+| Cmd+Shift+Left / Right | Move active tab left / right |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
+| Drag tab in tab bar | Reorder tabs |
+| Cmd+D / Cmd+Shift+D | Split pane vertically / horizontally |
 | Cmd++ / Cmd+- / Cmd+0 | Grow / shrink / reset font |
+| Cmd+A | Select all visible text in active pane |
 | Cmd+C / Cmd+V | Copy selection / paste |
+| Cmd+click | Open OSC 8 hyperlink |
+| Shift+click | Select text even when mouse reporting is on |
 | Ctrl+(letter) | C0 control byte (SIGINT, etc.) |
 | Shift+PgUp / PgDn | Scroll history |
 | Mouse wheel | Scroll history |
-| Double-click | Select word |
+| Double-click | Select word (with smart-trim) |
 | Triple-click | Select row |
+| `?` button | Keyboard cheat sheet |
 
 ## Build
 
@@ -211,9 +271,13 @@ On Linux: DejaVu Sans Mono → Liberation Mono → Noto Sans Mono.
   piece of work — the stub fails gracefully and monochrome glyphs
   still work via the main font).
 - Windows has no CWD-in-tab-label tracking (falls back to OSC title).
-- No sixel / kitty graphics protocol.
-- No bracketed paste (accepted, not yet acted on).
-- No mouse reporting — clicks don't reach the shell.
+- No iTerm2 inline-image protocol (`OSC 1337 ; File=`) — sixel and
+  kitty are supported instead.
+- Cmd+N spawns a new OS process per window, so macOS shows each as
+  a separate Dock icon and Cmd+` only cycles within one window.
+  Same-process multi-window is a future project; see CLAUDE.md.
+- No in-scrollback find (Cmd+F), no OSC 133 prompt marks.
+- Splits are limited to two panes per tab; no recursive nesting.
 
 ## Layout
 
