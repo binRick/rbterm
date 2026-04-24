@@ -2,6 +2,36 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Fail early with a platform-specific hint if `make` isn't installed.
+# On macOS this usually means Xcode Command Line Tools aren't set up;
+# on Linux it's a missing build-essential / base-devel package.
+if ! command -v make >/dev/null 2>&1; then
+  echo "run.sh: 'make' not found."
+  case "$(uname -s)" in
+    Darwin)
+      echo "  Install Apple's command line tools:"
+      echo "    xcode-select --install"
+      ;;
+    Linux)
+      if command -v apt-get >/dev/null 2>&1; then
+        echo "  Debian/Ubuntu:  sudo apt-get install -y build-essential"
+      elif command -v dnf >/dev/null 2>&1; then
+        echo "  Fedora/RHEL:    sudo dnf groupinstall -y 'Development Tools'"
+      elif command -v pacman >/dev/null 2>&1; then
+        echo "  Arch:           sudo pacman -S --needed base-devel"
+      elif command -v zypper >/dev/null 2>&1; then
+        echo "  openSUSE:       sudo zypper install -t pattern devel_basis"
+      else
+        echo "  Install your distro's build tools meta-package (make, gcc/clang)."
+      fi
+      ;;
+    *)
+      echo "  Install 'make' using your platform's package manager."
+      ;;
+  esac
+  exit 1
+fi
+
 # Kill any currently-running rbterm (from .app or raw binary).
 if pgrep -x rbterm >/dev/null 2>&1; then
   echo "run.sh: killing running rbterm…"

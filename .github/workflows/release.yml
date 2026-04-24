@@ -23,6 +23,12 @@ jobs:
             build_subdir: build
             binary_name: rbterm
             cmake_extra: ""
+          - os: macos-latest
+            platform: macos-arm64
+            asset_name: rbterm-macos-arm64.zip
+            build_subdir: build
+            binary_name: rbterm
+            cmake_extra: ""
           - os: windows-latest
             platform: windows-x86_64
             asset_name: rbterm-windows-x86_64.zip
@@ -46,6 +52,15 @@ jobs:
             libxcursor-dev libxi-dev libxkbcommon-dev \
             libwayland-dev wayland-protocols \
             libssh-dev
+
+      - name: Install macOS dependencies
+        if: matrix.os == 'macos-latest'
+        # libssh is the only non-system dep; raylib, mbedtls are
+        # FetchContent'd from source. Frameworks (Cocoa, IOKit,
+        # OpenGL, CoreVideo, CoreText, CoreGraphics) are provided by
+        # the OS, the bundled font assembly uses clang's built-in
+        # assembler so no extra tools needed.
+        run: brew install libssh
 
       - name: Configure (CMake)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
