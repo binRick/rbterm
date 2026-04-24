@@ -531,6 +531,17 @@ tmux's own scrollback, use tmux's `<prefix>[`".
 - Scrollback reflow on resize (only the main screen reflows today; the
   existing scrollback is just re-bucketed at the new width).
 - Linux `.desktop` file + icon install path.
+- **Maximized startup window mode is broken.** Settings → Window →
+  Maximized (on macOS, "Own Space") is wired up to
+  `mac_enter_native_fullscreen` in `emoji_mac.m` which calls
+  `[w toggleFullScreen:nil]`, but the result isn't right — symptom
+  to investigate next session. Fullscreen was already disabled for
+  the same class of reason (raylib's `ToggleFullscreen` on the macOS
+  GLFW build misbehaved); likely both need the same fix, probably
+  around timing the mode change relative to raylib's first frame or
+  making sure the screens resize to the new window size. For now
+  the picker only offers Default + Maximized in the UI; config-file
+  back-compat silently demotes `fullscreen` to default.
 
 ## Missing features (vs iTerm2 / Alacritty / kitty)
 
