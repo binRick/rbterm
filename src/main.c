@@ -2438,6 +2438,26 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
        handler; we own the keyboard while it has focus. */
     if (g_form_logdir_focus) {
         size_t len = strlen(g_form.log_dir);
+        /* Copy current value. */
+        if (mod && IsKeyPressed(KEY_C)) {
+            if (g_form.log_dir[0]) SetClipboardText(g_form.log_dir);
+            return;
+        }
+        /* Paste at end (no caret, so end is the only sensible target). */
+        if (mod && IsKeyPressed(KEY_V)) {
+            const char *clip = GetClipboardText();
+            if (clip && *clip) {
+                for (const char *q = clip; *q; q++) {
+                    unsigned char c = (unsigned char)*q;
+                    if (c == '\r' || c == '\n' || c == '\t') continue;
+                    if (c < 32 || c >= 127) continue;
+                    if (len + 1 >= sizeof(g_form.log_dir)) break;
+                    g_form.log_dir[len++] = (char)c;
+                }
+                g_form.log_dir[len] = 0;
+            }
+            return;
+        }
         if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
             if (len > 0) g_form.log_dir[len - 1] = 0;
         }
@@ -2460,6 +2480,18 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     /* Select-all (Ctrl+A / Cmd+A). */
     if (mod && IsKeyPressed(KEY_A)) {
         if (is_text_field) g_form.sel_all = true;
+        return;
+    }
+
+    /* Copy (Ctrl+C / Cmd+C) the focused text field's value. We don't
+       track a caret, so there's no partial-selection case — copying
+       always copies the whole field. Password is *not* copyable:
+       the field is obscured by design, and shoving the plaintext
+       onto the shared clipboard defeats that. */
+    if (mod && IsKeyPressed(KEY_C) && is_text_field && g_form.focus != F_PASS) {
+        size_t cap;
+        char *buf = form_buf(g_form.focus, &cap);
+        if (buf && *buf) SetClipboardText(buf);
         return;
     }
 
