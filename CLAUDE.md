@@ -312,6 +312,26 @@ the exclusion first before re-copying:
 ssh win 'powershell -NoProfile -Command "Add-MpPreference -ExclusionPath \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\""'
 ```
 
+When the user says **"push to my mia vm"** (or similar for the `mia`
+host): `mia` is a Linux x86_64 **VM** reached over SSH (`Host mia`
+in `~/.ssh/config`, currently 172.238.205.61, RHEL-family / el10).
+It's the user's "test this build before publishing" box — pre-release
+binaries land there first.
+
+Gotcha: the SSH alias defaults to `User root`, but the user
+interactively logs in / operates as **`rich`**. `scp
+mia:Downloads/…` goes to `/root/Downloads/`, which `rich`'s session
+never looks at. Always drop into `rich`'s home and hand over
+ownership:
+
+```bash
+scp rbterm-linux-x86_64.zip mia:/home/rich/Downloads/
+ssh mia 'chown rich:rich /home/rich/Downloads/rbterm-linux-x86_64.zip'
+```
+
+Running rbterm on mia from an SSH session needs `ssh -Y mia ./rbterm`
+(X forwarding) or a local VNC/desktop session — it's a GUI app.
+
 ## Graphics (sixel + kitty)
 
 rbterm advertises sixel support in its Primary-DA response
