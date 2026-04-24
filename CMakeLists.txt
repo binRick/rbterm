@@ -221,7 +221,7 @@ endif()
 if(WIN32)
   # ConPTY lives in kernel32 on modern Windows (10 1809+); linking
   # explicitly keeps older toolchains happy.
-  target_link_libraries(rbterm PRIVATE kernel32 user32 gdi32 winmm)
+  target_link_libraries(rbterm PRIVATE kernel32 user32 gdi32 winmm shell32)
   target_compile_definitions(rbterm PRIVATE _CRT_SECURE_NO_WARNINGS
                                              NOMINMAX WIN32_LEAN_AND_MEAN)
   # Ship as a GUI-subsystem binary so Windows doesn't open the black

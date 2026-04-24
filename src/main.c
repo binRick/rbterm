@@ -4196,6 +4196,17 @@ static bool ui_key_down(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* main.c compiles with NOUSER which strips shellapi.h from the
+   windows.h pull. Forward-declare the two bits we need — on x86_64
+   / ARM64 there's only one calling convention, so no need to spell
+   out __stdcall / WINAPI. */
+__declspec(dllimport) void *__stdcall ShellExecuteW(
+    void *hwnd, const wchar_t *verb, const wchar_t *file,
+    const wchar_t *params, const wchar_t *dir, int show);
+#define SW_SHOWNORMAL 1
+#endif
+
 /* Platform-independent "open this URL in the user's default handler".
    Fork+execvp on Unix so the URL is passed as argv (no shell injection).
    Windows uses ShellExecuteW which launches the registered protocol
