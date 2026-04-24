@@ -309,7 +309,9 @@ static Cell blank_cell(Screen *s) {
     c.cp = 0;
     c.fg = s->cur_attr.fg;
     c.bg = s->cur_attr.bg;
+    c.ul_color = 0;
     c.attrs = s->cur_attr.attrs & (ATTR_DEFAULT_FG | ATTR_DEFAULT_BG);
+    c.link_id = 0;
     return c;
 }
 
