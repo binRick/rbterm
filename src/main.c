@@ -1682,6 +1682,8 @@ static void ssh_profiles_load(void) {
     fclose(fp);
 }
 
+static void form_undo_clear_all(void);
+
 static void ssh_form_apply_profile(const SshProfile *prof) {
     if (!prof) return;
     /* Name is the ssh_config alias ("Host <name>"); Host is the real
@@ -1715,6 +1717,7 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     g_form.log_mode = prof->log_mode;
     g_form.sel_all = false;
     g_form.error[0] = 0;
+    form_undo_clear_all();
     /* Sync the selection indices used by Up/Down nav so the cursor
        starts on the loaded host's choices rather than the top row. */
     g_form_theme_idx = -1;
@@ -1758,6 +1761,7 @@ static void ssh_form_clear(void) {
     g_form_focused_list = FORM_FOCUS_NONE;
     g_form_theme_idx = -1;
     g_form_font_idx = -1;
+    form_undo_clear_all();
 }
 
 static void fonts_load(const char *current_path);
@@ -1784,6 +1788,96 @@ static char *form_buf(int field, size_t *cap) {
     case F_KEY:   *cap = sizeof(g_form.key);   return g_form.key;
     default: *cap = 0; return NULL;
     }
+}
+
+/* Per-field undo / redo for the SSH form. Seven stacks: the six main
+   text fields plus the per-host log-dir input. Each snapshot is a
+   strdup'd copy of the field's value BEFORE a mutation. Cmd/Ctrl+Z
+   pops undo and pushes the current value to redo; Cmd/Ctrl+Shift+Z
+   is the inverse. Stacks are cleared on form open, New / clear, and
+   apply-profile since those overwrite all fields. */
+#define UNDO_CAP 64
+#define UNDO_SLOT_COUNT (F_TEXT_FIELDS + 1)
+#define UNDO_SLOT_LOGDIR F_TEXT_FIELDS
+typedef struct {
+    char *items[UNDO_CAP];
+    int   count;
+} UndoStack;
+static UndoStack g_form_undo[UNDO_SLOT_COUNT];
+static UndoStack g_form_redo[UNDO_SLOT_COUNT];
+
+static void undo_stack_clear(UndoStack *st) {
+    for (int i = 0; i < st->count; i++) { free(st->items[i]); st->items[i] = NULL; }
+    st->count = 0;
+}
+
+static void undo_stack_push(UndoStack *st, const char *val) {
+    /* Dedup against the top so rejected / no-op edits don't pile up. */
+    if (st->count > 0 && strcmp(st->items[st->count - 1], val) == 0) return;
+    if (st->count == UNDO_CAP) {
+        free(st->items[0]);
+        memmove(st->items, st->items + 1, sizeof(st->items[0]) * (UNDO_CAP - 1));
+        st->count = UNDO_CAP - 1;
+    }
+    st->items[st->count++] = strdup(val);
+}
+
+static char *undo_stack_pop(UndoStack *st) {
+    if (st->count == 0) return NULL;
+    return st->items[--st->count];
+}
+
+static void form_undo_clear_all(void) {
+    for (int i = 0; i < UNDO_SLOT_COUNT; i++) {
+        undo_stack_clear(&g_form_undo[i]);
+        undo_stack_clear(&g_form_redo[i]);
+    }
+}
+
+static char *form_undo_slot_buf(int slot, size_t *cap) {
+    if (slot == UNDO_SLOT_LOGDIR) { *cap = sizeof(g_form.log_dir); return g_form.log_dir; }
+    return form_buf(F_NAME + slot, cap);
+}
+
+static int form_undo_current_slot(void) {
+    if (g_form_logdir_focus) return UNDO_SLOT_LOGDIR;
+    if (g_form.focus >= F_NAME && g_form.focus < F_NAME + F_TEXT_FIELDS)
+        return g_form.focus - F_NAME;
+    return -1;
+}
+
+/* Call before applying a mutation: snapshots the current value onto
+   the undo stack and drops the redo stack. Dedup in push means it's
+   safe to call even if the mutation is ultimately rejected. */
+static void form_undo_capture(int slot) {
+    if (slot < 0 || slot >= UNDO_SLOT_COUNT) return;
+    size_t cap;
+    char *buf = form_undo_slot_buf(slot, &cap);
+    if (!buf) return;
+    undo_stack_push(&g_form_undo[slot], buf);
+    undo_stack_clear(&g_form_redo[slot]);
+}
+
+/* Apply one step: direction -1 = undo, +1 = redo. Moves the other
+   side of history forward so Cmd+Z / Cmd+Shift+Z round-trip. */
+static bool form_undo_apply(int slot, int dir) {
+    if (slot < 0 || slot >= UNDO_SLOT_COUNT) return false;
+    UndoStack *from = (dir < 0) ? &g_form_undo[slot] : &g_form_redo[slot];
+    UndoStack *to   = (dir < 0) ? &g_form_redo[slot] : &g_form_undo[slot];
+    char *popped = undo_stack_pop(from);
+    if (!popped) return false;
+    size_t cap;
+    char *buf = form_undo_slot_buf(slot, &cap);
+    if (!buf || cap == 0) { free(popped); return false; }
+    undo_stack_push(to, buf);
+    size_t n = strlen(popped);
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, popped, n);
+    buf[n] = 0;
+    free(popped);
+    g_form.sel_all = false;
+    g_form.error[0] = 0;
+    return true;
 }
 
 static SshFormLayout ssh_form_layout(int win_w, int win_h) {
@@ -2438,6 +2532,11 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
        handler; we own the keyboard while it has focus. */
     if (g_form_logdir_focus) {
         size_t len = strlen(g_form.log_dir);
+        /* Undo / redo. */
+        if (mod && IsKeyPressed(KEY_Z)) {
+            form_undo_apply(UNDO_SLOT_LOGDIR, shift ? +1 : -1);
+            return;
+        }
         /* Copy current value. */
         if (mod && IsKeyPressed(KEY_C)) {
             if (g_form.log_dir[0]) SetClipboardText(g_form.log_dir);
@@ -2447,6 +2546,7 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
         if (mod && IsKeyPressed(KEY_V)) {
             const char *clip = GetClipboardText();
             if (clip && *clip) {
+                form_undo_capture(UNDO_SLOT_LOGDIR);
                 for (const char *q = clip; *q; q++) {
                     unsigned char c = (unsigned char)*q;
                     if (c == '\r' || c == '\n' || c == '\t') continue;
@@ -2459,7 +2559,10 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
             return;
         }
         if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
-            if (len > 0) g_form.log_dir[len - 1] = 0;
+            if (len > 0) {
+                form_undo_capture(UNDO_SLOT_LOGDIR);
+                g_form.log_dir[len - 1] = 0;
+            }
         }
         if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) ||
             IsKeyPressed(KEY_TAB)) {
@@ -2471,9 +2574,19 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
             if (mod) continue;
             if (cp < 32 || cp >= 127) continue;
             if (len + 1 >= sizeof(g_form.log_dir)) continue;
+            form_undo_capture(UNDO_SLOT_LOGDIR);
             g_form.log_dir[len++] = (char)cp;
             g_form.log_dir[len] = 0;
         }
+        return;
+    }
+
+    /* Undo / redo (Ctrl+Z / Cmd+Z, Shift variant for redo). Only fires
+       when a text field has focus — buttons and pickers don't have a
+       meaningful undo. */
+    if (mod && IsKeyPressed(KEY_Z) && is_text_field) {
+        int slot = form_undo_current_slot();
+        if (slot >= 0) form_undo_apply(slot, shift ? +1 : -1);
         return;
     }
 
@@ -2504,6 +2617,7 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
             size_t cap;
             char *buf = form_buf(g_form.focus, &cap);
             if (buf) {
+                form_undo_capture(form_undo_current_slot());
                 if (g_form.sel_all) { memset(buf, 0, cap); g_form.sel_all = false; }
                 size_t len = strlen(buf);
                 for (const char *q = clip; *q; q++) {
@@ -2572,9 +2686,11 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
 
         if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
             if (g_form.sel_all) {
+                form_undo_capture(form_undo_current_slot());
                 memset(buf, 0, cap);
                 g_form.sel_all = false;
             } else if (len > 0) {
+                form_undo_capture(form_undo_current_slot());
                 buf[len - 1] = 0;
             }
             g_form.error[0] = 0;
@@ -2588,11 +2704,13 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
             if (cp < 32 || cp >= 127) continue;
             if (g_form.focus == F_PORT && !(cp >= '0' && cp <= '9')) continue;
             if (g_form.sel_all) {
+                form_undo_capture(form_undo_current_slot());
                 memset(buf, 0, cap);
                 len = 0;
                 g_form.sel_all = false;
             }
             if (len + 1 >= (int)cap) continue;
+            form_undo_capture(form_undo_current_slot());
             buf[len++] = (char)cp;
             buf[len] = 0;
             g_form.error[0] = 0;
