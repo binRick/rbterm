@@ -434,6 +434,72 @@ This is ~8-12 focused hours and worth a dedicated session:
   the other's windows behave erratically. Has to be exactly one
   GLFW runtime.
 
+## Search-in-scrollback (not started — design recorded)
+
+No Cmd+F today. When the user asks for one, the architecture
+question is *what does it search when tmux is running*.
+
+### Background: what rbterm can actually see
+
+rbterm stores the cells it has painted. That's the main screen
+(5000 rows of scrollback + the live grid) or the alt screen (one
+screen, no scrollback). When tmux runs, tmux puts rbterm on alt
+screen and manages its own internal scrollback — content tmux has
+scrolled off the top is in *tmux*'s buffer, not rbterm's. So a
+local search can only see what's currently rendered.
+
+### Two architectures (pick when the user wants this)
+
+1. **Local-only search** (recommended).
+   - Cmd+F opens a compact search bar docked over the active pane
+     (input field + hit count + up/down arrows + close button).
+   - Scan cells across scrollback + live grid; case-insensitive by
+     default with a toggle. Wide-char continuation cells are skipped
+     so Unicode matches don't double-count.
+   - Highlight every match in a translucent yellow/amber background
+     overlay, rendered in the same pass as the selection.
+   - Up/Down (or F3/Shift+F3) jump to next/prev match and scroll the
+     view so the hit is visible. Enter leaves highlights up; Esc
+     clears highlights and restores `view_offset`.
+   - Honest behaviour: inside tmux it only searches the current
+     screen (alt-screen has no scrollback). Document it in README
+     and point users to tmux's own search (`<prefix>[` then `?`).
+   - Implementation notes:
+     - Selection / highlight code in `render.c` already paints
+       translucent rectangles per cell — piggy-back that for match
+       highlights with a separate color.
+     - Match list is recomputed when query changes; each match
+       stores (row, col_start, col_end). Row indices are
+       "absolute" (scrollback rows are negative from top-of-live).
+     - Viewport jump sets `view_offset` so the match row is on
+       screen, typically centred.
+   - Scope: ~3-4 focused hours.
+
+2. **tmux-forward hybrid** (more magic, tmux-specific, fragile).
+   - On main screen: as (1).
+   - On alt screen: write the configured tmux-search chord to the
+     PTY (e.g. `\x02[` for prefix `Ctrl+B` + enter copy mode, then
+     `?` for reverse search) and let tmux take over.
+   - Breaks if the user remapped tmux's prefix, or if the alt
+     screen is owned by something other than tmux (less, vim).
+   - Probably not worth the complexity.
+
+### What to build regardless of tmux angle
+
+Either approach needs:
+- Cmd+F / Ctrl+Shift+F handler in `main.c` that opens `UI_SEARCH` mode.
+- A small input modal (reuse the SSH-form text-field helpers).
+- A per-pane `Search` struct holding query, match list, current index.
+- A render pass that draws match backgrounds; selection overlay
+  semantics (`Color` with alpha) already set the pattern.
+- `screen_find_all(Screen *s, const char *needle, bool case_insensitive,
+                    int *out_rows, int *out_cols, int cap)` — walks
+   scrollback then live rows, handles UTF-8 folding, returns
+   positions in "absolute row" coordinates.
+
+Once built, the tmux angle becomes a footnote: "for search inside
+tmux's own scrollback, use tmux's `<prefix>[`".
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt
