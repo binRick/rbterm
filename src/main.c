@@ -368,6 +368,9 @@ typedef struct {
     int   ssh_font_size;       /* 0 = no override */
     char  ssh_log_dir[PATH_MAX];
     int   ssh_log_mode;        /* 0 = inherit, 1 = on, 2 = off */
+    /* Background-tab activity: set when any pane of a non-active tab
+       receives PTY output. Cleared when the tab becomes active. */
+    bool  activity;
 } Tab;
 
 #define MAX_TABS 16
@@ -1045,11 +1048,138 @@ static void copy_selection(Screen *s, const Selection *sel) {
     free(buf);
 }
 
+static bool ui_key_down(void);
+
 static bool cell_is_word(Screen *s, int col, int row) {
     if (col < 0 || row < 0 || col >= screen_cols(s) || row >= screen_rows(s)) return false;
     Cell c = screen_view_cell(s, col, row);
     if (c.cp == 0 || c.cp == ' ' || c.cp == '\t') return false;
     return true;
+}
+
+/* ----- Plain-text URL detection for Cmd/Ctrl+click. -----
+ *
+ * We scan the hovered row for spans that start with a known URI
+ * scheme (http://, https://, ftp(s)://, ssh://, file://, git://,
+ * mailto:, www.) and walk forward across URL-body characters.
+ * Trailing sentence punctuation and unmatched closing brackets get
+ * trimmed the same way as double-click word selection. OSC 8
+ * hyperlinks are handled separately — the click handler consults
+ * screen_link_url first, and falls through to this only when the
+ * cell carries no link_id. */
+static bool is_url_body_cp(unsigned char c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9')) return true;
+    switch (c) {
+    case '-': case '_': case '.': case '/': case '?': case '#':
+    case '=': case '&': case '%': case '+': case ':': case ',':
+    case ';': case '@': case '~': case '!': case '*': case '$':
+    case '(': case ')': case '[': case ']': case '\'':
+        return true;
+    }
+    return false;
+}
+
+static int url_scheme_at(const char *row, int col, int cols) {
+    static const char *schemes[] = {
+        "https://", "http://", "ftps://", "ftp://", "ssh://",
+        "file://", "git://", "mailto:", "www.", NULL
+    };
+    for (int i = 0; schemes[i]; i++) {
+        int n = (int)strlen(schemes[i]);
+        if (col + n > cols) continue;
+        if (memcmp(row + col, schemes[i], (size_t)n) == 0) return n;
+    }
+    return 0;
+}
+
+/* If (col, row) sits inside a URL span, write start/end (inclusive)
+   column positions and return true. Scans non-ASCII cells as spaces
+   — URLs in the wild are ASCII. */
+static bool url_at_view_pos(Screen *s, int col, int row,
+                            int *start_col, int *end_col) {
+    int cols = screen_cols(s);
+    int rows = screen_rows(s);
+    if (col < 0 || col >= cols || row < 0 || row >= rows) return false;
+
+    char rowbuf[512];
+    int ncols = cols < (int)sizeof(rowbuf) ? cols : (int)sizeof(rowbuf);
+    for (int c = 0; c < ncols; c++) {
+        Cell cc = screen_view_cell(s, c, row);
+        uint32_t cp = cc.cp;
+        if (cc.attrs & ATTR_WIDE_CONT) cp = ' ';
+        rowbuf[c] = (cp < 128) ? (char)cp : ' ';
+    }
+
+    /* Walk backward from col looking for a scheme start. */
+    for (int c = col; c >= 0; c--) {
+        int slen = url_scheme_at(rowbuf, c, ncols);
+        if (slen == 0) continue;
+        /* Scheme at c. Walk forward across body chars. */
+        int end = c + slen;
+        while (end < ncols && is_url_body_cp((unsigned char)rowbuf[end])) end++;
+        /* Trim trailing sentence punctuation. */
+        const char *trail = ".,;:!?";
+        while (end > c + slen && strchr(trail, rowbuf[end - 1])) end--;
+        /* Trim unmatched closing brackets. */
+        while (end > c + slen) {
+            char last = rowbuf[end - 1];
+            char want = 0;
+            if      (last == ')') want = '(';
+            else if (last == ']') want = '[';
+            else if (last == '}') want = '{';
+            else break;
+            bool matched = false;
+            for (int k = c; k < end - 1; k++) {
+                if (rowbuf[k] == want) { matched = true; break; }
+            }
+            if (matched) break;
+            end--;
+        }
+        if (col >= c && col < end) {
+            *start_col = c;
+            *end_col   = end - 1;
+            return true;
+        }
+        /* Scheme matched but col is outside the span — keep walking
+           left in case of a second URL earlier on the line. */
+    }
+    return false;
+}
+
+/* Copy the URL span into a heap buffer (caller frees). Wide-char
+   continuation cells are skipped. Prepends https:// for www.*
+   URLs so the OS-level opener has a real scheme. */
+static char *url_copy_span(Screen *s, int row, int c0, int c1) {
+    char buf[1024];
+    int n = 0;
+    for (int c = c0; c <= c1 && n + 4 < (int)sizeof(buf); c++) {
+        Cell cc = screen_view_cell(s, c, row);
+        if (cc.attrs & ATTR_WIDE_CONT) continue;
+        uint32_t cp = cc.cp ? cc.cp : ' ';
+        if (cp < 128) {
+            buf[n++] = (char)cp;
+        } else if (cp < 0x800) {
+            buf[n++] = (char)(0xC0 | (cp >> 6));
+            buf[n++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            buf[n++] = (char)(0xE0 | (cp >> 12));
+            buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            buf[n++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            buf[n++] = (char)(0xF0 | (cp >> 18));
+            buf[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            buf[n++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    buf[n] = 0;
+    const char *prefix = (n >= 4 && memcmp(buf, "www.", 4) == 0) ? "https://" : "";
+    char *out = malloc(strlen(prefix) + n + 1);
+    if (!out) return NULL;
+    strcpy(out, prefix);
+    strcat(out, buf);
+    return out;
 }
 
 /* Intelligent double-click trim rules.
@@ -1681,6 +1811,7 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                               double time_sec, bool focused) {
     if (!t) return;
     Vector2 mpos = GetMousePosition();
+    bool want_url_cursor = false;
     for (int pi = 0; pi < t->num_panes; pi++) {
         Pane *p = &t->panes[pi];
         if (!p->scr) continue;
@@ -1702,6 +1833,25 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         }
         renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
                       pr.x, pr.y, hcol, hrow);
+
+        /* Cmd/Ctrl-hover over a plain-text URL: underline it and
+           switch the mouse cursor to pointer so the user knows it's
+           clickable. OSC 8 hyperlinks are already brightened by
+           renderer_draw via the link_id path. */
+        if (ui_key_down() && hcol >= 0 && hrow >= 0) {
+            int uc0, uc1;
+            Cell hc = screen_view_cell(p->scr, hcol, hrow);
+            bool has_osc8 = (hc.link_id != 0);
+            if (!has_osc8 && url_at_view_pos(p->scr, hcol, hrow, &uc0, &uc1)) {
+                int ux = pr.x + r->pad_x + uc0 * r->cell_w;
+                int uw = (uc1 - uc0 + 1) * r->cell_w;
+                int uy = pr.y + r->pad_y + hrow * r->cell_h + r->cell_h - 2;
+                DrawRectangle(ux, uy, uw, 1, (Color){125, 207, 255, 220});
+                want_url_cursor = true;
+            } else if (has_osc8) {
+                want_url_cursor = true;
+            }
+        }
 
         /* Search match highlights. Drawn after the grid so they sit
            over glyphs; alpha is low enough that text reads through.
@@ -1835,6 +1985,8 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
     if (splitter_rect(t, win_w, win_h, &sp)) {
         DrawRectangle(sp.x, sp.y, sp.w, sp.h, (Color){60, 60, 75, 255});
     }
+    SetMouseCursor(want_url_cursor ? MOUSE_CURSOR_POINTING_HAND
+                                   : MOUSE_CURSOR_DEFAULT);
     (void)win_w; (void)win_h;
 }
 
@@ -2042,10 +2194,20 @@ static void draw_tab_bar(Renderer *r, int win_w) {
         DrawRectangle(x, 0, tw, TAB_BAR_H, bg);
         if (active) DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
 
+        /* Activity dot: small amber bullet left of the label when a
+           background tab has produced output since the user last
+           focused it. Cleared when the tab becomes active. */
+        int label_x = x + 10;
+        if (!active && g_tabs[i]->activity) {
+            int dy = TAB_BAR_H / 2;
+            int dx = x + 10;
+            DrawCircle(dx + 3, dy, 3.0f, (Color){255, 180, 60, 255});
+            label_x = dx + 12;
+        }
         const char *title = tab_label(g_tabs[i]);
-        BeginScissorMode(x + 8, 0, tw - TAB_CLOSE_W - 12, TAB_BAR_H);
+        BeginScissorMode(label_x - 2, 0, tw - TAB_CLOSE_W - (label_x - x) - 4, TAB_BAR_H);
         Vector2 tsz = MeasureTextEx(*f, title, fs, 0);
-        Vector2 tp  = { x + 10, (TAB_BAR_H - tsz.y) / 2.0f };
+        Vector2 tp  = { label_x, (TAB_BAR_H - tsz.y) / 2.0f };
         DrawTextEx(*f, title, tp, fs, 0, fg);
         EndScissorMode();
         const char *cross = "x";
@@ -5371,6 +5533,12 @@ int main(int argc, char **argv) {
            terminal. Panes whose shell has exited are closed right
            after the drain — if they're the last pane the tab dies
            with them. */
+        /* Clear activity on whichever tab is currently foregrounded
+           — whether it got there by click, chord, or the dirty dance
+           in tab_close. Simpler than patching every site that writes
+           g_active. */
+        if (g_active >= 0 && g_active < g_num_tabs)
+            g_tabs[g_active]->activity = false;
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
             bool pane_dead[2] = { false, false };
@@ -5391,6 +5559,9 @@ int main(int argc, char **argv) {
                     break;
                 }
                 if (!pty_alive(p->pty)) pane_dead[pi] = true;
+                /* Activity on a background tab lights the tab-bar
+                   indicator until the user switches to it. */
+                if (drained > 0 && i != g_active) t->activity = true;
             }
             /* Close dead panes in reverse so indices stay valid during
                the sweep. A single-pane tab promotes to t->dead inside
@@ -5688,6 +5859,17 @@ int main(int argc, char **argv) {
                                 if (u && *u) {
                                     open_url(u);
                                     goto pane_click_done;
+                                }
+                                /* Plain-text URL fallback when the
+                                   cell isn't OSC-8-tagged. */
+                                int uc0, uc1;
+                                if (url_at_view_pos(p->scr, mcol, mrow, &uc0, &uc1)) {
+                                    char *turl = url_copy_span(p->scr, mrow, uc0, uc1);
+                                    if (turl) {
+                                        open_url(turl);
+                                        free(turl);
+                                        goto pane_click_done;
+                                    }
                                 }
                             }
                             double tnow = GetTime();
