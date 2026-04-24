@@ -72,6 +72,25 @@ int mac_consume_ctrl_tab(void) {
     return v;
 }
 
+/* Enter macOS native fullscreen on the first (primary) window — the
+   window gets its own Space, so the user can three-finger swipe
+   between it and other desktops. Contrast with raylib's
+   ToggleFullscreen (exclusive fullscreen on the current Space). */
+void mac_enter_native_fullscreen(void) {
+    @autoreleasepool {
+        NSArray *wins = [NSApp windows];
+        for (NSWindow *w in wins) {
+            if (![w isVisible]) continue;
+            [w setCollectionBehavior:
+                [w collectionBehavior] | NSWindowCollectionBehaviorFullScreenPrimary];
+            if (!([w styleMask] & NSWindowStyleMaskFullScreen)) {
+                [w toggleFullScreen:nil];
+            }
+            break;
+        }
+    }
+}
+
 bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
                   uint8_t **out_rgba, int *out_w, int *out_h,
                   bool *out_colored) {

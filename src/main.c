@@ -33,6 +33,7 @@
   void mac_disable_close_menu_item(void);   /* defined in emoji_mac.m */
   void mac_install_ctrl_tab_monitor(void);
   int  mac_consume_ctrl_tab(void);
+  void mac_enter_native_fullscreen(void);
 #endif
 
 #ifndef _WIN32
@@ -84,12 +85,25 @@ static bool ini_split(char *line, char **k_out, char **v_out) {
 
 /* ---------- App-wide settings ---------- */
 
+/* Startup window layout. `MAXIMIZED` is the OS-native "own Space"
+   fullscreen on macOS (green-button behavior: its own desktop,
+   switchable via three-finger trackpad swipe) and a regular maximized
+   window on Linux/Windows. `FULLSCREEN` is borderless/exclusive
+   fullscreen on the current Space — covers the display, no menu bar,
+   no own Space. */
+typedef enum {
+    STARTUP_WINDOW_DEFAULT    = 0,
+    STARTUP_WINDOW_FULLSCREEN = 1,
+    STARTUP_WINDOW_MAXIMIZED  = 2,
+} StartupWindowMode;
+
 typedef struct {
     bool log_enabled;
     char log_dir[PATH_MAX];
     int  key_repeat_initial_ms;  /* delay before first repeat fires (held key) */
     int  key_repeat_rate_ms;     /* period between subsequent repeats */
     int  cursor_style;           /* CursorStyle enum — default for new panes */
+    int  startup_window;         /* StartupWindowMode */
 } AppSettings;
 static AppSettings g_app_settings;
 static char        g_settings_status[160]; /* status line in the settings modal */
@@ -146,6 +160,12 @@ static void config_load_into_defaults(void) {
             else if (!strcmp(v, "underline")) g_app_settings.cursor_style = CURSOR_STYLE_UNDERLINE;
             else if (!strcmp(v, "bar"))       g_app_settings.cursor_style = CURSOR_STYLE_BAR;
             else if (!strcmp(v, "blink"))     g_app_settings.cursor_style = CURSOR_STYLE_BLOCK_BLINK;
+        } else if (strcmp(k, "startup_window") == 0) {
+            /* "fullscreen" is accepted for back-compat but demoted to
+               default — the option was removed because the backing
+               ToggleFullscreen call was broken. */
+            if      (!strcmp(v, "maximized"))  g_app_settings.startup_window = STARTUP_WINDOW_MAXIMIZED;
+            else                               g_app_settings.startup_window = STARTUP_WINDOW_DEFAULT;
         }
     }
     fclose(fp);
@@ -180,6 +200,11 @@ static bool config_save(Renderer *r) {
         }
         if (cs) fprintf(fp, "cursor_style=%s\n", cs);
     }
+    {
+        const char *sw = (g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED)
+                             ? "maximized" : "default";
+        fprintf(fp, "startup_window=%s\n", sw);
+    }
     fclose(fp);
 #ifndef _WIN32
     chmod(path, 0600);
@@ -192,6 +217,7 @@ static void app_settings_init(void) {
     g_app_settings.key_repeat_initial_ms = 300;
     g_app_settings.key_repeat_rate_ms    = 25;
     g_app_settings.cursor_style          = CURSOR_STYLE_DEFAULT;
+    g_app_settings.startup_window        = STARTUP_WINDOW_DEFAULT;
     const char *home = getenv("HOME");
 #ifdef _WIN32
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -3187,9 +3213,19 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
 }
 
 /* ---------- Settings modal ----------
- * Minimal today (just font size), but the intent is this is *the*
- * preferences surface — new settings get an entry here rather than a
- * one-off shortcut. Keep it boring and extensible. */
+ * Organised into tabs (Font / Theme / Session / Window). Each tab
+ * owns a subset of controls so the modal fits comfortably in a
+ * reasonable window without overflow. New settings get slotted into
+ * whichever tab makes sense — keep it boring and extensible. */
+
+typedef enum {
+    SETTINGS_TAB_FONT    = 0,
+    SETTINGS_TAB_THEME   = 1,
+    SETTINGS_TAB_SESSION = 2,
+    SETTINGS_TAB_WINDOW  = 3,
+    SETTINGS_TAB_COUNT   = 4,
+} SettingsTab;
+static int g_settings_tab = SETTINGS_TAB_FONT;
 
 static void fonts_load(const char *current_path);
 static void settings_open(Renderer *r) {
@@ -3207,6 +3243,7 @@ static void settings_apply_font_size(Renderer *r, int new_size) {
 
 typedef struct {
     Rect modal;
+    Rect tab[SETTINGS_TAB_COUNT];  /* tab-bar buttons (always populated) */
     Rect font_val;   /* current font size display */
     Rect dec, inc;   /* font -/+ buttons */
     Rect font_list;  /* scrollable list of monospace fonts */
@@ -3223,6 +3260,9 @@ typedef struct {
     Rect log_dir;    /* editable text box with log directory */
     Rect repeat_initial; /* slider track — initial repeat delay */
     Rect repeat_rate;    /* slider track — per-repeat period */
+    Rect startup_default;    /* startup-window-size picker: three buttons */
+    Rect startup_fullscreen;
+    Rect startup_maximized;
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -3510,7 +3550,9 @@ static bool g_settings_dir_sel_all = false;
 
 static SettingsLayout settings_layout(int win_w, int win_h) {
     SettingsLayout L = {0};
-    int w = 600, h = 790;
+    /* Modal is sized to the tallest tab's content so swapping tabs
+       doesn't reshuffle the window. Clamp to fit the OS window. */
+    int w = 600, h = 560;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -3518,64 +3560,92 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     L.modal.w = w;
     L.modal.h = h;
 
-    int btn = 32;
-    int font_row_y = L.modal.y + 70;
-    L.font_val = (Rect){ L.modal.x + w - 214, font_row_y, 66, btn };
-    L.dec      = (Rect){ L.modal.x + w - 138, font_row_y, btn, btn };
-    L.inc      = (Rect){ L.modal.x + w - 60,  font_row_y, btn, btn };
-
-    int font_list_y = font_row_y + btn + 16;
-    L.font_list = (Rect){ L.modal.x + 140, font_list_y, w - 140 - 22, 140 };
-
-    int theme_list_y = font_list_y + L.font_list.h + 16;
-    L.theme_list = (Rect){ L.modal.x + 140, theme_list_y, w - 140 - 22, 140 };
-
-    /* Cursor-style row. Four equal buttons aligned with the list width. */
-    int cur_row_y = theme_list_y + L.theme_list.h + 12;
+    /* Tab bar row, directly under the 40px title bar. Four equal
+       pills across the full inner width. */
     {
+        int bar_y = L.modal.y + 40 + 6;
+        int bar_h = 28;
+        int gap = 4;
+        int total_w = w - 2 * 14;
+        int bw = (total_w - (SETTINGS_TAB_COUNT - 1) * gap) / SETTINGS_TAB_COUNT;
+        int bx = L.modal.x + 14;
+        for (int i = 0; i < SETTINGS_TAB_COUNT; i++)
+            L.tab[i] = (Rect){ bx + i * (bw + gap), bar_y, bw, bar_h };
+    }
+
+    int btn = 32;
+    int content_y = L.modal.y + 40 + 6 + 28 + 16;  /* title + tab bar + gap */
+    int close_w = 90, close_h = 32, save_def_w = 150;
+    int footer_y = L.modal.y + h - 22 - close_h;
+    L.close = (Rect){ L.modal.x + w - 22 - close_w, footer_y, close_w, close_h };
+    L.save_default = (Rect){ L.close.x - 8 - save_def_w, footer_y, save_def_w, close_h };
+
+    /* Only the active tab gets content rects. Others stay zero-filled
+       so click handlers can't hit them. */
+    if (g_settings_tab == SETTINGS_TAB_FONT) {
+        int font_row_y = content_y;
+        L.font_val = (Rect){ L.modal.x + w - 214, font_row_y, 66, btn };
+        L.dec      = (Rect){ L.modal.x + w - 138, font_row_y, btn, btn };
+        L.inc      = (Rect){ L.modal.x + w - 60,  font_row_y, btn, btn };
+
+        int font_list_y = font_row_y + btn + 16;
+        L.font_list = (Rect){ L.modal.x + 140, font_list_y, w - 140 - 22, 160 };
+
+        int pad_row_y = font_list_y + L.font_list.h + 16;
+        L.pad_val  = (Rect){ L.modal.x + w - 214, pad_row_y, 66, btn };
+        L.pad_dec  = (Rect){ L.modal.x + w - 138, pad_row_y, btn, btn };
+        L.pad_inc  = (Rect){ L.modal.x + w - 60,  pad_row_y, btn, btn };
+
+        int spc_row_y = pad_row_y + btn + 10;
+        L.spc_val  = (Rect){ L.modal.x + w - 214, spc_row_y, 66, btn };
+        L.spc_dec  = (Rect){ L.modal.x + w - 138, spc_row_y, btn, btn };
+        L.spc_inc  = (Rect){ L.modal.x + w - 60,  spc_row_y, btn, btn };
+    } else if (g_settings_tab == SETTINGS_TAB_THEME) {
+        int theme_list_y = content_y;
+        int theme_h = footer_y - 22 - theme_list_y - (30 + 16);  /* leave room for cursor row */
+        if (theme_h < 120) theme_h = 120;
+        L.theme_list = (Rect){ L.modal.x + 140, theme_list_y, w - 140 - 22, theme_h };
+
+        int cur_row_y = theme_list_y + L.theme_list.h + 12;
         int bwidth = L.theme_list.w;
         int gap_sty = 6;
         int bw = (bwidth - 3 * gap_sty) / 4;
         int bx = L.modal.x + 140;
         int bh = 30;
-        L.cur_block = (Rect){ bx,                           cur_row_y, bw, bh };
-        L.cur_under = (Rect){ bx + (bw + gap_sty),           cur_row_y, bw, bh };
-        L.cur_bar   = (Rect){ bx + 2 * (bw + gap_sty),       cur_row_y, bw, bh };
-        L.cur_blink = (Rect){ bx + 3 * (bw + gap_sty),       cur_row_y, bw, bh };
+        L.cur_block = (Rect){ bx,                          cur_row_y, bw, bh };
+        L.cur_under = (Rect){ bx + (bw + gap_sty),          cur_row_y, bw, bh };
+        L.cur_bar   = (Rect){ bx + 2 * (bw + gap_sty),      cur_row_y, bw, bh };
+        L.cur_blink = (Rect){ bx + 3 * (bw + gap_sty),      cur_row_y, bw, bh };
+    } else if (g_settings_tab == SETTINGS_TAB_SESSION) {
+        int log_row1_y = content_y;
+        L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
+
+        int log_row2_y = log_row1_y + btn + 10;
+        L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
+
+        int slider_track_h = 8;
+        int row_pitch = 22;
+        int kr1_y = log_row2_y + btn + 24;
+        L.repeat_initial = (Rect){ L.modal.x + 140, kr1_y, w - 140 - 22 - 60,
+                                   slider_track_h };
+        int kr2_y = kr1_y + row_pitch;
+        L.repeat_rate    = (Rect){ L.modal.x + 140, kr2_y, w - 140 - 22 - 60,
+                                   slider_track_h };
+    } else if (g_settings_tab == SETTINGS_TAB_WINDOW) {
+        int sw_row_y = content_y;
+        int bwidth = w - 140 - 22;
+        int gap_sty = 6;
+        int bw = (bwidth - gap_sty) / 2;
+        int bx = L.modal.x + 140;
+        int bh = 30;
+        L.startup_default    = (Rect){ bx,                   sw_row_y, bw, bh };
+        L.startup_maximized  = (Rect){ bx + (bw + gap_sty),  sw_row_y, bw, bh };
+        /* Fullscreen removed — raylib's ToggleFullscreen is buggy on
+           macOS here. Users wanting a distraction-free window use
+           Maximized (own Space on macOS). */
+        L.startup_fullscreen = (Rect){ 0, 0, 0, 0 };
     }
 
-    int pad_row_y = cur_row_y + 30 + 16;
-    L.pad_val  = (Rect){ L.modal.x + w - 214, pad_row_y, 66, btn };
-    L.pad_dec  = (Rect){ L.modal.x + w - 138, pad_row_y, btn, btn };
-    L.pad_inc  = (Rect){ L.modal.x + w - 60,  pad_row_y, btn, btn };
-
-    int spc_row_y = pad_row_y + btn + 10;
-    L.spc_val  = (Rect){ L.modal.x + w - 214, spc_row_y, 66, btn };
-    L.spc_dec  = (Rect){ L.modal.x + w - 138, spc_row_y, btn, btn };
-    L.spc_inc  = (Rect){ L.modal.x + w - 60,  spc_row_y, btn, btn };
-
-    int log_row1_y = spc_row_y + btn + 14;
-    L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
-
-    int log_row2_y = log_row1_y + btn + 10;
-    L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
-
-    /* Key-repeat sliders: two compact rows below logging. Value
-       readout eats a few px of track width so numbers don't collide
-       with the modal's right edge. */
-    int slider_track_h = 8;
-    int row_pitch = 22;
-    int kr1_y = log_row2_y + btn + 8;
-    L.repeat_initial = (Rect){ L.modal.x + 140, kr1_y, w - 140 - 22 - 60,
-                               slider_track_h };
-    int kr2_y = kr1_y + row_pitch;
-    L.repeat_rate    = (Rect){ L.modal.x + 140, kr2_y, w - 140 - 22 - 60,
-                               slider_track_h };
-
-    int close_w = 90, close_h = 32, save_def_w = 150;
-    int row_y = L.modal.y + h - 22 - close_h;
-    L.close = (Rect){ L.modal.x + w - 22 - close_w, row_y, close_w, close_h };
-    L.save_default = (Rect){ L.close.x - 8 - save_def_w, row_y, save_def_w, close_h };
     return L;
 }
 
@@ -3629,6 +3699,20 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         }
     }
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+    /* Tab bar: switching tabs clears focus held by the previous tab's
+       controls so keyboard input doesn't bleed into the new tab. */
+    for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
+        if (rect_hit(L.tab[i], mx, my)) {
+            if (g_settings_tab != i) {
+                g_settings_tab = i;
+                g_settings_dir_focus = false;
+                g_settings_focused_list = SETTINGS_FOCUS_NONE;
+                g_slider_drag_track.w = 0;
+                g_slider_drag_target = NULL;
+            }
+            return;
+        }
+    }
     if (rect_hit(L.dec, mx, my))   { settings_apply_font_size(r, r->font_size - 1); return; }
     if (rect_hit(L.inc, mx, my))   { settings_apply_font_size(r, r->font_size + 1); return; }
     if (rect_hit(L.pad_dec, mx, my)) { settings_apply_padding(r, r->pad_x - 2); return; }
@@ -3715,6 +3799,20 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         g_settings_dir_focus = true;
         g_settings_dir_sel_all = false;
         return;
+    }
+    /* Startup window mode: Default or Maximized. Applied on next
+       launch. Fullscreen option removed — raylib's ToggleFullscreen
+       misbehaves on macOS. */
+    {
+        int pick = -1;
+        if      (rect_hit(L.startup_default,   mx, my)) pick = STARTUP_WINDOW_DEFAULT;
+        else if (rect_hit(L.startup_maximized, mx, my)) pick = STARTUP_WINDOW_MAXIMIZED;
+        if (pick >= 0) {
+            g_app_settings.startup_window = pick;
+            snprintf(g_settings_status, sizeof(g_settings_status),
+                     "Startup window mode set. Save as Default to persist.");
+            return;
+        }
     }
     if (rect_hit(L.save_default, mx, my)) {
         if (config_save(r)) {
@@ -3989,6 +4087,32 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                (Vector2){L.modal.x + 20, L.modal.y + 11},
                16, 0, (Color){230, 232, 240, 255});
 
+    /* Tab bar. Active tab gets an accent fill; others sit dim. */
+    {
+        const char *labels[SETTINGS_TAB_COUNT] = {
+            "Font", "Theme", "Session", "Window"
+        };
+        for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
+            Rect tr = L.tab[i];
+            bool on = (g_settings_tab == i);
+            DrawRectangle(tr.x, tr.y, tr.w, tr.h,
+                          on ? (Color){46, 92, 150, 255}
+                             : (Color){34, 38, 52, 255});
+            DrawRectangleLines(tr.x, tr.y, tr.w, tr.h,
+                               (Color){125, 207, 255, on ? 255 : 120});
+            Vector2 ts = MeasureTextEx(*f, labels[i], 13, 0);
+            DrawTextEx(*f, labels[i],
+                       (Vector2){tr.x + (tr.w - ts.x) / 2,
+                                 tr.y + (tr.h - ts.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+        }
+    }
+
+    /* Glyph metrics reused across every +/- button in the Font tab. */
+    Vector2 ms = MeasureTextEx(*f, "-", 18, 0);
+    Vector2 ps = MeasureTextEx(*f, "+", 18, 0);
+
+    if (g_settings_tab == SETTINGS_TAB_FONT) {
     /* Font size row. */
     DrawTextEx(*f, "Font size",
                (Vector2){L.modal.x + 22, L.font_val.y + 8},
@@ -4007,14 +4131,12 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
 
     DrawRectangle(L.dec.x, L.dec.y, L.dec.w, L.dec.h, (Color){46, 52, 70, 255});
     DrawRectangleLines(L.dec.x, L.dec.y, L.dec.w, L.dec.h, (Color){125, 207, 255, 180});
-    Vector2 ms = MeasureTextEx(*f, "-", 18, 0);
     DrawTextEx(*f, "-",
                (Vector2){L.dec.x + (L.dec.w - ms.x) / 2,
                          L.dec.y + (L.dec.h - ms.y) / 2},
                18, 0, (Color){230, 232, 240, 255});
     DrawRectangle(L.inc.x, L.inc.y, L.inc.w, L.inc.h, (Color){46, 52, 70, 255});
     DrawRectangleLines(L.inc.x, L.inc.y, L.inc.w, L.inc.h, (Color){125, 207, 255, 180});
-    Vector2 ps = MeasureTextEx(*f, "+", 18, 0);
     DrawTextEx(*f, "+",
                (Vector2){L.inc.x + (L.inc.w - ps.x) / 2,
                          L.inc.y + (L.inc.h - ps.y) / 2},
@@ -4088,6 +4210,8 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         }
     }
 
+    }  /* end Font tab */
+    if (g_settings_tab == SETTINGS_TAB_THEME) {
     /* Theme list. Clicking a row applies that palette + default fg/bg/
        cursor to the *active* pane only; other panes keep their state. */
     DrawTextEx(*f, "Theme",
@@ -4193,6 +4317,8 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         }
     }
 
+    }  /* end Theme tab */
+    if (g_settings_tab == SETTINGS_TAB_FONT) {
     /* Padding row. */
     DrawTextEx(*f, "Padding",
                (Vector2){L.modal.x + 22, L.pad_val.y + 8},
@@ -4249,6 +4375,8 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                          L.spc_inc.y + (L.spc_inc.h - ps.y) / 2},
                18, 0, (Color){230, 232, 240, 255});
 
+    }  /* end Font tab (padding + spacing) */
+    if (g_settings_tab == SETTINGS_TAB_SESSION) {
     /* Session logging rows. */
     DrawTextEx(*f, "Log session",
                (Vector2){L.modal.x + 22, L.log_toggle.y + 8},
@@ -4338,6 +4466,40 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                        13, 0, (Color){180, 190, 210, 255});
         }
     }
+
+    }  /* end Session tab */
+    if (g_settings_tab == SETTINGS_TAB_WINDOW) {
+    /* Startup window mode row. Three mutually-exclusive buttons;
+       applied on next launch so we don't fight the user's current
+       window state. Save as Default persists the pick. */
+    {
+        DrawTextEx(*f, "On launch",
+                   (Vector2){L.modal.x + 22, L.startup_default.y + 8},
+                   14, 0, (Color){200, 205, 220, 255});
+        struct { Rect r; const char *label; int mode; } opts[] = {
+            { L.startup_default,    "Default",    STARTUP_WINDOW_DEFAULT },
+#ifdef __APPLE__
+            { L.startup_maximized,  "Own Space",  STARTUP_WINDOW_MAXIMIZED },
+#else
+            { L.startup_maximized,  "Maximized",  STARTUP_WINDOW_MAXIMIZED },
+#endif
+        };
+        for (int i = 0; i < 2; i++) {
+            Rect rr = opts[i].r;
+            bool on = (g_app_settings.startup_window == opts[i].mode);
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h,
+                          on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255});
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               (Color){125, 207, 255, on ? 255 : 150});
+            Vector2 bsz = MeasureTextEx(*f, opts[i].label, 13, 0);
+            DrawTextEx(*f, opts[i].label,
+                       (Vector2){rr.x + (rr.w - bsz.x) / 2,
+                                 rr.y + (rr.h - bsz.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+        }
+    }
+
+    }  /* end Window tab */
 
     /* Save-as-Default button. */
     DrawRectangle(L.save_default.x, L.save_default.y,
@@ -4548,6 +4710,24 @@ int main(int argc, char **argv) {
 
     Renderer r;
     g_renderer = &r;
+    /* Apply startup window layout (configured under Settings). Must
+       come after InitWindow but before the first frame so the user
+       doesn't see the default 800x500 briefly before the transition.
+       On macOS, MAXIMIZED means native fullscreen in its own Space
+       so three-finger swipe crosses between it and other desktops. */
+#ifndef __EMSCRIPTEN__
+    if (g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED) {
+#ifdef __APPLE__
+        mac_enter_native_fullscreen();
+#else
+        MaximizeWindow();
+#endif
+    }
+    /* STARTUP_WINDOW_FULLSCREEN is accepted by config parsing for
+       back-compat but is now treated as DEFAULT — raylib's
+       ToggleFullscreen misbehaves on our macOS GLFW build. */
+#endif
+
 #ifdef __APPLE__
     /* Strip Cmd+W from AppKit's File > Close Window menu item so our
        in-app handler can use the chord to close just the active tab. */
