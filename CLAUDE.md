@@ -694,7 +694,7 @@ Deliberate v1 limits:
 
 ## Idle CPU floor (macOS)
 
-**The number to know: ~4.7% idle CPU is the floor with brew raylib
+**The number to know: ~3.2% idle CPU is the floor with brew raylib
 on macOS. alacritty / kitty sit at 0%.**
 
 How we got here, and what blocks going lower (so future sessions
@@ -710,10 +710,17 @@ don't burn time re-discovering this):
    wheel events, window resize, title changes. **Cursor blink is
    intentionally NOT a trigger** — terminating that 2 Hz redraw
    cycle was the single biggest contributor to the drop.
-3. **Adaptive idle cadence**: cap stretches with how long it's
-   been since `last_dirty_ts`. Recent activity (<1 s) wakes at
-   5 Hz so typing stays snappy; deep idle (>1 s) drops to 1 Hz.
-   Unfocused windows always sit at 1 Hz.
+3. **Wake cadence**: 250 Hz when focused (cap=0.004), 20 Hz when
+   unfocused (cap=0.05). Counter-intuitive but verified: at
+   higher poll rates the `NSApp` event queue is consistently
+   empty and each `PollInputEvents` returns near-instantly, so
+   net CPU is *lower* than at 1 Hz where the queue accumulates
+   and each call costs ~50 ms. The 4 ms cap also keeps typing
+   and chord shortcuts (Cmd+T, Cmd+1) feeling instant — slower
+   caps showed up as user-visible "very slow" chord lag. Don't
+   try an "adaptive" sleep that stretches when idle; it just
+   raises CPU and adds first-keystroke latency without saving
+   anything.
 
 **The remaining 5% is `glfwPollEvents` itself.** Verified with a
 minimal repro:

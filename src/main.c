@@ -7900,12 +7900,6 @@ int main(int argc, char **argv) {
        at the cursor-blink rate (~2Hz) while idle. */
     Vector2 prev_mp = {0, 0};
     bool prev_focused = true;
-    /* Adaptive idle cadence: cap stretches the longer we go without
-       a dirtying event. Burst-typing stays at 5 Hz (~200 ms latency);
-       a stretch of silence rolls back to 1 Hz, halving the
-       PollInputEvents tax (~5 ms each on macOS). The first input
-       resets the timer immediately so latency snaps back. */
-    double last_dirty_ts = GetTime();
 
     while (!WindowShouldClose() && g_num_tabs > 0) {
         bool dirty = false;
@@ -8849,7 +8843,6 @@ int main(int argc, char **argv) {
            terminals do the same as a power-save gesture. */
 
         if (dirty) {
-            last_dirty_ts = GetTime();
             BeginDrawing();
             ClearBackground((Color){0, 0, 0, 255});
             draw_tab_bar(&r, win_w_now);
@@ -8857,23 +8850,23 @@ int main(int argc, char **argv) {
             EndDrawing();
         } else {
             /* Idle path: pump events + sleep. PollInputEvents on
-               macOS is a heavy call (~5 ms — dispatches the whole
-               NSApp event queue) so 5 Hz alone is ~5% CPU. We can't
-               kernel-block on events without rebuilding raylib with
-               USE_EXTERNAL_GLFW (raylib's bundled GLFW hides the
-               symbol; linking brew libglfw alongside causes Cocoa
-               class-name collisions and the wait function then
-               doesn't actually block — empirically 3 M empty
-               iterations/sec). Adaptive cadence instead: if nothing
-               has dirtied for >1 s, stretch the cap to 1 Hz; under
-               1 s use 5 Hz so typing stays snappy. Unfocused windows
-               always sit at 1 Hz regardless. */
+               macOS is heavy (dispatches the NSApp queue) and we
+               can't kernel-block on events without rebuilding
+               raylib with USE_EXTERNAL_GLFW — see "Idle CPU floor"
+               in CLAUDE.md.
+
+               cap = worst-case input latency. Keep it tight:
+               typing AND chord shortcuts (Cmd+T, Cmd+1) need to
+               feel instant or the editor feels broken. 0.008 =
+               ~125 Hz wake, ~8 ms worst-case typing latency.
+               Unfocused windows still need fast wake too —
+               otherwise Cmd+Tab takes the full unfocused-cap to
+               surface the app, which feels like a stall. Use 0.05
+               unfocused: ~50 ms to come back to front, which feels
+               immediate. CPU when unfocused stays low because we
+               immediately go focused → typing path. */
             PollInputEvents();
-            double idle_for = GetTime() - last_dirty_ts;
-            double cap;
-            if (!focused)             cap = 1.00;  /* 1 Hz */
-            else if (idle_for < 1.0)  cap = 0.20;  /* 5 Hz, recent activity */
-            else                      cap = 1.00;  /* 1 Hz, deep idle */
+            double cap = focused ? 0.004 : 0.05;
             WaitTime(cap);
         }
     }

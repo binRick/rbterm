@@ -270,7 +270,7 @@ Same machine, three running terminals, sampled with `top -l 5 -s 3` while each w
 
 | Terminal | RSS (MB) | Idle CPU% |
 |---|---:|---:|
-| **rbterm** | **123** ★ | ~4.7% |
+| **rbterm** | **123** ★ | ~3.2% |
 | alacritty | 165 | 0.0% ★ |
 | kitty | 194 | 0.0% ★ |
 
@@ -279,20 +279,21 @@ Same machine, three running terminals, sampled with `top -l 5 -s 3` while each w
 - **Low idle CPU**. raylib doesn't have a damage model out of the
   box, so the main loop tracks a per-frame "did anything change?"
   flag and skips `BeginDrawing`/`EndDrawing` entirely when nothing
-  did. Adaptive idle cadence: a 5 Hz wake during recent activity
-  (typing stays snappy), stretching to 1 Hz after one quiet
-  second. Compared to the unconditional 60 fps full-grid redraw,
-  idle CPU dropped roughly 10×.
-- The remaining ~5% vs alacritty / kitty's 0% is the architectural
-  floor for raylib + GLFW on macOS: each `glfwPollEvents` call
-  drains the whole `NSApp` queue and costs ~50 ms even at 1 Hz.
-  Verified with a minimal `InitWindow + PollInputEvents +
-  WaitTime(1.0)` test program — same 5%. To go lower you'd need
-  `glfwWaitEventsTimeout` (kernel-blocked event wait), which
-  brew-installed raylib hides; closing the gap requires rebuilding
-  raylib with `USE_EXTERNAL_GLFW` so its bundled GLFW is replaced
-  by a single shared one. That's a multi-hour change tied to the
-  same constraint as the multi-window rework.
+  did. Wake cadence is 250 Hz (4 ms cap) when focused — keeps
+  typing and chord shortcuts (Cmd+T, Cmd+1) feeling instant —
+  and 20 Hz when unfocused so Cmd+Tab still surfaces the window
+  fast. Compared to the unconditional 60 fps full-grid redraw,
+  idle CPU dropped ~15×.
+- The remaining ~3% vs alacritty / kitty's 0% is the architectural
+  floor for raylib + GLFW on macOS: every `glfwPollEvents` call
+  drains the whole `NSApp` queue. Verified with a minimal
+  `InitWindow + PollInputEvents + WaitTime` repro — same floor.
+  To go lower you'd need `glfwWaitEventsTimeout` (kernel-blocked
+  event wait), which brew-installed raylib hides; closing the gap
+  requires rebuilding raylib with `USE_EXTERNAL_GLFW` so its
+  bundled GLFW is replaced by a single shared one. That's a
+  multi-hour change tied to the same constraint as the
+  multi-window rework.
 
 > **Caveat to set expectations**: vtebench measures *one* axis — PTY
 > drain throughput. echo_bench measures *another* — round-trip
