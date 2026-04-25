@@ -169,6 +169,7 @@ typedef struct {
     int  hud_color[HUD_FIELD_COUNT];  /* index into the preset palette (0..HUD_PALETTE_COUNT-1) */
     int  hud_size[HUD_FIELD_COUNT];   /* font size in points, clamped 10..18 */
     bool hud_show_cpu;           /* CPU sparkline (last 60 sec) under the text slab */
+    bool hud_collapsed;          /* user rolled the slab up to a chevron tab */
 } AppSettings;
 
 /* Indexed palette used for HUD field colours. Keep the order stable
@@ -317,6 +318,7 @@ static void app_settings_init(void) {
         g_app_settings.hud_size[i]  = 12;    /* sensible default; range 10..18 */
     }
     g_app_settings.hud_show_cpu = true;
+    g_app_settings.hud_collapsed = false;
     const char *home = getenv("HOME");
 #ifdef _WIN32
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -2215,7 +2217,10 @@ static const char *tab_label(const Tab *t) {
         if (base) return base + 1;
         return p->cwd;
     }
-    return "shell";
+    /* Cold-start fallback: nothing known yet (no OSC 0/2 title, cwd
+       not yet detected). Use the brand so the macOS title bar +
+       Cmd-Tab label read as "rbterm" instead of a generic "shell". */
+    return "rbterm";
 }
 
 /* ---------- Pane layout ---------- */
@@ -2528,11 +2533,26 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
        use hud_format's single-string output anymore — each field is
        formatted, measured, and drawn separately so it can carry its
        own size + colour. Slab dimensions are computed from the
-       widest measured line and the sum of per-line heights. */
+       widest measured line and the sum of per-line heights.
+
+       Click-to-roll: clicking the slab toggles g_app_settings.hud_collapsed.
+       When collapsed, the slab eases down to a tiny chevron tab the
+       user can click to expand again. Useful when the HUD covers
+       interesting terminal text. */
+    static float s_hud_phase = 1.0f;   /* 0 = collapsed, 1 = fully expanded */
+    {
+        float target = g_app_settings.hud_collapsed ? 0.0f : 1.0f;
+        s_hud_phase += (target - s_hud_phase) * 0.25f;
+        if (s_hud_phase < 0.001f) s_hud_phase = 0.0f;
+        if (s_hud_phase > 0.999f) s_hud_phase = 1.0f;
+    }
+    bool hud_hover = false;
     if (g_app_settings.show_hud) {
         const int x_pad  = 8;
         const int y_pad  = 6;
         const int margin = 8;
+        Vector2 _mp = GetMousePosition();
+        bool _click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
         for (int pi = 0; pi < t->num_panes; pi++) {
             Pane *p = &t->panes[pi];
             PaneRect pr;
@@ -2592,8 +2612,20 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             if (rendered_count == 0 && !draw_spark) continue;
 
             int spark_w = (max_w > spark_min_w) ? max_w : spark_min_w;
-            int slab_w = (draw_spark ? spark_w : max_w) + x_pad * 2;
-            int slab_h = total_h + (draw_spark ? spark_h + 4 : 0) + y_pad * 2;
+            int slab_w_full = (draw_spark ? spark_w : max_w) + x_pad * 2;
+            int slab_h_full = total_h + (draw_spark ? spark_h + 4 : 0) + y_pad * 2;
+            /* When collapsed, the slab shrinks vertically to ~14px
+               and shows just a chevron. Animate via s_hud_phase. */
+            const int collapsed_h = 14;
+            int slab_w = slab_w_full;
+            int slab_h;
+            if (s_hud_phase >= 1.0f) {
+                slab_h = slab_h_full;
+            } else if (s_hud_phase <= 0.0f) {
+                slab_h = collapsed_h;
+            } else {
+                slab_h = (int)(collapsed_h + (slab_h_full - collapsed_h) * s_hud_phase);
+            }
             int slab_x, slab_y;
             switch (g_app_settings.hud_pos) {
             case HUD_POS_TOP_LEFT:
@@ -2614,28 +2646,54 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                 slab_y = pr.y + margin;
                 break;
             }
+            /* Hover + click handling. While the slab is at least
+               partly visible, hovering inside it changes the cursor
+               to a pointer; clicking toggles the collapsed state. */
+            bool inside_slab = _mp.x >= slab_x && _mp.x < slab_x + slab_w
+                            && _mp.y >= slab_y && _mp.y < slab_y + slab_h;
+            if (inside_slab) hud_hover = true;
+            if (inside_slab && _click) {
+                g_app_settings.hud_collapsed = !g_app_settings.hud_collapsed;
+            }
+
             DrawRectangle(slab_x, slab_y, slab_w, slab_h,
                           (Color){10, 12, 18, 175});
             DrawRectangleLines(slab_x, slab_y, slab_w, slab_h,
                                (Color){80, 90, 110, 100});
 
+            /* Roll-up content draws at full opacity but is clipped
+               to the current slab height so as the slab shrinks the
+               text rolls up cleanly behind the slab edge. */
+            BeginScissorMode(slab_x, slab_y, slab_w, slab_h);
             int yy = slab_y + y_pad;
-            for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
-                if (!g_app_settings.hud_show[fi]) continue;
-                int fs = g_app_settings.hud_size[fi];
-                if (fs < 10) fs = 10;
-                if (fs > 18) fs = 18;
-                int ci = g_app_settings.hud_color[fi];
-                if (ci < 0 || ci >= HUD_PALETTE_COUNT) ci = 0;
-                DrawText(texts[fi], slab_x + x_pad, yy, fs,
-                         HUD_PALETTE[ci]);
-                yy += line_h[fi];
+            if (s_hud_phase > 0.05f) {
+                for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+                    if (!g_app_settings.hud_show[fi]) continue;
+                    int fs = g_app_settings.hud_size[fi];
+                    if (fs < 10) fs = 10;
+                    if (fs > 18) fs = 18;
+                    int ci = g_app_settings.hud_color[fi];
+                    if (ci < 0 || ci >= HUD_PALETTE_COUNT) ci = 0;
+                    DrawText(texts[fi], slab_x + x_pad, yy, fs,
+                             HUD_PALETTE[ci]);
+                    yy += line_h[fi];
+                }
+            } else {
+                /* Collapsed handle: draw a small chevron (▾) so the
+                   user knows where to click to expand again. */
+                const char *chevron = "v stats";
+                int csz_w = MeasureText(chevron, 10);
+                int cx = slab_x + (slab_w - csz_w) / 2;
+                int cy = slab_y + (slab_h - 10) / 2;
+                DrawText(chevron, cx, cy, 10,
+                         (Color){180, 200, 230, 220});
             }
 
             /* CPU sparkline. Walks the ring buffer in chronological
                order (oldest sample at the left, newest at the right)
-               and draws one filled bar per sample. */
-            if (draw_spark) {
+               and draws one filled bar per sample. Inside the same
+               scissor as text so it rolls up with the rest. */
+            if (draw_spark && s_hud_phase > 0.05f) {
                 yy += 4;
                 int gx = slab_x + x_pad;
                 int gy = yy;
@@ -2686,11 +2744,13 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                              (Color){220, 224, 232, 220});
                 }
             }
+            EndScissorMode();
         }
     }
 
-    SetMouseCursor(want_url_cursor ? MOUSE_CURSOR_POINTING_HAND
-                                   : MOUSE_CURSOR_DEFAULT);
+    SetMouseCursor(hud_hover ? MOUSE_CURSOR_POINTING_HAND
+                  : want_url_cursor ? MOUSE_CURSOR_POINTING_HAND
+                                    : MOUSE_CURSOR_DEFAULT);
     (void)win_w; (void)win_h;
     (void)time_sec;
 }
