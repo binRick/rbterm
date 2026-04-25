@@ -692,6 +692,44 @@ Deliberate v1 limits:
   `<prefix>[` copy-mode.
 - No regex, no search-within-selection, no case-sensitivity toggle.
 
+## Dirty-flag gotcha — state changes need an explicit trigger
+
+The main loop skips `BeginDrawing` / `EndDrawing` whenever
+`dirty == false`. That means **any code path that mutates UI
+state without producing PTY output has to set `dirty = true`
+itself, or the screen freezes on the old state until something
+else (mouse move, shell write) triggers a redraw**.
+
+The trap is that the screen is sometimes wrong but the action
+fired correctly — symptom looks like "Cmd+1 is extremely
+sluggish" when really the tab switched instantly and the loop
+just isn't repainting.
+
+The unified catch in `main.c` is a snapshot of cross-frame UI
+state: `prev_active` (= `g_active`) and `prev_ui_mode`
+(= `g_ui_mode`). At the end of each iteration:
+
+```c
+if (g_active != prev_active) dirty = true;
+if ((int)g_ui_mode != prev_ui_mode) dirty = true;
+prev_active = g_active;
+prev_ui_mode = (int)g_ui_mode;
+```
+
+This catches every tab-switch chord (`Cmd+1..9`, `Cmd+[/]`,
+`Cmd+arrows`, `Cmd+Shift+arrows` reorder) and every modal
+toggle (settings / help / SSH form / pickers) without each
+one having to remember to mark dirty.
+
+When you add new cross-frame UI state (a new global, a new
+modal, a per-pane bool that affects rendering), either:
+
+- Extend the snapshot/compare block above, or
+- Set `dirty = true;` at the site that mutates it.
+
+Don't rely on the next mouse twitch to bail you out — the user
+notices.
+
 ## Idle CPU floor (macOS)
 
 **The number to know: ~3.2% idle CPU is the floor with brew raylib
