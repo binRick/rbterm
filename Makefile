@@ -190,4 +190,62 @@ PARSER_BENCH_OBJS := src/screen.o src/sixel.o src/kitty.o src/theme.o
 parser_bench: tools/parser_bench.c $(PARSER_BENCH_OBJS) src/themes_embedded.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/parser_bench.c $(PARSER_BENCH_OBJS) -lraylib -lm
 
-.PHONY: all app clean bench bench-plot bench-clean
+# ---------- latency benchmark (typometer) ----------
+#
+# vtebench measures PTY drain throughput; typometer measures the
+# axis users actually feel: keystroke → pixel latency. It paints a
+# coloured square the moment a synthetic keypress fires and watches
+# the screen for the rendered character to appear.
+#
+# Interactive — `make latency-bench` downloads + launches Typometer,
+# but you have to position the window over the terminal under test,
+# click "Measure", and read the min/avg/max ms result yourself.
+# Repeat for each terminal you want to compare.
+#
+# macOS gotcha: Typometer needs Accessibility + Screen Recording
+# permissions (System Settings → Privacy & Security). Approve once
+# per relaunch.
+TYPOMETER_VER := 1.0.1
+TYPOMETER_DIR := tools/typometer
+TYPOMETER_JAR := $(TYPOMETER_DIR)/typometer-$(TYPOMETER_VER).jar
+TYPOMETER_URL := https://github.com/pavelfatin/typometer/releases/download/v$(TYPOMETER_VER)/typometer-$(TYPOMETER_VER)-bin.zip
+
+$(TYPOMETER_JAR):
+	@if ! command -v java >/dev/null 2>&1 || ! java -version >/dev/null 2>&1; then \
+	  echo "Java not found. Install:"; \
+	  echo "  macOS:  brew install --cask temurin"; \
+	  echo "  Linux:  sudo apt install default-jre"; \
+	  exit 1; \
+	fi
+	@mkdir -p tools
+	@echo "Downloading typometer $(TYPOMETER_VER)..."
+	curl -fL -o /tmp/typometer.zip $(TYPOMETER_URL)
+	rm -rf $(TYPOMETER_DIR)
+	unzip -q -d tools /tmp/typometer.zip
+	mv tools/typometer-$(TYPOMETER_VER) $(TYPOMETER_DIR)
+	rm /tmp/typometer.zip
+
+latency-bench: $(TYPOMETER_JAR)
+	@echo ""
+	@echo "─────────────────────────────────────────────────────────────"
+	@echo "  Typometer — keystroke-to-pixel latency"
+	@echo "─────────────────────────────────────────────────────────────"
+	@echo "  1. Launch the terminal under test (rbterm / alacritty / …)."
+	@echo "  2. Position Typometer's window over a quiet patch of the"
+	@echo "     terminal — click into the terminal first so its cursor"
+	@echo "     blink doesn't pollute the pixel diff."
+	@echo "  3. Hit Typometer's 'Measure' button. Sit on your hands"
+	@echo "     for ~30s while it records 100+ samples."
+	@echo "  4. Read the min/avg/max latency in ms."
+	@echo "  5. Repeat for each terminal. Lower is better."
+	@echo ""
+	@echo "  macOS: first run will prompt for Accessibility + Screen"
+	@echo "  Recording permission. Grant both, then re-run."
+	@echo "─────────────────────────────────────────────────────────────"
+	@echo ""
+	java -jar $(TYPOMETER_JAR)
+
+latency-bench-clean:
+	rm -rf $(TYPOMETER_DIR)
+
+.PHONY: all app clean bench bench-plot bench-clean latency-bench latency-bench-clean

@@ -476,6 +476,16 @@ self-label. Alacritty and Kitty don't set `$TERM_PROGRAM`, so pass
 For step-by-step instructions across rbterm + iTerm2 + Apple
 Terminal + Kitty + Alacritty, see [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
+For the **other axis** users feel — keystroke-to-pixel latency —
+use [Typometer](https://pavelfatin.com/typometer/):
+
+```bash
+make latency-bench   # downloads + launches Typometer (Java GUI)
+```
+
+Setup, permissions, and per-terminal procedure are documented in
+[docs/BENCHMARKING.md#latency-benchmarking-with-typometer](docs/BENCHMARKING.md#latency-benchmarking-with-typometer).
+
 ## Limitations
 
 - No shaping, so ligatures and ZWJ sequences render as components.

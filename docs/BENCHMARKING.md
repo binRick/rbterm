@@ -175,6 +175,91 @@ older `.dat` files).
 
 ---
 
+## Latency benchmarking with Typometer
+
+vtebench measures PTY-drain throughput. The other axis users
+actually *feel* is **keystroke-to-pixel latency** — how long
+between hitting a key and seeing the character appear. A terminal
+can have great drain throughput and still feel sluggish if its
+render loop isn't tuned, and vice-versa.
+
+[Pavel Fatin's Typometer](https://pavelfatin.com/typometer/) is
+the standard tool for this. It paints a coloured square at the
+moment of a synthetic keypress and watches the screen for the
+rendered character to appear, sampling many times to give a
+distribution.
+
+```bash
+make latency-bench
+```
+
+The first run downloads Typometer (~5 MB) into
+`tools/typometer/`, checks for Java, and launches the GUI.
+Subsequent runs reuse the cached download.
+
+### Procedure (interactive — Typometer is a GUI)
+
+1. **Open the terminal** you want to test (rbterm / alacritty /
+   iTerm2 / …) at a comfortable size.
+2. **Click into the terminal once** so its text cursor isn't
+   blinking under the area Typometer will sample (a blinking
+   cursor is just noise the diff has to filter out).
+3. **Position the Typometer window** over a quiet patch of the
+   terminal — anywhere that isn't actively being redrawn.
+4. **Hit Typometer's "Measure" button**. Sit on your hands for
+   ~30 seconds. Don't touch the keyboard, mouse, or any other
+   window while it records.
+5. **Read the result** — Typometer reports min, avg, median, and
+   max latency in milliseconds. Lower = snappier.
+6. **Repeat for each terminal** you want to compare. Screenshot
+   or note the results manually; there's no automatic export.
+
+### Permissions (macOS)
+
+The first launch will prompt for two permissions:
+
+- **Accessibility** — to send synthetic keystrokes (System
+  Settings → Privacy & Security → Accessibility).
+- **Screen Recording** — to capture the pixels under its window
+  (System Settings → Privacy & Security → Screen Recording).
+
+Grant both, then `make latency-bench` again. macOS may also
+require a re-grant after every Typometer download (the binary
+identity changes), so if it stops working after a `make
+latency-bench-clean`, re-approve.
+
+### Java
+
+Typometer is a JVM app. Install Java once, system-wide:
+
+```bash
+# macOS
+brew install --cask temurin
+
+# Linux (Debian/Ubuntu)
+sudo apt install default-jre
+```
+
+### Cleaning up
+
+```bash
+make latency-bench-clean   # rm tools/typometer/
+```
+
+### Realistic expectations
+
+- A well-tuned native terminal lands around **10–25 ms** end-to-end
+  on M-series macOS at 60 Hz. Below 16.7 ms means you're getting
+  the keypress drawn within one display frame.
+- Electron-based terminals (Hyper, etc.) typically sit at
+  40–80 ms.
+- Vsync gates the floor — at 60 Hz you can't be faster than
+  ~8 ms (half a frame) without VRR / 120 Hz hardware.
+- Run on AC power. Laptops on battery throttle the GPU/scheduler
+  and add 5–15 ms of jitter.
+
+---
+
 ## Notes on what the numbers mean
 
 - vtebench writes 1 MiB of escape-sequence payload per sample and
