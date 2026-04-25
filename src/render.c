@@ -427,8 +427,8 @@ static void install_font(Renderer *r, Font f, int size, const char *path) {
     r->font_path[sizeof(r->font_path) - 1] = 0;
     measure_cell(r);
     present_set_build(&f);
-    int atlas_size = size * 2;
-    if (atlas_size > 96) atlas_size = 96;
+    int atlas_size = size * 3;
+    if (atlas_size > 144) atlas_size = 144;
     backup_font_ensure(atlas_size);
 }
 
@@ -515,12 +515,14 @@ static void forget_embedded_blob(Renderer *r) {
 static bool load_font_into(Renderer *r, const char *path, int size) {
     int cp_count;
     int *cps = build_codepoints(&cp_count);
-    /* Rasterise the atlas at 2× the display size and downsample at draw
+    /* Rasterise the atlas at 3× the display size and downsample at draw
        time. The extra glyph resolution survives the bilinear filter so
        strokes look brighter / less washed out — without this the default
-       white text reads as gray-ish because sRGB blending eats the edges. */
-    int atlas_size = size * 2;
-    if (atlas_size > 96) atlas_size = 96;
+       white text reads as gray-ish because sRGB blending eats the edges.
+       (2× looked fine on Linux + Windows but text felt thin on macOS
+       retina; 3× is sharper without the GPU memory hit being noticeable.) */
+    int atlas_size = size * 3;
+    if (atlas_size > 144) atlas_size = 144;
     Font f = LoadFontEx(path, atlas_size, cps, cp_count);
     free(cps);
     if (f.texture.id == 0) return false;
@@ -538,8 +540,8 @@ static bool load_font_data_into(Renderer *r, const unsigned char *data,
                                 const char *display_path) {
     int cp_count;
     int *cps = build_codepoints(&cp_count);
-    int atlas_size = size * 2;
-    if (atlas_size > 96) atlas_size = 96;
+    int atlas_size = size * 3;
+    if (atlas_size > 144) atlas_size = 144;
     char file_type[8] = ".";
     if (ext && *ext) {
         strncat(file_type, ext, sizeof(file_type) - 2);
