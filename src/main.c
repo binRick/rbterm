@@ -7900,9 +7900,13 @@ int main(int argc, char **argv) {
        at the cursor-blink rate (~2Hz) while idle. */
     Vector2 prev_mp = {0, 0};
     bool prev_blink_phase = false;
+    bool prev_focused = true;
 
     while (!WindowShouldClose() && g_num_tabs > 0) {
         bool dirty = false;
+        bool focused = IsWindowFocused();
+        if (focused != prev_focused) dirty = true;
+        prev_focused = focused;
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
@@ -8825,7 +8829,12 @@ int main(int argc, char **argv) {
             dirty = true;
         }
         bool blink_phase = ((long long)(GetTime() * 2.0)) & 1;
-        if (blink_phase != prev_blink_phase) dirty = true;
+        /* Cursor only blinks while focused — unfocused windows don't
+           need a redraw on every blink boundary. Real changes (PTY
+           input, mouse, focus toggle) keep their dirty triggers
+           regardless so incoming text still updates the visible
+           framebuffer if the window is partly on screen. */
+        if (focused && blink_phase != prev_blink_phase) dirty = true;
         prev_blink_phase = blink_phase;
 
         if (dirty) {
