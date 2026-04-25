@@ -51,6 +51,13 @@ typedef struct {
 #define IMG_CACHE_CAP 128
 static ImgEntry g_img_cache[IMG_CACHE_CAP];
 
+/* Look up an entry for this ScreenImage in the per-renderer image
+   cache; if it's not there (or has been replaced), upload its RGBA
+   pixels to a new GPU texture. Returns NULL on alloc failure or
+   when the screen reports zero pixel dims. Mark-and-sweep
+   eviction: in_use is reset by img_cache_begin_frame and slots
+   that don't get their flag set during the draw pass are evicted
+   by img_cache_prune_frame. */
 static ImgEntry *img_cache_get_or_upload(const ScreenImage *img) {
     uint64_t g = screen_image_generation(img);
     for (int i = 0; i < IMG_CACHE_CAP; i++) {
@@ -94,6 +101,10 @@ static ImgEntry *img_cache_get_or_upload(const ScreenImage *img) {
     return &g_img_cache[slot];
 }
 
+/* Drop GPU textures for image cache entries that weren't touched
+   this frame — i.e. images that have scrolled off or been evicted
+   from the screen's list. Called at end-of-frame after all in_use
+   flags have been set by the draw pass. */
 static void img_cache_prune_frame(void) {
     for (int i = 0; i < IMG_CACHE_CAP; i++) {
         if (g_img_cache[i].ok && !g_img_cache[i].in_use) {
@@ -103,10 +114,16 @@ static void img_cache_prune_frame(void) {
     }
 }
 
+/* Mark every image-cache slot as "not yet seen" at the start of a
+   frame. The draw pass sets in_use=true for slots it actually
+   blits; img_cache_prune_frame later evicts the ones still false. */
 static void img_cache_begin_frame(void) {
     for (int i = 0; i < IMG_CACHE_CAP; i++) g_img_cache[i].in_use = false;
 }
 
+/* Drop every cached glyph in `c`, freeing its GPU texture. Called
+   when the font / size changes and the existing rasterisations are
+   stale. */
 static void glyph_cache_clear(GlyphCache *c) {
     for (int i = 0; i < c->count; i++) {
         if (c->items[i].ok) UnloadTexture(c->items[i].tex);
@@ -114,11 +131,21 @@ static void glyph_cache_clear(GlyphCache *c) {
     c->count = 0;
 }
 
+/* Drop both emoji + monochrome-fallback glyph caches together —
+   typically called when font size changes and any rasterised
+   substitute glyphs need re-baking at the new pixel size. */
 static void emoji_cache_clear(void) {
     glyph_cache_clear(&g_emoji);
     glyph_cache_clear(&g_fallback);
 }
 
+/* Find or create a glyph cache entry for `cp` at `pixel_size`. If
+   the cache's recorded size doesn't match, we drop everything in
+   it (size changes are rare). Cache hits return immediately;
+   misses call glyph_render (Core Text on macOS, no-op stub on
+   other platforms) and upload the rasterised RGBA to a Texture2D.
+   `attempted` is sticky so we don't keep retrying glyphs the
+   rasteriser already declined. */
 static GlyphEntry *glyph_lookup(GlyphCache *c, uint32_t cp, int pixel_size) {
     if (c->pixel_size != pixel_size) {
         glyph_cache_clear(c);
@@ -195,6 +222,12 @@ static bool draw_box_drawing(int x, int y, int cw, int ch,
     return false;
 }
 
+/* Cheap heuristic: is this codepoint likely to be an emoji that
+   should go through the colour-glyph path? Used to short-circuit
+   font_missing() for the common case (any non-ASCII PUA / dingbat
+   codepoint should try the emoji rasteriser before falling back to
+   `?`). Not exhaustive — false negatives just mean an emoji draws
+   monochrome via Menlo fallback, which is OK. */
 static bool is_emoji_cp(uint32_t cp) {
     if (cp >= 0x1F000) return true;
     if (cp >= 0x2600  && cp <= 0x27BF) return true;
@@ -214,17 +247,24 @@ typedef struct {
 
 static CodepointSet g_present;
 
+/* qsort comparator — ordered ascending so font_missing can binary-
+   search the codepoint set. */
 static int cmp_u32(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return (x > y) - (x < y);
 }
 
+/* Forget the present-codepoint set; called before re-building it
+   for a new font. */
 static void present_set_clear(void) {
     free(g_present.cps);
     g_present.cps = NULL;
     g_present.count = g_present.cap = 0;
 }
 
+/* Walk every glyph raylib successfully rasterised in `f` and record
+   its codepoint into the present-set. Sorted afterwards so
+   font_missing's binary search works. Called once per font load. */
 static void present_set_build(Font *f) {
     present_set_clear();
     if (!f || !f->glyphs) return;
@@ -242,6 +282,9 @@ static void present_set_build(Font *f) {
     qsort(g_present.cps, g_present.count, sizeof(uint32_t), cmp_u32);
 }
 
+/* True iff `cp` is NOT in the main font's rasterised set, meaning
+   the renderer should try emoji / Menlo fallback / `?` placeholder
+   instead of drawing the font's tofu .notdef glyph. */
 static bool font_missing(uint32_t cp) {
     /* Space + control chars: nothing to draw, treat as "present" so
        the renderer doesn't burn cycles trying to substitute them. */
@@ -255,8 +298,9 @@ static bool font_missing(uint32_t cp) {
     return true;
 }
 
-/* Curated codepoint set: ASCII, Latin-1, Latin Ext-A/B, punctuation,
-   box drawing, block elements, powerline-ish arrows. */
+/* Build the codepoint list passed to LoadFontEx. Curated set:
+   ASCII, Latin-1, Latin Ext-A/B, general punctuation, arrows, box
+   drawing, block elements, dingbats, powerline. Caller frees. */
 static int *build_codepoints(int *out_count) {
     int ranges[][2] = {
         {0x20,   0x7E},
@@ -280,11 +324,17 @@ static int *build_codepoints(int *out_count) {
     return cps;
 }
 
+/* True if the path exists and is statable. Used by the font picker
+   to skip non-existent system paths without spamming raylib's
+   "couldn't load" log. */
 static bool file_exists(const char *p) {
     struct stat st;
     return stat(p, &st) == 0;
 }
 
+/* Return a sane default-monospace path or NULL. Walks a list of
+   well-known per-OS install locations in priority order. Caller
+   must NOT free — points into a static. */
 const char *renderer_find_default_font(void) {
     static const char *candidates[] = {
 #if defined(__EMSCRIPTEN__)
@@ -326,8 +376,14 @@ const char *renderer_find_default_font(void) {
     return NULL;
 }
 
+/* Cast helper — Renderer.font_data is a void* in the public header
+   so consumers don't need to include raylib.h. */
 static Font *as_font(Renderer *r) { return (Font *)r->font_data; }
 
+/* Compute the cell pixel dimensions from the current font + size.
+   Width is the rasterised "M" advance plus user-configured letter
+   spacing; height is 1.2x the nominal point size — slightly tall so
+   underlines and box-drawing don't crowd the next row. */
 static void measure_cell(Renderer *r) {
     Font *f = as_font(r);
     Vector2 v = MeasureTextEx(*f, "M", (float)r->font_size, 0.0f);
@@ -340,6 +396,9 @@ static void measure_cell(Renderer *r) {
     r->cell_h = h;
 }
 
+/* Adjust the per-cell pixel width by the configured letter-spacing
+   delta (clamped 0..32). Wider cells trade horizontal density for
+   readability on dense displays. */
 void renderer_set_cell_spacing(Renderer *r, int extra_w) {
     if (extra_w < 0)  extra_w = 0;
     if (extra_w > 32) extra_w = 32;
@@ -352,8 +411,10 @@ static void backup_font_ensure(int atlas_size);
 
 /* Install a freshly-loaded Font into the renderer, replacing whatever
    was loaded before. Shared by load_font_into / load_font_data_into.
-   Also reloads the broad backup font at the matching atlas size so
-   missing-glyph fallback rasterises at the right resolution. */
+   Records the path for future Settings-modal display, rebuilds the
+   present-codepoint set, and reloads the broad backup font at the
+   matching atlas size so missing-glyph fallback rasterises at the
+   right resolution. */
 static void install_font(Renderer *r, Font f, int size, const char *path) {
     if (r->font_data) {
         UnloadFont(*as_font(r));
@@ -381,6 +442,8 @@ static char g_backup_ext[8] = {0};
 static Font g_backup_font = {0};
 static int  g_backup_loaded_size = 0;     /* 0 = not yet loaded */
 
+/* Drop the loaded backup font (if any), freeing its GPU texture
+   and atlas. Idempotent. */
 static void backup_font_unload(void) {
     if (g_backup_loaded_size > 0) {
         UnloadFont(g_backup_font);
@@ -389,6 +452,9 @@ static void backup_font_unload(void) {
     }
 }
 
+/* Lazy-load the backup font at the requested atlas size, replacing
+   any previous load. No-op if (a) no backup blob is registered or
+   (b) the backup is already at the right size. */
 static void backup_font_ensure(int atlas_size) {
     if (!g_backup_data || g_backup_data_size <= 0) return;
     if (g_backup_loaded_size == atlas_size) return;
@@ -405,6 +471,10 @@ static void backup_font_ensure(int atlas_size) {
     g_backup_loaded_size = atlas_size;
 }
 
+/* Register the embedded backup-font blob (DejaVu Sans Mono in this
+   build) and trigger a lazy reload at the next size change. The
+   backup is rasterised on first need so we don't waste atlas RAM
+   if the primary font already has every glyph. */
 void renderer_set_backup_font_data(const unsigned char *data, int data_size,
                                    const char *ext) {
     g_backup_data = data;
@@ -418,7 +488,9 @@ void renderer_set_backup_font_data(const unsigned char *data, int data_size,
     backup_font_unload();   /* lazy reload at next size change */
 }
 
-/* Returns true if the backup font has a non-empty glyph for `cp`. */
+/* True iff the backup font has a non-empty rasterised glyph for
+   `cp` — used by the missing-glyph fallback to decide whether to
+   draw via the backup atlas before giving up to "?". */
 static bool backup_font_has(uint32_t cp) {
     if (g_backup_loaded_size == 0 || !g_backup_font.glyphs) return false;
     int idx = GetGlyphIndex(g_backup_font, (int)cp);
@@ -427,14 +499,19 @@ static bool backup_font_has(uint32_t cp) {
     return (gi->image.width > 0 && gi->image.height > 0);
 }
 
-/* Forget any cached embedded blob — call after switching back to a
-   disk-loaded font so a subsequent size change re-reads from path. */
+/* Drop the cached pointer to the embedded font blob. Called after
+   switching back to a disk-loaded font so the next size-change
+   path falls through to the disk loader instead of a stale memory
+   blob. */
 static void forget_embedded_blob(Renderer *r) {
     r->cur_data = NULL;
     r->cur_data_size = 0;
     r->cur_ext[0] = 0;
 }
 
+/* Load a font from disk + install it. Atlas is rasterised at 2x
+   the display size so bilinear-filtered glyphs stay crisp. Returns
+   false if raylib couldn't open / parse the file. */
 static bool load_font_into(Renderer *r, const char *path, int size) {
     int cp_count;
     int *cps = build_codepoints(&cp_count);
@@ -453,6 +530,9 @@ static bool load_font_into(Renderer *r, const char *path, int size) {
     return true;
 }
 
+/* Load a font from an in-memory blob (embedded fonts) and install
+   it. `display_path` is what gets shown in the font picker /
+   settings — typically a synthetic "embedded:NAME" string. */
 static bool load_font_data_into(Renderer *r, const unsigned char *data,
                                 int data_size, const char *ext, int size,
                                 const char *display_path) {
@@ -484,6 +564,8 @@ static bool load_font_data_into(Renderer *r, const unsigned char *data,
     return true;
 }
 
+/* Bring a Renderer up from zero state with a font loaded from disk
+   at the given size. Returns false if the font path doesn't open. */
 bool renderer_init(Renderer *r, const char *font_path, int font_size) {
     memset(r, 0, sizeof(*r));
     if (font_size < 6) font_size = 14;
@@ -497,6 +579,9 @@ bool renderer_init(Renderer *r, const char *font_path, int font_size) {
     return load_font_into(r, font_path, font_size);
 }
 
+/* Bring a Renderer up using an in-memory font blob (the embedded
+   fonts table). `display_path` is what the font picker shows to
+   the user; pass "embedded:NAME" by convention. */
 bool renderer_init_with_data(Renderer *r, const unsigned char *data,
                              int data_size, const char *ext,
                              const char *display_path, int font_size) {
@@ -510,6 +595,9 @@ bool renderer_init_with_data(Renderer *r, const unsigned char *data,
                                display_path ? display_path : "embedded:font");
 }
 
+/* Free every GPU resource the renderer holds — atlas textures,
+   glyph caches, present-codepoint set, backup font, primary font.
+   Safe to call on an uninitialised Renderer. */
 void renderer_shutdown(Renderer *r) {
     emoji_cache_clear();
     free(g_emoji.items);    g_emoji.items = NULL;    g_emoji.cap = 0;
@@ -522,6 +610,10 @@ void renderer_shutdown(Renderer *r) {
     r->font_data = NULL;
 }
 
+/* Re-rasterise the current font at a new pixel size. Clamps to
+   6..96. Re-uses the cached embedded blob (if the current font came
+   from memory) or re-reads from disk. Returns false on load fail —
+   the renderer stays at its previous size. */
 bool renderer_set_font_size(Renderer *r, int font_size) {
     if (font_size < 6) font_size = 6;
     if (font_size > 96) font_size = 96;
@@ -535,12 +627,16 @@ bool renderer_set_font_size(Renderer *r, int font_size) {
     return load_font_into(r, r->font_path, font_size);
 }
 
+/* Switch the active font to one at `path`, keeping the current
+   size. Validates the path exists first. */
 bool renderer_set_font_path(Renderer *r, const char *path) {
     if (!path || !*path) return false;
     if (!file_exists(path)) return false;
     return load_font_into(r, path, r->font_size);
 }
 
+/* Switch the active font to one in memory. Same idea as
+   renderer_init_with_data but for live-swap from the font picker. */
 bool renderer_set_font_data(Renderer *r, const unsigned char *data,
                             int data_size, const char *ext,
                             const char *display_path) {
@@ -550,6 +646,8 @@ bool renderer_set_font_data(Renderer *r, const unsigned char *data,
                                display_path ? display_path : "embedded:font");
 }
 
+/* 0xRRGGBB + alpha in 0..1 → raylib Color. Used everywhere a Cell's
+   stored RGB needs to be drawn. */
 static Color col_from_rgb(uint32_t v, float alpha) {
     Color c;
     c.r = (v >> 16) & 0xff;
@@ -568,12 +666,16 @@ static uint32_t resolve_fg(const Screen *s, Cell c) {
     if (c.attrs & ATTR_FG_INDEX)   return screen_palette(s, (int)(c.fg & 0xff));
     return c.fg;
 }
+/* Symmetric to resolve_fg — see the comment above. */
 static uint32_t resolve_bg(const Screen *s, Cell c) {
     if (c.attrs & ATTR_DEFAULT_BG) return screen_default_bg(s);
     if (c.attrs & ATTR_BG_INDEX)   return screen_palette(s, (int)(c.bg & 0xff));
     return c.bg;
 }
 
+/* True iff the given (col, row) view position falls inside the
+   active selection rectangle (which may run forward or backward —
+   we normalise locally). Used to paint the selection overlay. */
 static bool sel_contains(const Selection *sel, int col, int row) {
     if (!sel || !sel->active) return false;
     int r1 = sel->a_row, c1 = sel->a_col;
@@ -587,6 +689,15 @@ static bool sel_contains(const Selection *sel, int col, int row) {
     return true;
 }
 
+/* Render one Screen into the window at (x_offset, y_offset). Walks
+   the visible rows in three passes: backgrounds + selection overlay,
+   cursor shape, then glyphs (with per-codepoint fallback to the
+   emoji rasteriser, the embedded backup font, or a literal `?`).
+   Also paints sixel/kitty image bitmaps (cached as Texture2D),
+   underlines, the OSC 133 status gutter, and the right-edge
+   scrollback indicator when view_offset > 0. `hover_col`/`hover_row`
+   are -1 when the mouse isn't over this pane; otherwise they
+   identify the cell to brighten for OSC 8 hyperlink hover. */
 void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                    const Selection *sel, int x_offset, int y_offset,
                    int hover_col, int hover_row) {
