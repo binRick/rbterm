@@ -422,55 +422,65 @@ fail:
     return NULL;
 }
 
-/* HUD probe shell snippet. Designed to run on any vaguely
-   POSIX-like remote without leaking errors. Each line is `KEY=VALUE`
-   followed by a sentinel ("END=1") so the parser knows when to
-   stop reading. The CPU line is cumulative tick counts (busy +
-   total) — main.c computes % busy as a delta against the previous
-   sample, identical to the local-pane logic. */
+/* HUD probe shell snippet — Linux + BSD/macOS portable, sub-100ms
+   typical, silent-failure tolerant. Each line is `KEY=VALUE` ending
+   with `END=1` so the parser knows when to stop reading. CPU line
+   is cumulative tick counts; main.c computes % busy as a delta.
+
+   Wrapped in `sh -c` so we don't depend on the user's login shell
+   being sh-compatible (some remotes default to fish or csh, where
+   our $(...) and arithmetic expansion would break). */
 static const char *HUD_PROBE_SCRIPT =
-    "{"
-    "  H=$(hostname 2>/dev/null);"
-    /* IPv4: try `hostname -I` (Linux), then `hostname -i` (older), then ifconfig en0/en1 (BSD/macOS). */
-    "  I=$(hostname -I 2>/dev/null | awk '{print $1}');"
-    "  [ -z \"$I\" ] && I=$(hostname -i 2>/dev/null | awk '{print $1}');"
-    "  [ -z \"$I\" ] && for IF in en0 en1 eth0 ens33; do"
-    "    V=$(ifconfig $IF 2>/dev/null | awk '/inet /{print $2; exit}');"
-    "    [ -n \"$V\" ] && I=$V && break;"
-    "  done;"
-    "  L=$(uptime 2>/dev/null | sed -E 's/.*load averages?: ([0-9.]+).*/\\1/' | awk '{print $1}');"
-    /* Free memory in MB. Linux: free -m; macOS: vm_stat + sysctl. */
-    "  M=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}');"
-    "  if [ -z \"$M\" ]; then"
-    "    PS=$(sysctl -n hw.pagesize 2>/dev/null);"
-    "    if [ -n \"$PS\" ]; then"
-    "      M=$(vm_stat 2>/dev/null | awk -v ps=$PS '/free/{f=$3} /inactive/{i=$3} END{gsub(/\\./,\"\",f); gsub(/\\./,\"\",i); print int((f+i)*ps/1024/1024)}');"
-    "    fi;"
+    "exec /bin/sh -c '"
+    /* Hostname: env var first (always set by login shells), then
+       `hostname` command. Strip a trailing newline if any. */
+    "H=${HOSTNAME:-$(hostname 2>/dev/null)};"
+    /* IPv4: cascade through Linux + BSD locations. */
+    "I=$(hostname -I 2>/dev/null | awk \"{print \\$1}\");"
+    "[ -z \"$I\" ] && I=$(hostname -i 2>/dev/null | awk \"{print \\$1}\");"
+    "[ -z \"$I\" ] && for IF in en0 en1 eth0 ens33 enp0s3 wlan0; do"
+    "  V=$(ifconfig $IF 2>/dev/null | awk \"/inet /{print \\$2; exit}\");"
+    "  [ -n \"$V\" ] && I=$V && break;"
+    "done;"
+    "[ -z \"$I\" ] && I=$(ip -4 -o addr 2>/dev/null | awk \"\\$2!=\\\"lo\\\" {sub(/\\/.*/, \\\"\\\", \\$4); print \\$4; exit}\");"
+    /* Load average: /proc/loadavg first (cheapest, most reliable),
+       then uptime. */
+    "L=$(awk \"{print \\$1; exit}\" /proc/loadavg 2>/dev/null);"
+    "[ -z \"$L\" ] && L=$(uptime 2>/dev/null | sed -E \"s/.*load averages?: ([0-9.]+).*/\\1/\" | awk \"{print \\$1}\");"
+    /* Free memory in MB. Order: free -m ($7 = available on modern
+       util-linux); /proc/meminfo MemAvailable; vm_stat + page size
+       on macOS. */
+    "M=$(free -m 2>/dev/null | awk \"/^Mem:/{print \\$7}\");"
+    "[ -z \"$M\" ] && M=$(awk \"/^MemAvailable:/{print int(\\$2/1024); exit}\" /proc/meminfo 2>/dev/null);"
+    "if [ -z \"$M\" ]; then"
+    "  PS=$(sysctl -n hw.pagesize 2>/dev/null);"
+    "  if [ -n \"$PS\" ]; then"
+    "    M=$(vm_stat 2>/dev/null | awk -v ps=$PS \"/free/{f=\\$3} /inactive/{i=\\$3} END{gsub(/\\\\./,\\\"\\\",f); gsub(/\\\\./,\\\"\\\",i); print int((f+i)*ps/1024/1024)}\");"
     "  fi;"
-    "  D=$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,\"\",$5); print 100-$5}');"
-    /* Cumulative CPU ticks: Linux /proc/stat, macOS sysctl. */
-    "  if [ -r /proc/stat ]; then"
-    "    set -- $(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat);"
-    "    USER=$1; NICE=$2; SYSTEM=$3; IDLE=$4; IOWAIT=${5:-0}; IRQ=${6:-0}; SOFTIRQ=${7:-0}; STEAL=${8:-0};"
-    "    BUSY=$((USER+NICE+SYSTEM+IRQ+SOFTIRQ+STEAL));"
-    "    TOTAL=$((BUSY+IDLE+IOWAIT));"
-    "  else"
-    /* macOS fallback: aggregate ticks via sysctl kern.cp_time. */
-    "    CPT=$(sysctl -n kern.cp_time 2>/dev/null);"
-    "    set -- $CPT;"
-    "    USER=$1; NICE=$2; SYSTEM=$3; INTR=$4; IDLE=$5;"
-    "    BUSY=$((USER+NICE+SYSTEM+INTR));"
-    "    TOTAL=$((BUSY+IDLE));"
-    "  fi;"
-    "  echo HOST=$H;"
-    "  echo IP=$I;"
-    "  echo LOAD=$L;"
-    "  echo MEM_MB=$M;"
-    "  echo DISK_PCT=$D;"
-    "  echo CPU_BUSY=$BUSY;"
-    "  echo CPU_TOTAL=$TOTAL;"
-    "  echo END=1;"
-    "} 2>/dev/null";
+    "fi;"
+    "D=$(df -P / 2>/dev/null | awk \"NR==2{gsub(/%/,\\\"\\\",\\$5); print 100-\\$5}\");"
+    /* Cumulative CPU ticks. */
+    "if [ -r /proc/stat ]; then"
+    "  set -- $(awk \"/^cpu / {print \\$2,\\$3,\\$4,\\$5,\\$6,\\$7,\\$8,\\$9}\" /proc/stat);"
+    "  USER=$1; NICE=$2; SYSTEM=$3; IDLE=$4; IOWAIT=${5:-0}; IRQ=${6:-0}; SOFTIRQ=${7:-0}; STEAL=${8:-0};"
+    "  BUSY=$((USER+NICE+SYSTEM+IRQ+SOFTIRQ+STEAL));"
+    "  TOTAL=$((BUSY+IDLE+IOWAIT));"
+    "else"
+    "  CPT=$(sysctl -n kern.cp_time 2>/dev/null);"
+    "  set -- $CPT;"
+    "  USER=${1:-0}; NICE=${2:-0}; SYSTEM=${3:-0}; INTR=${4:-0}; IDLE=${5:-0};"
+    "  BUSY=$((USER+NICE+SYSTEM+INTR));"
+    "  TOTAL=$((BUSY+IDLE));"
+    "fi;"
+    "echo HOST=$H;"
+    "echo IP=$I;"
+    "echo LOAD=$L;"
+    "echo MEM_MB=$M;"
+    "echo DISK_PCT=$D;"
+    "echo CPU_BUSY=$BUSY;"
+    "echo CPU_TOTAL=$TOTAL;"
+    "echo END=1;"
+    "' 2>/dev/null";
 
 /* Read the next line from `chan` into `out` (NUL-terminated, no
    trailing newline). Returns the byte length or -1 on close/error.
@@ -525,9 +535,17 @@ static bool ssh_run_one_probe(SshPty *p) {
     snap.disk_free_pct = -1;
     bool got_end = false;
     char line[256];
+    /* Set RBTERM_HUD_DEBUG=1 to dump every probe response line to
+       stderr. Helpful when a remote returns nothing or garbage. */
+    static int debug = -1;
+    if (debug < 0) {
+        const char *dv = getenv("RBTERM_HUD_DEBUG");
+        debug = (dv && *dv && *dv != '0') ? 1 : 0;
+    }
     for (int i = 0; i < 16; i++) {   /* hard cap on lines */
         int n = read_line_locked(chan, line, sizeof(line), 500);
         if (n <= 0) break;
+        if (debug) fprintf(stderr, "rbterm hud probe: %s\n", line);
         if (strncmp(line, "HOST=", 5) == 0) {
             strncpy(snap.hostname, line + 5, sizeof(snap.hostname) - 1);
         } else if (strncmp(line, "IP=", 3) == 0) {
