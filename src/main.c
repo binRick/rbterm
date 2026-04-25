@@ -1480,6 +1480,9 @@ static void search_scroll_to_match(Pane *p, int idx) {
     if (want > 0) screen_scroll_view(p->scr, want);
 }
 
+/* Advance the current-match index by `delta` (+1 = next, -1 =
+   prev). Wraps around. Triggers a viewport scroll so the new
+   current match is visible. */
 static void search_next(Pane *p, int delta) {
     Search *S = &p->search;
     if (S->count == 0) return;
@@ -1490,6 +1493,9 @@ static void search_next(Pane *p, int delta) {
     search_scroll_to_match(p, i);
 }
 
+/* Open the search bar on a pane. Resets the query, caret, and
+   selection state so the bar starts fresh — caller is expected to
+   have already saved any view state they want to preserve. */
 static void search_open(Pane *p) {
     if (!p) return;
     p->search.active = true;
@@ -1500,6 +1506,8 @@ static void search_open(Pane *p) {
     search_clear_matches(&p->search);
 }
 
+/* Close the search bar and snap the viewport back to the live
+   bottom (matches iTerm2's "Esc-out reverts scroll" behaviour). */
 static void search_close(Pane *p) {
     if (!p) return;
     p->search.active = false;
@@ -4074,12 +4082,17 @@ typedef enum {
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
 static void fonts_load(const char *current_path);
+/* Open the Settings modal. Reloads the on-disk font list so the
+   font picker is populated with whatever's installed right now. */
 static void settings_open(Renderer *r) {
     g_ui_mode = UI_SETTINGS;
     g_settings_status[0] = 0;
     fonts_load(r ? r->font_path : NULL);
 }
 
+/* Set the renderer font size + cascade through every tab so each
+   pane resizes to the new cell dimensions. Also bumps the window
+   minimum size so the user can't shrink below a usable grid. */
 static void settings_apply_font_size(Renderer *r, int new_size) {
     if (renderer_set_font_size(r, new_size)) {
         tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
@@ -4124,6 +4137,9 @@ static int g_theme_list_selected = -1;
    FontEntry + g_fonts + scroll state are declared near the top of the
    file so the SSH form can read the same list for its per-host picker. */
 
+/* Quick filename heuristic — does this font's name contain any of
+   the well-known monospace markers? Used to filter the disk-scan
+   results so the picker isn't drowned in proportional fonts. */
 static bool looks_monospace(const char *name) {
     /* Anything whose filename contains one of these fragments is shown
        in the picker. Keep the list generous — false positives in the
@@ -4144,17 +4160,23 @@ static bool looks_monospace(const char *name) {
     return false;
 }
 
+/* qsort comparator — alphabetise font entries case-insensitively. */
 static int cmp_font_name(const void *a, const void *b) {
     return strcasecmp(((const FontEntry *)a)->name,
                       ((const FontEntry *)b)->name);
 }
 
+/* Case-insensitive ends-with check — used to filter for .ttf /
+   .otf / .ttc when scanning system font dirs. */
 static bool ends_with_ci(const char *s, const char *suffix) {
     size_t ls = strlen(s), lsfx = strlen(suffix);
     if (ls < lsfx) return false;
     return strcasecmp(s + ls - lsfx, suffix) == 0;
 }
 
+/* Walk one font directory (recursing one level — most distros nest
+   under font-name subdirs) and append every monospace-looking font
+   to g_fonts. Silent on opendir failure so missing dirs don't spam. */
 static void scan_font_dir(const char *dir) {
 #ifdef _WIN32
     char pattern[1024];
@@ -4309,6 +4331,10 @@ static void scan_bundled_fonts(void) {
 #endif
 }
 
+/* Scan every known font location (system dirs, bundled rbterm
+   resources, embedded blobs) and rebuild g_fonts. Highlights the
+   `current_path` in the picker if found. Idempotent — every
+   settings_open / ssh_form_open call rebuilds the list. */
 static void fonts_load(const char *current_path) {
     fonts_free_previews();
     g_font_count = 0;
@@ -4359,6 +4385,9 @@ static void fonts_load(const char *current_path) {
     }
 }
 
+/* Switch the renderer to a picked font (disk file or embedded
+   blob), keep the current size, and reflow every pane to the
+   new cell metrics. */
 static void settings_apply_font(Renderer *r, const FontEntry *fe) {
     if (!fe) return;
     bool ok;
@@ -4374,6 +4403,9 @@ static void settings_apply_font(Renderer *r, const FontEntry *fe) {
                      r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
 }
 
+/* Adjust the cell-grid padding (gap between window edge and the
+   first cell), clamped to 0..64. Triggers a pane resize since
+   usable cell rows/cols depend on padding. */
 static void settings_apply_padding(Renderer *r, int new_pad) {
     if (new_pad < 0) new_pad = 0;
     if (new_pad > 64) new_pad = 64;
@@ -4384,6 +4416,8 @@ static void settings_apply_padding(Renderer *r, int new_pad) {
                      r->cell_h * 5 + TAB_BAR_H + 2 * r->pad_y);
 }
 
+/* Set the extra horizontal pixels per cell (letter spacing).
+   Triggers a pane resize. */
 static void settings_apply_spacing(Renderer *r, int new_extra) {
     renderer_set_cell_spacing(r, new_extra);
     tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
@@ -4394,6 +4428,10 @@ static void settings_apply_spacing(Renderer *r, int new_extra) {
 static bool g_settings_dir_focus = false;
 static bool g_settings_dir_sel_all = false;
 
+/* Compute the Settings modal layout: tab-bar buttons, content rects
+   for the active tab only (Font / Theme / Session / Window),
+   bottom-anchored Save-as-Default + Close. Shared by draw + click
+   hit-test. */
 static SettingsLayout settings_layout(int win_w, int win_h) {
     SettingsLayout L = {0};
     /* Modal is sized to the tallest tab's content so swapping tabs
@@ -4512,6 +4550,11 @@ static int *g_slider_drag_target;
 static int  g_slider_drag_min;
 static int  g_slider_drag_max;
 
+/* One frame of mouse handling for the Settings modal. Continues an
+   in-progress slider drag, hit-tests tab-bar buttons, then dispatches
+   to the controls of the active tab (font +/-, font list rows,
+   theme rows, cursor-style buttons, padding/spacing, log toggle/dir,
+   key-repeat sliders, startup-window picker, save/close). */
 static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
@@ -4690,6 +4733,10 @@ static void list_scroll_to(int *scroll, int selected, int total, int row_h, int 
     if (*scroll < 0) *scroll = 0;
 }
 
+/* Keyboard handling for the Settings modal: Esc closes, Tab cycles
+   focus, the log-dir text input has its own caret/edit chord set,
+   and Up/Down navigates whichever list (font/theme) currently has
+   keyboard focus. */
 static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
 #if defined(__APPLE__)
@@ -4997,6 +5044,11 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
                11, 0, (Color){110, 115, 130, 255});
 }
 
+/* Render the Settings modal: panel + title bar, tab-bar buttons,
+   the active tab's content (font controls / theme list / session
+   logging + key repeat / startup-window mode), the bottom-anchored
+   Save-as-Default + Close, and the status / "saved" line above
+   them. */
 static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
     DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
@@ -5514,6 +5566,7 @@ static void open_url(const char *url) {
 
 /* ---------- Main ---------- */
 
+/* Print the --help message to stdout. */
 static void usage(void) {
     printf("rbterm — raylib terminal emulator\n"
            "Usage: rbterm [--font PATH] [--size N] [--cols N] [--rows N]\n"
