@@ -124,6 +124,157 @@ job each frame is walking the cell grid, parsing PTY input through a
 hand-written DFA, and handing rlgl the vertex data; the rest is
 pixels on the GPU.
 
+## Session recording — seven formats, two of them ffmpeg-free
+
+Hit **● Rec** in the tab bar and rbterm captures the active pane.
+Stop opens a save modal with seven format pills:
+
+| Format | Encoder | External deps |
+|---|---|---|
+| `cast` | asciinema v2 (raw event log) | none |
+| `txt`  | ANSI-stripped, CR/BS-aware overprint | none |
+| `gif`  | hand-written LZW + 6×6×6 RGB cube + 40-step gray ramp (`gif_encoder.c`) | **none** |
+| `webp` | `libwebp` + `libwebpmux` animated WebP (`webp_encoder.c`) | bundled into the binary |
+| `mp4`  | rawvideo piped to `ffmpeg -c:v libx264 -pix_fmt yuv420p -movflags +faststart` | ffmpeg on PATH |
+| `webm` | rawvideo piped to `ffmpeg -c:v libvpx -b:v 1M -pix_fmt yuv420p` | ffmpeg on PATH |
+| `apng` | render via the gif encoder, then `ffmpeg -i tmp.gif -plays 1` | ffmpeg on PATH |
+
+`cast`, `txt`, `gif`, and `webp` work out of the box on a fresh
+machine. The video formats need ffmpeg only because the static
+build with libx264/libvpx isn't worth bundling alongside the binary
+yet.
+
+How it actually works:
+
+1. **Tap.** Every byte the shell hands back is mirrored into a
+   live asciinema v2 `.cast` (`[<seconds>, "o", "<json-bytes>"]`).
+   The recording opens with a **synthetic snapshot at t=0** that
+   emits ANSI to reproduce the screen state at the moment Rec was
+   pressed — playback starts on what you were already looking at,
+   not a blank screen.
+2. **Stop.** Capture freezes; the save modal opens.
+3. **Render.** Replay the cast events into a *hidden* `Screen`
+   (no IO, no callbacks), draw each frame to an off-screen
+   `RenderTexture2D`, hand the rgba to whichever encoder the
+   format pill picked. Encoding runs in **6-frame chunks** with
+   the modal redrawn between chunks so the spinner + percentage
+   stay live — without that, macOS overlays the "not responding"
+   beachball during a long save.
+4. **Preview** opens the result in the OS default app without
+   saving over the destination; **Save** writes to the path field.
+
+```mermaid
+flowchart TB
+    Tap["PTY tap<br/>(every byte the shell prints)"] -->|"asciinema v2 events"| Cast[("temp .cast")]
+    Cast --> Pick{"Save format?"}
+    Pick -->|cast| Mv["rename → dst"]
+    Pick -->|txt| Strip["strip ANSI · CR/BS cursor<br/>(one pass, no render)"]
+    Pick -->|"gif · webp · mp4 · webm · apng"| Replay["Replay events into hidden Screen<br/>off-screen RenderTexture · 15 fps · chunked 6 frames"]
+    Replay --> Enc{encoder}
+    Enc -->|gif| GE["gif_encoder.c<br/>(LZW · 6×6×6 cube)"]
+    Enc -->|webp| WE["webp_encoder.c<br/>(libwebp + libwebpmux)"]
+    Enc -->|"mp4 · webm"| FF["ffmpeg pipe<br/>(rawvideo → x264 / vpx)"]
+    Enc -->|apng| TP["temp gif → ffmpeg apng"]
+    Mv --> Out[("dst.<ext>")]
+    Strip --> Out
+    GE --> Out
+    WE --> Out
+    FF --> Out
+    TP --> Out
+
+    classDef src fill:#1e2a44,stroke:#5a8,color:#dfe;
+    classDef enc fill:#44321e,stroke:#fa5,color:#fed;
+    classDef out fill:#2a1e44,stroke:#a58,color:#fde;
+    class Tap,Cast src;
+    class GE,WE,FF,TP,Strip,Mv enc;
+    class Out out;
+```
+
+Default save folder is configurable in **Settings → Recording**.
+One recording at a time globally; switching tabs while recording
+works but only the originally-selected pane is captured.
+
+## System-info HUD — local *and* remote, in the corner of every pane
+
+A translucent overlay in any corner of every pane showing the
+host's vitals at a glance. Built so SSH panes "just work": tab
+into a remote box and the HUD switches to that machine's stats
+without any agent install, sidecar, or extra port — it
+piggy-backs on the existing libssh connection.
+
+| Field | Local source (macOS / Linux) | Remote source (over SSH) |
+|---|---|---|
+| Hostname | `gethostname()` (`.local` stripped) | `hostname` (parsed) |
+| IP | `getifaddrs()` first non-loopback IPv4 | `hostname -I` → `hostname -i` → ifconfig |
+| Load (1m) | `getloadavg()` | `uptime` |
+| Free memory | `host_statistics64(HOST_VM_INFO64)` / `MemAvailable` | `free -m` → `vm_stat + sysctl` |
+| Free disk % | `statfs("/")` / `statvfs("/")` | `df -P /` |
+| CPU sparkline | `host_statistics(HOST_CPU_LOAD_INFO)` / `/proc/stat` | `/proc/stat` → `sysctl kern.cp_time` |
+
+**Local panes** sample once a second via direct syscalls. All
+sub-millisecond — measured zero CPU impact at 1 Hz on a modern
+host.
+
+**SSH panes** run a dedicated probe thread next to the reader
+thread. Every 2 sec it opens a fresh exec channel on the *same*
+libssh session, runs a small POSIX-portable shell snippet that
+echoes `KEY=VALUE` lines, parses them, and stores the result
+under a mutex. The probe uses `pthread_mutex_trylock` against
+the shared session lock so a busy interactive shell (`cat`,
+`find`, `git log`) never gets stalled by it — busy probe cycles
+just skip and show the previous second's data for one more
+second. The shell snippet is intentionally portable: tries
+`hostname -I` then `-i` then ifconfig; reads `/proc/stat` if
+present else `sysctl -n kern.cp_time`; reads `free -m` then
+falls back to `vm_stat + sysctl`. Failure modes are quiet —
+anything the probe can't compute keeps the last known value
+rather than flickering to `?`.
+
+```mermaid
+flowchart LR
+    subgraph Local["Local pane"]
+        L1["main loop (1 Hz)"] --> L2["hud_local_poll()"]
+        L2 --> L3["gethostname · getifaddrs<br/>getloadavg · host_statistics64<br/>statfs · CPU ticks"]
+    end
+    subgraph SSH["SSH pane"]
+        S1["probe thread (2 Hz)<br/>· pthread_mutex_trylock"] --> S2["fresh exec channel<br/>on existing libssh session"]
+        S2 --> S3["KEY=VALUE shell snippet<br/>· portable Linux + macOS"]
+        S3 --> S4["pty_hud_snapshot()<br/>(under hud_lock)"]
+    end
+    L3 --> R["Pane->hud_*<br/>(common storage)"]
+    S4 --> R
+    R --> Render["draw HUD slab + sparkline<br/>(translucent · per-field colour/size)"]
+
+    classDef poll fill:#1e2a44,stroke:#5a8,color:#dfe;
+    classDef store fill:#2a1e44,stroke:#a58,color:#fde;
+    class L1,L2,L3,S1,S2,S3,S4 poll;
+    class R,Render store;
+```
+
+The CPU sparkline is a 60-sample ring buffer rendered as filled
+bars below the text slab — green to yellow at 0–50 %, yellow to
+red at 50–100 %, with the most-recent value shown as a `cpu N%`
+tag. First minute ramps up as samples arrive; nothing flickers.
+
+Customization lives in **Settings → HUD**:
+
+- Master enable, plus a position picker for the four corners.
+- Per-field **Visible** toggle (suppressed fields shrink the
+  slab to fit).
+- Per-field **colour** swatch — click cycles an 8-entry palette
+  (light grey / white / cyan / green / yellow / orange / pink /
+  lavender). Indices are stable across releases so saved configs
+  roundtrip.
+- Per-field **size** in points (10–18). Each row measures at its
+  own size; the slab handles mixed-height rows.
+- CPU graph toggle — flip off if a pinned 1 Hz line on every
+  pane bothers you.
+
+Click the chevron above the slab to **roll the HUD up** when
+it's covering text you care about; click again to roll back
+down. State is per-process; persistence sits with the rest of
+the settings under "Save as Default".
+
 ## Architecture
 
 Three layers wired together by a thin platform abstraction. Bytes
@@ -406,59 +557,16 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   commands jump out from a screenful of output. Per-row
   `pmark`/`pexit` storage means the marks scroll with their content
   and stick around through scrollback.
-- **System-info HUD** — translucent overlay in the corner of every
-  pane: hostname, IP, 1-min load average, free memory, free disk,
-  and a 60-second CPU sparkline (green→yellow→red ramp). Per-field
-  colour and font size, choose any of the four corners, toggle
-  individual fields off in Settings → HUD. **Local panes** poll
-  via direct syscalls (`getloadavg`, `getifaddrs`,
-  `host_statistics64` / `/proc/meminfo`, `statfs` / `statvfs`).
-  **SSH panes** automatically show the *remote* host's stats — a
-  dedicated probe thread runs an auxiliary exec channel on the
-  existing libssh session every 2 sec, parses the output, and
-  feeds the same render path. Probe uses `pthread_mutex_trylock`
-  against the shared session lock so a busy shell never gets
-  stalled — it just shows the previous-second's data for one
-  extra second.
-- **Session recording with native encoders — no ffmpeg required for
-  most outputs.** Toolbar **● Rec** button captures the active pane
-  to an asciinema v2 `.cast`. Stop opens a save modal with format
-  pills: `cast` (raw), `txt` (plain text, ANSI-stripped with
-  CR/BS-aware overprint), `gif` (native encoder bundled into the
-  binary — LZW + 6×6×6 RGB cube + 40-step gray ramp, no deps),
-  `webp` (native libwebp + libwebpmux, no ffmpeg), `mp4` / `webm` /
-  `apng` (via ffmpeg, optional). Live progress spinner during
-  render; Preview opens the result in your default app without
-  saving. Recording starts with a snapshot of the current screen
-  so playback opens on what you see, not blank. Default save
-  folder is configurable in Settings → Recording.
-
-  ```mermaid
-  flowchart TB
-      Tap["PTY tap<br/>(every byte the shell prints)"] -->|"asciinema v2 events"| Cast[("temp .cast")]
-      Cast --> Pick{"Save format?"}
-      Pick -->|cast| Mv["rename → dst"]
-      Pick -->|txt| Strip["strip ANSI · CR/BS cursor<br/>(one pass, no render)"]
-      Pick -->|"gif · webp · mp4 · webm · apng"| Replay["Replay events into hidden Screen<br/>off-screen RenderTexture · 15fps · chunked 6 frames"]
-      Replay --> Enc{encoder}
-      Enc -->|gif| GE["gif_encoder.c<br/>(LZW · 6×6×6 cube)"]
-      Enc -->|webp| WE["webp_encoder.c<br/>(libwebp + libwebpmux)"]
-      Enc -->|"mp4 · webm"| FF["ffmpeg pipe<br/>(rawvideo → x264 / vpx)"]
-      Enc -->|apng| TP["temp gif → ffmpeg apng"]
-      Mv --> Out[("dst.<ext>")]
-      Strip --> Out
-      GE --> Out
-      WE --> Out
-      FF --> Out
-      TP --> Out
-
-      classDef src fill:#1e2a44,stroke:#5a8,color:#dfe;
-      classDef enc fill:#44321e,stroke:#fa5,color:#fed;
-      classDef out fill:#2a1e44,stroke:#a58,color:#fde;
-      class Tap,Cast src;
-      class GE,WE,FF,TP,Strip,Mv enc;
-      class Out out;
-  ```
+- **System-info HUD** — corner overlay with hostname, IP, load,
+  free memory + disk, and a 60-second CPU sparkline. SSH panes
+  automatically show the *remote* host's stats via a dedicated
+  probe thread. See **[System-info HUD](#system-info-hud--local-and-remote-in-the-corner-of-every-pane)**
+  above for how it's wired.
+- **Session recording with native encoders.** Capture any pane to
+  one of seven formats — `cast` / `txt` / `gif` / `webp` work
+  without ffmpeg; `mp4` / `webm` / `apng` use ffmpeg if it's on
+  PATH. See **[Session recording](#session-recording--seven-formats-two-of-them-ffmpeg-free)**
+  above for the pipeline.
 
 ## Keybindings
 
