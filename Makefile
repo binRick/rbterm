@@ -168,4 +168,26 @@ bench-clean:
 	rm -rf $(BENCH_DIR)
 	cd $(VTEBENCH_DIR) && cargo clean
 
+# ---------- parser microbench ----------
+#
+# Isolates screen_feed() from raylib / render / vsync so we can
+# iterate on parser perf cleanly. Run under `sample` (built-in) or
+# `samply` (cargo install samply) for a profile.
+#
+#   make parser_bench
+#   ./parser_bench               # default: dense_cells
+#   ./parser_bench scrolling
+#   ./parser_bench unicode
+#
+# Profile under macOS sample:
+#   ./parser_bench >/dev/null & PID=$!; sample $$PID 5 -file /tmp/sample.txt; \
+#     wait $$PID; less /tmp/sample.txt
+PARSER_BENCH_OBJS := src/screen.o src/sixel.o src/kitty.o src/theme.o
+# kitty.o pulls in raylib for image decode (LoadImageFromMemory).
+# Our streams never contain kitty graphics, but the symbol still
+# needs to resolve at link time. Link the same raylib the main
+# binary uses.
+parser_bench: tools/parser_bench.c $(PARSER_BENCH_OBJS) src/themes_embedded.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/parser_bench.c $(PARSER_BENCH_OBJS) -lraylib -lm
+
 .PHONY: all app clean bench bench-plot bench-clean
