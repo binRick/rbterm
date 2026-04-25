@@ -121,4 +121,44 @@ clean:
 	rm -f $(OBJS) rbterm tools/gen_icon
 	rm -rf rbterm.app $(ICONSET) $(ICNS) assets/icon.png
 
-.PHONY: all app clean
+# ---------- benchmarks (alacritty/vtebench) ----------
+#
+# vtebench measures how fast a terminal drains its PTY through a
+# stream of escape sequences (dense cells, scrolling, cursor motion,
+# unicode, etc.). Run `make bench` *inside* the terminal you want to
+# measure: results land in bench/<hostname>-<timestamp>.dat. Run it
+# again from inside another terminal (alacritty, iTerm2, kitty) to
+# compare; `make bench-plot` overlays every .dat into one SVG chart.
+VTEBENCH_DIR := third_party/vtebench
+VTEBENCH_BIN := $(VTEBENCH_DIR)/target/release/vtebench
+BENCH_DIR    := bench
+BENCH_DAT    := $(BENCH_DIR)/$(shell hostname -s)-$(shell date +%Y%m%d-%H%M%S).dat
+
+$(VTEBENCH_BIN):
+	@if [ ! -d $(VTEBENCH_DIR) ] || [ -z "$$(ls $(VTEBENCH_DIR))" ]; then \
+	  echo "vtebench submodule missing — run: git submodule update --init --recursive"; \
+	  exit 1; \
+	fi
+	cd $(VTEBENCH_DIR) && cargo build --release
+
+bench: $(VTEBENCH_BIN)
+	@mkdir -p $(BENCH_DIR)
+	@echo "Running vtebench inside $$TERM_PROGRAM$${TERM_PROGRAM:+ }(this only measures the terminal you are *currently in*)."
+	@echo "Output → $(BENCH_DAT)"
+	cd $(VTEBENCH_DIR) && cargo run --release --quiet -- --dat $(CURDIR)/$(BENCH_DAT)
+	@echo ""
+	@echo "Done. Re-run inside another terminal (e.g. alacritty) to collect a comparison .dat."
+	@echo "Then: make bench-plot"
+
+bench-plot:
+	@if ! ls $(BENCH_DIR)/*.dat >/dev/null 2>&1; then \
+	  echo "no .dat files in $(BENCH_DIR) — run make bench first"; exit 1; \
+	fi
+	cd $(VTEBENCH_DIR) && ./gnuplot/summary.sh $(CURDIR)/$(BENCH_DIR)/*.dat $(CURDIR)/$(BENCH_DIR)/summary.svg
+	@echo "Wrote $(BENCH_DIR)/summary.svg"
+
+bench-clean:
+	rm -rf $(BENCH_DIR)
+	cd $(VTEBENCH_DIR) && cargo clean
+
+.PHONY: all app clean bench bench-plot bench-clean

@@ -360,6 +360,28 @@ Bring your own font if you want (e.g. JetBrains Mono, Fira Code). On
 macOS rbterm searches, in order: Consolas → SFNSMono → Monaco → Menlo.
 On Linux: DejaVu Sans Mono → Liberation Mono → Noto Sans Mono.
 
+## Benchmarking
+
+rbterm vendors [alacritty/vtebench](https://github.com/alacritty/vtebench)
+as a submodule under `third_party/vtebench`. It measures how fast a
+terminal drains its PTY through twelve different escape-sequence
+streams (dense cells, scrolling, cursor motion, unicode, …).
+
+```bash
+# Inside an rbterm tab:
+make bench           # builds vtebench, runs the suite,
+                     # writes bench/<host>-<timestamp>.dat
+# Now open another terminal (alacritty / iTerm2 / kitty) and:
+make bench           # collects a second .dat
+make bench-plot      # gnuplot overlay of every .dat → bench/summary.svg
+```
+
+vtebench has to run *inside* the terminal under test — it times how
+long each escape stream takes to drain, which is meaningless if the
+host shell is in a different terminal than the target. Run `make
+bench` separately inside each terminal you want to compare; the
+plot script combines every `.dat` it can find.
+
 ## Limitations
 
 - No shaping, so ligatures and ZWJ sequences render as components.
