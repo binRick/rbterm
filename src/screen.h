@@ -121,6 +121,14 @@ Cell    screen_cell_abs(const Screen *s, int col, int abs_row);
    ('A'/'B'/'C'/'D'/0) and the associated exit code (only meaningful
    for 'D'). Always 0 on alt screen. */
 uint8_t screen_view_row_pmark(const Screen *s, int vy, uint8_t *out_exit);
+/* OSC 133 prompt mark by absolute-row coordinate (oldest scrollback
+   row = 0). Used by jump-to-prompt / select-last-output, which need
+   to walk the full history. */
+uint8_t screen_pmark_at_abs(const Screen *s, int abs_row, uint8_t *out_exit);
+/* True iff an OSC 133;C has fired with no matching D yet — i.e. a
+   command is currently running in this screen. Used by the tab
+   bar to draw a "still working" spinner. */
+bool    screen_command_running(const Screen *s);
 bool    screen_app_cursor(const Screen *s);
 bool    screen_app_keypad(const Screen *s);
 bool    screen_focus_report(const Screen *s);

@@ -489,6 +489,17 @@ static int g_form_font_scroll  = 0;
    that triggered the open doesn't immediately dismiss it via the
    "click outside" check. */
 static bool g_help_just_opened = false;
+/* 0 = Navigation, 1 = Edit & Search, 2 = Shell integration. Persists
+   between opens so the user lands on whichever tab they last
+   looked at. */
+static int  g_help_tab = 0;
+/* Filled by draw_help_modal each frame so the main-loop click
+   handler can hit-test the tab buttons AND know the actual panel
+   rect (which depends on the active tab's row count, so a fixed
+   fallback would over-claim "inside" for short tabs). */
+#define HELP_TAB_COUNT 3
+static Rect g_help_tab_rects[HELP_TAB_COUNT];
+static Rect g_help_modal_rect;
 
 /* Which scrollable list owns Up/Down keyboard nav while the modal is
    open. Set when the user clicks a list row, cleared when clicking
@@ -2202,11 +2213,38 @@ static void draw_tab_bar(Renderer *r, int win_w) {
         DrawRectangle(x, 0, tw, TAB_BAR_H, bg);
         if (active) DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
 
-        /* Activity dot: small amber bullet left of the label when a
-           background tab has produced output since the user last
-           focused it. Cleared when the tab becomes active. */
+        /* Per-tab status glyph left of the label:
+             - Spinner (cyan) while any pane has a command running
+               (OSC 133;C without a matching D).
+             - Activity dot (amber) for backgrounded tabs that have
+               produced output since the user last focused them.
+           Spinner takes precedence — a running command is the more
+           informative signal. */
         int label_x = x + 10;
-        if (!active && g_tabs[i]->activity) {
+        bool any_running = false;
+        for (int pi = 0; pi < g_tabs[i]->num_panes; pi++) {
+            const Pane *_pp = &g_tabs[i]->panes[pi];
+            if (_pp->scr && screen_command_running(_pp->scr)) {
+                any_running = true;
+                break;
+            }
+        }
+        if (any_running) {
+            /* Plain-ASCII 4-frame spinner — `|/-\` renders in every
+               monospace font (braille / spinner glyphs aren't always
+               in SF Mono / Consolas, and the missing-glyph fallback
+               drew "?" instead). */
+            static const char *frames[] = { "|", "/", "-", "\\" };
+            int frame_idx = ((int)(GetTime() * 8.0)) % 4;
+            if (frame_idx < 0) frame_idx += 4;
+            const char *gly = frames[frame_idx];
+            Color sp = {125, 207, 255, 255};
+            Vector2 sz = MeasureTextEx(*f, gly, fs, 0);
+            DrawTextEx(*f, gly,
+                       (Vector2){label_x, (TAB_BAR_H - sz.y) / 2.0f},
+                       fs, 0, sp);
+            label_x += (int)sz.x + 6;
+        } else if (!active && g_tabs[i]->activity) {
             int dy = TAB_BAR_H / 2;
             int dx = x + 10;
             DrawCircle(dx + 3, dy, 3.0f, (Color){255, 180, 60, 255});
@@ -4635,8 +4673,7 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
 #else
     const char *MOD = "Ctrl";
 #endif
-    /* Each row is { chord, description } — two entries per visible row,
-       so size to 2 × max-rows (with headroom for future bindings).
+    /* Each row is { chord, description } — two entries per visible row.
        After building, every "Cmd" in a chord cell is rewritten to MOD
        so Linux + Windows show "Ctrl+T" instead of "Cmd+T". */
     char buf[128][128];
@@ -4660,50 +4697,101 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
             } \
         } \
     } while (0)
-    ROW("",                          "Tabs");
-    ROW("Cmd+T",                     "New tab (local shell)");
-    ROW("Cmd+Shift+T",               "New tab via SSH (open the connect form)");
-    ROW("Cmd+W",                     "Close active tab (or pane if split)");
-    ROW("Cmd+1..9",                  "Jump to tab N");
-    ROW("Cmd+Left / Cmd+Right",      "Cycle to previous / next tab");
-    ROW("Cmd+[ / Cmd+]",             "Cycle to previous / next tab (alt)");
-    ROW("Cmd+Shift+Left/Right",      "Move active tab left / right");
-    ROW("Cmd+N",                     "New rbterm window (separate process — Mission Control groups them)");
-    ROW("",                          "Splits");
-    ROW("Cmd+D",                     "Split active tab vertically (side-by-side)");
-    ROW("Cmd+Shift+D",               "Split horizontally (top / bottom)");
-    ROW("Cmd+Shift+W",               "Close active pane (collapses to single)");
-    ROW("Click a pane",              "Focus that pane");
-    ROW("Drag the splitter",         "Resize panes");
-    ROW("",                          "Selection + clipboard");
-    ROW("Cmd+A",                     "Select all visible text in active pane");
-    ROW("Cmd+C",                     "Copy selection");
-    ROW("Cmd+V",                     "Paste");
-    ROW("Click + drag",              "Select text");
-    ROW("Double-click / triple-click", "Select word / line");
-    ROW("",                          "Scroll + view");
-    ROW("Mouse wheel",               "Scroll into history (when not in app cursor mode)");
-    ROW("Ctrl+Shift+Up/Down",        "Scroll one row");
-    ROW("Shift+PageUp/PageDown",     "Scroll one screen");
-    ROW("Cmd+= / Cmd+-",             "Font size up / down");
-    ROW("Cmd+0",                     "Reset font size to 20pt");
-    ROW("",                          "Modals");
-    ROW("Cmd+,",                     "Settings");
-    ROW("Cmd+Shift+T",               "SSH connect form");
-    ROW("Esc / click outside",       "Dismiss the active modal");
-    ROW("",                          "");
-    ROW("Note",                      "Cmd shows on macOS; Ctrl is the modifier on Linux + Windows.");
+    if (g_help_tab == 0) {
+        /* Navigation: tabs / splits / scroll / modals — all the
+           "moving around" chords, no editing or finding. */
+        ROW("",                          "Tabs");
+        ROW("Cmd+T",                     "New tab (local shell)");
+        ROW("Cmd+Shift+T",               "New tab via SSH (open the connect form)");
+        ROW("Cmd+W",                     "Close active tab (or pane if split)");
+        ROW("Cmd+1..9",                  "Jump to tab N");
+        ROW("Cmd+Left / Cmd+Right",      "Cycle to previous / next tab");
+        ROW("Cmd+[ / Cmd+]",             "Cycle to previous / next tab (alt)");
+        ROW("Cmd+Shift+Left/Right",      "Move active tab left / right");
+        ROW("Cmd+N",                     "New rbterm window (separate process — Mission Control groups them)");
+        ROW("",                          "Splits");
+        ROW("Cmd+D",                     "Split active tab vertically (side-by-side)");
+        ROW("Cmd+Shift+D",               "Split horizontally (top / bottom)");
+        ROW("Cmd+Shift+W",               "Close active pane (collapses to single)");
+        ROW("Click a pane",              "Focus that pane");
+        ROW("Drag the splitter",         "Resize panes");
+        ROW("",                          "Scroll + view");
+        ROW("Mouse wheel",               "Scroll into history (when not in app cursor mode)");
+        ROW("Ctrl+Shift+Up/Down",        "Scroll one row");
+        ROW("Shift+PageUp/PageDown",     "Scroll one screen");
+        ROW("Cmd+= / Cmd+-",             "Font size up / down");
+        ROW("Cmd+0",                     "Reset font size to 20pt");
+        ROW("",                          "Modals");
+        ROW("Cmd+,",                     "Settings");
+        ROW("Cmd+Shift+T",               "SSH connect form");
+        ROW("Esc / click outside",       "Dismiss the active modal");
+        ROW("",                          "");
+        ROW("Note",                      "Cmd shows on macOS; Ctrl is the modifier on Linux + Windows.");
+    } else if (g_help_tab == 1) {
+        /* Edit & Search: selection, clipboard, find, plus the
+           OSC-133-powered "select last output" / prompt-jump chords
+           (cross-referenced — full setup lives on the Shell tab). */
+        ROW("",                          "Selection + clipboard");
+        ROW("Cmd+A",                     "Select all visible text in active pane");
+        ROW("Cmd+C",                     "Copy selection");
+        ROW("Cmd+V",                     "Paste");
+        ROW("Click + drag",              "Select text");
+        ROW("Double-click",              "Select word (smart trim of trailing punctuation)");
+        ROW("Triple-click",              "Select line (joins wrapped rows)");
+        ROW("",                          "Search");
+        ROW("Cmd+F",                     "Open search bar on the active pane");
+        ROW("Enter / Down / F3",         "Next match");
+        ROW("Shift+Enter / Up / Shift+F3","Previous match");
+        ROW("Cmd+A (in search)",         "Select all in search query");
+        ROW("Click / Shift+click / drag","Position caret / extend / range select in search");
+        ROW("Esc",                       "Close search, restore scroll position");
+        ROW("",                          "Shell integration (needs OSC 133 — see Shell tab)");
+        ROW("Cmd+Up / Cmd+Down",         "Jump to previous / next prompt");
+        ROW("Cmd+Shift+L",               "Select last command's output");
+    } else {
+        /* Shell integration tab — narrative, not chords. Use chord
+           column blank + desc column carrying the prose. */
+        ROW("", "What is shell integration?");
+        ROW("", "rbterm understands OSC 133 — a small protocol where your");
+        ROW("", "shell tells the terminal where each prompt and command");
+        ROW("", "starts/ends. Once it knows that structure, rbterm can:");
+        ROW("", "");
+        ROW("•",  "Paint a green/red badge in the left gutter next to each");
+        ROW("",   "command (green = exit 0, red = nonzero).");
+        ROW("•",  "Show a cyan spinner in the tab bar while a command is");
+        ROW("",   "running, so you can glance over and see if your build is");
+        ROW("",   "still going.");
+        ROW("•",  "Jump prompt-to-prompt with Cmd+Up / Cmd+Down — no more");
+        ROW("",   "hunting for the start of the previous compile in scrollback.");
+        ROW("•",  "Select the last command's output with Cmd+Shift+L; then");
+        ROW("",   "Cmd+C copies it to the clipboard.");
+        ROW("",   "");
+        ROW("",   "Setup (one time)");
+        ROW("",   "Source the helper from your shell rc:");
+        ROW("zsh:", "echo 'source <rbterm-repo>/tools/rbterm-shell-integration.zsh' >> ~/.zshrc");
+        ROW("bash:", "echo 'source <rbterm-repo>/tools/rbterm-shell-integration.bash' >> ~/.bashrc");
+        ROW("",     "");
+        ROW("",     "Open a new pane (Cmd+T) so the new shell picks up the");
+        ROW("",     "hook. Existing panes that didn't source the script");
+        ROW("",     "stay un-instrumented — that's deliberate.");
+        ROW("",     "");
+        ROW("",     "Caveats");
+        ROW("•",    "Inside tmux / vim / less, rbterm is on the alt screen");
+        ROW("",     "with no scrollback, so marks aren't recorded there.");
+        ROW("•",    "Other terminals also recognize OSC 133. Sourcing the");
+        ROW("",     "helper is safe in iTerm2 / kitty / Wezterm too.");
+    }
     ROW_END();
     #undef ROW
     #undef ROW_END
 
     int row_h = 22;
-    int header_h = 50;
+    int header_h = 50 + 32; /* title bar + tab bar */
     int side_pad = 28;
     int top_pad  = 18;
-    int footer_h = 32;        /* room for the "Esc or click outside…" hint */
+    int footer_h = 32;
     int needed_h = header_h + n * row_h + top_pad + footer_h;
-    int w = 720, h = needed_h;
+    int w = 760, h = needed_h;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     int mx = (win_w - w) / 2;
@@ -4713,30 +4801,58 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
     DrawRectangle(mx, my, w, h, (Color){30, 34, 46, 255});
     DrawRectangleLines(mx, my, w, h, (Color){125, 207, 255, 220});
     DrawRectangle(mx + 1, my + 1, w - 2, 38, (Color){38, 42, 58, 255});
+    g_help_modal_rect = (Rect){mx, my, w, h};
 
     Font *f = (Font *)r->font_data;
-    char title[64];
-    snprintf(title, sizeof(title), "Keyboard shortcuts (modifier = %s)", MOD);
+    char title[80];
+    snprintf(title, sizeof(title), "Help (modifier = %s)", MOD);
     DrawTextEx(*f, title,
                (Vector2){ mx + 20, my + 11 },
                16, 0, (Color){230, 232, 240, 255});
 
-    int chord_w = 220;
+    /* Tab bar between title and content. */
+    {
+        const char *labels[HELP_TAB_COUNT] = {
+            "Navigation", "Edit & Search", "Shell integration"
+        };
+        int bar_y = my + 44;
+        int bar_h = 26;
+        int bw = (w - 2 * 14 - 2 * 6) / HELP_TAB_COUNT;
+        int bx = mx + 14;
+        for (int i = 0; i < HELP_TAB_COUNT; i++) {
+            Rect tr = { bx + i * (bw + 6), bar_y, bw, bar_h };
+            g_help_tab_rects[i] = tr;
+            bool on = (g_help_tab == i);
+            DrawRectangle(tr.x, tr.y, tr.w, tr.h,
+                          on ? (Color){46, 92, 150, 255}
+                             : (Color){34, 38, 52, 255});
+            DrawRectangleLines(tr.x, tr.y, tr.w, tr.h,
+                               (Color){125, 207, 255, on ? 255 : 120});
+            Vector2 ts = MeasureTextEx(*f, labels[i], 13, 0);
+            DrawTextEx(*f, labels[i],
+                       (Vector2){tr.x + (tr.w - ts.x) / 2,
+                                 tr.y + (tr.h - ts.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+        }
+    }
+
+    int chord_w = (g_help_tab < 2) ? 240 : 60;
     BeginScissorMode(mx + 8, my + header_h, w - 16,
                      h - header_h - footer_h);
     int y = my + header_h;
     for (int i = 0; i < n; i++) {
         const char *chord = buf[i*2];
         const char *desc  = buf[i*2 + 1];
-        if (!chord[0]) {
-            /* Section header. */
+        if (g_help_tab < 2 && !chord[0]) {
             DrawTextEx(*f, desc,
                        (Vector2){ mx + side_pad, y + 3 },
                        14, 0, (Color){140, 200, 255, 255});
         } else {
-            DrawTextEx(*f, chord,
-                       (Vector2){ mx + side_pad, y + 4 },
-                       13, 0, (Color){200, 230, 255, 255});
+            if (chord[0]) {
+                DrawTextEx(*f, chord,
+                           (Vector2){ mx + side_pad, y + 4 },
+                           13, 0, (Color){200, 230, 255, 255});
+            }
             DrawTextEx(*f, desc,
                        (Vector2){ mx + side_pad + chord_w, y + 4 },
                        13, 0, (Color){200, 205, 220, 255});
@@ -5972,20 +6088,37 @@ int main(int argc, char **argv) {
         if (g_ui_mode == UI_HELP) {
             cur = active_tab();
             if (!cur) break;
-            int hw = 720, hh = 800;
-            if (hw > win_w_now - 40) hw = win_w_now - 40;
-            if (hh > win_h_now - 40) hh = win_h_now - 40;
-            int hmx = (win_w_now - hw) / 2;
-            int hmy = (win_h_now - hh) / 2;
+            /* Hit-test against the actual panel rect that
+               draw_help_modal published last frame — different tabs
+               have different content heights, so a fixed-size
+               fallback would wrongly mark the empty space above/
+               below the panel as "inside". On the very first open
+               the rect is zero (draw hasn't run yet); g_help_just_
+               opened below eats that frame's click anyway. */
+            Rect hr = g_help_modal_rect;
             Vector2 mp_help = GetMousePosition();
-            bool inside = (mp_help.x >= hmx && mp_help.x < hmx + hw &&
-                           mp_help.y >= hmy && mp_help.y < hmy + hh);
+            bool inside = (hr.w > 0 && mp_help.x >= hr.x &&
+                           mp_help.x < hr.x + hr.w &&
+                           mp_help.y >= hr.y &&
+                           mp_help.y < hr.y + hr.h);
             if (g_help_just_opened) {
                 /* Eat the press from the same frame that opened the
                    modal — the help button sits outside the modal
                    panel, so the click-outside check would otherwise
                    close it instantly. */
                 g_help_just_opened = false;
+            } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && inside) {
+                /* Tab switch — uses rects populated by draw_help_modal
+                   on the previous frame. */
+                int mxp = (int)mp_help.x, myp = (int)mp_help.y;
+                for (int _i = 0; _i < HELP_TAB_COUNT; _i++) {
+                    Rect tr = g_help_tab_rects[_i];
+                    if (tr.w > 0 && mxp >= tr.x && mxp < tr.x + tr.w &&
+                        myp >= tr.y && myp < tr.y + tr.h) {
+                        g_help_tab = _i;
+                        break;
+                    }
+                }
             } else if (IsKeyPressed(KEY_ESCAPE) ||
                        (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !inside)) {
                 g_ui_mode = UI_NORMAL;
@@ -6013,6 +6146,89 @@ int main(int argc, char **argv) {
                 Tab *_ct = active_tab();
                 Pane *_ap = _ct ? active_pane_of(_ct) : NULL;
                 if (_ap) search_open(_ap);
+            }
+            /* OSC 133 navigation. Cmd/Ctrl+Up jumps to the previous
+               prompt (an A-marked row above the current view), Down
+               jumps to the next. Walks abs_rows from the visible
+               anchor outward. Silent no-op when no marks exist. */
+            else if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_DOWN)) {
+                bool back = IsKeyPressed(KEY_UP);
+                Tab *_ct = active_tab();
+                Pane *_ap = _ct ? active_pane_of(_ct) : NULL;
+                if (_ap && _ap->scr) {
+                    Screen *sc = _ap->scr;
+                    int total = screen_total_rows(sc);
+                    int sb_len = screen_scrollback_len(sc);
+                    int rows = screen_rows(sc);
+                    int off = screen_view_offset(sc);
+                    /* Anchor = abs_row at the top of the current view. */
+                    int anchor = sb_len - off;
+                    int target = -1;
+                    if (back) {
+                        for (int r = anchor - 1; r >= 0; r--) {
+                            if (screen_pmark_at_abs(sc, r, NULL) == 'A') { target = r; break; }
+                        }
+                    } else {
+                        for (int r = anchor + 1; r < total; r++) {
+                            if (screen_pmark_at_abs(sc, r, NULL) == 'A') { target = r; break; }
+                        }
+                    }
+                    if (target >= 0) {
+                        /* Place the target row near the top of the
+                           viewport (abs_row maps to vy = abs_row - sb_len + view_off). */
+                        int want_off = sb_len - target;
+                        if (want_off < 0) want_off = 0;
+                        if (want_off > sb_len) want_off = sb_len;
+                        screen_scroll_reset(sc);
+                        if (want_off > 0) screen_scroll_view(sc, want_off);
+                        (void)rows;
+                    }
+                }
+            }
+            /* Cmd/Ctrl+Shift+L: select the most recent command's
+               output (between the latest C mark and the next A/D
+               or end of buffer). Then Cmd+C copies it. */
+            else if (shift_held && IsKeyPressed(KEY_L)) {
+                Tab *_ct = active_tab();
+                Pane *_ap = _ct ? active_pane_of(_ct) : NULL;
+                if (_ap && _ap->scr) {
+                    Screen *sc = _ap->scr;
+                    int total = screen_total_rows(sc);
+                    int sb_len = screen_scrollback_len(sc);
+                    int rows = screen_rows(sc);
+                    int cols = screen_cols(sc);
+                    int c_row = -1;
+                    for (int r = total - 1; r >= 0; r--) {
+                        if (screen_pmark_at_abs(sc, r, NULL) == 'C') { c_row = r; break; }
+                    }
+                    if (c_row >= 0) {
+                        int end_row = total;  /* exclusive */
+                        for (int r = c_row + 1; r < total; r++) {
+                            uint8_t mk = screen_pmark_at_abs(sc, r, NULL);
+                            if (mk == 'A' || mk == 'D') { end_row = r; break; }
+                        }
+                        if (end_row > c_row) {
+                            /* Scroll so c_row is on screen (top), then
+                               translate abs rows into view rows. */
+                            int want_off = sb_len - c_row;
+                            if (want_off < 0) want_off = 0;
+                            if (want_off > sb_len) want_off = sb_len;
+                            screen_scroll_reset(sc);
+                            if (want_off > 0) screen_scroll_view(sc, want_off);
+                            int new_off = screen_view_offset(sc);
+                            int va = c_row - sb_len + new_off;
+                            int vb = (end_row - 1) - sb_len + new_off;
+                            if (va < 0) va = 0;
+                            if (vb >= rows) vb = rows - 1;
+                            _ap->sel.active = true;
+                            _ap->sel.dragging = false;
+                            _ap->sel.a_col = 0;
+                            _ap->sel.a_row = va;
+                            _ap->sel.b_col = cols - 1;
+                            _ap->sel.b_row = vb;
+                        }
+                    }
+                }
             }
             else if (shift_held && IsKeyPressed(KEY_T)) {
                 ssh_form_open();

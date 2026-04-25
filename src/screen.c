@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <time.h>
 
 enum {
     ST_GROUND = 0,
@@ -92,6 +93,11 @@ struct Screen {
        NEXT A mark so the prompt row inherits the previous
        command's status when D and A land on different rows. */
     uint8_t pending_pexit;
+    /* Wall-clock time (seconds) when the most recent OSC 133;C was
+       parsed. Used to compute command duration on D and fire a
+       slow-command notification via io.notify. 0 = no command
+       currently running. */
+    time_t c_time;
     bool on_alt;
 
     // Scrollback ring buffer: rows of `cols` cells
@@ -1093,7 +1099,10 @@ static void finish_osc(Screen *s) {
         if (!s->on_alt && s->main_pmark && s->cy >= 0 && s->cy < s->rows) {
             char kind = *p ? *p : 0;
             if (kind == 'A' || kind == 'B' || kind == 'C' || kind == 'D') {
-                if (kind == 'D') {
+                if (kind == 'C') {
+                    s->main_pmark[s->cy] = 'C';
+                    s->c_time = time(NULL);
+                } else if (kind == 'D') {
                     const char *q = p + 1;
                     if (*q == ';') q++;
                     int v = 0;
@@ -1104,6 +1113,9 @@ static void finish_osc(Screen *s) {
                     s->main_pmark[s->cy] = 'D';
                     s->main_pexit[s->cy] = enc;
                     s->pending_pexit     = enc;
+                    /* Command finished — clear the "running" timer so
+                       the tab-bar spinner stops. */
+                    s->c_time = 0;
                 } else if (kind == 'A') {
                     s->main_pmark[s->cy] = 'A';
                     /* Carry the previous D's exit status onto the prompt row.
@@ -1114,8 +1126,8 @@ static void finish_osc(Screen *s) {
                         s->pending_pexit = 0;
                     }
                 } else {
-                    /* B / C: keep pmark fresh but don't disturb pexit; the
-                       last A/D on this row already painted the status. */
+                    /* B: prompt-end, command-edit area. Doesn't
+                       disturb pexit. */
                     s->main_pmark[s->cy] = (uint8_t)kind;
                 }
             }
@@ -1953,6 +1965,25 @@ Cell screen_cell_abs(const Screen *s, int col, int abs_row) {
     int y = abs_row - s->sb_len;
     if (y >= s->rows) return e;
     return s->main[y * s->cols + col];
+}
+
+bool screen_command_running(const Screen *s) {
+    return s && s->c_time != 0;
+}
+
+uint8_t screen_pmark_at_abs(const Screen *s, int abs_row, uint8_t *out_exit) {
+    if (out_exit) *out_exit = 0;
+    if (!s || abs_row < 0 || s->on_alt) return 0;
+    if (abs_row < s->sb_len) {
+        if (!s->sb_pmark || s->sb_cap == 0) return 0;
+        int ring = ((s->sb_head - s->sb_len + abs_row) % s->sb_cap + s->sb_cap) % s->sb_cap;
+        if (out_exit && s->sb_pexit) *out_exit = s->sb_pexit[ring];
+        return s->sb_pmark[ring];
+    }
+    int y = abs_row - s->sb_len;
+    if (y < 0 || y >= s->rows || !s->main_pmark) return 0;
+    if (out_exit && s->main_pexit) *out_exit = s->main_pexit[y];
+    return s->main_pmark[y];
 }
 
 uint8_t screen_view_row_pmark(const Screen *s, int vy, uint8_t *out_exit) {
