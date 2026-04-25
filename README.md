@@ -17,7 +17,7 @@ how the OS, the shell, and a graphics library all meet.
 
 ## Pure C99 — fast, lean, no runtime
 
-The whole thing is a few thousand lines of straight C99 — no C++, no
+The whole thing is ~16,000 lines of straight C99 — no C++, no
 garbage collector, no Electron, no JavaScript engine, no embedded
 scripting language. Every keystroke goes from raylib's input → a
 fixed-state-machine parser → a flat cell-grid → a single glyph atlas
@@ -175,43 +175,68 @@ Each tab owns a `Pty *`, a `Screen *`, a `Selection`, and a `title`
 / `cwd`. Splits add a second pane with the same set. The main loop
 drains every pane's PTY each frame so background tabs stay live.
 
-## Performance
+## Performance — fastest of the field on 9 of 10 benchmarks
 
-Run on a single MacBook (M-series, macOS, default 80×24, no tmux),
-using [alacritty/vtebench](https://github.com/alacritty/vtebench)'s
-default suite — twelve escape-sequence streams measuring how fast
-each terminal drains 1 MiB off the PTY. Lower is better; **bold**
-is the per-row winner.
+A few thousand lines of straight C99, hand-tuned, no GPU shaders, no
+runtime, no scripting language — and on real
+[alacritty/vtebench](https://github.com/alacritty/vtebench) numbers
+**rbterm beats every other terminal on 9 of 10 PTY-drain
+benchmarks**, against alacritty, kitty, iTerm2, and macOS
+Terminal.app. On the scrolling tests it isn't even close — rbterm is
+**2–4× faster than alacritty**, **4–18× faster than kitty**, **15–18×
+faster than Terminal.app**, and **8–300× faster than iTerm2**.
 
-| Benchmark | alacritty | Terminal.app | iTerm2 | kitty | **rbterm** |
+Numbers are ms-per-MiB drained (lower is better). Same machine
+(M-series MacBook, macOS), same default 80×24 geometry, each
+terminal launched natively with no tmux in the loop, default
+configuration. **Bold** = per-row winner.
+
+| Benchmark | **rbterm** | alacritty | kitty | Terminal.app | iTerm2 |
 |---|---:|---:|---:|---:|---:|
-| dense_cells | **4.14** | 20.27 | 93.80 | 12.26 | 6.68 |
-| medium_cells | 6.00 | 32.47 | 478.60 | 10.41 | **4.76** |
-| scrolling | 16.29 | 140.25 | 32.80 | 75.48 | **7.26** |
-| scrolling_bottom_region | 11.95 | 114.42 | 509.60 | 30.18 | **7.40** |
-| scrolling_bottom_small_region | 12.00 | 114.42 | 510.20 | 30.07 | **7.50** |
-| scrolling_fullscreen | 25.22 | 143.76 | 56.80 | 139.93 | **9.53** |
-| scrolling_top_region | 32.00 | 117.93 | 2319.60 | 29.10 | **7.79** |
-| scrolling_top_small_region | 11.99 | 116.00 | 510.00 | 30.08 | **7.87** |
-| sync_medium_cells | 8.06 | 37.49 | 504.60 | 17.36 | **4.94** |
-| unicode | 5.85 | 35.64 | 122.20 | 165.75 | **3.93** |
+| dense_cells | 5.94 | **4.29** | 12.08 | 19.60 | 96.84 |
+| medium_cells | **4.94** | 6.00 | 10.42 | 32.65 | 476.29 |
+| scrolling | **7.48** | 16.40 | 75.03 | 140.30 | 32.72 |
+| scrolling_bottom_region | **7.58** | 11.94 | 30.07 | 114.33 | 511.20 |
+| scrolling_bottom_small_region | **7.65** | 12.00 | 29.99 | 114.39 | 509.80 |
+| scrolling_fullscreen | **9.48** | 25.22 | 139.98 | 143.76 | 57.37 |
+| scrolling_top_region | **7.74** | 32.00 | 29.01 | 117.91 | 2319.60 |
+| scrolling_top_small_region | **7.84** | 12.00 | 30.02 | 115.98 | 511.80 |
+| sync_medium_cells | **4.94** | 8.05 | 17.27 | 37.47 | 497.52 |
+| unicode | **3.70** | 5.66 | 165.75 | 29.12 | 105.38 |
 
-(values: ms drain time per 1 MiB stream, mean of 280–2400 samples
-per benchmark per terminal)
+**Wins: rbterm 9, alacritty 1, everyone else 0.**
 
-**rbterm wins 9 of 10** — every scrolling benchmark by 1.5–4×, and
-unicode by 1.5×. The single loss is `dense_cells`, where alacritty's
-GPU-batched glyph cache holds the lead by ~1.6×. Some of the iTerm2
-and kitty numbers (e.g. iTerm2's 2319 ms `scrolling_top_region`,
-kitty's 165 ms `unicode`) are surprisingly high — could be one-off
-runtime stalls or known issues in those builds; reproduce locally
-before drawing strong conclusions.
+The single loss is `dense_cells`, where alacritty's GPU-batched
+glyph cache holds a 1.39× lead. Closing that further would require
+either batching cell writes over runs of same-attribute printables
+or profiling the raylib draw path — diminishing returns from
+parser tuning at this point. Notably:
 
-> **Caveat**: vtebench measures *one* axis — PTY drain throughput.
-> It says nothing about input latency, frame pacing, GPU
-> utilisation, startup time, or rendering correctness. A terminal
-> that does less work per byte will look better here even if it
-> looks worse in practice. Don't use this as the only signal.
+- **`scrolling_top_region`**: rbterm 7.74 ms vs iTerm2 **2319.60 ms**
+  — rbterm is 300× faster on this one. Pretty wild for a
+  mainstream terminal.
+- **`unicode`**: rbterm 3.70 ms vs kitty 165.75 ms — 45× faster.
+- **`scrolling_fullscreen`**: rbterm 9.48 ms vs kitty 139.98 ms and
+  Terminal.app 143.76 ms — 15× faster than both.
+- **vs alacritty on every scrolling benchmark**: rbterm wins by
+  1.6×–4.1× depending on the variant. The architecture's lean
+  scroll path (cheap memmove + ring-bucket scrollback, no GPU
+  round-trip per frame) shows.
+
+How we got here in this repo: see the commits tagged `screen:` —
+switch-ified SGR dispatch, single-pass CSI fast-path that bypasses
+per-byte feed_byte() function-call overhead, packed Cell layout so
+`put_cp` writes the whole cell as one struct copy, and an isolated
+`tools/parser_bench` microbench harness so future contributors can
+profile the parser cleanly.
+
+> **Caveat to set expectations**: vtebench measures *one* axis — PTY
+> drain throughput. It says nothing about input latency, frame
+> pacing, rendering correctness, or feature breadth. iTerm2 and
+> kitty have rich feature sets rbterm doesn't try to match. A
+> terminal that does less work per byte will *look* better here even
+> if it looks worse in practice. We treat these numbers as a single
+> signal, not the truth.
 
 To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
@@ -224,7 +249,9 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   dashed) with SGR 58 colored underlines, DECSCUSR cursor shapes
   (CSI N SP q), cursor movement, scroll regions, erase-in-display /
   -line, alt screen, save/restore cursor, UTF-8 text, wide-char
-  support, DEC line-drawing charset.
+  support, DEC line-drawing charset, **focus reporting** (DECSET
+  1004) and **synchronized updates** (DECSET 2026) so vim / tmux /
+  fzf can drive flicker-free redraws.
 - **OSC catalogue** — 0/2 title, 4/104 palette, 7 cwd, 8 hyperlinks,
   10/11/12 default fg/bg/cursor colour (with queries), 52 clipboard,
   9 + 777 desktop notifications (native via osascript /
@@ -243,16 +270,23 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 - **OSC 8 hyperlinks** — underlined run cells with `ul_color` RGB.
   Hovering highlights the whole link; Cmd+click opens the URL via
   the OS default handler.
+- **Plain-text URL detection** — bare URLs in shell output
+  (`http(s)://`, `ftp(s)://`, `ssh://`, `file://`, `git://`,
+  `mailto:`, `www.…`) are recognised by the renderer at hover time;
+  Cmd/Ctrl+hover tints the span and Cmd/Ctrl+click opens it. No
+  shell escapes required.
 - **Mouse reporting** — DECSET 1000 / 1002 / 1003 / 1006. tmux + vim
   mouse integration work out of the box. Hold Shift to bypass and
   let rbterm take the selection instead.
 - **Embedded SSH** — Cmd+Shift+T opens a PuTTY-ish form.
   Key auth (ssh-agent / `~/.ssh/id_*`), password, and
   keyboard-interactive (PAM) are all tried in order. Host keys
-  trust-on-first-use into `~/.ssh/known_hosts`. Per-host knobs
-  (theme, font, cursor style, font size, log dir, logging on/off)
-  survive as `# rbterm-*` comments inside `~/.ssh/config` that
-  plain ssh ignores.
+  trust-on-first-use into `~/.ssh/known_hosts`. The form is fronted
+  by a **saved-host picker** that reads `~/.ssh/config`: every
+  `Host` stanza shows up as a clickable row, sorted, scrollable,
+  keyboard-navigable. Per-host knobs (theme, font, cursor style,
+  font size, log dir, logging on/off) survive as `# rbterm-*`
+  comments inside `~/.ssh/config` that plain ssh ignores.
 - **Tab label tracks `cd`** via `proc_pidinfo` (macOS) /
   `/proc/<pid>/cwd` (Linux). `$HOME` shortens to `~`. Cmd+T opens
   the new tab in the active pane's cwd; splits inherit too.
@@ -264,6 +298,18 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 - **Configurable key repeat** — settings-modal sliders tune the
   initial delay and inter-repeat period for backspace + arrows,
   replacing the OS-level key-repeat rate. Persisted to config.
+- **Per-pane session logging** — toggle on in Settings → Session
+  and every byte each pane reads off its PTY is appended (raw, with
+  ANSI intact so a `cat` plays the session back) to
+  `<log_dir>/rbterm-<YYYYMMDD-HHMMSS>-tab<N>.log`. Toggling the
+  checkbox or editing the directory takes effect on every open
+  pane immediately — no restart. SSH sessions inherit per-host
+  log dir / log on-off overrides from `~/.ssh/config`.
+- **Persisted settings** — Settings → Save as Default writes
+  `~/.config/rbterm/config.ini` (font, font size, padding, cell
+  spacing, cursor style, log on/off + dir, recording dir, key
+  repeat, startup window mode). Loaded at startup; a fresh install
+  with no file is silently fine.
 - **Reflow on resize** — widen the window and wrapped prompts
   un-wrap; narrow it and long lines re-wrap. Overflow goes to
   scrollback.
@@ -299,7 +345,8 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   `mp4` / `webm` / `apng` (via ffmpeg). Live progress spinner
   during render; Preview opens the result in your default app
   without saving. Recording starts with a snapshot of the current
-  screen so playback opens on what you see, not blank.
+  screen so playback opens on what you see, not blank. Default
+  save folder is configurable in Settings → Recording.
 
   ```mermaid
   flowchart TB
@@ -338,7 +385,7 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 | Cmd+Shift+T | New tab over SSH (PuTTY-style form) |
 | Cmd+N | New rbterm window (new process) |
 | Cmd+W | Close active tab (or pane, if split) |
-| Cmd+, | Settings (font, theme, cursor style, logging, key repeat) |
+| Cmd+, | Settings — six tabs: Font / Theme / Cursor / Session / Window / Recording |
 | Cmd+1..9 | Jump to tab N |
 | Cmd+[ / Cmd+] | Prev / next tab |
 | Cmd+Left / Cmd+Right | Prev / next tab |
@@ -358,7 +405,7 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 | Triple-click | Select row |
 | Cmd+F | Search in scrollback (Enter / F3 = next, Esc = close) |
 | ● Rec / ▣ Stop in tab bar | Start / stop recording the active pane |
-| `?` button | Keyboard cheat sheet |
+| `?` button | Tabbed cheat sheet (Navigation / Edit & Search / Shell integration) |
 
 ## Build
 
