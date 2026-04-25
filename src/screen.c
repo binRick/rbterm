@@ -202,6 +202,9 @@ uint32_t screen_cursor_color(const Screen *s)  { return s ? s->cursor_color  : S
 
 /* ---------- Palette (mutable — can be set by OSC 4) ---------- */
 
+/* Seed `dst` with the standard 256-colour xterm palette: 16 system
+   colours, then a 6×6×6 RGB cube (indices 16..231), then 24 grays.
+   Anything OSC 4 changes will overwrite specific entries on top. */
 static void palette_fill_defaults(uint32_t dst[256]) {
     static const uint32_t base[16] = {
         0x000000, 0xCC0000, 0x4E9A06, 0xC4A000,
@@ -222,19 +225,25 @@ static void palette_fill_defaults(uint32_t dst[256]) {
     }
 }
 
+/* Bounds-checked palette lookup. Returns the seed default-fg for
+   out-of-range indices so a malformed SGR can't crash. */
 static uint32_t pal(const Screen *s, int i) {
     if (!s || i < 0 || i > 255) return SEED_DEFAULT_FG;
     return s->palette[i];
 }
 
-/* Parse one OSC 4 colour spec: "#RGB" / "#RRGGBB" / "#RRRRGGGGBBBB"
-   or "rgb:R/G/B" with 1..4 hex digits each. Returns true + rgb. */
+/* Hex digit → 0..15. -1 for non-hex, so callers can detect end of
+   a colour spec or malformed input. */
 static int hexval(int c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
 }
+/* Parse one OSC 4 / OSC 10/11/12 colour spec. Accepts both
+   "#RRGGBB" / "#RGB" / "#RRRRGGGGBBBB" and the X11 "rgb:R/G/B"
+   form (with 1..4 hex digits per component, scaled to 8-bit).
+   Writes 0xRRGGBB into *out and returns true on success. */
 static bool parse_color_spec(const char *s, uint32_t *out) {
     if (!s || !*s) return false;
     if (*s == '#') {
@@ -333,6 +342,9 @@ static uint32_t dec_graphic(uint32_t cp) {
     return table[cp - 0x60];
 }
 
+/* Construct a blank Cell carrying the current SGR-state fg/bg —
+   so backgrounds that scroll into a cleared row keep whatever
+   palette colour was active. cp=0 means "no glyph drawn here". */
 static Cell blank_cell(Screen *s) {
     Cell c;
     c.cp = 0;
@@ -344,16 +356,21 @@ static Cell blank_cell(Screen *s) {
     return c;
 }
 
+/* Pick whichever cell buffer is currently being displayed (alt or
+   main). All grid mutators go through this. */
 static Cell *active(Screen *s) { return s->on_alt ? s->alt : s->main; }
 
 /* ---------- Images ---------- */
 
+/* Free a single ScreenImage's pixel data and struct. NULL-safe. */
 static void image_free_one(ScreenImage *img) {
     if (!img) return;
     free(img->rgba);
     free(img);
 }
 
+/* Free every image owned by a screen. Called from screen_free and
+   on hard-reset / clear-everything paths. */
 static void images_free_all(Screen *s) {
     for (int i = 0; i < s->nimages; i++) image_free_one(s->images[i]);
     s->nimages = 0;
@@ -514,6 +531,9 @@ static void scroll_down_region(Screen *s, int top, int bot, int n) {
     for (int i = 0; i < n; i++) clear_row(s, top + i);
 }
 
+/* Move the cursor down one row. If we're on the last row of the
+   active scroll region, scroll the region up by one (pushing the
+   top row to scrollback for the main screen). */
 static void newline(Screen *s) {
     if (s->cy == s->scroll_bot) {
         scroll_up_region(s, s->scroll_top, s->scroll_bot, 1);
@@ -549,6 +569,15 @@ static bool cp_is_wide(uint32_t cp) {
     return false;
 }
 
+/* Write one codepoint into the cell at the cursor position with
+   the current SGR attrs / OSC 8 link / SGR 58 underline colour.
+   Handles auto-wrap-on-write (deferred from the previous put_cp
+   if the cursor was already at column cols-1), wide-character
+   handling (writes both the head cell with ATTR_WIDE and the
+   continuation cell with ATTR_WIDE_CONT), and DEC Special Graphics
+   charset translation when SI/SO has selected G0=0. Resets
+   view_off so any new output rolls the viewport back to the live
+   bottom. */
 static void put_cp(Screen *s, uint32_t cp) {
     /* Apply the active charset mapping before any width/wrap logic. */
     char active = (s->charset_active == 1) ? s->charset_g1 : s->charset_g0;
@@ -602,10 +631,14 @@ static void put_cp(Screen *s, uint32_t cp) {
     s->view_off = 0;
 }
 
+/* Generic int clamp helper used throughout the parser. */
 static int clamp(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/* Wipe the CSI parameter buffer + private/intermediate flags +
+   the OSC payload length. Called at the start of each new
+   sequence and on parser-state transitions. */
 static void reset_params(Screen *s) {
     for (int i = 0; i < MAX_PARAMS; i++) {
         s->params[i] = 0;
@@ -620,6 +653,9 @@ static void reset_params(Screen *s) {
     s->osc_len = 0;
 }
 
+/* Read parameter `i` from the current CSI, falling back to `dflt`
+   when omitted. Most VT controls use this so missing params take
+   their per-spec defaults (usually 1 — "move 1 cell" etc.). */
 static int pget(Screen *s, int i, int dflt) {
     if (i >= s->param_cnt || !s->param_set[i]) return dflt;
     return s->params[i];
@@ -636,11 +672,20 @@ static bool sgr_has_sub(Screen *s, int i, int n, int *out_sub) {
     return true;
 }
 
+/* Update the 3-bit underline-style field embedded in cur_attr.attrs
+   without disturbing the other flag bits. */
 static void set_underline_style(Screen *s, UlStyle st) {
     s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_UL_STYLE_MASK)
                                    | ((uint16_t)st << ATTR_UL_STYLE_SHIFT));
 }
 
+/* Apply one CSI SGR (Select Graphic Rendition) — the catch-all
+   styling sequence. Walks the parameter list updating
+   s->cur_attr (used by subsequent put_cp calls). Handles both the
+   classic 30..37/90..97 palette indices, 38/48 with sub-arg colour
+   space (5;N for indexed, 2;R;G;B for true colour), the 4:N
+   underline-style sub-form, and 58 underline colour. Anything we
+   don't recognise is silently skipped. */
 static void sgr(Screen *s) {
     int n = s->param_cnt ? s->param_cnt : 1;
     for (int i = 0; i < n; i++) {
@@ -803,6 +848,9 @@ static uint16_t url_intern(Screen *s, const char *url) {
     return s->urls_count;   /* 1-based — links_count after increment */
 }
 
+/* Look up an OSC 8 hyperlink target by its 1-based link_id. Returns
+   the interned URL string (NUL-terminated, owned by the screen) or
+   NULL for out-of-range / no-link cells. */
 const char *screen_link_url(const Screen *s, uint16_t link_id) {
     if (!s || link_id == 0 || link_id > s->urls_count) return NULL;
     return s->urls[link_id - 1];
@@ -810,6 +858,12 @@ const char *screen_link_url(const Screen *s, uint16_t link_id) {
 
 /* ---------- Erase ---------- */
 
+/* Implement CSI Ps J — erase in display. Modes:
+     0 = cursor to end of screen
+     1 = start of screen to cursor
+     2/3 = whole screen (and drop any sixel/kitty images on it).
+   Existing cells are replaced with blanks carrying the current
+   SGR-state bg, so a coloured background scrolls in cleanly. */
 static void erase_in_display(Screen *s, int mode) {
     Cell b = blank_cell(s);
     if (mode == 0) {
@@ -829,6 +883,8 @@ static void erase_in_display(Screen *s, int mode) {
     }
 }
 
+/* Implement CSI Ps K — erase in line. 0 = cursor→eol, 1 = bol→
+   cursor, 2 = whole row. */
 static void erase_in_line(Screen *s, int mode) {
     Cell b = blank_cell(s);
     Cell *row = row_ptr(s, s->cy);
@@ -843,6 +899,11 @@ static void erase_in_line(Screen *s, int mode) {
 
 /* ---------- DEC modes ---------- */
 
+/* Apply DECSET/DECRST (CSI ? Pn h / l) for one private mode. We
+   only handle the modes rbterm actually consumes — most are
+   feature flags (app-cursor, autowrap, mouse reporting, focus
+   reports, bracketed paste, alt screen, sync updates). Unknown
+   modes are silently ignored. */
 static void set_mode(Screen *s, int p, bool on) {
     if (!s->priv) return;
     switch (p) {
@@ -883,6 +944,12 @@ static void set_mode(Screen *s, int p, bool on) {
 
 /* ---------- CSI ---------- */
 
+/* Drive the CSI state machine one byte at a time. Accumulates
+   parameter digits, tracks separators (';' for new param, ':' for
+   sub-param) and intermediates ('?' '>' '=' SP), then dispatches
+   on the final byte to apply the actual operation (cursor moves,
+   erases, scroll regions, mode sets, SGR, the lot). Resets to
+   ground when the operation finishes. */
 static void handle_csi(Screen *s, uint8_t b) {
     if (b == '?') { s->priv = true; return; }
     if (b == '>') { s->inter_gt = true; return; }
@@ -1035,6 +1102,12 @@ static void handle_csi(Screen *s, uint8_t b) {
 
 /* ---------- ESC ---------- */
 
+/* Called when the OSC string parser has just consumed the
+   terminator (ESC \ or BEL). Parses the leading numeric "Ps" out
+   of s->osc, then dispatches to whichever OSC code (0/2 title,
+   4 palette, 7 cwd, 8 hyperlink, 9/777 notification, 10/11/12
+   default colours, 52 clipboard, 104 palette reset, 133 prompt
+   marks). Unknown codes are silently dropped. */
 static void finish_osc(Screen *s) {
     s->osc[s->osc_len] = 0;
     int ps = 0;
@@ -1323,6 +1396,8 @@ static void kpending_append(Screen *s, const unsigned char *buf, size_t n) {
     s->kpending_len += n;
 }
 
+/* Wipe the kitty chunk accumulator after a final-chunk decode (or
+   on error). Doesn't free the buffer — kept for the next image. */
 static void kpending_reset(Screen *s) {
     s->kpending_len = 0;
     s->kpending_active = false;
@@ -1419,8 +1494,14 @@ static void dpayload_push(Screen *s, uint8_t b) {
     s->dpayload[s->dpayload_len++] = b;
 }
 
+/* Wipe the DCS/APC payload accumulator. Buffer kept for re-use. */
 static void dpayload_reset(Screen *s) { s->dpayload_len = 0; }
 
+/* Handle the byte immediately following an unescaped ESC (0x1b).
+   Dispatches into CSI / OSC / DCS / APC submachines (`[`, `]`,
+   `P`, `_`), stand-alone two-byte ESC codes (D/E/M/c/=/>), the
+   DEC save/restore cursor pair (7/8), and charset designation
+   `( )`. Anything unrecognised drops back to ground. */
 static void handle_esc(Screen *s, uint8_t b) {
     switch (b) {
     case '[': s->pstate = ST_CSI; reset_params(s); return;
@@ -1464,6 +1545,10 @@ static void handle_esc(Screen *s, uint8_t b) {
 
 /* ---------- C0 ---------- */
 
+/* Handle one C0 control byte (0x00..0x1F). BEL fires the bell
+   callback, BS/HT/LF/VT/FF/CR move the cursor as expected, SO/SI
+   switch the active charset between G1 and G0. ESC (0x1B) is
+   handled by feed_byte before reaching here. */
 static void handle_c0(Screen *s, uint8_t b) {
     switch (b) {
     case 0x07: if (s->io.bell) s->io.bell(s->io.user); break;
@@ -1494,6 +1579,11 @@ static void handle_c0(Screen *s, uint8_t b) {
 
 /* ---------- Feed ---------- */
 
+/* The single-byte parser core. Routes the byte through whichever
+   parser sub-state we're in (ground / OSC / OSC_ESC / DCS / DCS_ESC
+   / APC / APC_ESC / CSI / CHARSET) and into the right handler.
+   Maintains UTF-8 multi-byte assembly inline; emitted codepoints
+   end up as cells via put_cp. */
 static void feed_byte(Screen *s, uint8_t b) {
     // Always handle CAN/SUB/ESC
     if (s->pstate == ST_OSC) {
@@ -1573,6 +1663,11 @@ static void feed_byte(Screen *s, uint8_t b) {
     put_cp(s, 0xFFFD);
 }
 
+/* Feed `n` bytes from the PTY into the parser. Public entry point —
+   called from the main loop after pty_read fills a buffer. Includes
+   a fast path for runs of printable ASCII in GROUND state to avoid
+   the per-byte parser dispatch when commands flood the PTY (e.g.
+   `find /usr`). */
 void screen_feed(Screen *s, const uint8_t *data, size_t n) {
     /* Hot path: when we're in GROUND state and the next bytes are all
        printable ASCII, write them straight into the current row without
@@ -1599,6 +1694,12 @@ void screen_feed(Screen *s, const uint8_t *data, size_t n) {
 
 /* ---------- Construction ---------- */
 
+/* Allocate a fresh Screen with `cols` columns, `rows` rows, and
+   `scrollback` rows of history (0 disables scrollback — used for
+   the alt-screen-only buffer). The IO callbacks let the screen
+   call back into the host for things it can't do itself: writing
+   responses to the PTY, setting the window title, posting
+   notifications, etc. */
 Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     Screen *s = calloc(1, sizeof(*s));
     s->cols = cols;
@@ -1640,6 +1741,9 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     return s;
 }
 
+/* Tear down a Screen and free every owned allocation: cells, alt
+   buffer, scrollback ring, parallel wrap / pmark / pexit arrays,
+   image bitmaps, OSC 8 URL pool, DCS / APC payload buffers. */
 void screen_free(Screen *s) {
     if (!s) return;
     images_free_all(s);
@@ -1653,7 +1757,12 @@ void screen_free(Screen *s) {
     free(s);
 }
 
+/* ---------- Image accessors (see header for the contract). ---------- */
+
+/* Number of images (sixel + kitty) currently anchored on the
+   visible viewport for this screen. */
 int screen_image_count(const Screen *s) { return s ? s->nimages : 0; }
+/* Indexed lookup (0..count-1). NULL on out-of-range. */
 const ScreenImage *screen_image_at(const Screen *s, int i) {
     if (!s || i < 0 || i >= s->nimages) return NULL;
     return s->images[i];
@@ -1666,10 +1775,15 @@ int screen_image_anchor_col(const ScreenImage *img) { return img ? img->anchor_c
 uint64_t screen_image_generation(const ScreenImage *img) { return img ? img->gen : 0; }
 bool screen_image_on_alt(const ScreenImage *img) { return img ? img->on_alt : false; }
 bool screen_on_alt(const Screen *s) { return s ? s->on_alt : false; }
+/* Renderer-side hint: tell the screen how many pixels tall each
+   cell currently is, so image scroll bookkeeping can translate
+   pixel-heighted graphics into cell-rows correctly. */
 void screen_set_cell_h_px(Screen *s, int cell_h_px) {
     if (s && cell_h_px > 0) s->cell_h_px = cell_h_px;
 }
 
+/* Update the IO callback's `user` pointer (typically a Pane*) on
+   an existing screen — used when a pane is realloc'd. */
 void screen_set_io_user(Screen *s, void *user) {
     if (!s) return;
     s->io.user = user;
@@ -1686,6 +1800,14 @@ void screen_set_palette_entry(Screen *s, int i, uint32_t rgb) {
 void        screen_set_cursor_style(Screen *s, CursorStyle st) { if (s) s->cursor_style = st; }
 CursorStyle screen_cursor_style(const Screen *s) { return s ? s->cursor_style : CURSOR_STYLE_DEFAULT; }
 
+/* Resize the main + alt grids to (cols, rows). The main screen is
+   reflowed: existing logical lines (groups of rows joined by
+   main_wrap[]) are concatenated, rewrapped at the new width, and
+   then re-split. Overflow off the top of the new viewport is
+   pushed into scrollback. The alt screen is *not* reflowed (full-
+   screen apps redraw on SIGWINCH). Per-row wrap / pmark / pexit
+   arrays are rebuilt; some scrollback wrap info is approximate
+   after resize — accepted v1 lossiness. */
 void screen_resize(Screen *s, int cols, int rows) {
     if (cols == s->cols && rows == s->rows) return;
     if (cols < 1) cols = 1;
@@ -1918,6 +2040,9 @@ bool screen_bracketed_paste(const Screen *s){ return s->bracketed_paste; }
 int  screen_mouse_mode(const Screen *s)     { return s->mouse_mode; }
 bool screen_mouse_sgr(const Screen *s)      { return s->mouse_sgr; }
 
+/* Adjust the scrollback view offset by `delta_rows` (positive scrolls
+   into older history, negative back toward the live grid).
+   Clamped to [0, sb_len] — out-of-range deltas are silent no-ops. */
 void screen_scroll_view(Screen *s, int delta_rows) {
     int v = s->view_off + delta_rows;
     if (v < 0) v = 0;
@@ -1925,6 +2050,7 @@ void screen_scroll_view(Screen *s, int delta_rows) {
     s->view_off = v;
 }
 
+/* Snap the viewport back to the live grid (offset = 0). */
 void screen_scroll_reset(Screen *s) { s->view_off = 0; }
 
 Cell screen_view_cell(const Screen *s, int col, int vy) {
