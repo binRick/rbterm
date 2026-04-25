@@ -34,6 +34,7 @@ LDLIBS += -lssh
 # we don't depend on a libwebp-enabled ffmpeg build.
 LDLIBS += -lwebp -lwebpmux
 
+
 SRCS := src/main.c src/screen.c src/render.c src/input.c src/theme.c \
         src/sixel.c src/kitty.c src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c \
         src/gif_encoder.c src/webp_encoder.c src/cast.c src/hud.c

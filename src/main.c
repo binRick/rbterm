@@ -8835,11 +8835,24 @@ int main(int argc, char **argv) {
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             EndDrawing();
         } else {
-            /* Idle path: poll input + sleep ~30ms. Cursor blink
-               (2Hz) re-marks dirty on its next phase boundary so
-               we re-render then. CPU drops near zero between. */
+            /* Idle path: pump events + sleep up to the next predicted
+               dirty trigger. Sleep length is the nearest of:
+                 - cursor-blink boundary (~2 Hz)
+                 - 100 ms safety net so input events get polled even
+                   if no animation deadline is closer.
+               Net effect: when truly idle (no input, no PTY), we
+               wake ~10 Hz to poll input + ~2 Hz on top to flip the
+               blink. CPU drops below 1%. We avoid
+               glfwWaitEventsTimeout because brew raylib bundles its
+               own GLFW with hidden symbols — linking against brew's
+               libglfw alongside loads two runtimes and can collide. */
             PollInputEvents();
-            WaitTime(0.030);
+            double now = GetTime();
+            double next_blink = ((long long)(now * 2.0) + 1) / 2.0;
+            double sleep_for  = next_blink - now;
+            if (sleep_for > 0.10) sleep_for = 0.10;
+            if (sleep_for < 0.005) sleep_for = 0.005;
+            WaitTime(sleep_for);
         }
     }
 
