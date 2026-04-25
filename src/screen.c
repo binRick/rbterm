@@ -176,10 +176,10 @@ struct Screen {
     uint16_t urls_count;
     uint32_t urls_cap;
 
-    /* Active OSC 8 link the next put_cp will stamp into cells. */
-    uint16_t cur_link_id;
-    /* Active SGR 58 underline color (0 = inherit fg). */
-    uint32_t cur_ul_color;
+    /* OSC 8 link id and SGR 58 underline color now live inside
+       cur_attr (.link_id / .ul_color). Carrying them on Screen
+       separately forced put_cp to do six discrete stores per cell;
+       folding them in lets put_cp emit a single struct copy. */
 
     /* Per-screen palette (mutable via OSC 4/104). Kept per-screen so
        a tab/pane rewriting its colours doesn't bleed into the others. */
@@ -603,22 +603,22 @@ static void put_cp(Screen *s, uint32_t cp) {
             return;
         }
     }
+    /* Build the cell on the stack, then copy as one struct write.
+       cur_attr already carries fg/bg/ul_color/attrs/link_id, so the
+       per-cell setup is just stamping cp + the wide flag. The
+       compiler lowers `*c = t` to two stores (16 + 4 bytes) instead
+       of the six it'd emit for individual field assignments. */
     Cell *row = row_ptr(s, s->cy);
     Cell *c = row + s->cx;
-    c->cp = cp;
-    c->fg = s->cur_attr.fg;
-    c->bg = s->cur_attr.bg;
-    c->attrs = s->cur_attr.attrs | (wide ? ATTR_WIDE : 0);
-    c->link_id = s->cur_link_id;
-    c->ul_color = s->cur_ul_color;
+    Cell t = s->cur_attr;
+    t.cp = cp;
+    if (wide) t.attrs |= ATTR_WIDE;
+    *c = t;
     if (wide) {
         Cell *c2 = row + s->cx + 1;
-        c2->cp = 0;
-        c2->fg = s->cur_attr.fg;
-        c2->bg = s->cur_attr.bg;
-        c2->attrs = s->cur_attr.attrs | ATTR_WIDE_CONT;
-        c2->link_id = s->cur_link_id;
-        c2->ul_color = s->cur_ul_color;
+        t.cp = 0;
+        t.attrs = (uint16_t)((t.attrs & ~ATTR_WIDE) | ATTR_WIDE_CONT);
+        *c2 = t;
     }
     int advance = wide ? 2 : 1;
     int next = s->cx + advance;
@@ -705,7 +705,7 @@ static void sgr(Screen *s) {
             s->cur_attr.fg = s->default_fg;
             s->cur_attr.bg = s->default_bg;
             s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
-            s->cur_ul_color = 0;
+            s->cur_attr.ul_color = 0;
             break;
         case 1: s->cur_attr.attrs |= ATTR_BOLD;   break;
         case 2: s->cur_attr.attrs |= ATTR_DIM;    break;
@@ -802,20 +802,20 @@ static void sgr(Screen *s) {
                 uint32_t r = s->params[i + 2] & 0xff;
                 uint32_t g = s->params[i + 3] & 0xff;
                 uint32_t b = s->params[i + 4] & 0xff;
-                s->cur_ul_color = (r << 16) | (g << 8) | b;
-                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u;
+                s->cur_attr.ul_color = (r << 16) | (g << 8) | b;
+                if (s->cur_attr.ul_color == 0) s->cur_attr.ul_color = 0x010101u;
                 i += 4;
             } else if (i + 1 < n && s->params[i + 1] == 5 && i + 2 < n) {
                 int idx = s->params[i + 2] & 0xff;
-                s->cur_ul_color = pal(s, idx);
-                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u;
+                s->cur_attr.ul_color = pal(s, idx);
+                if (s->cur_attr.ul_color == 0) s->cur_attr.ul_color = 0x010101u;
                 i += 2;
             }
             while (i + 1 < n && s->param_colon[i + 1]) i++;
             break;
         case 59:
             /* Reset underline color — fall back to fg. */
-            s->cur_ul_color = 0;
+            s->cur_attr.ul_color = 0;
             break;
         case 90: case 91: case 92: case 93:
         case 94: case 95: case 96: case 97:
@@ -1165,9 +1165,9 @@ static void finish_osc(Screen *s) {
         if (*q == ';') q++;
         const char *url = q;
         if (!*url) {
-            s->cur_link_id = 0;
+            s->cur_attr.link_id = 0;
         } else {
-            s->cur_link_id = url_intern(s, url);
+            s->cur_attr.link_id = url_intern(s, url);
         }
         return;
     }
