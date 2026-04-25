@@ -3807,19 +3807,13 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                     DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
                                   swatch_w, swatch_h, col);
                 }
-                /* Two-column: category prefix in a dim left gutter,
-                   bare name in the main column. */
-                char catbuf[16];
-                const char *bare = theme_display_split(ts[i-1].name,
-                                                       catbuf, sizeof(catbuf));
-                int cat_w = 56;
-                if (catbuf[0]) {
-                    DrawTextEx(*f, catbuf,
-                               (Vector2){L.theme_list.x + 10, ry + 4},
-                               12, 0, (Color){130, 140, 160, 220});
-                }
+                /* Display the bare name only — the upstream prefix
+                   ("base16-" / "dkeg-" / "sexy-") is hidden so the
+                   list is easier to scan. The underlying theme.name
+                   keeps its prefix so saved profiles still match. */
+                const char *bare = theme_display_split(ts[i-1].name, NULL, 0);
                 DrawTextEx(*f, bare,
-                           (Vector2){L.theme_list.x + 10 + cat_w, ry + 4},
+                           (Vector2){L.theme_list.x + 10, ry + 4},
                            13, 0,
                            sel ? (Color){230, 232, 240, 255}
                                : (Color){200, 205, 220, 255});
@@ -5281,19 +5275,12 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                 DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
                               swatch_w, swatch_h, col);
             }
-            /* Two-column: dim category prefix on the left, bare name
-               in the main column. Underlying theme.name unchanged. */
-            char catbuf[16];
-            const char *bare = theme_display_split(ts[i].name,
-                                                   catbuf, sizeof(catbuf));
-            int cat_w = 64;
-            if (catbuf[0]) {
-                DrawTextEx(*f, catbuf,
-                           (Vector2){L.theme_list.x + 10, ry + 4},
-                           13, 0, (Color){130, 140, 160, 220});
-            }
+            /* Bare name only — upstream prefix (base16-/dkeg-/sexy-)
+               hidden for readability. Underlying theme.name unchanged
+               so saved profiles still match. */
+            const char *bare = theme_display_split(ts[i].name, NULL, 0);
             DrawTextEx(*f, bare,
-                       (Vector2){L.theme_list.x + 10 + cat_w, ry + 4},
+                       (Vector2){L.theme_list.x + 10, ry + 4},
                        14, 0,
                        sel ? (Color){230, 232, 240, 255}
                            : (Color){200, 205, 220, 255});
