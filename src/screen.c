@@ -1269,7 +1269,16 @@ static void finish_osc(Screen *s) {
             if (s->io.write) s->io.write(s->io.user, (const uint8_t *)buf, n);
         } else {
             uint32_t col;
-            if (parse_color_spec(p, &col)) *slot = col;
+            if (parse_color_spec(p, &col)) {
+                /* Route through the public setter so cells holding the
+                   old default as a literal RGB get retroactively
+                   re-tagged — see remap_default_recolour. Cursor
+                   colour writes the slot directly: it isn't a cell
+                   attribute so there's nothing to remap. */
+                if (ps == 10)      screen_set_default_fg(s, col);
+                else if (ps == 11) screen_set_default_bg(s, col);
+                else               *slot = col;
+            }
         }
         return;
     }
@@ -1856,8 +1865,68 @@ void screen_set_io_user(Screen *s, void *user) {
     s->io.user = user;
 }
 
-void screen_set_default_fg(Screen *s, uint32_t rgb)   { if (s) s->default_fg = rgb; }
-void screen_set_default_bg(Screen *s, uint32_t rgb)   { if (s) s->default_bg = rgb; }
+/* When the default fg/bg changes (OSC 10/11), convert cells that
+   stored the old default as a literal RGB into ATTR_DEFAULT_*
+   markers. This makes tmux / starship-style apps that paint blank
+   regions with truecolor matching the previous default follow the
+   new default — instead of leaving stale rectangles of the old
+   colour after a `pal random` palette swap. Cells with explicit
+   indexed colours (ATTR_*_INDEX) or already-defaulted cells are
+   untouched. */
+static void remap_default_recolour(Screen *s, uint32_t old_rgb, bool is_bg) {
+    if (!s) return;
+    /* Walk every cell buffer that carries colour state: live main,
+       alt, and the scrollback ring. */
+    Cell *bufs[2] = { s->main, s->alt };
+    int  cnts[2] = { s->rows * s->cols, s->rows * s->cols };
+    for (int b = 0; b < 2; b++) {
+        Cell *cs = bufs[b];
+        if (!cs) continue;
+        int n = cnts[b];
+        for (int i = 0; i < n; i++) {
+            Cell *c = &cs[i];
+            if (is_bg) {
+                if (c->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) continue;
+                if (c->bg != old_rgb) continue;
+                c->attrs = (uint16_t)(c->attrs | ATTR_DEFAULT_BG);
+            } else {
+                if (c->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) continue;
+                if (c->fg != old_rgb) continue;
+                c->attrs = (uint16_t)(c->attrs | ATTR_DEFAULT_FG);
+            }
+        }
+    }
+    if (s->sb && s->sb_cap > 0) {
+        int n = s->sb_cap * s->cols;
+        for (int i = 0; i < n; i++) {
+            Cell *c = &s->sb[i];
+            if (is_bg) {
+                if (c->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) continue;
+                if (c->bg != old_rgb) continue;
+                c->attrs = (uint16_t)(c->attrs | ATTR_DEFAULT_BG);
+            } else {
+                if (c->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) continue;
+                if (c->fg != old_rgb) continue;
+                c->attrs = (uint16_t)(c->attrs | ATTR_DEFAULT_FG);
+            }
+        }
+    }
+}
+
+void screen_set_default_fg(Screen *s, uint32_t rgb) {
+    if (!s) return;
+    if (s->default_fg == rgb) return;
+    uint32_t old = s->default_fg;
+    s->default_fg = rgb;
+    remap_default_recolour(s, old, /*is_bg=*/false);
+}
+void screen_set_default_bg(Screen *s, uint32_t rgb) {
+    if (!s) return;
+    if (s->default_bg == rgb) return;
+    uint32_t old = s->default_bg;
+    s->default_bg = rgb;
+    remap_default_recolour(s, old, /*is_bg=*/true);
+}
 void screen_set_cursor_color(Screen *s, uint32_t rgb) { if (s) s->cursor_color = rgb; }
 void screen_set_palette_entry(Screen *s, int i, uint32_t rgb) {
     if (!s || i < 0 || i >= 256) return;
