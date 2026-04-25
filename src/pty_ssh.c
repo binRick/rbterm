@@ -1,9 +1,17 @@
 /* SSH backend for rbterm via libssh. Cross-platform.
  *
- * Connect + auth + channel setup run in blocking mode on the caller's
- * thread (SSH handshake stalls ~1-2 s), then the session flips to
- * non-blocking so pty_read can drain ssh_channel_read_nonblocking the
- * same way local PTYs drain read() + EAGAIN.
+ * Connect + auth + channel setup run in blocking mode on the
+ * caller's thread (SSH handshake stalls ~1-2 s). Once the channel
+ * is up, a dedicated reader thread keeps the channel drained into a
+ * ring buffer, mirroring the local-PTY pattern in pty_unix.c —
+ * without it, SSH throughput is capped at one read per UI frame
+ * and `find /usr | head -10000` runs ~5x slower than iTerm2.
+ *
+ * Threading: libssh sessions aren't thread-safe by default. We
+ * serialise every libssh call (read / write / resize / close)
+ * behind `session_lock`. The reader holds the lock only during
+ * the actual ssh_channel_read_timeout call (50ms max) so the main
+ * thread's writes interleave fluidly between reads.
  *
  * Auth is key-based: explicit private key if the form supplies one,
  * otherwise ssh_userauth_publickey_auto (ssh-agent + ~/.ssh/id_*).
@@ -14,16 +22,74 @@
 
 #include <libssh/libssh.h>
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#define SSH_RING_CAP (1u << 20)   /* 1 MB per SSH session */
+
 typedef struct {
     ssh_session session;
     ssh_channel channel;
     bool alive;
+
+    /* Reader thread + ring (mirrors pty_unix.c). */
+    pthread_t       reader;
+    bool            reader_started;
+    pthread_mutex_t session_lock;   /* serialises libssh calls */
+    pthread_mutex_t ring_lock;      /* protects ring head/tail */
+    uint8_t        *ring;
+    size_t          head;
+    size_t          tail;
+    volatile int    stop;
+    volatile int    eof;
 } SshPty;
+
+/* Reader-thread entry. Polls the SSH channel non-blocking under a
+   briefly-held session lock; sleeps a few ms between empty polls
+   so write latency from the main thread (i.e. typed input) stays
+   low — without the sleep the reader can lock-starve the writer
+   and key echo lags noticeably. The session is set non-blocking
+   in ssh_open_impl so each call returns immediately with whatever
+   libssh has already pumped from the socket. */
+static void *ssh_reader(void *arg) {
+    SshPty *p = (SshPty *)arg;
+    uint8_t buf[16384];
+    while (!__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&p->session_lock);
+        int n = (p->channel)
+            ? ssh_channel_read_nonblocking(p->channel, buf,
+                                           (uint32_t)sizeof(buf), 0)
+            : SSH_ERROR;
+        pthread_mutex_unlock(&p->session_lock);
+        if (n > 0) {
+            pthread_mutex_lock(&p->ring_lock);
+            for (int i = 0; i < n; i++) {
+                p->ring[p->head] = buf[i];
+                p->head = (p->head + 1) & (SSH_RING_CAP - 1);
+                if (p->head == p->tail)
+                    p->tail = (p->tail + 1) & (SSH_RING_CAP - 1);
+            }
+            pthread_mutex_unlock(&p->ring_lock);
+            /* Got data — loop hot but yield so a pending writer
+               can grab the session lock before we re-acquire. */
+            sched_yield();
+            continue;
+        }
+        if (n == SSH_EOF || n == SSH_ERROR) {
+            __atomic_store_n(&p->eof, 1, __ATOMIC_RELAXED);
+            break;
+        }
+        /* No data right now — sleep ~3 ms so the writer thread
+           wins the lock immediately when the user types. Idle CPU
+           stays well under 1%. */
+        struct timespec ts = { 0, 3 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
 
 /* printf-style writer for the caller-supplied error buffer.
    NULL/zero-cap-safe so call sites don't have to guard. */
@@ -293,7 +359,26 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         goto fail;
     }
 
+    /* Non-blocking session so the reader thread's
+       ssh_channel_read_nonblocking returns immediately with
+       whatever libssh has already pumped. The reader sleeps a few
+       ms between empty polls instead of holding the lock. */
     ssh_set_blocking(p->session, 0);
+    p->ring = malloc(SSH_RING_CAP);
+    if (!p->ring) {
+        set_err(err, errsz, "out of memory (ring)");
+        goto fail;
+    }
+    pthread_mutex_init(&p->session_lock, NULL);
+    pthread_mutex_init(&p->ring_lock, NULL);
+    if (pthread_create(&p->reader, NULL, ssh_reader, p) != 0) {
+        set_err(err, errsz, "pthread_create");
+        pthread_mutex_destroy(&p->session_lock);
+        pthread_mutex_destroy(&p->ring_lock);
+        free(p->ring);
+        goto fail;
+    }
+    p->reader_started = true;
     p->alive = true;
     return p;
 
@@ -310,65 +395,88 @@ fail:
     return NULL;
 }
 
-/* Close the channel, disconnect the session, free libssh handles. */
+/* Close the channel, signal + join the reader thread, free libssh
+   handles. The reader's 50ms timeout caps shutdown latency. */
 void ssh_close_impl(void *impl) {
     SshPty *p = impl;
     if (!p) return;
+    __atomic_store_n(&p->stop, 1, __ATOMIC_RELAXED);
+    if (p->reader_started) {
+        pthread_join(p->reader, NULL);
+        p->reader_started = false;
+    }
     if (p->channel) {
+        pthread_mutex_lock(&p->session_lock);
         ssh_channel_close(p->channel);
         ssh_channel_free(p->channel);
+        p->channel = NULL;
+        pthread_mutex_unlock(&p->session_lock);
     }
     if (p->session) {
         ssh_disconnect(p->session);
         ssh_free(p->session);
     }
+    if (p->ring) {
+        pthread_mutex_destroy(&p->ring_lock);
+        pthread_mutex_destroy(&p->session_lock);
+        free(p->ring);
+    }
     free(p);
 }
 
-/* True while the channel is open + the remote shell hasn't sent EOF.
-   Tracks the local `alive` cache so once we see EOF/ERROR on read,
-   subsequent calls report dead immediately. */
+/* True while the channel is open + the reader hasn't seen EOF. */
 bool ssh_alive_impl(void *impl) {
     SshPty *p = impl;
-    if (!p || !p->alive || !p->channel) return false;
-    if (ssh_channel_is_closed(p->channel)) return false;
-    if (ssh_channel_is_eof(p->channel)) return false;
+    if (!p || !p->alive) return false;
+    if (__atomic_load_n(&p->eof, __ATOMIC_RELAXED)) return false;
     return true;
 }
 
-/* Non-blocking drain of the SSH channel. Returns the byte count, 0
-   if nothing's pending, -1 on EOF / ERROR / channel-closed (which
-   also flips `alive` so pty_alive() flips false on the next poll). */
+/* Drain bytes the reader thread has already buffered. Returns the
+   count, 0 when nothing's pending but the channel is still up,
+   -1 once the reader has signalled EOF and the ring is empty. */
 int ssh_read_impl(void *impl, uint8_t *buf, size_t cap) {
     SshPty *p = impl;
-    if (!p || !p->channel) return -1;
-    if (cap > (size_t)0xFFFFFFFF) cap = 0xFFFFFFFF;
-    int n = ssh_channel_read_nonblocking(p->channel, buf, (uint32_t)cap, 0);
-    if (n > 0) return n;
-    if (n == SSH_EOF) { p->alive = false; return -1; }
-    if (n == SSH_ERROR) { p->alive = false; return -1; }
-    if (ssh_channel_is_closed(p->channel)) { p->alive = false; return -1; }
+    if (!p || !p->ring) return -1;
+    size_t n = 0;
+    pthread_mutex_lock(&p->ring_lock);
+    while (n < cap && p->tail != p->head) {
+        buf[n++] = p->ring[p->tail];
+        p->tail = (p->tail + 1) & (SSH_RING_CAP - 1);
+    }
+    pthread_mutex_unlock(&p->ring_lock);
+    if (n > 0) return (int)n;
+    if (__atomic_load_n(&p->eof, __ATOMIC_RELAXED)) {
+        p->alive = false;
+        return -1;
+    }
     return 0;
 }
 
-/* Loop over ssh_channel_write retrying short writes. SSH_ERROR
-   marks the channel dead so pty_alive flips on the next poll. */
+/* Send bytes to the remote shell. Holds session_lock so it can't
+   collide with the reader thread's libssh call. SSH_ERROR marks
+   the channel dead so pty_alive() flips false on the next poll. */
 void ssh_write_impl(void *impl, const uint8_t *buf, size_t n) {
     SshPty *p = impl;
     if (!p || !p->channel) return;
+    pthread_mutex_lock(&p->session_lock);
     size_t off = 0;
-    while (off < n) {
+    while (off < n && p->channel) {
         int w = ssh_channel_write(p->channel, buf + off, (uint32_t)(n - off));
-        if (w == SSH_ERROR) { p->alive = false; return; }
-        if (w <= 0) return;
+        if (w == SSH_ERROR) { p->alive = false; break; }
+        if (w <= 0) break;
         off += (size_t)w;
     }
+    pthread_mutex_unlock(&p->session_lock);
 }
 
-/* Send a "window-change" SSH_MSG_CHANNEL_REQUEST. Result ignored —
-   if the remote disagrees there's nothing useful we can do. */
+/* Send a "window-change" SSH_MSG_CHANNEL_REQUEST under the session
+   lock. Result ignored — if the remote disagrees there's nothing
+   useful we can do. */
 void ssh_resize_impl(void *impl, int cols, int rows) {
     SshPty *p = impl;
     if (!p || !p->channel) return;
-    ssh_channel_change_pty_size(p->channel, cols, rows);
+    pthread_mutex_lock(&p->session_lock);
+    if (p->channel) ssh_channel_change_pty_size(p->channel, cols, rows);
+    pthread_mutex_unlock(&p->session_lock);
 }
