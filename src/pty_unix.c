@@ -41,6 +41,15 @@ typedef struct {
     size_t          tail;
     volatile int    stop;
     volatile int    eof;
+
+    /* Cursor snapshot — set by the main thread after every screen_feed,
+       read by the reader thread to fast-path CSI 6n (Device Status
+       Report) responses without waiting for the next frame. Without
+       this, DSR queries sit in the ring buffer until the main loop
+       drains it at vsync (one full frame of latency). With this, the
+       reader thread emits the reply within microseconds. */
+    volatile int    cy_snap;
+    volatile int    cx_snap;
 } LocalPty;
 
 /* Reader thread entry point. Loops on blocking read() from the
@@ -57,6 +66,37 @@ static void *local_reader(void *arg) {
             break;
         }
         if (n == 0) break;
+
+        /* Fast-path CSI 6n (Device Status Report — cursor position
+           query). The reply doesn't depend on parser-side state we'd
+           have to wait for, just the cursor coordinates that the main
+           thread snapshots after every screen_feed. Replying here in
+           the reader thread cuts ~16 ms (one frame) off the round
+           trip vs queueing the query for the next frame.
+
+           Scan the just-read chunk for the 4-byte pattern. For each
+           hit, write the reply directly to the master fd and remove
+           the 4 bytes from `buf` so the main thread doesn't try to
+           emit a duplicate response. */
+        for (ssize_t i = 0; i + 3 < n; i++) {
+            if (buf[i] == 0x1B && buf[i+1] == '[' &&
+                buf[i+2] == '6' && buf[i+3] == 'n') {
+                int cy = __atomic_load_n(&p->cy_snap, __ATOMIC_RELAXED);
+                int cx = __atomic_load_n(&p->cx_snap, __ATOMIC_RELAXED);
+                char reply[32];
+                int  rlen = snprintf(reply, sizeof(reply),
+                                     "\x1b[%d;%dR", cy + 1, cx + 1);
+                if (rlen > 0) {
+                    ssize_t w = write(p->fd, reply, (size_t)rlen);
+                    (void)w;   /* best-effort; nothing to do on EAGAIN */
+                }
+                memmove(buf + i, buf + i + 4, (size_t)(n - i - 4));
+                n -= 4;
+                i--;   /* re-check current position after shift */
+            }
+        }
+        if (n <= 0) continue;
+
         pthread_mutex_lock(&p->lock);
         for (ssize_t i = 0; i < n; i++) {
             p->ring[p->head] = buf[i];
@@ -262,4 +302,15 @@ bool local_cwd_impl(void *impl, char *out, size_t cap) {
     out[n] = 0;
     return true;
 #endif
+}
+
+/* Atomic-store the screen's cursor position so the reader thread
+   can fast-path CSI 6n responses without taking the parser lock or
+   waiting for the next frame. Called from main loop after every
+   screen_feed. Cheap (two relaxed stores). */
+void local_snap_cursor_impl(void *impl, int cy, int cx) {
+    LocalPty *p = impl;
+    if (!p) return;
+    __atomic_store_n(&p->cy_snap, cy, __ATOMIC_RELAXED);
+    __atomic_store_n(&p->cx_snap, cx, __ATOMIC_RELAXED);
 }

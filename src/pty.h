@@ -56,3 +56,13 @@ void pty_resize(Pty *p, int cols, int rows);
    implemented on Windows (returns false); on Windows users rely on the
    shell's OSC 0/2 title instead. */
 bool pty_cwd(Pty *p, char *out, size_t cap);
+
+/* Publish the screen's cursor position so the local backend's
+   reader thread can fast-path CSI 6n (Device Status Report)
+   replies — sending a response from the reader thread the moment
+   the query arrives, rather than waiting for the next render
+   frame to drain the ring buffer. Call after every `screen_feed`.
+   No-op on backends that don't have the optimisation (currently
+   SSH; the SSH I/O thread already hands data straight to the
+   parser via libssh callbacks). */
+void pty_snap_cursor(Pty *p, int cy, int cx);

@@ -7403,6 +7403,15 @@ int main(int argc, char **argv) {
                     if (n < 0) pane_dead[pi] = true;
                     break;
                 }
+                /* Refresh the PTY's cursor snapshot so the reader
+                   thread can fast-path CSI 6n responses without
+                   waiting for the next frame. Cheap (two relaxed
+                   atomic stores). */
+                if (drained > 0) {
+                    pty_snap_cursor(p->pty,
+                                    screen_cursor_y(p->scr),
+                                    screen_cursor_x(p->scr));
+                }
                 if (!pty_alive(p->pty)) pane_dead[pi] = true;
                 /* Activity on a background tab lights the tab-bar
                    indicator until the user switches to it. */

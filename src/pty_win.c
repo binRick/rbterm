@@ -224,3 +224,10 @@ bool local_cwd_impl(void *impl, char *out, size_t cap) {
     (void)impl; (void)out; (void)cap;
     return false;
 }
+
+/* CSI 6n fast-path stub. Windows port doesn't have it implemented
+   yet — DSR queries fall through to the main-loop parser as
+   before. Wire up when porting the rest of the latency work. */
+void local_snap_cursor_impl(void *impl, int cy, int cx) {
+    (void)impl; (void)cy; (void)cx;
+}

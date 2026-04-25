@@ -28,6 +28,7 @@ int   local_read_impl(void *impl, uint8_t *buf, size_t cap);
 void  local_write_impl(void *impl, const uint8_t *buf, size_t n);
 void  local_resize_impl(void *impl, int cols, int rows);
 bool  local_cwd_impl(void *impl, char *out, size_t cap);
+void  local_snap_cursor_impl(void *impl, int cy, int cx);
 
 /* SSH backend (src/pty_ssh.c, cross-platform via libssh). See pty.h. */
 void *ssh_open_impl(const char *user, const char *host, int port,

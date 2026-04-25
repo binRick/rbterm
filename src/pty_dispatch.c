@@ -85,3 +85,13 @@ bool pty_cwd(Pty *p, char *out, size_t cap) {
     if (p->kind == PTY_SSH) return false;
     return local_cwd_impl(p->impl, out, cap);
 }
+
+/* Publish the screen's cursor position to the backend so it can
+   fast-path CSI 6n (DSR) replies from the reader thread. Local-only
+   for now; SSH path is no-op since the I/O thread already pushes
+   bytes to the parser without frame-rate gating. */
+void pty_snap_cursor(Pty *p, int cy, int cx) {
+    if (!p) return;
+    if (p->kind == PTY_SSH) return;
+    local_snap_cursor_impl(p->impl, cy, cx);
+}
