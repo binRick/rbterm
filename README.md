@@ -175,6 +175,46 @@ Each tab owns a `Pty *`, a `Screen *`, a `Selection`, and a `title`
 / `cwd`. Splits add a second pane with the same set. The main loop
 drains every pane's PTY each frame so background tabs stay live.
 
+## Performance
+
+Run on a single MacBook (M-series, macOS, default 80×24, no tmux),
+using [alacritty/vtebench](https://github.com/alacritty/vtebench)'s
+default suite — twelve escape-sequence streams measuring how fast
+each terminal drains 1 MiB off the PTY. Lower is better; **bold**
+is the per-row winner.
+
+| Benchmark | alacritty | Terminal.app | iTerm2 | kitty | **rbterm** |
+|---|---:|---:|---:|---:|---:|
+| dense_cells | **4.14** | 20.27 | 93.80 | 12.26 | 6.68 |
+| medium_cells | 6.00 | 32.47 | 478.60 | 10.41 | **4.76** |
+| scrolling | 16.29 | 140.25 | 32.80 | 75.48 | **7.26** |
+| scrolling_bottom_region | 11.95 | 114.42 | 509.60 | 30.18 | **7.40** |
+| scrolling_bottom_small_region | 12.00 | 114.42 | 510.20 | 30.07 | **7.50** |
+| scrolling_fullscreen | 25.22 | 143.76 | 56.80 | 139.93 | **9.53** |
+| scrolling_top_region | 32.00 | 117.93 | 2319.60 | 29.10 | **7.79** |
+| scrolling_top_small_region | 11.99 | 116.00 | 510.00 | 30.08 | **7.87** |
+| sync_medium_cells | 8.06 | 37.49 | 504.60 | 17.36 | **4.94** |
+| unicode | 5.85 | 35.64 | 122.20 | 165.75 | **3.93** |
+
+(values: ms drain time per 1 MiB stream, mean of 280–2400 samples
+per benchmark per terminal)
+
+**rbterm wins 9 of 10** — every scrolling benchmark by 1.5–4×, and
+unicode by 1.5×. The single loss is `dense_cells`, where alacritty's
+GPU-batched glyph cache holds the lead by ~1.6×. Some of the iTerm2
+and kitty numbers (e.g. iTerm2's 2319 ms `scrolling_top_region`,
+kitty's 165 ms `unicode`) are surprisingly high — could be one-off
+runtime stalls or known issues in those builds; reproduce locally
+before drawing strong conclusions.
+
+> **Caveat**: vtebench measures *one* axis — PTY drain throughput.
+> It says nothing about input latency, frame pacing, GPU
+> utilisation, startup time, or rendering correctness. A terminal
+> that does less work per byte will look better here even if it
+> looks worse in practice. Don't use this as the only signal.
+
+To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+
 ## Features
 
 - **Shell in a PTY** via `forkpty` on macOS/Linux and **ConPTY** on
