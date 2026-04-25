@@ -2681,7 +2681,7 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             } else {
                 /* Collapsed handle: draw a small chevron (▾) so the
                    user knows where to click to expand again. */
-                const char *chevron = "v stats";
+                const char *chevron = "v hud";
                 int csz_w = MeasureText(chevron, 10);
                 int cx = slab_x + (slab_w - csz_w) / 2;
                 int cy = slab_y + (slab_h - 10) / 2;
