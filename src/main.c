@@ -5568,7 +5568,7 @@ static void open_url(const char *url) {
 
 /* Print the --help message to stdout. */
 static void usage(void) {
-    printf("rbterm — raylib terminal emulator\n"
+    printf("rbterm — terminal emulator\n"
            "Usage: rbterm [--font PATH] [--size N] [--cols N] [--rows N]\n"
            "  --font PATH     path to a .ttf / .otf / .ttc monospace font\n"
            "  --size N        font size in points (default 20)\n"
