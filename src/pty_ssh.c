@@ -501,29 +501,64 @@ static int read_line_locked(ssh_channel chan, char *out, size_t cap,
     return (int)n;
 }
 
+/* Returns true iff RBTERM_HUD_DEBUG is set in the env. Cached
+   after the first call. */
+static int hud_debug_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *dv = getenv("RBTERM_HUD_DEBUG");
+        v = (dv && *dv && *dv != '0') ? 1 : 0;
+    }
+    return v;
+}
+
 /* Parse one HUD probe response and write it to `*out` under hud_lock.
    On any parse failure we leave the previous snapshot intact so the
    render keeps the last-known values rather than flicking to "?". */
 static bool ssh_run_one_probe(SshPty *p) {
+    int dbg = hud_debug_enabled();
     /* Try-lock: skip this probe cycle if shell I/O is mid-burst.
        Better to show stale stats than to add 50ms of latency to a
        cat / find / git log running in the same session. */
-    if (pthread_mutex_trylock(&p->session_lock) != 0) return false;
+    if (pthread_mutex_trylock(&p->session_lock) != 0) {
+        if (dbg) fprintf(stderr, "rbterm hud probe: trylock contended, skipping\n");
+        return false;
+    }
+    /* The session is set non-blocking after auth so the shell-reader
+       thread can use ssh_channel_read_nonblocking. But channel-open
+       and request-exec need to block on the round-trip — in
+       non-blocking mode they return SSH_AGAIN (-2) and the channel
+       gets confused. Briefly flip to blocking; we restore before
+       releasing the lock so the reader thread's next call still
+       sees non-blocking. */
+    ssh_set_blocking(p->session, 1);
     ssh_channel chan = ssh_channel_new(p->session);
-    if (!chan) { pthread_mutex_unlock(&p->session_lock); return false; }
+    if (!chan) {
+        if (dbg) fprintf(stderr, "rbterm hud probe: ssh_channel_new failed\n");
+        ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        return false;
+    }
     int rc = ssh_channel_open_session(chan);
     if (rc != SSH_OK) {
+        if (dbg) fprintf(stderr, "rbterm hud probe: ssh_channel_open_session=%d (%s)\n",
+                         rc, ssh_get_error(p->session));
         ssh_channel_free(chan);
+        ssh_set_blocking(p->session, 0);
         pthread_mutex_unlock(&p->session_lock);
         return false;
     }
     rc = ssh_channel_request_exec(chan, HUD_PROBE_SCRIPT);
     if (rc != SSH_OK) {
+        if (dbg) fprintf(stderr, "rbterm hud probe: ssh_channel_request_exec=%d (%s)\n",
+                         rc, ssh_get_error(p->session));
         ssh_channel_close(chan);
         ssh_channel_free(chan);
+        ssh_set_blocking(p->session, 0);
         pthread_mutex_unlock(&p->session_lock);
         return false;
     }
+    if (dbg) fprintf(stderr, "rbterm hud probe: channel open + exec ok, reading...\n");
 
     /* Drain the probe's output line by line. We hold the session
        lock the whole time which means shell I/O can't interleave
@@ -535,17 +570,16 @@ static bool ssh_run_one_probe(SshPty *p) {
     snap.disk_free_pct = -1;
     bool got_end = false;
     char line[256];
-    /* Set RBTERM_HUD_DEBUG=1 to dump every probe response line to
-       stderr. Helpful when a remote returns nothing or garbage. */
-    static int debug = -1;
-    if (debug < 0) {
-        const char *dv = getenv("RBTERM_HUD_DEBUG");
-        debug = (dv && *dv && *dv != '0') ? 1 : 0;
-    }
+    int line_count = 0;
     for (int i = 0; i < 16; i++) {   /* hard cap on lines */
         int n = read_line_locked(chan, line, sizeof(line), 500);
-        if (n <= 0) break;
-        if (debug) fprintf(stderr, "rbterm hud probe: %s\n", line);
+        if (n <= 0) {
+            if (dbg) fprintf(stderr, "rbterm hud probe: read returned %d after %d lines\n",
+                             n, line_count);
+            break;
+        }
+        line_count++;
+        if (dbg) fprintf(stderr, "rbterm hud probe: %s\n", line);
         if (strncmp(line, "HOST=", 5) == 0) {
             strncpy(snap.hostname, line + 5, sizeof(snap.hostname) - 1);
         } else if (strncmp(line, "IP=", 3) == 0) {
@@ -573,6 +607,8 @@ static bool ssh_run_one_probe(SshPty *p) {
     ssh_channel_send_eof(chan);
     ssh_channel_close(chan);
     ssh_channel_free(chan);
+    /* Restore non-blocking for the next reader-thread iteration. */
+    ssh_set_blocking(p->session, 0);
     pthread_mutex_unlock(&p->session_lock);
 
     if (!got_end) return false;
@@ -586,6 +622,8 @@ static bool ssh_run_one_probe(SshPty *p) {
 
 static void *ssh_hud_probe(void *arg) {
     SshPty *p = (SshPty *)arg;
+    if (hud_debug_enabled())
+        fprintf(stderr, "rbterm hud probe: thread started\n");
     /* Initial 1 sec delay so the channel/auth dust settles before
        we open a second channel. */
     for (int slept = 0; slept < 10; slept++) {
@@ -593,8 +631,12 @@ static void *ssh_hud_probe(void *arg) {
         struct timespec ts = {0, 100000000};   /* 100ms */
         nanosleep(&ts, NULL);
     }
+    int probe_n = 0;
     while (!__atomic_load_n(&p->hud_probe_stop, __ATOMIC_RELAXED) &&
            !__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) {
+        probe_n++;
+        if (hud_debug_enabled())
+            fprintf(stderr, "rbterm hud probe: --- attempt %d ---\n", probe_n);
         ssh_run_one_probe(p);
         for (int slept = 0; slept < 20; slept++) {
             if (__atomic_load_n(&p->hud_probe_stop, __ATOMIC_RELAXED)) return NULL;
