@@ -95,6 +95,10 @@ static void rl_trace_log(int logType, const char *text, va_list args) {
     char line[1024];
     vsnprintf(line, sizeof(line), text, args);
     if (strstr(line, "size is bigger than expected font size")) return;
+    /* stb_truetype rejects some .ttc collections + the occasional
+       odd .ttf in the picker — the affected font just won't render,
+       not a fatal problem. Drop the noise. */
+    if (strstr(line, "Failed to process TTF font data")) return;
     const char *pfx = "INFO";
     switch (logType) {
     case LOG_DEBUG:   pfx = "DEBUG";   break;
