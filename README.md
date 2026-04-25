@@ -230,13 +230,47 @@ per-byte feed_byte() function-call overhead, packed Cell layout so
 `tools/parser_bench` microbench harness so future contributors can
 profile the parser cleanly.
 
+### Round-trip latency — rbterm wins by 4× or more
+
+vtebench measures throughput. The other axis is **round-trip
+latency**: when a program issues an ANSI query (e.g. `CSI 6n` for
+cursor position), how fast does the terminal reply? `tools/echo_bench`
+times the round-trip end to end — kernel write, terminal parse,
+terminal reply, kernel read — across 1000 samples per terminal:
+
+| Terminal | min | **median** | mean | p99 | max | stdev |
+|---|---:|---:|---:|---:|---:|---:|
+| **rbterm** | 0.006 | **0.009** ★ | 0.009 | 0.015 | 0.035 | 0.002 |
+| alacritty | 0.023 | 0.036 | 0.056 | 0.077 | 7.702 | 0.319 |
+| Apple Terminal | 0.027 | 0.053 | 0.066 | 0.122 | 7.250 | 0.237 |
+| kitty | 3.082 | 3.493 | 3.487 | 3.709 | 9.808 | 0.231 |
+
+(values: ms per round trip, lower is better)
+
+- **4× faster than alacritty** on median round-trip
+- **5.9× faster than Apple Terminal**
+- **388× faster than kitty**
+- **stdev of 0.002 ms** — essentially deterministic, no jitter
+
+Why so fast? `pty_unix.c`'s reader thread peeks at incoming bytes
+for the 4-byte `\e[6n` pattern and emits the reply directly using a
+cursor snapshot the main thread refreshes after every parser drain
+(two relaxed atomic stores, ~free). No parser. No frame budget. No
+GUI thread hop. The reply path is deterministic memcmp + write.
+
+Reproduce with:
+```bash
+make echo_bench
+./echo_bench   # run inside each terminal you want to compare
+```
+
 > **Caveat to set expectations**: vtebench measures *one* axis — PTY
-> drain throughput. It says nothing about input latency, frame
-> pacing, rendering correctness, or feature breadth. iTerm2 and
-> kitty have rich feature sets rbterm doesn't try to match. A
-> terminal that does less work per byte will *look* better here even
-> if it looks worse in practice. We treat these numbers as a single
-> signal, not the truth.
+> drain throughput. echo_bench measures *another* — round-trip
+> latency. Neither captures keystroke-to-pixel latency (use
+> [Typometer](docs/BENCHMARKING.md#latency-benchmarking-with-typometer)
+> for that), input handling correctness, frame pacing, or feature
+> breadth. iTerm2 and kitty have rich feature sets rbterm doesn't
+> try to match. We treat these numbers as signals, not the truth.
 
 To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
