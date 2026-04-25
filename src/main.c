@@ -493,6 +493,12 @@ typedef struct {
     int   ssh_font_size;       /* 0 = no override */
     char  ssh_log_dir[PATH_MAX];
     int   ssh_log_mode;        /* 0 = inherit, 1 = on, 2 = off */
+    /* Per-host accent colour for the tab in the tab bar. Empty = no
+       override (uses the default bg). Stored as a "#rrggbb" string so
+       it round-trips cleanly through ssh_config and is easy to
+       hand-edit. Applied at draw_tab_bar time only — the terminal
+       contents themselves remain whatever theme is in force. */
+    char  ssh_color[16];
     /* Background-tab activity: set when any pane of a non-active tab
        receives PTY output. Cleared when the tab becomes active. */
     bool  activity;
@@ -545,6 +551,7 @@ typedef struct {
     int  font_size;          /* 0 = use default */
     char log_dir[PATH_MAX];
     int  log_mode;           /* 0 = inherit, 1 = on, 2 = off */
+    char color[16];          /* "#rrggbb" tab accent colour; empty = none */
     char key[512];
     int  focus;              /* SshField */
     bool sel_all;            /* focused text field's contents are fully selected */
@@ -574,7 +581,39 @@ typedef struct {
     char log_dir[PATH_MAX];
     /* 0 = inherit app setting, 1 = force on, 2 = force off. */
     int  log_mode;
+    char color[16];          /* "#rrggbb" tab accent; empty = none */
 } SshProfile;
+
+/* Curated palette for SSH tab accents. 8 saturated colours that all
+   read well as a tab background plus a "none" sentinel handled
+   separately. Hex stored on disk so users can hand-edit
+   ssh_config and choose any colour they like. */
+static const char * const SSH_COLOR_PRESETS[] = {
+    "#c84a4a",   /* red — prod / danger */
+    "#d68a3a",   /* amber — staging */
+    "#5aa84a",   /* green — dev / safe */
+    "#3a8aa8",   /* teal */
+    "#3a7bff",   /* blue */
+    "#7a4ad6",   /* purple */
+    "#c84aa0",   /* pink */
+    "#5a6275",   /* slate — neutral */
+};
+#define SSH_COLOR_PRESET_COUNT (int)(sizeof(SSH_COLOR_PRESETS) / sizeof(SSH_COLOR_PRESETS[0]))
+
+/* Parse "#rrggbb" or "rrggbb" into an opaque Color. Returns false on
+   malformed input — caller falls back to the default bg. */
+static bool parse_hex_color(const char *hex, Color *out) {
+    if (!hex || !*hex) return false;
+    if (*hex == '#') hex++;
+    if (strlen(hex) < 6) return false;
+    unsigned int rr = 0, gg = 0, bb = 0;
+    if (sscanf(hex, "%2x%2x%2x", &rr, &gg, &bb) != 3) return false;
+    out->r = (unsigned char)rr;
+    out->g = (unsigned char)gg;
+    out->b = (unsigned char)bb;
+    out->a = 255;
+    return true;
+}
 
 #define SSH_PROFILES_MAX 128
 static SshProfile g_ssh_profiles[SSH_PROFILES_MAX];
@@ -599,6 +638,9 @@ typedef struct {
     Rect log_on;
     Rect log_off;
     Rect log_dir;
+    /* Tab accent colour row: 8 preset swatches plus a "none" sentinel
+       at index SSH_COLOR_PRESET_COUNT. */
+    Rect color_swatch[9];
     Rect newbtn;
     Rect connect;
     Rect delbtn;                /* zero-sized when not deletable */
@@ -1228,6 +1270,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const char *theme, int cursor_style,
                          const char *font, int font_size,
                          const char *log_dir, int log_mode,
+                         const char *color,
                          int cols, int rows,
                          char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
@@ -1259,6 +1302,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     t->ssh_font_size = font_size;
     if (log_dir)  { strncpy(t->ssh_log_dir, log_dir, sizeof(t->ssh_log_dir) - 1); t->ssh_log_dir[sizeof(t->ssh_log_dir) - 1] = 0; }
     t->ssh_log_mode = log_mode;
+    if (color)    { strncpy(t->ssh_color, color, sizeof(t->ssh_color) - 1); t->ssh_color[sizeof(t->ssh_color) - 1] = 0; }
     t->ssh_port = port;
     snprintf(t->panes[0].title, sizeof(t->panes[0].title), "%s", t->ssh_target);
     if (!pane_open_ssh(&t->panes[0], user, host, port, password, keyfile,
@@ -3065,6 +3109,25 @@ static void draw_tab_bar(Renderer *r, int win_w) {
         bool active = (i == g_active);
         Color bg = active ? (Color){46, 52, 70, 255} : (Color){28, 32, 44, 255};
         Color fg = active ? (Color){230, 230, 240, 255} : (Color){150, 150, 165, 255};
+        /* Per-host accent: SSH tabs with a configured colour use it
+           as the tab background, dimmed for inactive tabs so the
+           active one still pops out of the bar. The top accent
+           stripe (drawn below) and label colour stay constant. */
+        Color host_tint;
+        if (g_tabs[i]->is_ssh && g_tabs[i]->ssh_color[0] &&
+            parse_hex_color(g_tabs[i]->ssh_color, &host_tint)) {
+            if (active) {
+                bg = host_tint;
+            } else {
+                /* Mix the tint 35% with the dim default so the
+                   inactive tab still looks "off" but still hints
+                   at the host identity. */
+                bg.r = (unsigned char)((host_tint.r * 35 + 28 * 65) / 100);
+                bg.g = (unsigned char)((host_tint.g * 35 + 32 * 65) / 100);
+                bg.b = (unsigned char)((host_tint.b * 35 + 44 * 65) / 100);
+                bg.a = 255;
+            }
+        }
         DrawRectangle(x, 0, tw, TAB_BAR_H, bg);
         if (active) DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
 
@@ -3211,8 +3274,9 @@ static void ssh_profiles_load(void) {
                 strncpy(cur->font, q, sizeof(cur->font) - 1);
                 cur->font[sizeof(cur->font) - 1] = 0;
             } else {
-                const char *ldir_pfx = "rbterm-log-dir:";
-                const char *log_pfx  = "rbterm-log:";
+                const char *ldir_pfx  = "rbterm-log-dir:";
+                const char *log_pfx   = "rbterm-log:";
+                const char *color_pfx = "rbterm-color:";
                 if (strncmp(q, ldir_pfx, strlen(ldir_pfx)) == 0) {
                     q += strlen(ldir_pfx);
                     while (*q == ' ' || *q == '\t') q++;
@@ -3225,6 +3289,12 @@ static void ssh_profiles_load(void) {
                     trim_end(q);
                     if      (!strcmp(q, "on"))  cur->log_mode = 1;
                     else if (!strcmp(q, "off")) cur->log_mode = 2;
+                } else if (strncmp(q, color_pfx, strlen(color_pfx)) == 0) {
+                    q += strlen(color_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    strncpy(cur->color, q, sizeof(cur->color) - 1);
+                    cur->color[sizeof(cur->color) - 1] = 0;
                 }
             }
             continue;
@@ -3320,6 +3390,8 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     strncpy(g_form.log_dir, prof->log_dir, sizeof(g_form.log_dir) - 1);
     g_form.log_dir[sizeof(g_form.log_dir) - 1] = 0;
     g_form.log_mode = prof->log_mode;
+    strncpy(g_form.color, prof->color, sizeof(g_form.color) - 1);
+    g_form.color[sizeof(g_form.color) - 1] = 0;
     g_form.sel_all = false;
     g_form.error[0] = 0;
     form_undo_clear_all();
@@ -3503,7 +3575,7 @@ static bool form_undo_apply(int slot, int dir) {
    the current window size. Shared by draw + click hit-test. */
 static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     SshFormLayout L = {0};
-    int w = 860, h = 780;
+    int w = 860, h = 830;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -3576,6 +3648,20 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     int logdir_row_y = log_row_y + 28 + 8;
     L.log_dir = (Rect){ field_x, logdir_row_y, field_w, 28 };
 
+    /* Tab-accent colour row: 8 preset swatches + a "none" sentinel.
+       Sized so all 9 fit the field width with 4px gaps. */
+    {
+        int swatch_row_y = logdir_row_y + 28 + 14;
+        int n = SSH_COLOR_PRESET_COUNT + 1;   /* presets + "none" */
+        int gap = 4;
+        int sw = (field_w - (n - 1) * gap) / n;
+        int sh = 28;
+        for (int i = 0; i < n; i++) {
+            L.color_swatch[i] = (Rect){
+                field_x + i * (sw + gap), swatch_row_y, sw, sh };
+        }
+    }
+
     /* Buttons: [New] ... [Connect] [Delete] [Save] [Cancel].
        Delete has zero size when no saved host is selected so it can't
        receive clicks; everything else keeps its position. */
@@ -3644,6 +3730,7 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.font_size,
         g_form.log_dir[0] ? g_form.log_dir : NULL,
         g_form.log_mode,
+        g_form.color[0]   ? g_form.color   : NULL,
         cols, rows, err, sizeof(err));
     if (t) {
         /* Clear the password from memory as soon as we no longer need it. */
@@ -3708,6 +3795,8 @@ static void emit_form_managed_lines(FILE *fp) {
         fprintf(fp, "    # rbterm-log: on\n");
     else if (g_form.log_mode == 2)
         fprintf(fp, "    # rbterm-log: off\n");
+    if (g_form.color[0])
+        fprintf(fp, "    # rbterm-color: %s\n", g_form.color);
 }
 
 /* Returns true if `line` (leading whitespace already skipped) is a
@@ -4028,6 +4117,20 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     if (rect_hit(L.log_inherit, mx, my)) { g_form.log_mode = 0; return; }
     if (rect_hit(L.log_on,      mx, my)) { g_form.log_mode = 1; return; }
     if (rect_hit(L.log_off,     mx, my)) { g_form.log_mode = 2; return; }
+
+    /* Tab accent colour swatches. The last entry is the "none"
+       sentinel — clears any colour override. */
+    for (int i = 0; i < SSH_COLOR_PRESET_COUNT; i++) {
+        if (rect_hit(L.color_swatch[i], mx, my)) {
+            strncpy(g_form.color, SSH_COLOR_PRESETS[i], sizeof(g_form.color) - 1);
+            g_form.color[sizeof(g_form.color) - 1] = 0;
+            return;
+        }
+    }
+    if (rect_hit(L.color_swatch[SSH_COLOR_PRESET_COUNT], mx, my)) {
+        g_form.color[0] = 0;
+        return;
+    }
     if (rect_hit(L.log_dir,     mx, my)) {
         g_form_logdir_focus = true;
         return;
@@ -4797,6 +4900,43 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                           (Color){125, 207, 255, 255});
         }
         EndScissorMode();
+    }
+
+    /* Tab accent colour swatches. Click cycles through 8 presets +
+       a "none" sentinel that clears the override. The currently
+       selected swatch wears a brighter outline. */
+    {
+        DrawTextEx(*f, "Tab color",
+                   (Vector2){L.color_swatch[0].x - 104,
+                             L.color_swatch[0].y + 7},
+                   13, 0, (Color){180, 185, 200, 255});
+        for (int i = 0; i < SSH_COLOR_PRESET_COUNT; i++) {
+            Rect rr = L.color_swatch[i];
+            Color c = (Color){90, 95, 110, 255};
+            parse_hex_color(SSH_COLOR_PRESETS[i], &c);
+            bool on = (strcmp(g_form.color, SSH_COLOR_PRESETS[i]) == 0);
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, c);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               on ? (Color){240, 245, 255, 255}
+                                  : (Color){0, 0, 0, 120});
+            if (on) {
+                /* Inner highlight ring so the choice stands out
+                   against any tint. */
+                DrawRectangleLines(rr.x + 1, rr.y + 1, rr.w - 2, rr.h - 2,
+                                   (Color){240, 245, 255, 180});
+            }
+        }
+        Rect nr = L.color_swatch[SSH_COLOR_PRESET_COUNT];
+        bool none_on = (g_form.color[0] == 0);
+        DrawRectangle(nr.x, nr.y, nr.w, nr.h, (Color){34, 38, 52, 255});
+        DrawRectangleLines(nr.x, nr.y, nr.w, nr.h,
+                           none_on ? (Color){240, 245, 255, 255}
+                                   : (Color){125, 207, 255, 150});
+        Vector2 nsz2 = MeasureTextEx(*f, "none", 12, 0);
+        DrawTextEx(*f, "none",
+                   (Vector2){nr.x + (nr.w - nsz2.x) / 2,
+                             nr.y + (nr.h - nsz2.y) / 2},
+                   12, 0, (Color){200, 205, 220, 255});
     }
 
     /* Buttons. */
