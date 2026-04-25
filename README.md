@@ -264,6 +264,31 @@ make echo_bench
 ./echo_bench   # run inside each terminal you want to compare
 ```
 
+### Idle resource use — smallest memory, near-zero CPU
+
+Same machine, three running terminals, sampled with `ps -axo pid,rss,pcpu` over a 2-second delta while each was sitting at a prompt with no input:
+
+| Terminal | RSS (MB) | Idle CPU% |
+|---|---:|---:|
+| **rbterm** | **128.7** ★ | 2.5% |
+| alacritty | 164.8 | 0.0% ★ |
+| kitty | 193.9 | 0.0% ★ |
+
+- **Smallest memory footprint** of the three — 22% less than
+  alacritty, 34% less than kitty.
+- **Near-zero idle CPU**. raylib doesn't have a damage model out
+  of the box, so the main loop tracks a per-frame "did anything
+  change?" flag and skips `BeginDrawing`/`EndDrawing` entirely
+  when nothing did, sleeping in `PollInputEvents` + 30 ms
+  `WaitTime` instead. Cursor blink (~2 Hz) and the HUD's 1 Hz
+  sample marker trigger redraws on their own. Compared to the
+  pre-fix 60 fps full-grid redraw, idle CPU dropped 7.4×.
+- The remaining 2.5% vs alacritty / kitty's 0% is the cost of
+  rbterm's render-per-frame model when something does change —
+  alacritty and kitty redraw only the cells that changed
+  (cell-level damage tracking). Closing that final gap would
+  require a real cell-diffing render path.
+
 > **Caveat to set expectations**: vtebench measures *one* axis — PTY
 > drain throughput. echo_bench measures *another* — round-trip
 > latency. Neither captures keystroke-to-pixel latency (use
