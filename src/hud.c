@@ -13,7 +13,17 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
+#ifdef _WIN32
+  /* GetComputerNameA — the only Windows-side syscall we use here.
+     NOGDI / NOUSER mirror main.c so raylib's Rectangle / DrawText
+     don't collide if the headers ever cross-include. */
+  #define NOGDI
+  #define NOUSER
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+#else
+  #include <unistd.h>      /* gethostname; not on MSVC */
+#endif
 
 #if defined(__APPLE__)
   #include <sys/sysctl.h>
@@ -123,6 +133,22 @@ void hud_local_poll(char *out_hostname, int hostname_cap,
                     double *out_load1,
                     long *out_mem_free_mb,
                     int *out_disk_free_pct) {
+#ifdef _WIN32
+    /* Windows HUD is intentionally a stub for now (see TODO at top
+       of file). Fill safe defaults so callers don't display garbage. */
+    (void)hostname_cap;
+    (void)ip_cap;
+    if (out_hostname && hostname_cap > 0) {
+        DWORD len = (DWORD)hostname_cap;
+        if (!GetComputerNameA(out_hostname, &len)) {
+            snprintf(out_hostname, (size_t)hostname_cap, "?");
+        }
+    }
+    if (out_ip && ip_cap > 0) out_ip[0] = 0;
+    if (out_load1)        *out_load1        = -1.0;
+    if (out_mem_free_mb)  *out_mem_free_mb  = -1;
+    if (out_disk_free_pct)*out_disk_free_pct= -1;
+#else
     if (out_hostname && hostname_cap > 0) {
         if (gethostname(out_hostname, (size_t)hostname_cap) != 0) {
             snprintf(out_hostname, (size_t)hostname_cap, "%s", "?");
@@ -151,6 +177,7 @@ void hud_local_poll(char *out_hostname, int hostname_cap,
 #endif
     }
     if (out_disk_free_pct) *out_disk_free_pct = root_disk_free_pct();
+#endif
 }
 
 /* Format helper: render the unit suffix that fits the magnitude.
