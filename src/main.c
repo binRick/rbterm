@@ -7899,8 +7899,13 @@ int main(int argc, char **argv) {
        dirty without an external event, so the loop wakes at most
        at the cursor-blink rate (~2Hz) while idle. */
     Vector2 prev_mp = {0, 0};
-    bool prev_blink_phase = false;
     bool prev_focused = true;
+    /* Adaptive idle cadence: cap stretches the longer we go without
+       a dirtying event. Burst-typing stays at 5 Hz (~200 ms latency);
+       a stretch of silence rolls back to 1 Hz, halving the
+       PollInputEvents tax (~5 ms each on macOS). The first input
+       resets the timer immediately so latency snaps back. */
+    double last_dirty_ts = GetTime();
 
     while (!WindowShouldClose() && g_num_tabs > 0) {
         bool dirty = false;
@@ -8816,52 +8821,60 @@ int main(int argc, char **argv) {
            current — any change marks dirty so we redraw. We avoid
            GetKeyPressed/GetCharPressed here because those POP the
            event queue; the input section above already saw them
-           via input_poll and set dirty when in_n > 0. */
-        Vector2 cur_mp = GetMousePosition();
-        if (cur_mp.x != prev_mp.x || cur_mp.y != prev_mp.y) dirty = true;
-        prev_mp = cur_mp;
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)
-            || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)
-            || IsMouseButtonReleased(MOUSE_BUTTON_LEFT)
-            || IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)
-            || GetMouseWheelMoveV().y != 0
-            || IsWindowResized()) {
-            dirty = true;
+           via input_poll and set dirty when in_n > 0.
+           Mouse + button checks are gated behind `focused` because
+           macOS keeps reporting cursor positions to background
+           windows, and IsMouseButtonReleased / IsKeyPressed all
+           reflect events delivered to the focused app. Unfocused
+           rbterm shouldn't burn CPU re-rendering on cursor twitches
+           that aren't even visible to it. */
+        if (focused) {
+            Vector2 cur_mp = GetMousePosition();
+            if (cur_mp.x != prev_mp.x || cur_mp.y != prev_mp.y) dirty = true;
+            prev_mp = cur_mp;
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)
+                || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)
+                || IsMouseButtonReleased(MOUSE_BUTTON_LEFT)
+                || IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)
+                || GetMouseWheelMoveV().y != 0) {
+                dirty = true;
+            }
         }
-        bool blink_phase = ((long long)(GetTime() * 2.0)) & 1;
-        /* Cursor only blinks while focused — unfocused windows don't
-           need a redraw on every blink boundary. Real changes (PTY
-           input, mouse, focus toggle) keep their dirty triggers
-           regardless so incoming text still updates the visible
-           framebuffer if the window is partly on screen. */
-        if (focused && blink_phase != prev_blink_phase) dirty = true;
-        prev_blink_phase = blink_phase;
+        if (IsWindowResized()) dirty = true;
+        /* Cursor-blink driven dirty is intentionally NOT a trigger:
+           two redraws/sec just to flip cursor colour was the single
+           biggest contributor to idle CPU. The cursor stops blinking
+           while idle — input or shell output triggers a render and
+           lands the cursor at the current blink phase. Most
+           terminals do the same as a power-save gesture. */
 
         if (dirty) {
+            last_dirty_ts = GetTime();
             BeginDrawing();
             ClearBackground((Color){0, 0, 0, 255});
             draw_tab_bar(&r, win_w_now);
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             EndDrawing();
         } else {
-            /* Idle path: pump events + sleep up to the next predicted
-               dirty trigger. Sleep length is the nearest of:
-                 - cursor-blink boundary (~2 Hz)
-                 - 100 ms safety net so input events get polled even
-                   if no animation deadline is closer.
-               Net effect: when truly idle (no input, no PTY), we
-               wake ~10 Hz to poll input + ~2 Hz on top to flip the
-               blink. CPU drops below 1%. We avoid
-               glfwWaitEventsTimeout because brew raylib bundles its
-               own GLFW with hidden symbols — linking against brew's
-               libglfw alongside loads two runtimes and can collide. */
+            /* Idle path: pump events + sleep. PollInputEvents on
+               macOS is a heavy call (~5 ms — dispatches the whole
+               NSApp event queue) so 5 Hz alone is ~5% CPU. We can't
+               kernel-block on events without rebuilding raylib with
+               USE_EXTERNAL_GLFW (raylib's bundled GLFW hides the
+               symbol; linking brew libglfw alongside causes Cocoa
+               class-name collisions and the wait function then
+               doesn't actually block — empirically 3 M empty
+               iterations/sec). Adaptive cadence instead: if nothing
+               has dirtied for >1 s, stretch the cap to 1 Hz; under
+               1 s use 5 Hz so typing stays snappy. Unfocused windows
+               always sit at 1 Hz regardless. */
             PollInputEvents();
-            double now = GetTime();
-            double next_blink = ((long long)(now * 2.0) + 1) / 2.0;
-            double sleep_for  = next_blink - now;
-            if (sleep_for > 0.10) sleep_for = 0.10;
-            if (sleep_for < 0.005) sleep_for = 0.005;
-            WaitTime(sleep_for);
+            double idle_for = GetTime() - last_dirty_ts;
+            double cap;
+            if (!focused)             cap = 1.00;  /* 1 Hz */
+            else if (idle_for < 1.0)  cap = 0.20;  /* 5 Hz, recent activity */
+            else                      cap = 1.00;  /* 1 Hz, deep idle */
+            WaitTime(cap);
         }
     }
 

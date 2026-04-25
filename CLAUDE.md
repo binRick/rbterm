@@ -692,6 +692,76 @@ Deliberate v1 limits:
   `<prefix>[` copy-mode.
 - No regex, no search-within-selection, no case-sensitivity toggle.
 
+## Idle CPU floor (macOS)
+
+**The number to know: ~4.7% idle CPU is the floor with brew raylib
+on macOS. alacritty / kitty sit at 0%.**
+
+How we got here, and what blocks going lower (so future sessions
+don't burn time re-discovering this):
+
+1. **Pre-optimisation**: 60 fps full-grid redraw → ~18% idle CPU
+   (much higher when typing).
+2. **Dirty-flag gating** in `main.c`: each iteration computes a
+   `dirty` flag. If nothing changed, skip `BeginDrawing` /
+   `EndDrawing` entirely and just call `PollInputEvents()` +
+   `WaitTime()`. Triggers: any PTY drain, any `input_poll` byte,
+   focus changes, mouse movement (only when focused), button /
+   wheel events, window resize, title changes. **Cursor blink is
+   intentionally NOT a trigger** — terminating that 2 Hz redraw
+   cycle was the single biggest contributor to the drop.
+3. **Adaptive idle cadence**: cap stretches with how long it's
+   been since `last_dirty_ts`. Recent activity (<1 s) wakes at
+   5 Hz so typing stays snappy; deep idle (>1 s) drops to 1 Hz.
+   Unfocused windows always sit at 1 Hz.
+
+**The remaining 5% is `glfwPollEvents` itself.** Verified with a
+minimal repro:
+
+```c
+InitWindow(640, 400, "idle test");
+while (!WindowShouldClose()) {
+    PollInputEvents();
+    WaitTime(1.0);
+}
+```
+
+That program — no rbterm logic, no draw calls — sits at 4.6-6.0%
+CPU on macOS. macOS dispatches the entire `NSApp` event queue per
+call (~50 ms each, even when there's nothing to dispatch). At 1 Hz
+that's 50 ms / 1000 ms = 5%. There's no cheap version of this
+function.
+
+**The only way past the floor is `glfwWaitEventsTimeout`** (kernel-
+blocked wait — sleeps until an event arrives or timeout fires).
+Two failed attempts:
+
+- **Link `-lglfw` alongside brew raylib**: builds, but two GLFW
+  runtimes register the same Objective-C classes
+  (`GLFWApplicationDelegate`, `GLFWContentView`, etc.) and Cocoa
+  emits warnings. Worse, the wait function call resolves to brew's
+  GLFW — which has no window of its own — and returns instantly.
+  3 million empty iterations / sec. Same class-collision blocker
+  as the multi-window arc.
+- **`extern void glfwWaitEventsTimeout(double)` resolved out of
+  brew raylib**: brew raylib hides those symbols, so the link
+  fails outright.
+
+**The actual fix** is rebuilding raylib with `USE_EXTERNAL_GLFW=ON`
+(via CMake `FetchContent`), so a single brew GLFW handles both
+raylib's window and our `glfwWaitEventsTimeout` calls. That's the
+same architectural unblocker the multi-window arc needs and is
+deferred for the same reason — it's a multi-hour change touching
+build, init, and per-window state. See "Multi-window (unfinished)"
+above.
+
+**Diagnostics that aren't worth re-trying**: per-iteration timing,
+per-thread sampling (`sample $PID 15`), HUD bypass — confirmed the
+main loop body costs only ~0.16 ms at 1 Hz (0.016% main thread).
+The CPU is being charged to the process for `PollInputEvents`
+work that runs synchronously inside the call but doesn't show up
+on any individual thread sample.
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt

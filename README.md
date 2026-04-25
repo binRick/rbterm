@@ -264,30 +264,35 @@ make echo_bench
 ./echo_bench   # run inside each terminal you want to compare
 ```
 
-### Idle resource use — smallest memory, near-zero CPU
+### Idle resource use — smallest memory, low idle CPU
 
-Same machine, three running terminals, sampled with `ps -axo pid,rss,pcpu` over a 2-second delta while each was sitting at a prompt with no input:
+Same machine, three running terminals, sampled with `top -l 5 -s 3` while each was sitting at a prompt with no input:
 
 | Terminal | RSS (MB) | Idle CPU% |
 |---|---:|---:|
-| **rbterm** | **128.7** ★ | 2.5% |
-| alacritty | 164.8 | 0.0% ★ |
-| kitty | 193.9 | 0.0% ★ |
+| **rbterm** | **123** ★ | ~4.7% |
+| alacritty | 165 | 0.0% ★ |
+| kitty | 194 | 0.0% ★ |
 
-- **Smallest memory footprint** of the three — 22% less than
-  alacritty, 34% less than kitty.
-- **Near-zero idle CPU**. raylib doesn't have a damage model out
-  of the box, so the main loop tracks a per-frame "did anything
-  change?" flag and skips `BeginDrawing`/`EndDrawing` entirely
-  when nothing did, sleeping in `PollInputEvents` + 30 ms
-  `WaitTime` instead. Cursor blink (~2 Hz) and the HUD's 1 Hz
-  sample marker trigger redraws on their own. Compared to the
-  pre-fix 60 fps full-grid redraw, idle CPU dropped 7.4×.
-- The remaining 2.5% vs alacritty / kitty's 0% is the cost of
-  rbterm's render-per-frame model when something does change —
-  alacritty and kitty redraw only the cells that changed
-  (cell-level damage tracking). Closing that final gap would
-  require a real cell-diffing render path.
+- **Smallest memory footprint** of the three — 25% less than
+  alacritty, 37% less than kitty.
+- **Low idle CPU**. raylib doesn't have a damage model out of the
+  box, so the main loop tracks a per-frame "did anything change?"
+  flag and skips `BeginDrawing`/`EndDrawing` entirely when nothing
+  did. Adaptive idle cadence: a 5 Hz wake during recent activity
+  (typing stays snappy), stretching to 1 Hz after one quiet
+  second. Compared to the unconditional 60 fps full-grid redraw,
+  idle CPU dropped roughly 10×.
+- The remaining ~5% vs alacritty / kitty's 0% is the architectural
+  floor for raylib + GLFW on macOS: each `glfwPollEvents` call
+  drains the whole `NSApp` queue and costs ~50 ms even at 1 Hz.
+  Verified with a minimal `InitWindow + PollInputEvents +
+  WaitTime(1.0)` test program — same 5%. To go lower you'd need
+  `glfwWaitEventsTimeout` (kernel-blocked event wait), which
+  brew-installed raylib hides; closing the gap requires rebuilding
+  raylib with `USE_EXTERNAL_GLFW` so its bundled GLFW is replaced
+  by a single shared one. That's a multi-hour change tied to the
+  same constraint as the multi-window rework.
 
 > **Caveat to set expectations**: vtebench measures *one* axis — PTY
 > drain throughput. echo_bench measures *another* — round-trip
