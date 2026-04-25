@@ -25,6 +25,8 @@ typedef struct {
     bool alive;
 } SshPty;
 
+/* printf-style writer for the caller-supplied error buffer.
+   NULL/zero-cap-safe so call sites don't have to guard. */
 static void set_err(char *err, size_t errsz, const char *fmt, ...) {
     if (!err || errsz == 0) return;
     va_list ap;
@@ -52,6 +54,14 @@ static void expand_tilde(const char *in, char *out, size_t cap) {
     out[cap - 1] = 0;
 }
 
+/* Establish an SSH session, authenticate, and request an interactive
+   shell on a remote PTY of the given size. Connect/auth runs blocking
+   on the caller's thread (~1-2s of UI freeze); the session flips to
+   non-blocking before returning so subsequent reads/writes don't
+   stall the main loop. On failure writes a human-readable reason
+   into `err` and returns NULL — see set_err / TRIED above. Auth
+   order: explicit password, explicit key file, ssh-agent, default
+   ~/.ssh/id_* keys. */
 void *ssh_open_impl(const char *user, const char *host, int port,
                     const char *password, const char *keyfile,
                     int cols, int rows,
@@ -300,6 +310,7 @@ fail:
     return NULL;
 }
 
+/* Close the channel, disconnect the session, free libssh handles. */
 void ssh_close_impl(void *impl) {
     SshPty *p = impl;
     if (!p) return;
@@ -314,6 +325,9 @@ void ssh_close_impl(void *impl) {
     free(p);
 }
 
+/* True while the channel is open + the remote shell hasn't sent EOF.
+   Tracks the local `alive` cache so once we see EOF/ERROR on read,
+   subsequent calls report dead immediately. */
 bool ssh_alive_impl(void *impl) {
     SshPty *p = impl;
     if (!p || !p->alive || !p->channel) return false;
@@ -322,6 +336,9 @@ bool ssh_alive_impl(void *impl) {
     return true;
 }
 
+/* Non-blocking drain of the SSH channel. Returns the byte count, 0
+   if nothing's pending, -1 on EOF / ERROR / channel-closed (which
+   also flips `alive` so pty_alive() flips false on the next poll). */
 int ssh_read_impl(void *impl, uint8_t *buf, size_t cap) {
     SshPty *p = impl;
     if (!p || !p->channel) return -1;
@@ -334,6 +351,8 @@ int ssh_read_impl(void *impl, uint8_t *buf, size_t cap) {
     return 0;
 }
 
+/* Loop over ssh_channel_write retrying short writes. SSH_ERROR
+   marks the channel dead so pty_alive flips on the next poll. */
 void ssh_write_impl(void *impl, const uint8_t *buf, size_t n) {
     SshPty *p = impl;
     if (!p || !p->channel) return;
@@ -346,6 +365,8 @@ void ssh_write_impl(void *impl, const uint8_t *buf, size_t n) {
     }
 }
 
+/* Send a "window-change" SSH_MSG_CHANNEL_REQUEST. Result ignored —
+   if the remote disagrees there's nothing useful we can do. */
 void ssh_resize_impl(void *impl, int cols, int rows) {
     SshPty *p = impl;
     if (!p || !p->channel) return;

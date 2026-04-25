@@ -165,6 +165,12 @@ static void scan_extents(const unsigned char *p, const unsigned char *end,
     if (out_rows) *out_rows = rows;
 }
 
+/* Decode a complete sixel DCS payload into an RGBA8 bitmap. Two
+   passes: scan_extents walks the stream to find the final width
+   and sixel-row count, then a second pass allocates the buffer
+   and rasterises it. Returns a malloc'd buffer (caller frees) and
+   writes pixel dims into out_w/out_h. NULL on alloc failure or
+   empty/garbage input. */
 unsigned char *sixel_decode(const unsigned char *p, size_t n,
                             int *out_w, int *out_h) {
     if (!p || n == 0) return NULL;

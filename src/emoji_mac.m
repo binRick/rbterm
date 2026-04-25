@@ -91,6 +91,15 @@ void mac_enter_native_fullscreen(void) {
     }
 }
 
+/* Rasterise a single Unicode codepoint into an RGBA8 bitmap using
+   Core Text. CTFontCreateForString picks a substitute font when the
+   requested one lacks the glyph (so missing arrows / box-drawing /
+   emoji still render). On success, fills *out_rgba (caller frees),
+   *out_w / *out_h, and *out_colored — true means the output is a
+   baked colour bitmap (SBIX) and the caller should NOT tint; false
+   means the glyph is a monochrome vector and the caller should
+   apply the cell's fg colour. Returns false if the rasteriser
+   produced an empty (all-transparent) bitmap. */
 bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
                   uint8_t **out_rgba, int *out_w, int *out_h,
                   bool *out_colored) {

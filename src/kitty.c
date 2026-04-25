@@ -103,6 +103,11 @@ static bool keys_get(const char *keys, size_t klen,
     return false;
 }
 
+/* Decode a single Kitty graphics APC payload (the bytes between
+   `ESC _` and `ESC \\`, with the leading 'G' tag still attached) into
+   an RGBA8 bitmap. Returns a malloc'd buffer (caller frees) and
+   writes width/height into out_w/out_h, or NULL if the payload
+   doesn't carry f=100 PNG data we know how to decode. */
 unsigned char *kitty_decode(const unsigned char *p, size_t n,
                             int *out_w, int *out_h) {
     if (!p || n < 2 || p[0] != 'G') return NULL;
