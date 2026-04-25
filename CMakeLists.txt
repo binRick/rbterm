@@ -21,6 +21,16 @@ FetchContent_Declare(
 set(BUILD_EXAMPLES   OFF CACHE BOOL "" FORCE)
 set(BUILD_GAMES      OFF CACHE BOOL "" FORCE)
 set(SUPPORT_MODULE_RAUDIO OFF CACHE BOOL "" FORCE)
+# Multi-window support requires linking against an EXTERNAL GLFW
+# (brew's libglfw on macOS, libglfw3-dev on Linux) rather than the
+# copy raylib bundles. With two GLFW runtimes in one process,
+# Cocoa's Objective-C runtime sees GLFWApplicationDelegate /
+# GLFWContentView / etc. registered twice and picks one at random,
+# producing "may cause spurious casting failures and mysterious
+# crashes" warnings. One GLFW = no class collisions.
+if(NOT EMSCRIPTEN)
+  set(USE_EXTERNAL_GLFW ON CACHE BOOL "" FORCE)
+endif()
 # raylib's CMake doesn't auto-detect emscripten — have to pin the
 # platform before MakeAvailable or it tries to find X11 and fails.
 if(EMSCRIPTEN)
@@ -49,6 +59,9 @@ set(RBTERM_SOURCES
     src/sixel.c
     src/kitty.c
     src/pty_dispatch.c
+    src/cast.c
+    src/gif_encoder.c
+    src/webp_encoder.c
 )
 
 # Embedded fonts. Three platform paths share one fonts_embedded.h:
@@ -182,6 +195,17 @@ target_include_directories(rbterm PRIVATE src)
 target_link_libraries(rbterm PRIVATE raylib)
 if(RBTERM_SSH)
     target_link_libraries(rbterm PRIVATE ssh)
+endif()
+
+# libwebp + libwebpmux for native animated WebP encoding.
+if(NOT EMSCRIPTEN)
+    find_library(WEBP_LIB     webp     REQUIRED)
+    find_library(WEBPMUX_LIB  webpmux  REQUIRED)
+    target_link_libraries(rbterm PRIVATE ${WEBP_LIB} ${WEBPMUX_LIB})
+    if(APPLE)
+        target_include_directories(rbterm PRIVATE /opt/homebrew/include)
+        target_link_directories(rbterm PRIVATE /opt/homebrew/lib)
+    endif()
 endif()
 
 if(APPLE)
