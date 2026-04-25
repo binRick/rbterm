@@ -77,12 +77,21 @@ struct Screen {
                              natural line terminator). Used by resize reflow. */
     /* OSC 133 (semantic prompt marks) per-row metadata. Type values:
        0 = none, 'A' = prompt start, 'B' = prompt end / command edit
-       start, 'C' = command output start, 'D' = command finished. For
-       'D', `pexit` carries the shell's $? exit code (0..255). The
-       arrays are parallel to main_wrap and sb_wrap; resize and
-       scroll bookkeeping touches them in lockstep. */
+       start, 'C' = command output start, 'D' = command finished.
+       `pexit` is exit_code+1 (so 0 = "no exit known", 1 = success,
+       2..255 = failure exit codes 1..254). Stored separately from
+       pmark so D's exit info survives an immediately-following A
+       overwriting the same row (zsh emits both from precmd back-to-
+       back without any intervening cursor motion). The arrays are
+       parallel to main_wrap and sb_wrap; resize and scroll
+       bookkeeping touches them in lockstep. */
     uint8_t *main_pmark;
     uint8_t *main_pexit;
+    /* Exit code from the most recent OSC 133;D, encoded as
+       exit_code + 1 (0 = none pending). Carried forward to the
+       NEXT A mark so the prompt row inherits the previous
+       command's status when D and A land on different rows. */
+    uint8_t pending_pexit;
     bool on_alt;
 
     // Scrollback ring buffer: rows of `cols` cells
@@ -1084,19 +1093,31 @@ static void finish_osc(Screen *s) {
         if (!s->on_alt && s->main_pmark && s->cy >= 0 && s->cy < s->rows) {
             char kind = *p ? *p : 0;
             if (kind == 'A' || kind == 'B' || kind == 'C' || kind == 'D') {
-                int exit_code = 0;
                 if (kind == 'D') {
                     const char *q = p + 1;
                     if (*q == ';') q++;
-                    /* Parse a base-10 exit code; clamp to 0..255. */
                     int v = 0;
                     while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
                     if (v < 0)   v = 0;
-                    if (v > 255) v = 255;
-                    exit_code = v;
+                    if (v > 254) v = 254;
+                    uint8_t enc = (uint8_t)(v + 1);  /* 1 = exit 0; >1 = failure */
+                    s->main_pmark[s->cy] = 'D';
+                    s->main_pexit[s->cy] = enc;
+                    s->pending_pexit     = enc;
+                } else if (kind == 'A') {
+                    s->main_pmark[s->cy] = 'A';
+                    /* Carry the previous D's exit status onto the prompt row.
+                       If the previous A already consumed it, leave whatever
+                       was there (likely from a same-row D earlier this hook). */
+                    if (s->pending_pexit > 0) {
+                        s->main_pexit[s->cy] = s->pending_pexit;
+                        s->pending_pexit = 0;
+                    }
+                } else {
+                    /* B / C: keep pmark fresh but don't disturb pexit; the
+                       last A/D on this row already painted the status. */
+                    s->main_pmark[s->cy] = (uint8_t)kind;
                 }
-                s->main_pmark[s->cy] = (uint8_t)kind;
-                s->main_pexit[s->cy] = (uint8_t)exit_code;
             }
         }
         return;

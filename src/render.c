@@ -892,18 +892,18 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     }
     img_cache_prune_frame();
 
-    // OSC 133 gutter: small badge to the left of each row that
-    // carries a "command finished" mark (green = exit 0, red
-    // otherwise). Drawn in the pad area so it sits just outside the
-    // first column. Only visible when the user's shell emits OSC 133.
+    // OSC 133 gutter: small badge in the pad area to the left of any
+    // row whose pexit byte is set (green for exit 0, red otherwise).
+    // pexit is exit_code+1, so 0 = "no info"; 1 = success; >1 = fail.
+    // Invisible when the user's shell doesn't emit OSC 133.
     {
         int gutter_x = -4;
         for (int y = 0; y < rows; y++) {
-            uint8_t exit_code = 0;
-            uint8_t mk = screen_view_row_pmark(s, y, &exit_code);
-            if (mk != 'D') continue;
-            Color c = (exit_code == 0) ? (Color){80, 200, 100, 220}
-                                       : (Color){230, 80, 80, 240};
+            uint8_t enc = 0;
+            screen_view_row_pmark(s, y, &enc);
+            if (enc == 0) continue;
+            Color c = (enc == 1) ? (Color){80, 200, 100, 220}
+                                 : (Color){230, 80, 80, 240};
             int badge_h = ch - 4;
             DrawRectangle(gutter_x, y * ch + 2, 3, badge_h, c);
         }
