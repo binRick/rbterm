@@ -43,6 +43,8 @@ jobs:
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
+        # libwebp-dev gets us the native WebP encoder; without it
+        # the stub builds and recording's WebP output would be inert.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -51,16 +53,16 @@ jobs:
             libx11-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxi-dev libxkbcommon-dev \
             libwayland-dev wayland-protocols \
-            libssh-dev
+            libssh-dev libwebp-dev
 
       - name: Install macOS dependencies
         if: matrix.os == 'macos-latest'
-        # libssh is the only non-system dep; raylib, mbedtls are
+        # libssh + webp are the non-system deps; raylib, mbedtls are
         # FetchContent'd from source. Frameworks (Cocoa, IOKit,
         # OpenGL, CoreVideo, CoreText, CoreGraphics) are provided by
         # the OS, the bundled font assembly uses clang's built-in
         # assembler so no extra tools needed.
-        run: brew install libssh
+        run: brew install libssh webp
 
       - name: Configure (CMake)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}

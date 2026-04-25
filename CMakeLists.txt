@@ -53,13 +53,28 @@ set(RBTERM_SOURCES
     src/gif_encoder.c
     src/hud.c
 )
-# Native webp + libwebpmux on desktop; stub on Emscripten where the
-# wasm libwebp port isn't worth pulling in (the recording feature
-# itself is inert in the demo since there's no PTY to record).
-if(EMSCRIPTEN)
-    list(APPEND RBTERM_SOURCES src/webp_encoder_stub.c)
-else()
+# Native webp + libwebpmux on desktop when the libs are available;
+# stub otherwise (Emscripten always; desktop CI runners that don't
+# have libwebp installed). webp_encoder.c #include's <webp/encode.h>
+# which fails to compile if headers aren't present, so we have to
+# pick the source file at configure time, not just the link libs.
+set(RBTERM_HAVE_WEBP FALSE)
+if(NOT EMSCRIPTEN)
+    find_library(WEBP_LIB    webp)
+    find_library(WEBPMUX_LIB webpmux)
+    find_path(WEBP_INCLUDE_DIR webp/encode.h
+              PATHS /opt/homebrew/include /usr/local/include /usr/include)
+    if(WEBP_LIB AND WEBPMUX_LIB AND WEBP_INCLUDE_DIR)
+        set(RBTERM_HAVE_WEBP TRUE)
+    endif()
+endif()
+if(RBTERM_HAVE_WEBP)
     list(APPEND RBTERM_SOURCES src/webp_encoder.c)
+else()
+    list(APPEND RBTERM_SOURCES src/webp_encoder_stub.c)
+    if(NOT EMSCRIPTEN)
+        message(WARNING "libwebp / libwebpmux not found — building with WebP-encoder stub. Recording's WebP output will be inert. brew install webp / apt install libwebp-dev to enable.")
+    endif()
 endif()
 
 # Embedded fonts. Three platform paths share one fonts_embedded.h:
@@ -195,20 +210,11 @@ if(RBTERM_SSH)
     target_link_libraries(rbterm PRIVATE ssh)
 endif()
 
-# Native animated WebP encoding on desktop builds. webp_encoder.c
-# expects -lwebp + -lwebpmux to resolve. Skipped on Emscripten —
-# the stub above keeps the link clean.
-if(NOT EMSCRIPTEN)
-    find_library(WEBP_LIB    webp)
-    find_library(WEBPMUX_LIB webpmux)
-    if(WEBP_LIB AND WEBPMUX_LIB)
-        target_link_libraries(rbterm PRIVATE ${WEBP_LIB} ${WEBPMUX_LIB})
-        if(APPLE)
-            target_include_directories(rbterm PRIVATE /opt/homebrew/include /usr/local/include)
-        endif()
-    else()
-        message(WARNING "libwebp / libwebpmux not found — recording's WebP output will fail at runtime. brew install webp / apt install libwebp-dev.")
-    endif()
+# Link libwebp + libwebpmux only when we picked the real encoder
+# above. The stub has no external deps.
+if(RBTERM_HAVE_WEBP)
+    target_link_libraries(rbterm PRIVATE ${WEBP_LIB} ${WEBPMUX_LIB})
+    target_include_directories(rbterm PRIVATE ${WEBP_INCLUDE_DIR})
 endif()
 
 if(APPLE)
