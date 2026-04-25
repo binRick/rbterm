@@ -187,6 +187,22 @@ typedef struct {
     bool hud_collapsed;          /* user rolled the slab up to a chevron tab */
 } AppSettings;
 
+/* Per-instance HUD configuration. Used both as the per-SSH-host
+   override (Tab/SshProfile/SshForm) and as the value returned by
+   hud_effective(active_tab) — render code reads from it uniformly
+   so it doesn't need to know whether the values came from the
+   global settings or a host override. */
+typedef struct {
+    bool override;            /* only meaningful inside SshProfile/Tab/SshForm:
+                                 false → fall back to g_app_settings */
+    bool show;
+    int  pos;                 /* HudPosition */
+    bool field_show[HUD_FIELD_COUNT];
+    int  field_color[HUD_FIELD_COUNT];
+    int  field_size[HUD_FIELD_COUNT];
+    bool show_cpu;
+} HudConfig;
+
 /* Indexed palette used for HUD field colours. Keep the order stable
    — the index is what gets saved to disk. */
 static const Color HUD_PALETTE[HUD_PALETTE_COUNT] = {
@@ -201,6 +217,26 @@ static const Color HUD_PALETTE[HUD_PALETTE_COUNT] = {
 };
 static AppSettings g_app_settings;
 static char        g_settings_status[160]; /* status line in the settings modal */
+
+/* Pull a HudConfig view of the global app settings. Used as the
+   fallback for tabs that don't override and as the seed when a
+   user enables the per-host override on a fresh form. */
+static HudConfig hud_config_from_app_settings(void) {
+    HudConfig c = {0};
+    c.override = false;
+    c.show     = g_app_settings.show_hud;
+    c.pos      = g_app_settings.hud_pos;
+    for (int i = 0; i < HUD_FIELD_COUNT; i++) {
+        c.field_show[i]  = g_app_settings.hud_show[i];
+        c.field_color[i] = g_app_settings.hud_color[i];
+        c.field_size[i]  = g_app_settings.hud_size[i];
+    }
+    c.show_cpu = g_app_settings.hud_show_cpu;
+    return c;
+}
+/* hud_effective(tab) is defined after the Tab struct since it
+   reads tab->ssh_hud / tab->is_ssh; declared here so call sites
+   in earlier static helpers compile. */
 
 /* Defaults read from the config file at startup. Consumed (and cleared)
    by main() after the renderer and tabs exist. */
@@ -499,10 +535,23 @@ typedef struct {
        hand-edit. Applied at draw_tab_bar time only — the terminal
        contents themselves remain whatever theme is in force. */
     char  ssh_color[16];
+    /* Per-host HUD configuration. ssh_hud.override == false means
+       fall back to g_app_settings; render code goes through
+       hud_effective(t) so it doesn't have to branch. */
+    HudConfig ssh_hud;
     /* Background-tab activity: set when any pane of a non-active tab
        receives PTY output. Cleared when the tab becomes active. */
     bool  activity;
 } Tab;
+
+/* Returns the HudConfig the renderer should consult for `t`. SSH
+   tab with override flag set → use the per-host config; otherwise
+   fall back to the global app settings. Returned by value so call
+   sites can read fields uniformly. */
+static HudConfig hud_effective(const Tab *t) {
+    if (t && t->is_ssh && t->ssh_hud.override) return t->ssh_hud;
+    return hud_config_from_app_settings();
+}
 
 #define MAX_TABS 16
 #define TAB_BAR_H 30
@@ -552,6 +601,7 @@ typedef struct {
     char log_dir[PATH_MAX];
     int  log_mode;           /* 0 = inherit, 1 = on, 2 = off */
     char color[16];          /* "#rrggbb" tab accent colour; empty = none */
+    HudConfig hud;           /* per-host HUD override (override flag gates use) */
     char key[512];
     int  focus;              /* SshField */
     bool sel_all;            /* focused text field's contents are fully selected */
@@ -582,6 +632,7 @@ typedef struct {
     /* 0 = inherit app setting, 1 = force on, 2 = force off. */
     int  log_mode;
     char color[16];          /* "#rrggbb" tab accent; empty = none */
+    HudConfig hud;           /* per-host HUD override */
 } SshProfile;
 
 /* Curated palette for SSH tab accents. 8 saturated colours that all
@@ -641,6 +692,19 @@ typedef struct {
     /* Tab accent colour row: 8 preset swatches plus a "none" sentinel
        at index SSH_COLOR_PRESET_COUNT. */
     Rect color_swatch[9];
+    /* HUD tab — per-host override of the HUD config. */
+    Rect hud_override_btn;      /* "Use host overrides" toggle */
+    Rect hud_toggle;            /* show / hide HUD on this host */
+    Rect hud_pos_tl, hud_pos_tr, hud_pos_bl, hud_pos_br;
+    Rect hud_show_btn[HUD_FIELD_COUNT];
+    Rect hud_color_btn[HUD_FIELD_COUNT];
+    Rect hud_size_dec[HUD_FIELD_COUNT];
+    Rect hud_size_val[HUD_FIELD_COUNT];
+    Rect hud_size_inc[HUD_FIELD_COUNT];
+    Rect hud_cpu_toggle;
+    /* Form-tab buttons across the top of the modal — Connection /
+       Appearance / Logging / HUD. Mirrors the Settings modal pattern. */
+    Rect form_tab[4];
     Rect newbtn;
     Rect connect;
     Rect delbtn;                /* zero-sized when not deletable */
@@ -652,6 +716,19 @@ typedef struct {
    modal's scrolls so each picker remembers its own position). */
 static int g_form_theme_scroll = 0;
 static int g_form_font_scroll  = 0;
+
+/* SSH form is split into tabs the same way the Settings modal is.
+   Connection holds the text fields users always edit; the rest are
+   appearance / logging / HUD knobs that they don't usually touch
+   on every connect. */
+typedef enum {
+    SSH_FORM_TAB_CONNECTION = 0,
+    SSH_FORM_TAB_APPEARANCE = 1,
+    SSH_FORM_TAB_LOGGING    = 2,
+    SSH_FORM_TAB_HUD        = 3,
+    SSH_FORM_TAB_COUNT      = 4,
+} SshFormTabId;
+static int g_ssh_form_tab = SSH_FORM_TAB_CONNECTION;
 
 /* True for one frame after the help modal opens, so the same click
    that triggered the open doesn't immediately dismiss it via the
@@ -1271,6 +1348,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const char *font, int font_size,
                          const char *log_dir, int log_mode,
                          const char *color,
+                         const HudConfig *hud,
                          int cols, int rows,
                          char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
@@ -1303,6 +1381,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     if (log_dir)  { strncpy(t->ssh_log_dir, log_dir, sizeof(t->ssh_log_dir) - 1); t->ssh_log_dir[sizeof(t->ssh_log_dir) - 1] = 0; }
     t->ssh_log_mode = log_mode;
     if (color)    { strncpy(t->ssh_color, color, sizeof(t->ssh_color) - 1); t->ssh_color[sizeof(t->ssh_color) - 1] = 0; }
+    if (hud) t->ssh_hud = *hud;
     t->ssh_port = port;
     snprintf(t->panes[0].title, sizeof(t->panes[0].title), "%s", t->ssh_target);
     if (!pane_open_ssh(&t->panes[0], user, host, port, password, keyfile,
@@ -2614,7 +2693,8 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         if (s_hud_phase > 0.999f) s_hud_phase = 1.0f;
     }
     bool hud_hover = false;
-    if (g_app_settings.show_hud) {
+    HudConfig hud = hud_effective(t);
+    if (hud.show) {
         const int x_pad  = 8;
         const int y_pad  = 6;
         const int margin = 8;
@@ -2658,8 +2738,8 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             int line_w[HUD_FIELD_COUNT] = {0};
             int rendered_count = 0;
             for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
-                if (!g_app_settings.hud_show[fi]) continue;
-                int fs = g_app_settings.hud_size[fi];
+                if (!hud.field_show[fi]) continue;
+                int fs = hud.field_size[fi];
                 if (fs < 10) fs = 10;
                 if (fs > 18) fs = 18;
                 int w = MeasureText(texts[fi], fs);
@@ -2675,7 +2755,7 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                wider of the slab text or a 100px minimum. */
             const int spark_h = 30;
             const int spark_min_w = 100;
-            bool draw_spark = g_app_settings.hud_show_cpu && p->hud_cpu_inited;
+            bool draw_spark = hud.show_cpu && p->hud_cpu_inited;
             if (rendered_count == 0 && !draw_spark) continue;
 
             int spark_w = (max_w > spark_min_w) ? max_w : spark_min_w;
@@ -2694,7 +2774,7 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                 slab_h = (int)(collapsed_h + (slab_h_full - collapsed_h) * s_hud_phase);
             }
             int slab_x, slab_y;
-            switch (g_app_settings.hud_pos) {
+            switch (hud.pos) {
             case HUD_POS_TOP_LEFT:
                 slab_x = pr.x + margin;
                 slab_y = pr.y + margin;
@@ -2735,11 +2815,11 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             int yy = slab_y + y_pad;
             if (s_hud_phase > 0.05f) {
                 for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
-                    if (!g_app_settings.hud_show[fi]) continue;
-                    int fs = g_app_settings.hud_size[fi];
+                    if (!hud.field_show[fi]) continue;
+                    int fs = hud.field_size[fi];
                     if (fs < 10) fs = 10;
                     if (fs > 18) fs = 18;
-                    int ci = g_app_settings.hud_color[fi];
+                    int ci = hud.field_color[fi];
                     if (ci < 0 || ci >= HUD_PALETTE_COUNT) ci = 0;
                     DrawText(texts[fi], slab_x + x_pad, yy, fs,
                              HUD_PALETTE[ci]);
@@ -3274,9 +3354,21 @@ static void ssh_profiles_load(void) {
                 strncpy(cur->font, q, sizeof(cur->font) - 1);
                 cur->font[sizeof(cur->font) - 1] = 0;
             } else {
-                const char *ldir_pfx  = "rbterm-log-dir:";
-                const char *log_pfx   = "rbterm-log:";
-                const char *color_pfx = "rbterm-color:";
+                const char *ldir_pfx     = "rbterm-log-dir:";
+                const char *log_pfx      = "rbterm-log:";
+                const char *color_pfx    = "rbterm-color:";
+                const char *hud_pfx      = "rbterm-hud:";
+                const char *hud_pos_pfx  = "rbterm-hud-pos:";
+                const char *hud_cpu_pfx  = "rbterm-hud-cpu:";
+                /* Per-field "<name>=<show>,<color_idx>,<size>" comments,
+                   one per field. Names mirror HudField order. */
+                static const struct { const char *pfx; int idx; } hud_field_pfx[] = {
+                    { "rbterm-hud-host:", 0 },
+                    { "rbterm-hud-ip:",   1 },
+                    { "rbterm-hud-load:", 2 },
+                    { "rbterm-hud-mem:",  3 },
+                    { "rbterm-hud-disk:", 4 },
+                };
                 if (strncmp(q, ldir_pfx, strlen(ldir_pfx)) == 0) {
                     q += strlen(ldir_pfx);
                     while (*q == ' ' || *q == '\t') q++;
@@ -3295,6 +3387,74 @@ static void ssh_profiles_load(void) {
                     trim_end(q);
                     strncpy(cur->color, q, sizeof(cur->color) - 1);
                     cur->color[sizeof(cur->color) - 1] = 0;
+                /* Any rbterm-hud-* presence implies an override is in
+                   effect. We seed the rest of cur->hud once on first
+                   sight so unspecified fields take sensible defaults
+                   instead of zero. */
+                } else if (strncmp(q, hud_pos_pfx, strlen(hud_pos_pfx)) == 0) {
+                    if (!cur->hud.override) {
+                        cur->hud = hud_config_from_app_settings();
+                        cur->hud.override = true;
+                    }
+                    q += strlen(hud_pos_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    if      (!strcmp(q, "tl")) cur->hud.pos = HUD_POS_TOP_LEFT;
+                    else if (!strcmp(q, "tr")) cur->hud.pos = HUD_POS_TOP_RIGHT;
+                    else if (!strcmp(q, "bl")) cur->hud.pos = HUD_POS_BOTTOM_LEFT;
+                    else if (!strcmp(q, "br")) cur->hud.pos = HUD_POS_BOTTOM_RIGHT;
+                } else if (strncmp(q, hud_cpu_pfx, strlen(hud_cpu_pfx)) == 0) {
+                    if (!cur->hud.override) {
+                        cur->hud = hud_config_from_app_settings();
+                        cur->hud.override = true;
+                    }
+                    q += strlen(hud_cpu_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    cur->hud.show_cpu = (!strcmp(q, "on") || !strcmp(q, "true") || !strcmp(q, "1"));
+                } else if (strncmp(q, hud_pfx, strlen(hud_pfx)) == 0) {
+                    if (!cur->hud.override) {
+                        cur->hud = hud_config_from_app_settings();
+                        cur->hud.override = true;
+                    }
+                    q += strlen(hud_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    cur->hud.show = (!strcmp(q, "on") || !strcmp(q, "true") || !strcmp(q, "1"));
+                } else {
+                    for (size_t hi = 0; hi < sizeof(hud_field_pfx) / sizeof(hud_field_pfx[0]); hi++) {
+                        size_t pl = strlen(hud_field_pfx[hi].pfx);
+                        if (strncmp(q, hud_field_pfx[hi].pfx, pl) != 0) continue;
+                        if (!cur->hud.override) {
+                            cur->hud = hud_config_from_app_settings();
+                            cur->hud.override = true;
+                        }
+                        const char *r = q + pl;
+                        while (*r == ' ' || *r == '\t') r++;
+                        /* Format: <show>,<color_idx>,<size> — show is on/off,
+                           color_idx is 0..HUD_PALETTE_COUNT-1, size is 10..18. */
+                        char tok[64];
+                        snprintf(tok, sizeof(tok), "%s", r);
+                        trim_end(tok);
+                        char *p1 = strchr(tok, ',');
+                        if (p1) {
+                            *p1++ = 0;
+                            char *p2 = strchr(p1, ',');
+                            if (p2) *p2++ = 0;
+                            int idx = hud_field_pfx[hi].idx;
+                            cur->hud.field_show[idx] =
+                                (!strcmp(tok, "on") || !strcmp(tok, "true") || !strcmp(tok, "1"));
+                            int ci = atoi(p1);
+                            if (ci >= 0 && ci < HUD_PALETTE_COUNT)
+                                cur->hud.field_color[idx] = ci;
+                            if (p2) {
+                                int sz = atoi(p2);
+                                if (sz >= 10 && sz <= 18)
+                                    cur->hud.field_size[idx] = sz;
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             continue;
@@ -3392,6 +3552,16 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     g_form.log_mode = prof->log_mode;
     strncpy(g_form.color, prof->color, sizeof(g_form.color) - 1);
     g_form.color[sizeof(g_form.color) - 1] = 0;
+    /* If this profile has any HUD override, copy it; otherwise seed
+       the form's per-host HUD from the global app settings so the
+       user starts editing from a sensible baseline if they enable
+       the override. */
+    if (prof->hud.override) {
+        g_form.hud = prof->hud;
+    } else {
+        g_form.hud = hud_config_from_app_settings();
+        g_form.hud.override = false;
+    }
     g_form.sel_all = false;
     g_form.error[0] = 0;
     form_undo_clear_all();
@@ -3438,6 +3608,11 @@ static void ssh_form_clear(void) {
     g_form_focused_list = FORM_FOCUS_NONE;
     g_form_theme_idx = -1;
     g_form_font_idx = -1;
+    /* Seed the HUD config from the current app settings — if the user
+       enables override on a fresh form they start from defaults that
+       look like what they're already running with. */
+    g_form.hud = hud_config_from_app_settings();
+    g_form.hud.override = false;
     form_undo_clear_all();
 }
 
@@ -3448,6 +3623,7 @@ static void fonts_load(const char *current_path);
    leftover form state. */
 static void ssh_form_open(void) {
     g_ui_mode = UI_SSH_FORM;
+    g_ssh_form_tab = SSH_FORM_TAB_CONNECTION;
     ssh_form_clear();
     /* Refresh the saved-hosts list every time the modal opens so edits
        to ~/.ssh/config show up without restarting rbterm. */
@@ -3575,7 +3751,7 @@ static bool form_undo_apply(int slot, int dir) {
    the current window size. Shared by draw + click hit-test. */
 static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     SshFormLayout L = {0};
-    int w = 860, h = 830;
+    int w = 860, h = 720;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -3585,12 +3761,28 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
 
     int pad = 22;
     int title_h = 46;
+
+    /* Form-tab bar across the top of the modal, mirroring the
+       Settings modal layout pattern. The host list sidebar starts
+       below this so all four tabs share the same content area. */
+    int tab_bar_y = L.modal.y + title_h + 6;
+    int tab_bar_h = 28;
+    {
+        int gap = 4;
+        int total_w = w - 2 * 14;
+        int bw = (total_w - (SSH_FORM_TAB_COUNT - 1) * gap) / SSH_FORM_TAB_COUNT;
+        int bx = L.modal.x + 14;
+        for (int i = 0; i < SSH_FORM_TAB_COUNT; i++)
+            L.form_tab[i] = (Rect){ bx + i * (bw + gap), tab_bar_y, bw, tab_bar_h };
+    }
+
     int list_w = (g_ssh_profile_count > 0) ? 210 : 0;
+    int content_top = tab_bar_y + tab_bar_h + 14;
     if (list_w > 0) {
         L.list.x = L.modal.x + pad;
-        L.list.y = L.modal.y + title_h + 10;
+        L.list.y = content_top;
         L.list.w = list_w;
-        L.list.h = h - title_h - 10 - pad - 40;   /* leaves room for buttons */
+        L.list.h = h - (content_top - L.modal.y) - pad - 40;   /* leaves room for buttons */
     }
 
     int form_x = L.modal.x + pad + list_w + (list_w > 0 ? 14 : 0);
@@ -3598,61 +3790,47 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     int field_x = form_x + label_w;
     int field_w = L.modal.x + w - pad - field_x;
     int field_h = 28;
-    int y = L.modal.y + title_h + 10;
-    for (int i = 0; i < F_TEXT_FIELDS; i++) {
-        L.field[i].x = field_x;
-        L.field[i].y = y;
-        L.field[i].w = field_w;
-        L.field[i].h = field_h;
-        y += field_h + 8;
+
+    /* CONNECTION tab — six text fields stacked. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_CONNECTION) {
+        int y = content_top;
+        for (int i = 0; i < F_TEXT_FIELDS; i++) {
+            L.field[i].x = field_x;
+            L.field[i].y = y;
+            L.field[i].w = field_w;
+            L.field[i].h = field_h;
+            y += field_h + 8;
+        }
     }
 
-    /* Theme + font pickers sit side-by-side below the text fields. */
-    int picker_h = 130;
-    int picker_gap = 12;
-    int picker_w = (field_w - picker_gap) / 2;
-    int picker_y = y + 4;
-    L.theme_list = (Rect){ field_x,                    picker_y, picker_w, picker_h };
-    L.font_list  = (Rect){ field_x + picker_w + picker_gap, picker_y, picker_w, picker_h };
+    /* APPEARANCE tab — theme/font pickers, font-size row, cursor
+       style row, and the tab-accent colour swatches. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_APPEARANCE) {
+        int picker_h = 130;
+        int picker_gap = 12;
+        int picker_w = (field_w - picker_gap) / 2;
+        int picker_y = content_top;
+        L.theme_list = (Rect){ field_x,                          picker_y, picker_w, picker_h };
+        L.font_list  = (Rect){ field_x + picker_w + picker_gap,   picker_y, picker_w, picker_h };
 
-    /* Font-size row: number display + -/+ buttons below the pickers. */
-    int fs_row_y = picker_y + picker_h + 10;
-    int fs_btn = 28;
-    L.fs_val = (Rect){ field_x,                fs_row_y, 66, fs_btn };
-    L.fs_dec = (Rect){ field_x + 74,           fs_row_y, fs_btn, fs_btn };
-    L.fs_inc = (Rect){ field_x + 74 + fs_btn + 6, fs_row_y, fs_btn, fs_btn };
+        int fs_row_y = picker_y + picker_h + 10;
+        int fs_btn = 28;
+        L.fs_val = (Rect){ field_x,                fs_row_y, 66, fs_btn };
+        L.fs_dec = (Rect){ field_x + 74,           fs_row_y, fs_btn, fs_btn };
+        L.fs_inc = (Rect){ field_x + 74 + fs_btn + 6, fs_row_y, fs_btn, fs_btn };
 
-    /* Cursor-style picker: four equal buttons below the font size. */
-    int cur_row_y = fs_row_y + fs_btn + 10;
-    {
-        int btn_h_sty = 30;
-        int gap_sty = 6;
-        int bw = (field_w - 3 * gap_sty) / 4;
-        L.cur_block = (Rect){ field_x,                           cur_row_y, bw, btn_h_sty };
-        L.cur_under = (Rect){ field_x + (bw + gap_sty),           cur_row_y, bw, btn_h_sty };
-        L.cur_bar   = (Rect){ field_x + 2 * (bw + gap_sty),       cur_row_y, bw, btn_h_sty };
-        L.cur_blink = (Rect){ field_x + 3 * (bw + gap_sty),       cur_row_y, bw, btn_h_sty };
-    }
-
-    /* Logging row: 3-state pill (Inherit / On / Off) followed by a
-       second row with the per-host log directory text input. */
-    int log_row_y = cur_row_y + 30 + 10;
-    {
-        int log_btn_h = 28;
-        int gap_log = 6;
-        int bw = (field_w - 2 * gap_log) / 3;
-        L.log_inherit = (Rect){ field_x,                       log_row_y, bw, log_btn_h };
-        L.log_on      = (Rect){ field_x + (bw + gap_log),       log_row_y, bw, log_btn_h };
-        L.log_off     = (Rect){ field_x + 2 * (bw + gap_log),   log_row_y, bw, log_btn_h };
-    }
-    int logdir_row_y = log_row_y + 28 + 8;
-    L.log_dir = (Rect){ field_x, logdir_row_y, field_w, 28 };
-
-    /* Tab-accent colour row: 8 preset swatches + a "none" sentinel.
-       Sized so all 9 fit the field width with 4px gaps. */
-    {
-        int swatch_row_y = logdir_row_y + 28 + 14;
-        int n = SSH_COLOR_PRESET_COUNT + 1;   /* presets + "none" */
+        int cur_row_y = fs_row_y + fs_btn + 10;
+        {
+            int btn_h_sty = 30;
+            int gap_sty = 6;
+            int bw = (field_w - 3 * gap_sty) / 4;
+            L.cur_block = (Rect){ field_x,                           cur_row_y, bw, btn_h_sty };
+            L.cur_under = (Rect){ field_x + (bw + gap_sty),           cur_row_y, bw, btn_h_sty };
+            L.cur_bar   = (Rect){ field_x + 2 * (bw + gap_sty),       cur_row_y, bw, btn_h_sty };
+            L.cur_blink = (Rect){ field_x + 3 * (bw + gap_sty),       cur_row_y, bw, btn_h_sty };
+        }
+        int swatch_row_y = cur_row_y + 30 + 16;
+        int n = SSH_COLOR_PRESET_COUNT + 1;
         int gap = 4;
         int sw = (field_w - (n - 1) * gap) / n;
         int sh = 28;
@@ -3660,6 +3838,52 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
             L.color_swatch[i] = (Rect){
                 field_x + i * (sw + gap), swatch_row_y, sw, sh };
         }
+    }
+
+    /* LOGGING tab — tri-state mode pill + per-host log directory. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_LOGGING) {
+        int log_row_y = content_top;
+        int log_btn_h = 28;
+        int gap_log = 6;
+        int bw = (field_w - 2 * gap_log) / 3;
+        L.log_inherit = (Rect){ field_x,                       log_row_y, bw, log_btn_h };
+        L.log_on      = (Rect){ field_x + (bw + gap_log),       log_row_y, bw, log_btn_h };
+        L.log_off     = (Rect){ field_x + 2 * (bw + gap_log),   log_row_y, bw, log_btn_h };
+        int logdir_row_y = log_row_y + 28 + 14;
+        L.log_dir = (Rect){ field_x, logdir_row_y, field_w, 28 };
+    }
+
+    /* HUD tab — per-host override toggle, then the same controls
+       Settings → HUD has but writing into g_form.hud. Layout mirrors
+       Settings → HUD so muscle memory carries over. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_HUD) {
+        int row_y = content_top;
+        int btn = 28;
+        L.hud_override_btn = (Rect){ field_x, row_y, 200, btn };
+        row_y += btn + 14;
+        L.hud_toggle = (Rect){ field_x, row_y, 110, btn };
+        row_y += btn + 12;
+        int corner_w = 90, corner_h = btn, corner_gap = 6;
+        L.hud_pos_tl = (Rect){ field_x,                              row_y, corner_w, corner_h };
+        L.hud_pos_tr = (Rect){ field_x + (corner_w + corner_gap),    row_y, corner_w, corner_h };
+        row_y += corner_h + corner_gap;
+        L.hud_pos_bl = (Rect){ field_x,                              row_y, corner_w, corner_h };
+        L.hud_pos_br = (Rect){ field_x + (corner_w + corner_gap),    row_y, corner_w, corner_h };
+        row_y += btn + 14;
+        int show_w = 78, swatch_w = 26, sz_w = 22, val_w = 28;
+        int gap_x = 4;
+        int row_h = btn;
+        for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+            int x = field_x;
+            L.hud_show_btn[fi]  = (Rect){ x, row_y, show_w,   row_h }; x += show_w   + gap_x;
+            L.hud_color_btn[fi] = (Rect){ x, row_y, swatch_w, row_h }; x += swatch_w + gap_x;
+            L.hud_size_dec[fi]  = (Rect){ x, row_y, sz_w,     row_h }; x += sz_w     + gap_x;
+            L.hud_size_val[fi]  = (Rect){ x, row_y, val_w,    row_h }; x += val_w    + gap_x;
+            L.hud_size_inc[fi]  = (Rect){ x, row_y, sz_w,     row_h };
+            row_y += row_h + 4;
+        }
+        row_y += 8;
+        L.hud_cpu_toggle = (Rect){ field_x, row_y, 200, btn };
     }
 
     /* Buttons: [New] ... [Connect] [Delete] [Save] [Cancel].
@@ -3731,6 +3955,7 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.log_dir[0] ? g_form.log_dir : NULL,
         g_form.log_mode,
         g_form.color[0]   ? g_form.color   : NULL,
+        g_form.hud.override ? &g_form.hud  : NULL,
         cols, rows, err, sizeof(err));
     if (t) {
         /* Clear the password from memory as soon as we no longer need it. */
@@ -3797,6 +4022,30 @@ static void emit_form_managed_lines(FILE *fp) {
         fprintf(fp, "    # rbterm-log: off\n");
     if (g_form.color[0])
         fprintf(fp, "    # rbterm-color: %s\n", g_form.color);
+    /* Per-host HUD override. Writes a few lines so plain ssh still
+       parses it cleanly. We write the master toggle + position +
+       per-field rows + the cpu-graph toggle so the round-trip is
+       lossless. */
+    if (g_form.hud.override) {
+        fprintf(fp, "    # rbterm-hud: %s\n", g_form.hud.show ? "on" : "off");
+        const char *pos_s = "tr";
+        switch (g_form.hud.pos) {
+        case HUD_POS_TOP_LEFT:     pos_s = "tl"; break;
+        case HUD_POS_TOP_RIGHT:    pos_s = "tr"; break;
+        case HUD_POS_BOTTOM_LEFT:  pos_s = "bl"; break;
+        case HUD_POS_BOTTOM_RIGHT: pos_s = "br"; break;
+        }
+        fprintf(fp, "    # rbterm-hud-pos: %s\n", pos_s);
+        const char *fname[HUD_FIELD_COUNT] = { "host", "ip", "load", "mem", "disk" };
+        for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+            fprintf(fp, "    # rbterm-hud-%s: %s,%d,%d\n",
+                    fname[fi],
+                    g_form.hud.field_show[fi] ? "on" : "off",
+                    g_form.hud.field_color[fi],
+                    g_form.hud.field_size[fi]);
+        }
+        fprintf(fp, "    # rbterm-hud-cpu: %s\n", g_form.hud.show_cpu ? "on" : "off");
+    }
 }
 
 /* Returns true if `line` (leading whitespace already skipped) is a
@@ -4077,6 +4326,20 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
 
+    /* Form tab bar — switch which content section is shown. Clicking
+       a tab also drops keyboard focus on the previous tab's controls
+       so input doesn't bleed across. */
+    for (int i = 0; i < SSH_FORM_TAB_COUNT; i++) {
+        if (rect_hit(L.form_tab[i], mx, my)) {
+            if (g_ssh_form_tab != i) {
+                g_ssh_form_tab = i;
+                g_form_logdir_focus = false;
+                g_form_focused_list = FORM_FOCUS_NONE;
+            }
+            return;
+        }
+    }
+
     /* Click on a saved host → populate fields from ~/.ssh/config. The
        user hits Connect (or double-clicks) to actually open the session
        — keeps single-click from making a tab before you've checked the
@@ -4129,6 +4392,68 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     }
     if (rect_hit(L.color_swatch[SSH_COLOR_PRESET_COUNT], mx, my)) {
         g_form.color[0] = 0;
+        return;
+    }
+
+    /* Per-host HUD tab — only meaningful when the user has flipped
+       the override on. Clicks on the inner controls auto-enable the
+       override so the user doesn't need two clicks to start
+       customising. The L.hud_*.w == 0 check makes these no-ops on
+       other tabs since gated rects stay zero. */
+    if (L.hud_override_btn.w > 0 && rect_hit(L.hud_override_btn, mx, my)) {
+        g_form.hud.override = !g_form.hud.override;
+        return;
+    }
+    if (L.hud_toggle.w > 0 && rect_hit(L.hud_toggle, mx, my)) {
+        g_form.hud.override = true;
+        g_form.hud.show = !g_form.hud.show;
+        return;
+    }
+    if (L.hud_pos_tl.w > 0) {
+        struct { Rect r; int p; } pos_opts[] = {
+            { L.hud_pos_tl, HUD_POS_TOP_LEFT },
+            { L.hud_pos_tr, HUD_POS_TOP_RIGHT },
+            { L.hud_pos_bl, HUD_POS_BOTTOM_LEFT },
+            { L.hud_pos_br, HUD_POS_BOTTOM_RIGHT },
+        };
+        for (size_t pi = 0; pi < sizeof(pos_opts) / sizeof(pos_opts[0]); pi++) {
+            if (rect_hit(pos_opts[pi].r, mx, my)) {
+                g_form.hud.override = true;
+                g_form.hud.pos = pos_opts[pi].p;
+                return;
+            }
+        }
+    }
+    for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+        if (L.hud_show_btn[fi].w > 0 && rect_hit(L.hud_show_btn[fi], mx, my)) {
+            g_form.hud.override = true;
+            g_form.hud.field_show[fi] = !g_form.hud.field_show[fi];
+            return;
+        }
+        if (L.hud_color_btn[fi].w > 0 && rect_hit(L.hud_color_btn[fi], mx, my)) {
+            g_form.hud.override = true;
+            g_form.hud.field_color[fi] =
+                (g_form.hud.field_color[fi] + 1) % HUD_PALETTE_COUNT;
+            return;
+        }
+        if (L.hud_size_dec[fi].w > 0 && rect_hit(L.hud_size_dec[fi], mx, my)) {
+            g_form.hud.override = true;
+            int s = g_form.hud.field_size[fi] - 1;
+            if (s < 10) s = 10;
+            g_form.hud.field_size[fi] = s;
+            return;
+        }
+        if (L.hud_size_inc[fi].w > 0 && rect_hit(L.hud_size_inc[fi], mx, my)) {
+            g_form.hud.override = true;
+            int s = g_form.hud.field_size[fi] + 1;
+            if (s > 18) s = 18;
+            g_form.hud.field_size[fi] = s;
+            return;
+        }
+    }
+    if (L.hud_cpu_toggle.w > 0 && rect_hit(L.hud_cpu_toggle, mx, my)) {
+        g_form.hud.override = true;
+        g_form.hud.show_cpu = !g_form.hud.show_cpu;
         return;
     }
     if (rect_hit(L.log_dir,     mx, my)) {
@@ -4503,6 +4828,26 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     DrawTextEx(*f, "SSH — Connect", (Vector2){L.modal.x + 20, L.modal.y + 11},
                16, 0, (Color){230, 232, 240, 255});
 
+    /* Form-tab bar — matches the Settings modal pattern. */
+    {
+        const char *labels[SSH_FORM_TAB_COUNT] = {
+            "Connection", "Appearance", "Logging", "HUD"
+        };
+        for (int i = 0; i < SSH_FORM_TAB_COUNT; i++) {
+            Rect tb = L.form_tab[i];
+            bool on = (g_ssh_form_tab == i);
+            DrawRectangle(tb.x, tb.y, tb.w, tb.h,
+                          on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255});
+            DrawRectangleLines(tb.x, tb.y, tb.w, tb.h,
+                               (Color){125, 207, 255, on ? 255 : 150});
+            Vector2 lsz = MeasureTextEx(*f, labels[i], 13, 0);
+            DrawTextEx(*f, labels[i],
+                       (Vector2){tb.x + (tb.w - lsz.x) / 2,
+                                 tb.y + (tb.h - lsz.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+        }
+    }
+
     /* Fields. */
     const char *labels[F_TEXT_FIELDS] = {
         "Name", "Host", "Port", "Username", "Password", "Key file"
@@ -4563,6 +4908,7 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     }
 
     char masked[256];
+    if (g_ssh_form_tab == SSH_FORM_TAB_CONNECTION)
     for (int i = 0; i < F_TEXT_FIELDS; i++) {
         /* Labels sit just to the left of each field, not hugging the
            modal edge — otherwise they'd collide with the hosts list. */
@@ -4620,6 +4966,7 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
         EndScissorMode();
     }
 
+    if (g_ssh_form_tab == SSH_FORM_TAB_APPEARANCE) {
     /* Theme picker. First row is a synthetic "(none)" to clear the
        override; real entries follow, each with an 8-colour swatch. */
     DrawTextEx(*f, "Theme",
@@ -4843,7 +5190,9 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                        13, 0, (Color){230, 232, 240, 255});
         }
     }
+    }   /* end SSH_FORM_TAB_APPEARANCE first half (theme/font/cursor) */
 
+    if (g_ssh_form_tab == SSH_FORM_TAB_LOGGING) {
     /* Logging tri-state pill — Inherit (use Settings → Log session),
        On (force on for this host), Off (force off). */
     {
@@ -4901,7 +5250,9 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
         }
         EndScissorMode();
     }
+    }   /* end SSH_FORM_TAB_LOGGING */
 
+    if (g_ssh_form_tab == SSH_FORM_TAB_APPEARANCE) {
     /* Tab accent colour swatches. Click cycles through 8 presets +
        a "none" sentinel that clears the override. The currently
        selected swatch wears a brighter outline. */
@@ -4937,6 +5288,141 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                    (Vector2){nr.x + (nr.w - nsz2.x) / 2,
                              nr.y + (nr.h - nsz2.y) / 2},
                    12, 0, (Color){200, 205, 220, 255});
+    }
+    }   /* end SSH_FORM_TAB_APPEARANCE second half (tab color) */
+
+    if (g_ssh_form_tab == SSH_FORM_TAB_HUD) {
+        /* Per-host HUD config — mirror of Settings → HUD, writing
+           into g_form.hud. Any control toggling auto-enables the
+           override flag so the user doesn't need a separate click. */
+        Color hl_on  = (Color){46, 92, 150, 255};
+        Color hl_off = (Color){34, 38, 52, 255};
+        Color outline= (Color){125, 207, 255, 150};
+        Color outline_active = (Color){125, 207, 255, 255};
+        Color text_main = (Color){230, 232, 240, 255};
+        Color text_dim  = (Color){180, 185, 200, 255};
+
+        /* Override toggle. Without this on, all HUD knobs are
+           inert at runtime and the host falls back to the global
+           settings. */
+        DrawTextEx(*f, "Override",
+                   (Vector2){L.hud_override_btn.x - 104,
+                             L.hud_override_btn.y + 7},
+                   13, 0, text_dim);
+        const char *ov_label = g_form.hud.override
+            ? "Use host overrides"
+            : "Inherit from app";
+        Rect ob = L.hud_override_btn;
+        DrawRectangle(ob.x, ob.y, ob.w, ob.h, g_form.hud.override ? hl_on : hl_off);
+        DrawRectangleLines(ob.x, ob.y, ob.w, ob.h,
+                           g_form.hud.override ? outline_active : outline);
+        Vector2 osz = MeasureTextEx(*f, ov_label, 13, 0);
+        DrawTextEx(*f, ov_label,
+                   (Vector2){ob.x + (ob.w - osz.x) / 2,
+                             ob.y + (ob.h - osz.y) / 2},
+                   13, 0, text_main);
+
+        /* Show / hide. */
+        DrawTextEx(*f, "Show HUD",
+                   (Vector2){L.hud_toggle.x - 104,
+                             L.hud_toggle.y + 7},
+                   13, 0, text_dim);
+        Rect tb = L.hud_toggle;
+        const char *t_label = g_form.hud.show ? "Enabled" : "Disabled";
+        DrawRectangle(tb.x, tb.y, tb.w, tb.h, g_form.hud.show ? hl_on : hl_off);
+        DrawRectangleLines(tb.x, tb.y, tb.w, tb.h,
+                           g_form.hud.show ? outline_active : outline);
+        Vector2 tsz = MeasureTextEx(*f, t_label, 13, 0);
+        DrawTextEx(*f, t_label,
+                   (Vector2){tb.x + (tb.w - tsz.x) / 2,
+                             tb.y + (tb.h - tsz.y) / 2},
+                   13, 0, text_main);
+
+        /* 2×2 corner picker. */
+        DrawTextEx(*f, "Position",
+                   (Vector2){L.hud_pos_tl.x - 104,
+                             L.hud_pos_tl.y + 7},
+                   13, 0, text_dim);
+        struct { Rect r; const char *label; int p; } pos_opts[] = {
+            { L.hud_pos_tl, "Top-left",     HUD_POS_TOP_LEFT },
+            { L.hud_pos_tr, "Top-right",    HUD_POS_TOP_RIGHT },
+            { L.hud_pos_bl, "Bottom-left",  HUD_POS_BOTTOM_LEFT },
+            { L.hud_pos_br, "Bottom-right", HUD_POS_BOTTOM_RIGHT },
+        };
+        for (int pi = 0; pi < 4; pi++) {
+            bool on = (g_form.hud.pos == pos_opts[pi].p);
+            Rect rr = pos_opts[pi].r;
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, on ? hl_on : hl_off);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h, on ? outline_active : outline);
+            Vector2 ssz = MeasureTextEx(*f, pos_opts[pi].label, 12, 0);
+            DrawTextEx(*f, pos_opts[pi].label,
+                       (Vector2){rr.x + (rr.w - ssz.x) / 2,
+                                 rr.y + (rr.h - ssz.y) / 2},
+                       12, 0, text_main);
+        }
+
+        /* Per-field grid: visibility, colour swatch, size − value +. */
+        const char *fnames[HUD_FIELD_COUNT] = { "Host", "IP", "Load", "Mem", "Disk" };
+        for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+            DrawTextEx(*f, fnames[fi],
+                       (Vector2){L.hud_show_btn[fi].x - 60,
+                                 L.hud_show_btn[fi].y + 7},
+                       13, 0, text_dim);
+            Rect sb = L.hud_show_btn[fi];
+            bool sh = g_form.hud.field_show[fi];
+            DrawRectangle(sb.x, sb.y, sb.w, sb.h, sh ? hl_on : hl_off);
+            DrawRectangleLines(sb.x, sb.y, sb.w, sb.h, sh ? outline_active : outline);
+            const char *sl = sh ? "show" : "hide";
+            Vector2 zz = MeasureTextEx(*f, sl, 12, 0);
+            DrawTextEx(*f, sl,
+                       (Vector2){sb.x + (sb.w - zz.x) / 2,
+                                 sb.y + (sb.h - zz.y) / 2},
+                       12, 0, text_main);
+
+            /* Colour swatch (click cycles palette index). */
+            Rect cb = L.hud_color_btn[fi];
+            int ci = g_form.hud.field_color[fi];
+            if (ci < 0 || ci >= HUD_PALETTE_COUNT) ci = 0;
+            DrawRectangle(cb.x, cb.y, cb.w, cb.h, HUD_PALETTE[ci]);
+            DrawRectangleLines(cb.x, cb.y, cb.w, cb.h, outline);
+
+            /* Size − value +. */
+            Rect dec = L.hud_size_dec[fi];
+            DrawRectangle(dec.x, dec.y, dec.w, dec.h, hl_off);
+            DrawRectangleLines(dec.x, dec.y, dec.w, dec.h, outline);
+            Vector2 mss = MeasureTextEx(*f, "−", 16, 0);
+            DrawTextEx(*f, "−",
+                       (Vector2){dec.x + (dec.w - mss.x) / 2,
+                                 dec.y + (dec.h - mss.y) / 2},
+                       16, 0, text_main);
+            Rect val = L.hud_size_val[fi];
+            char vbuf[8]; snprintf(vbuf, sizeof(vbuf), "%d", g_form.hud.field_size[fi]);
+            Vector2 vsz = MeasureTextEx(*f, vbuf, 13, 0);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){val.x + (val.w - vsz.x) / 2,
+                                 val.y + (val.h - vsz.y) / 2},
+                       13, 0, text_main);
+            Rect inc = L.hud_size_inc[fi];
+            DrawRectangle(inc.x, inc.y, inc.w, inc.h, hl_off);
+            DrawRectangleLines(inc.x, inc.y, inc.w, inc.h, outline);
+            Vector2 pss = MeasureTextEx(*f, "+", 16, 0);
+            DrawTextEx(*f, "+",
+                       (Vector2){inc.x + (inc.w - pss.x) / 2,
+                                 inc.y + (inc.h - pss.y) / 2},
+                       16, 0, text_main);
+        }
+
+        /* CPU graph toggle. */
+        Rect cb2 = L.hud_cpu_toggle;
+        DrawRectangle(cb2.x, cb2.y, cb2.w, cb2.h, g_form.hud.show_cpu ? hl_on : hl_off);
+        DrawRectangleLines(cb2.x, cb2.y, cb2.w, cb2.h,
+                           g_form.hud.show_cpu ? outline_active : outline);
+        const char *cl2 = g_form.hud.show_cpu ? "CPU graph: on" : "CPU graph: off";
+        Vector2 cz = MeasureTextEx(*f, cl2, 13, 0);
+        DrawTextEx(*f, cl2,
+                   (Vector2){cb2.x + (cb2.w - cz.x) / 2,
+                             cb2.y + (cb2.h - cz.y) / 2},
+                   13, 0, text_main);
     }
 
     /* Buttons. */
