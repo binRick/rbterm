@@ -2012,6 +2012,18 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                 hcol = c; hrow = rr;
             }
         }
+        /* Paint the pane's full rect with the screen's default
+           background first. The renderer only covers cols*cw + pad
+           and rows*ch + pad — when the window height isn't a clean
+           multiple of cell_h, a thin sliver at the bottom would
+           otherwise show the window's black ClearBackground. */
+        {
+            uint32_t bg = screen_default_bg(p->scr);
+            Color bgc = { (unsigned char)((bg >> 16) & 0xff),
+                          (unsigned char)((bg >> 8)  & 0xff),
+                          (unsigned char)( bg        & 0xff), 255 };
+            DrawRectangle(pr.x, pr.y, pr.w, pr.h, bgc);
+        }
         renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
                       pr.x, pr.y, hcol, hrow);
 
