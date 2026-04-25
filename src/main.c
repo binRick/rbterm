@@ -1047,6 +1047,8 @@ static void pane_close_active(int tab_idx) {
 
 /* ---------- Clipboard + selection helpers ---------- */
 
+/* Codepoint -> 1..4 UTF-8 bytes appended to `buf`. Caller reserves
+   >= 4 bytes; returns the byte count actually written. */
 static size_t utf8_emit(char *buf, uint32_t cp) {
     if (cp < 0x80)    { buf[0] = (char)cp; return 1; }
     if (cp < 0x800)   { buf[0] = 0xC0 | (cp >> 6); buf[1] = 0x80 | (cp & 0x3F); return 2; }
@@ -1063,6 +1065,10 @@ static size_t utf8_emit(char *buf, uint32_t cp) {
     return 4;
 }
 
+/* Copy the active selection's cells into the system clipboard as
+   UTF-8. Trims trailing whitespace per row so a column-aligned
+   selection from `top` doesn't paste with stray padding. Wide-char
+   continuation cells are skipped (their head cell carries the cp). */
 static void copy_selection(Screen *s, const Selection *sel) {
     if (!sel || !sel->active) return;
     int cols = screen_cols(s), rows = screen_rows(s);
@@ -1101,6 +1107,9 @@ static void copy_selection(Screen *s, const Selection *sel) {
 
 static bool ui_key_down(void);
 
+/* Treat a cell as part of a "word" for double-click selection:
+   any non-blank, non-tab, non-empty cell. Position checks first
+   so out-of-range cells don't crash. */
 static bool cell_is_word(Screen *s, int col, int row) {
     if (col < 0 || row < 0 || col >= screen_cols(s) || row >= screen_rows(s)) return false;
     Cell c = screen_view_cell(s, col, row);
@@ -1252,12 +1261,19 @@ static bool is_trailing_trim(uint32_t cp) {
     return cp == ',' || cp == ';' || cp == ':'
         || cp == '.' || cp == '!' || cp == '?';
 }
+/* True if `cp` is a closing bracket-like char that should be
+   trimmed off the right side of a double-clicked word when its
+   matching opener isn't inside the span. */
 static bool is_close_delim(uint32_t cp) {
     return cp == ')' || cp == ']' || cp == '}' || cp == '>' || cp == '"';
 }
+/* Symmetric — opener that gets trimmed off the LEFT when its
+   matching closer is missing on the right. */
 static bool is_open_delim(uint32_t cp) {
     return cp == '(' || cp == '[' || cp == '{' || cp == '<' || cp == '"';
 }
+/* Map a closing delimiter to its opener (for the bracket-matching
+   logic in select_word). 0 for unknown / self-pairing chars. */
 static uint32_t matching_open(uint32_t close_cp) {
     switch (close_cp) {
     case ')': return '(';
@@ -1370,6 +1386,8 @@ static void select_line(Screen *s, Selection *sel, int row) {
 
 /* ---------- Per-pane in-grid search ---------- */
 
+/* Drop the current match list (without freeing the heap allocations
+   — those get reused on the next search). */
 static void search_clear_matches(Search *s) {
     s->count = 0;
     s->current = -1;
@@ -1495,18 +1513,26 @@ static void search_close(Pane *p) {
 
 /* ----- Search-bar query-text helpers (caret / selection / editing) ----- */
 
+/* True when the search bar has a non-empty range selection (caret
+   and sel_anchor differ). */
 static bool search_has_sel(const Search *S) {
     return S->sel_anchor >= 0 && S->sel_anchor != S->caret;
 }
+/* Lower bound (inclusive) of the search-bar selection range, or
+   the caret position when nothing is selected. */
 static int search_sel_lo(const Search *S) {
     if (!search_has_sel(S)) return S->caret;
     return S->sel_anchor < S->caret ? S->sel_anchor : S->caret;
 }
+/* Upper bound (exclusive) of the search-bar selection range. */
 static int search_sel_hi(const Search *S) {
     if (!search_has_sel(S)) return S->caret;
     return S->sel_anchor > S->caret ? S->sel_anchor : S->caret;
 }
+/* Drop any active range selection in the search bar. */
 static void search_clear_sel(Search *S) { S->sel_anchor = -1; }
+/* Delete the selected substring from the query and snap the caret
+   to the start of the deletion. No-op when nothing's selected. */
 static void search_delete_sel(Search *S) {
     if (!search_has_sel(S)) return;
     int lo = search_sel_lo(S), hi = search_sel_hi(S);
@@ -1516,6 +1542,8 @@ static void search_delete_sel(Search *S) {
     S->caret = lo;
     search_clear_sel(S);
 }
+/* Insert one ASCII char at the caret (replacing any selection).
+   Returns false if the query buffer is full. */
 static bool search_insert_char(Search *S, char c) {
     if (search_has_sel(S)) search_delete_sel(S);
     int len = (int)strlen(S->query);
@@ -1546,6 +1574,9 @@ static int search_x_to_caret(Font f, const char *q, int rel_x) {
     return best;
 }
 
+/* Convert a caret position (byte index into `q`) to its pixel
+   x-offset, by measuring the prefix string. Used for selection
+   highlight + caret blink draw. */
 static int search_caret_to_x(Font f, const char *q, int caret) {
     char buf[128];
     int n = caret > 127 ? 127 : caret;
@@ -1563,6 +1594,9 @@ static int search_caret_to_x(Font f, const char *q, int caret) {
 #define SEARCH_BAR_H    30
 #define SEARCH_TEXT_OFF 54   /* x offset from bar left to query text */
 
+/* Compute the search-bar rect (top-of-pane dock) given the pane's
+   position + width. Shared between draw and click hit-test so they
+   stay in sync. */
 static void search_bar_rect(int pane_x, int pane_y, int pane_w,
                             int *out_x, int *out_y, int *out_w, int *out_h) {
     *out_x = pane_x + SEARCH_BAR_XPAD;
