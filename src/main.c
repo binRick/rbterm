@@ -414,17 +414,44 @@ typedef struct {
 #define TAB_REC_W   26          /* one record button (start + stop, both always visible) */
 #define TAB_SSH_W   48
 
-static Tab *g_tabs[MAX_TABS];
+/* ---------- Window: per-OS-window state ----------
+ *
+ * One rbterm process can host multiple windows in one NSApplication
+ * (so macOS Cmd+` cycles them natively, no fork+exec per window).
+ * Per-window state — the set of tabs, the active tab index, and the
+ * tab-drag transient — lives here. Settings, SSH form, recording,
+ * and the help modal are still process-wide because they're modal
+ * (only one open at a time across the app), and they attach to
+ * whichever window is focused.
+ *
+ * The macro layer below redirects the legacy `g_tabs` / `g_active`
+ * / etc. names into `g_focused->...` so existing code continues to
+ * work unmodified. `g_focused` always points at one of the
+ * `g_windows[]` entries — the one that currently owns input. */
+#define MAX_WINDOWS 8
+typedef struct Window {
+    Tab *tabs[MAX_TABS];
+    int  num_tabs;
+    int  active;          /* index into tabs[] */
+    /* Tab-reorder-by-drag state. Set on left-press over a tab's body
+       (not the close 'x'); cleared on release. Once the cursor moves
+       past a threshold, `tab_dragging` flips on and subsequent mouse
+       movement swaps the tab into whichever slot the cursor is over. */
+    int  tab_press_idx;   /* -1 = no drag */
+    int  tab_press_mx;
+    bool tab_dragging;
+} Window;
 
-/* Tab-reorder-by-drag state. Set on left-press over a tab's body (not
-   the close 'x'); cleared on release. Once the cursor moves past a
-   threshold, `g_tab_dragging` flips on and subsequent mouse movement
-   swaps the tab into whichever slot the cursor is over. */
-static int  g_tab_press_idx = -1;
-static int  g_tab_press_mx  = 0;
-static bool g_tab_dragging  = false;
-static int g_num_tabs = 0;
-static int g_active = 0;
+static Window  g_windows[MAX_WINDOWS];
+static int     g_window_count = 1;
+static Window *g_focused = &g_windows[0];
+
+#define g_tabs           (g_focused->tabs)
+#define g_num_tabs       (g_focused->num_tabs)
+#define g_active         (g_focused->active)
+#define g_tab_press_idx  (g_focused->tab_press_idx)
+#define g_tab_press_mx   (g_focused->tab_press_mx)
+#define g_tab_dragging   (g_focused->tab_dragging)
 
 /* Modal SSH connection form. When non-NORMAL, the terminal is locked:
    keystrokes edit form fields and mouse clicks focus them instead of
@@ -7150,6 +7177,13 @@ int main(int argc, char **argv) {
     if (init_opacity > 1.0f) init_opacity = 1.0f;
     if (init_cols < 20) init_cols = 20;
     if (init_rows < 5)  init_rows = 5;
+
+    /* Initialise per-window defaults that aren't zero. tab_press_idx
+       starts at -1 ("no drag"), not 0 (which would mean dragging
+       tab 0 the moment the program starts). */
+    for (int wi = 0; wi < MAX_WINDOWS; wi++) {
+        g_windows[wi].tab_press_idx = -1;
+    }
 
     app_settings_init();
     themes_load_builtins();
