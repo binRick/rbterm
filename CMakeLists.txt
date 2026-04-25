@@ -62,6 +62,7 @@ set(RBTERM_SOURCES
     src/cast.c
     src/gif_encoder.c
     src/webp_encoder.c
+    src/multiwin.c
 )
 
 # Embedded fonts. Three platform paths share one fonts_embedded.h:

@@ -2,6 +2,7 @@
 #include "cast.h"
 #include "gif_encoder.h"
 #include "webp_encoder.h"
+#include "multiwin.h"
 #include <stdarg.h>
 #include "screen.h"
 #include "render.h"
@@ -430,6 +431,7 @@ typedef struct {
  * `g_windows[]` entries — the one that currently owns input. */
 #define MAX_WINDOWS 8
 typedef struct Window {
+    GLFWwindow *handle;   /* the underlying GLFW window; NULL if unused */
     Tab *tabs[MAX_TABS];
     int  num_tabs;
     int  active;          /* index into tabs[] */
@@ -452,6 +454,43 @@ static Window *g_focused = &g_windows[0];
 #define g_tab_press_idx  (g_focused->tab_press_idx)
 #define g_tab_press_mx   (g_focused->tab_press_mx)
 #define g_tab_dragging   (g_focused->tab_dragging)
+
+/* Render every non-primary Window after the primary frame has been
+   presented. Called from each EndDrawing site in the main loop. For
+   now secondary windows show a placeholder ("rbterm — extra
+   window") so we can verify macOS Cmd+` cycles between them. The
+   per-window terminal content is the next step (each Window getting
+   its own active tab + render — currently g_focused dictates which
+   window's tabs draw, and that's always windows[0] until input
+   routing wakes up to refocus on click). */
+static void render_secondary_windows(void) {
+    for (int wi = 1; wi < g_window_count; wi++) {
+        GLFWwindow *gw = g_windows[wi].handle;
+        if (!gw) continue;
+        if (multiwin_should_close(gw)) {
+            /* User clicked the close button — collapse the slot. */
+            multiwin_destroy(gw);
+            g_windows[wi].handle = NULL;
+            for (int j = wi; j + 1 < g_window_count; j++) {
+                g_windows[j] = g_windows[j + 1];
+            }
+            memset(&g_windows[g_window_count - 1], 0, sizeof(Window));
+            g_window_count--;
+            wi--;
+            continue;
+        }
+        multiwin_begin(gw);
+        int fw, fh;
+        multiwin_get_fbsize(gw, &fw, &fh);
+        ClearBackground((Color){26, 28, 38, 255});
+        DrawText("rbterm — extra window", 24, 24, 22, (Color){200, 210, 230, 255});
+        DrawText("Cmd+` cycles between rbterm windows.",
+                 24, 60, 16, (Color){140, 150, 170, 255});
+        DrawText("Per-window terminal content coming next.",
+                 24, 84, 16, (Color){140, 150, 170, 255});
+        multiwin_end(gw);
+    }
+}
 
 /* Modal SSH connection form. When non-NORMAL, the terminal is locked:
    keystrokes edit form fields and mouse clicks focus them instead of
@@ -7256,6 +7295,16 @@ int main(int argc, char **argv) {
 #endif
     SetExitKey(KEY_NULL);
 
+    /* Capture the GLFWwindow* raylib's InitWindow created so multiwin
+       can route per-frame begin/end against it. The first Window in
+       our array owns this handle; future Cmd+N additions get their
+       own via multiwin_create. */
+    {
+        GLFWwindow *primary = multiwin_primary();
+        multiwin_set_primary(primary);
+        g_windows[0].handle = primary;
+    }
+
     Renderer r;
     g_renderer = &r;
     /* Apply startup window layout (configured under Settings). Must
@@ -7816,6 +7865,7 @@ int main(int argc, char **argv) {
                 draw_tab_bar(&r, win_w_now);
                 draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
                 EndDrawing();
+                render_secondary_windows();
                 continue;
             }
             ssh_form_handle_keys(content_cols, content_rows, L);
@@ -7834,6 +7884,7 @@ int main(int argc, char **argv) {
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_ssh_form(&r, win_w_now, win_h_now, L);
             EndDrawing();
+            render_secondary_windows();
             continue;
         }
 
@@ -7852,6 +7903,7 @@ int main(int argc, char **argv) {
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_settings(&r, win_w_now, win_h_now, L);
             EndDrawing();
+            render_secondary_windows();
             continue;
         }
 
@@ -7870,6 +7922,7 @@ int main(int argc, char **argv) {
                 draw_rec_save_modal(&r, win_w_now, win_h_now, RL);
             }
             EndDrawing();
+            render_secondary_windows();
             continue;
         }
 
@@ -7921,6 +7974,7 @@ int main(int argc, char **argv) {
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_help_modal(&r, win_w_now, win_h_now);
             EndDrawing();
+            render_secondary_windows();
             continue;
         }
 
@@ -8036,25 +8090,24 @@ int main(int argc, char **argv) {
                 if (g_num_tabs == 0) break;
                 cur = active_tab();
             }
-            /* Cmd+N opens an entirely new rbterm window: fork+exec the
-               same binary that's running. macOS resolves it via
-               _NSGetExecutablePath (gives the .app's MacOS/rbterm
-               path); Linux via /proc/self/exe. The child detaches with
-               setsid() so closing either window won't affect the other. */
+            /* Cmd+N opens a new rbterm window in the SAME process so
+               macOS Cmd+` cycles between them natively (one
+               NSApplication, multiple GLFWwindows sharing the GL
+               context). New window starts with one tab. */
             else if (IsKeyPressed(KEY_N)) {
-#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
-                char self_path[PATH_MAX] = {0};
-#if defined(__APPLE__)
-                uint32_t _plen = (uint32_t)sizeof(self_path);
-                _NSGetExecutablePath(self_path, &_plen);
-#else
-                ssize_t _n = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
-                if (_n > 0) self_path[_n] = 0;
-#endif
-                if (self_path[0] && fork() == 0) {
-                    setsid();
-                    execl(self_path, self_path, (char *)NULL);
-                    _exit(127);
+#if !defined(__EMSCRIPTEN__)
+                if (g_window_count < MAX_WINDOWS) {
+                    GLFWwindow *gw = multiwin_create(800, 500, "rbterm");
+                    if (gw) {
+                        Window *nw = &g_windows[g_window_count++];
+                        nw->handle = gw;
+                        nw->tab_press_idx = -1;
+                        /* Future: open an initial tab in the new window.
+                           For now the new window is a placeholder so the
+                           Cmd+` cycle works; per-window tabs land in a
+                           follow-up commit (state migration is mostly
+                           done; render path needs the per-window switch). */
+                    }
                 }
 #endif
             }
@@ -8228,6 +8281,7 @@ int main(int argc, char **argv) {
         draw_tab_bar(&r, win_w_now);
         draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
         EndDrawing();
+        render_secondary_windows();
     }
 
     for (int i = g_num_tabs - 1; i >= 0; i--) tab_close(i);
