@@ -7888,7 +7888,21 @@ int main(int argc, char **argv) {
     int  prev_mouse_btn = -1;
     int  prev_mouse_col = -1, prev_mouse_row = -1;
 
+    /* Idle render-skipping. raylib has no damage model — every frame
+       walks the full grid and re-batches glyphs, which costs a
+       constant ~15% CPU on a 100x30 grid even when nothing changed.
+       To get to alacritty/kitty-style idle (~0% CPU when nothing's
+       moving), we track a "did anything happen this frame that
+       requires a redraw?" flag and, when no, skip BeginDrawing
+       entirely and just poll input + sleep. The cursor blink phase
+       and per-second HUD samples are the only animations that mark
+       dirty without an external event, so the loop wakes at most
+       at the cursor-blink rate (~2Hz) while idle. */
+    Vector2 prev_mp = {0, 0};
+    bool prev_blink_phase = false;
+
     while (!WindowShouldClose() && g_num_tabs > 0) {
+        bool dirty = false;
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
@@ -7948,6 +7962,7 @@ int main(int argc, char **argv) {
                 if (!pty_alive(p->pty)) pane_dead[pi] = true;
                 /* Activity on a background tab lights the tab-bar
                    indicator until the user switches to it. */
+                if (drained > 0) dirty = true;
                 if (drained > 0 && i != g_active) t->activity = true;
             }
             /* Close dead panes in reverse so indices stay valid during
@@ -8779,6 +8794,8 @@ int main(int argc, char **argv) {
                 SetWindowMinSize(r.cell_w * 20 + 2 * r.pad_x, r.cell_h * 5 + TAB_BAR_H + 2 * r.pad_y);
             }
         }
+        if (in_n > 0) dirty = true;
+        if (acts.font_delta != 100) dirty = true;
         if (ap && in_n > 0) {
             screen_scroll_reset(ap->scr);
             pty_write(ap->pty, inputbuf, in_n);
@@ -8788,13 +8805,42 @@ int main(int argc, char **argv) {
         if (ap && ap->title_dirty) {
             SetWindowTitle(ap->title[0] ? ap->title : tab_label(cur));
             ap->title_dirty = false;
+            dirty = true;
         }
 
-        BeginDrawing();
-        ClearBackground((Color){0, 0, 0, 255});
-        draw_tab_bar(&r, win_w_now);
-        draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
-        EndDrawing();
+        /* Wake-on-event sentinel checks. Previous-frame state vs
+           current — any change marks dirty so we redraw. We avoid
+           GetKeyPressed/GetCharPressed here because those POP the
+           event queue; the input section above already saw them
+           via input_poll and set dirty when in_n > 0. */
+        Vector2 cur_mp = GetMousePosition();
+        if (cur_mp.x != prev_mp.x || cur_mp.y != prev_mp.y) dirty = true;
+        prev_mp = cur_mp;
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)
+            || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)
+            || IsMouseButtonReleased(MOUSE_BUTTON_LEFT)
+            || IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)
+            || GetMouseWheelMoveV().y != 0
+            || IsWindowResized()) {
+            dirty = true;
+        }
+        bool blink_phase = ((long long)(GetTime() * 2.0)) & 1;
+        if (blink_phase != prev_blink_phase) dirty = true;
+        prev_blink_phase = blink_phase;
+
+        if (dirty) {
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
+            EndDrawing();
+        } else {
+            /* Idle path: poll input + sleep ~30ms. Cursor blink
+               (2Hz) re-marks dirty on its next phase boundary so
+               we re-render then. CPU drops near zero between. */
+            PollInputEvents();
+            WaitTime(0.030);
+        }
     }
 
     for (int i = g_num_tabs - 1; i >= 0; i--) tab_close(i);
