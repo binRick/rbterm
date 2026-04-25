@@ -4648,21 +4648,22 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         L.cur_under = (Rect){ bx + (bw + gap_sty),          cur_row_y, bw, bh };
         L.cur_bar   = (Rect){ bx + 2 * (bw + gap_sty),      cur_row_y, bw, bh };
         L.cur_blink = (Rect){ bx + 3 * (bw + gap_sty),      cur_row_y, bw, bh };
+        /* Key-repeat sliders live on the Cursor tab too — they're
+           keyboard-feel knobs, not session-state. */
+        int slider_track_h = 8;
+        int row_pitch = 22;
+        int kr1_y = cur_row_y + bh + 24;
+        L.repeat_initial = (Rect){ L.modal.x + 140, kr1_y, w - 140 - 22 - 60,
+                                   slider_track_h };
+        int kr2_y = kr1_y + row_pitch;
+        L.repeat_rate    = (Rect){ L.modal.x + 140, kr2_y, w - 140 - 22 - 60,
+                                   slider_track_h };
     } else if (g_settings_tab == SETTINGS_TAB_SESSION) {
         int log_row1_y = content_y;
         L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
 
         int log_row2_y = log_row1_y + btn + 10;
         L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
-
-        int slider_track_h = 8;
-        int row_pitch = 22;
-        int kr1_y = log_row2_y + btn + 24;
-        L.repeat_initial = (Rect){ L.modal.x + 140, kr1_y, w - 140 - 22 - 60,
-                                   slider_track_h };
-        int kr2_y = kr1_y + row_pitch;
-        L.repeat_rate    = (Rect){ L.modal.x + 140, kr2_y, w - 140 - 22 - 60,
-                                   slider_track_h };
     } else if (g_settings_tab == SETTINGS_TAB_WINDOW) {
         int sw_row_y = content_y;
         int bwidth = w - 140 - 22;
@@ -5487,6 +5488,48 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         }
     }
 
+    /* Key-repeat sliders. Two rows: initial delay, then per-repeat
+       period. Track is a thin inset bar; the thumb is a tall pill
+       overlapping the track. Current value renders to the right.
+       Lives on the Cursor tab — keyboard-feel knobs sit naturally
+       alongside the cursor-style picker. */
+    {
+        struct SliderSpec {
+            Rect        track;
+            const char *label;
+            int         val, vmin, vmax;
+            const char *unit;
+        } rows[2] = {
+            { L.repeat_initial, "Repeat delay",
+              g_app_settings.key_repeat_initial_ms, 0, 1000, "ms" },
+            { L.repeat_rate,    "Repeat rate",
+              g_app_settings.key_repeat_rate_ms,    5, 200, "ms" },
+        };
+        for (int i = 0; i < 2; i++) {
+            Rect tr = rows[i].track;
+            DrawTextEx(*f, rows[i].label,
+                       (Vector2){L.modal.x + 22, tr.y - 3},
+                       14, 0, (Color){200, 205, 220, 255});
+            DrawRectangle(tr.x, tr.y + tr.h / 2 - 2, tr.w, 4,
+                          (Color){46, 52, 70, 255});
+            float t = (float)(rows[i].val - rows[i].vmin)
+                    / (float)(rows[i].vmax - rows[i].vmin);
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+            int tx = tr.x + (int)(t * (float)tr.w + 0.5f);
+            DrawRectangle(tr.x, tr.y + tr.h / 2 - 2, tx - tr.x, 4,
+                          (Color){125, 207, 255, 220});
+            DrawRectangle(tx - 5, tr.y - 4, 10, tr.h + 8,
+                          (Color){220, 228, 245, 255});
+            DrawRectangleLines(tx - 5, tr.y - 4, 10, tr.h + 8,
+                               (Color){125, 207, 255, 220});
+            char vbuf[32];
+            snprintf(vbuf, sizeof(vbuf), "%d %s", rows[i].val, rows[i].unit);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){tr.x + tr.w + 8, tr.y - 3},
+                       13, 0, (Color){180, 190, 210, 255});
+        }
+    }
+
     }  /* end Cursor tab */
     if (g_settings_tab == SETTINGS_TAB_FONT) {
     /* Padding row. */
@@ -5591,51 +5634,6 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                       (Color){125, 207, 255, 255});
     }
     EndScissorMode();
-
-    /* Key-repeat sliders. Two rows: initial delay, then per-repeat
-       period. Track is a thin inset bar; the thumb is a tall pill
-       overlapping the track. Current value renders to the right. */
-    {
-        struct SliderSpec {
-            Rect        track;
-            const char *label;
-            int         val, vmin, vmax;
-            const char *unit;
-        } rows[2] = {
-            { L.repeat_initial, "Repeat delay",
-              g_app_settings.key_repeat_initial_ms, 0, 1000, "ms" },
-            { L.repeat_rate,    "Repeat rate",
-              g_app_settings.key_repeat_rate_ms,    5, 200, "ms" },
-        };
-        for (int i = 0; i < 2; i++) {
-            Rect tr = rows[i].track;
-            /* Label. */
-            DrawTextEx(*f, rows[i].label,
-                       (Vector2){L.modal.x + 22, tr.y - 3},
-                       14, 0, (Color){200, 205, 220, 255});
-            /* Track. */
-            DrawRectangle(tr.x, tr.y + tr.h / 2 - 2, tr.w, 4,
-                          (Color){46, 52, 70, 255});
-            /* Filled portion up to the thumb. */
-            float t = (float)(rows[i].val - rows[i].vmin)
-                    / (float)(rows[i].vmax - rows[i].vmin);
-            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
-            int tx = tr.x + (int)(t * (float)tr.w + 0.5f);
-            DrawRectangle(tr.x, tr.y + tr.h / 2 - 2, tx - tr.x, 4,
-                          (Color){125, 207, 255, 220});
-            /* Thumb. */
-            DrawRectangle(tx - 5, tr.y - 4, 10, tr.h + 8,
-                          (Color){220, 228, 245, 255});
-            DrawRectangleLines(tx - 5, tr.y - 4, 10, tr.h + 8,
-                               (Color){125, 207, 255, 220});
-            /* Value readout right of the track. */
-            char vbuf[32];
-            snprintf(vbuf, sizeof(vbuf), "%d %s", rows[i].val, rows[i].unit);
-            DrawTextEx(*f, vbuf,
-                       (Vector2){tr.x + tr.w + 8, tr.y - 3},
-                       13, 0, (Color){180, 190, 210, 255});
-        }
-    }
 
     }  /* end Session tab */
     if (g_settings_tab == SETTINGS_TAB_WINDOW) {
