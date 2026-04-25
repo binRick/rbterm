@@ -117,6 +117,10 @@ bool    screen_view_row_wrapped(const Screen *s, int vy);
    grid (or the alt screen, which has no scrollback). */
 int     screen_total_rows(const Screen *s);
 Cell    screen_cell_abs(const Screen *s, int col, int abs_row);
+/* OSC 133 prompt mark for view row `vy`. Returns the mark type byte
+   ('A'/'B'/'C'/'D'/0) and the associated exit code (only meaningful
+   for 'D'). Always 0 on alt screen. */
+uint8_t screen_view_row_pmark(const Screen *s, int vy, uint8_t *out_exit);
 bool    screen_app_cursor(const Screen *s);
 bool    screen_app_keypad(const Screen *s);
 bool    screen_focus_report(const Screen *s);

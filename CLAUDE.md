@@ -544,7 +544,16 @@ Not a roadmap — a shopping list to prioritise from.
 - **Rectangular / column selection** (Alt+drag) — all three.
 
 ### Shell integration
-- **OSC 133 prompt marks** so jumping prompt-to-prompt works.
+- **OSC 133 prompt marks** — *parser + gutter shipped.* Each row
+  carries a `pmark` (A/B/C/D) and `pexit` byte parallel to
+  `main_wrap` / `sb_wrap`; `screen_view_row_pmark` exposes them to
+  the renderer. `render.c` paints a 3px gutter badge in the pad area
+  just left of the grid (green for exit 0, red otherwise) on every
+  'D' mark. Helper scripts in `tools/rbterm-shell-integration.{zsh,
+  bash}` install precmd / preexec / DEBUG-trap hooks that emit
+  OSC 133 A/C/D. Future passes: jump-to-prev/next-prompt chord,
+  select-last-command-output, long-command notification (all use
+  the same already-stored marks).
 - **Per-tab cwd inheritance on new tab** (open new tab in same dir
   as current) — OSC 7 is parsed but not used for this.
 - **Command status badges** (success/fail glyph next to each prompt) —

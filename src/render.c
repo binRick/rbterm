@@ -892,6 +892,23 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     }
     img_cache_prune_frame();
 
+    // OSC 133 gutter: small badge to the left of each row that
+    // carries a "command finished" mark (green = exit 0, red
+    // otherwise). Drawn in the pad area so it sits just outside the
+    // first column. Only visible when the user's shell emits OSC 133.
+    {
+        int gutter_x = -4;
+        for (int y = 0; y < rows; y++) {
+            uint8_t exit_code = 0;
+            uint8_t mk = screen_view_row_pmark(s, y, &exit_code);
+            if (mk != 'D') continue;
+            Color c = (exit_code == 0) ? (Color){80, 200, 100, 220}
+                                       : (Color){230, 80, 80, 240};
+            int badge_h = ch - 4;
+            DrawRectangle(gutter_x, y * ch + 2, 3, badge_h, c);
+        }
+    }
+
     // Scrollback indicator
     if (screen_view_offset(s) > 0) {
         int W = cols * cw;

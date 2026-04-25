@@ -75,6 +75,14 @@ struct Screen {
     uint8_t *main_wrap;   /* size rows: main_wrap[y]=1 means row y ended
                              by auto-wrapping into row y+1 (as opposed to a
                              natural line terminator). Used by resize reflow. */
+    /* OSC 133 (semantic prompt marks) per-row metadata. Type values:
+       0 = none, 'A' = prompt start, 'B' = prompt end / command edit
+       start, 'C' = command output start, 'D' = command finished. For
+       'D', `pexit` carries the shell's $? exit code (0..255). The
+       arrays are parallel to main_wrap and sb_wrap; resize and
+       scroll bookkeeping touches them in lockstep. */
+    uint8_t *main_pmark;
+    uint8_t *main_pexit;
     bool on_alt;
 
     // Scrollback ring buffer: rows of `cols` cells
@@ -83,6 +91,8 @@ struct Screen {
                          auto-wrap into the next row. Mirrors main_wrap
                          so selection can cross wrap boundaries back
                          into scrollback. */
+    uint8_t *sb_pmark;
+    uint8_t *sb_pexit;
     int sb_cap;
     int sb_len;
     int sb_head;     // next write slot
@@ -403,13 +413,20 @@ static void clear_row(Screen *s, int y) {
     Cell b = blank_cell(s);
     Cell *r = row_ptr(s, y);
     for (int x = 0; x < s->cols; x++) r[x] = b;
-    if (!s->on_alt && s->main_wrap && y >= 0 && y < s->rows) s->main_wrap[y] = 0;
+    if (!s->on_alt && y >= 0 && y < s->rows) {
+        if (s->main_wrap)  s->main_wrap[y]  = 0;
+        if (s->main_pmark) s->main_pmark[y] = 0;
+        if (s->main_pexit) s->main_pexit[y] = 0;
+    }
 }
 
-static void push_scrollback(Screen *s, const Cell *row, bool wrapped) {
+static void push_scrollback(Screen *s, const Cell *row, bool wrapped,
+                            uint8_t pmark, uint8_t pexit) {
     if (s->on_alt || s->sb_cap == 0) return;
     memcpy(s->sb + s->sb_head * s->cols, row, sizeof(Cell) * s->cols);
-    if (s->sb_wrap) s->sb_wrap[s->sb_head] = wrapped ? 1 : 0;
+    if (s->sb_wrap)  s->sb_wrap[s->sb_head]  = wrapped ? 1 : 0;
+    if (s->sb_pmark) s->sb_pmark[s->sb_head] = pmark;
+    if (s->sb_pexit) s->sb_pexit[s->sb_head] = pexit;
     s->sb_head = (s->sb_head + 1) % s->sb_cap;
     if (s->sb_len < s->sb_cap) s->sb_len++;
     // Keep view anchored if we're at bottom; otherwise drift one row.
@@ -424,8 +441,10 @@ static void scroll_up_region(Screen *s, int top, int bot, int n) {
     Cell *base = active(s);
     if (!s->on_alt && top == 0) {
         for (int i = 0; i < n; i++) {
-            bool w = s->main_wrap ? s->main_wrap[top + i] != 0 : false;
-            push_scrollback(s, base + (top + i) * s->cols, w);
+            bool w  = s->main_wrap  ? s->main_wrap[top + i] != 0 : false;
+            uint8_t pm = s->main_pmark ? s->main_pmark[top + i] : 0;
+            uint8_t pe = s->main_pexit ? s->main_pexit[top + i] : 0;
+            push_scrollback(s, base + (top + i) * s->cols, w, pm, pe);
         }
         images_scroll(s, n);
     }
@@ -436,6 +455,16 @@ static void scroll_up_region(Screen *s, int top, int bot, int n) {
         if (!s->on_alt && s->main_wrap) {
             memmove(s->main_wrap + top,
                     s->main_wrap + top + n,
+                    (size_t)(span - n));
+        }
+        if (!s->on_alt && s->main_pmark) {
+            memmove(s->main_pmark + top,
+                    s->main_pmark + top + n,
+                    (size_t)(span - n));
+        }
+        if (!s->on_alt && s->main_pexit) {
+            memmove(s->main_pexit + top,
+                    s->main_pexit + top + n,
                     (size_t)(span - n));
         }
     }
@@ -454,6 +483,16 @@ static void scroll_down_region(Screen *s, int top, int bot, int n) {
         if (!s->on_alt && s->main_wrap) {
             memmove(s->main_wrap + top + n,
                     s->main_wrap + top,
+                    (size_t)(span - n));
+        }
+        if (!s->on_alt && s->main_pmark) {
+            memmove(s->main_pmark + top + n,
+                    s->main_pmark + top,
+                    (size_t)(span - n));
+        }
+        if (!s->on_alt && s->main_pexit) {
+            memmove(s->main_pexit + top + n,
+                    s->main_pexit + top,
                     (size_t)(span - n));
         }
     }
@@ -1030,6 +1069,38 @@ static void finish_osc(Screen *s) {
         }
         return;
     }
+    if (ps == 133) {
+        /* OSC 133 — semantic prompt marks (FinalTerm / iTerm2 spec).
+           Format: OSC 133 ; X [ ; <args> ] ST  where X is one of:
+              A — prompt about to draw (row above is end of prev cmd)
+              B — prompt finished, user is editing
+              C — Enter pressed, command output starts
+              D [;<exit_code>] — command finished
+           We record the mark on the current cursor row of the main
+           screen so the gutter renderer can show success/fail badges
+           and future passes can do prompt-to-prompt navigation. Alt
+           screen marks are dropped (vim/less don't run the shell's
+           prompt hooks anyway). */
+        if (!s->on_alt && s->main_pmark && s->cy >= 0 && s->cy < s->rows) {
+            char kind = *p ? *p : 0;
+            if (kind == 'A' || kind == 'B' || kind == 'C' || kind == 'D') {
+                int exit_code = 0;
+                if (kind == 'D') {
+                    const char *q = p + 1;
+                    if (*q == ';') q++;
+                    /* Parse a base-10 exit code; clamp to 0..255. */
+                    int v = 0;
+                    while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
+                    if (v < 0)   v = 0;
+                    if (v > 255) v = 255;
+                    exit_code = v;
+                }
+                s->main_pmark[s->cy] = (uint8_t)kind;
+                s->main_pexit[s->cy] = (uint8_t)exit_code;
+            }
+        }
+        return;
+    }
     if (ps == 7) {
         /* OSC 7 — current working directory, emitted by most shells on
            every prompt. Format: file://<host>/<urlencoded-path>. We
@@ -1516,7 +1587,9 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     s->charset_active = 0;
     s->main = calloc((size_t)cols * rows, sizeof(Cell));
     s->alt  = calloc((size_t)cols * rows, sizeof(Cell));
-    s->main_wrap = calloc((size_t)rows, 1);
+    s->main_wrap  = calloc((size_t)rows, 1);
+    s->main_pmark = calloc((size_t)rows, 1);
+    s->main_pexit = calloc((size_t)rows, 1);
     for (int y = 0; y < rows; y++) {
         Cell b = blank_cell(s);
         for (int x = 0; x < cols; x++) s->main[y * cols + x] = b;
@@ -1525,7 +1598,9 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
     s->sb_cap = scrollback;
     if (scrollback > 0) {
         s->sb = calloc((size_t)scrollback * cols, sizeof(Cell));
-        s->sb_wrap = calloc((size_t)scrollback, 1);
+        s->sb_wrap  = calloc((size_t)scrollback, 1);
+        s->sb_pmark = calloc((size_t)scrollback, 1);
+        s->sb_pexit = calloc((size_t)scrollback, 1);
     }
     s->cell_h_px = 20;   /* best-effort until renderer sets the real value */
     s->io = io;
@@ -1540,6 +1615,8 @@ void screen_free(Screen *s) {
     for (uint16_t i = 0; i < s->urls_count; i++) free(s->urls[i]);
     free(s->urls);
     free(s->main); free(s->alt); free(s->sb); free(s->sb_wrap); free(s->main_wrap);
+    free(s->sb_pmark); free(s->sb_pexit);
+    free(s->main_pmark); free(s->main_pexit);
     free(s);
 }
 
@@ -1677,9 +1754,13 @@ void screen_resize(Screen *s, int cols, int rows) {
        re-bucket into the new col count). */
     Cell *nsb = NULL;
     uint8_t *nsbw = NULL;
+    uint8_t *nsbpm = NULL;
+    uint8_t *nsbpe = NULL;
     if (s->sb_cap > 0) {
         nsb = calloc((size_t)s->sb_cap * cols, sizeof(Cell));
-        nsbw = calloc((size_t)s->sb_cap, 1);
+        nsbw  = calloc((size_t)s->sb_cap, 1);
+        nsbpm = calloc((size_t)s->sb_cap, 1);
+        nsbpe = calloc((size_t)s->sb_cap, 1);
         for (int y = 0; y < s->sb_cap; y++)
             for (int x = 0; x < cols; x++) nsb[y * cols + x] = blank;
         int ccols = (cols < old_cols) ? cols : old_cols;
@@ -1687,7 +1768,9 @@ void screen_resize(Screen *s, int cols, int rows) {
             int src = ((s->sb_head - s->sb_len + i) % s->sb_cap + s->sb_cap) % s->sb_cap;
             memcpy(nsb + (size_t)i * cols, s->sb + (size_t)src * old_cols,
                    sizeof(Cell) * ccols);
-            nsbw[i] = s->sb_wrap ? s->sb_wrap[src] : 0;
+            nsbw[i]  = s->sb_wrap  ? s->sb_wrap[src]  : 0;
+            nsbpm[i] = s->sb_pmark ? s->sb_pmark[src] : 0;
+            nsbpe[i] = s->sb_pexit ? s->sb_pexit[src] : 0;
         }
         s->sb_head = s->sb_len % s->sb_cap;
     }
@@ -1701,17 +1784,25 @@ void screen_resize(Screen *s, int cols, int rows) {
     if (s->sb_cap > 0 && start_row > 0) {
         Cell *saved_sb_was = s->sb;
         uint8_t *saved_sbw_was = s->sb_wrap;
+        uint8_t *saved_sbpm_was = s->sb_pmark;
+        uint8_t *saved_sbpe_was = s->sb_pexit;
         int saved_cols = s->cols;
         s->sb = nsb;
-        s->sb_wrap = nsbw;
+        s->sb_wrap  = nsbw;
+        s->sb_pmark = nsbpm;
+        s->sb_pexit = nsbpe;
         s->cols = cols;
         for (int r = 0; r < start_row; r++) {
+            /* Reflow loses per-row pmark/pexit on overflow rows —
+               accept v1 lossiness; new marks land correctly. */
             push_scrollback(s, scratch + (size_t)r * cols,
-                            scratch_wrap[r] != 0);
+                            scratch_wrap[r] != 0, 0, 0);
         }
         s->cols = saved_cols;
         s->sb = saved_sb_was;
-        s->sb_wrap = saved_sbw_was;
+        s->sb_wrap  = saved_sbw_was;
+        s->sb_pmark = saved_sbpm_was;
+        s->sb_pexit = saved_sbpe_was;
     }
     int copy_count = emit - start_row;
     if (copy_count > rows) copy_count = rows;
@@ -1739,8 +1830,16 @@ void screen_resize(Screen *s, int cols, int rows) {
     free(line_lens);
     free(scratch);
     free(scratch_wrap);
+    /* Fresh per-row pmark/pexit for the new main grid — we accept
+       reflow-time loss; new shell marks repopulate correctly. */
+    uint8_t *npmark = calloc((size_t)rows, 1);
+    uint8_t *npexit = calloc((size_t)rows, 1);
     free(s->main); free(s->alt); free(s->sb); free(s->sb_wrap); free(s->main_wrap);
+    free(s->sb_pmark); free(s->sb_pexit);
+    free(s->main_pmark); free(s->main_pexit);
     s->main = nmain; s->alt = nalt; s->sb = nsb; s->sb_wrap = nsbw; s->main_wrap = nwrap;
+    s->sb_pmark = nsbpm; s->sb_pexit = nsbpe;
+    s->main_pmark = npmark; s->main_pexit = npexit;
     s->cols = cols; s->rows = rows;
     s->scroll_top = 0;
     s->scroll_bot = rows - 1;
@@ -1833,6 +1932,23 @@ Cell screen_cell_abs(const Screen *s, int col, int abs_row) {
     int y = abs_row - s->sb_len;
     if (y >= s->rows) return e;
     return s->main[y * s->cols + col];
+}
+
+uint8_t screen_view_row_pmark(const Screen *s, int vy, uint8_t *out_exit) {
+    if (out_exit) *out_exit = 0;
+    if (!s || vy < 0 || vy >= s->rows || s->on_alt) return 0;
+    int off = s->view_off;
+    if (vy < off) {
+        if (!s->sb_pmark || s->sb_cap == 0) return 0;
+        int sb_index = s->sb_len - off + vy;
+        int ring = ((s->sb_head - s->sb_len + sb_index) % s->sb_cap + s->sb_cap) % s->sb_cap;
+        if (out_exit && s->sb_pexit) *out_exit = s->sb_pexit[ring];
+        return s->sb_pmark[ring];
+    }
+    int y = vy - off;
+    if (!s->main_pmark) return 0;
+    if (out_exit && s->main_pexit) *out_exit = s->main_pexit[y];
+    return s->main_pmark[y];
 }
 
 bool screen_view_row_wrapped(const Screen *s, int vy) {
