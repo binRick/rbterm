@@ -2753,22 +2753,25 @@ static int tab_width_for(int win_w) {
     return w;
 }
 
-/* Layout: [ssh] | tab1 | tab2 | ... | [gear] [split-v] [split-h] [?] | [+]
-   The split pair disappears entirely when the active tab is split. */
+/* Layout: [ssh] [+] | tab1 | tab2 | ... | [gear] [rec-start] [rec-stop] [split-v] [split-h] [?]
+   The split pair disappears entirely when the active tab is split.
+   The "+" was on the far right; moved next to [ssh] so the two
+   "open something" buttons live together. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     TabBarHit h = { -1, false, false, false, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     bool show_splits = split_buttons_visible();
-    int plus_x      = win_w - TAB_PLUS_W;
-    int help_x      = plus_x - TAB_HELP_W;
+    int help_x      = win_w - TAB_HELP_W;
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W     : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
     int rec_stop_x  = split_v_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
     int gear_x      = rec_start_x - TAB_GEAR_W;
-    int tab_start = TAB_SSH_W;
-    if (mx < TAB_SSH_W)     { h.on_ssh     = true; return h; }
-    if (mx >= plus_x)       { h.on_plus    = true; return h; }
+    int plus_x      = TAB_SSH_W;
+    int tab_start   = TAB_SSH_W + TAB_PLUS_W;
+    if (mx < TAB_SSH_W)                       { h.on_ssh  = true; return h; }
+    if (mx < tab_start)                       { h.on_plus = true; return h; }
+    (void)plus_x;
     if (mx >= help_x)       { h.on_help    = true; return h; }
     if (show_splits && mx >= split_h_x) { h.on_split_h = true; return h; }
     if (show_splits && mx >= split_v_x) { h.on_split_v = true; return h; }
@@ -2847,8 +2850,9 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                           (TAB_BAR_H - ssz.y) / 2.0f },
                13, 0, (Color){180, 230, 255, 255});
 
-    /* "+" button anchored top-right. */
-    int plus_x = win_w - TAB_PLUS_W;
+    /* "+" button — sits immediately right of the [ssh] button so
+       the two "open a new tab" actions are next to each other. */
+    int plus_x = TAB_SSH_W;
     DrawRectangle(plus_x, 0, TAB_PLUS_W, TAB_BAR_H, (Color){38, 48, 66, 255});
     DrawRectangleLines(plus_x, 2, TAB_PLUS_W - 1, TAB_BAR_H - 4,
                        (Color){125, 207, 255, 200});
@@ -2858,8 +2862,8 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                           (TAB_BAR_H - psz.y) / 2.0f },
                18, 0, (Color){230, 240, 255, 255});
 
-    /* Help button (?) sits immediately left of the "+" button. */
-    int help_x = plus_x - TAB_HELP_W;
+    /* Help button (?) anchored top-right. */
+    int help_x = win_w - TAB_HELP_W;
     {
         Color help_bg = (Color){38, 48, 66, 255};
         DrawRectangle(help_x, 0, TAB_HELP_W, TAB_BAR_H, help_bg);
@@ -2968,8 +2972,9 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                         TAB_BAR_H * 0.60f, false, split_icon);
     }
 
-    /* Tabs fill the space between the two buttons. */
-    int tab_start = TAB_SSH_W;
+    /* Tabs fill the space between the [ssh][+] cluster on the left
+       and the gear/rec/split/help cluster on the right. */
+    int tab_start = TAB_SSH_W + TAB_PLUS_W;
     int tw = tab_width_for(win_w);
 
     for (int i = 0; i < g_num_tabs; i++) {
@@ -8053,7 +8058,7 @@ int main(int argc, char **argv) {
                 }
                 if (g_tab_dragging) {
                     int tw = tab_width_for(win_w_now);
-                    int tab_start = TAB_SSH_W;
+                    int tab_start = TAB_SSH_W + TAB_PLUS_W;
                     int target = (mx - tab_start) / tw;
                     if (target < 0) target = 0;
                     if (target >= g_num_tabs) target = g_num_tabs - 1;
