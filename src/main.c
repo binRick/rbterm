@@ -879,7 +879,11 @@ static ScreenIO pane_io(Pane *p) {
    `cwd` is the directory the shell starts in (NULL = $HOME). */
 static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
     pane_init_click_state(p);
-    strncpy(p->title, "shell", sizeof(p->title) - 1);
+    /* Leave p->title empty (zero-initialised by tab_open's calloc).
+       tab_label naturally falls through to the cwd basename, or
+       "rbterm" if the cwd isn't yet detected — gives a clean
+       branded title the moment the window appears, without the
+       cold-start "shell" leak. */
     p->pty = pty_open(cols, rows, cwd);
     if (!p->pty) return false;
     p->scr = screen_new(cols, rows, 5000, pane_io(p));
