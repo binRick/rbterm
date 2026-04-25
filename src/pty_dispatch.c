@@ -86,6 +86,10 @@ bool pty_cwd(Pty *p, char *out, size_t cap) {
     return local_cwd_impl(p->impl, out, cap);
 }
 
+bool pty_is_local(Pty *p) {
+    return p && p->kind == PTY_LOCAL;
+}
+
 /* Publish the screen's cursor position to the backend so it can
    fast-path CSI 6n (DSR) replies from the reader thread. Local-only
    for now; SSH path is no-op since the I/O thread already pushes

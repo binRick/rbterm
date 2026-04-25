@@ -2,6 +2,7 @@
 #include "cast.h"
 #include "gif_encoder.h"
 #include "webp_encoder.h"
+#include "hud.h"
 #include <stdarg.h>
 #include "screen.h"
 #include "render.h"
@@ -130,6 +131,13 @@ typedef enum {
     STARTUP_WINDOW_MAXIMIZED  = 2,
 } StartupWindowMode;
 
+typedef enum {
+    HUD_POS_TOP_RIGHT    = 0,
+    HUD_POS_TOP_LEFT     = 1,
+    HUD_POS_BOTTOM_RIGHT = 2,
+    HUD_POS_BOTTOM_LEFT  = 3,
+} HudPosition;
+
 typedef struct {
     bool log_enabled;
     char log_dir[PATH_MAX];
@@ -138,6 +146,13 @@ typedef struct {
     int  cursor_style;           /* CursorStyle enum — default for new panes */
     int  startup_window;         /* StartupWindowMode */
     char rec_dir[PATH_MAX];      /* default folder for saved recordings */
+    bool show_hud;               /* master enable for the system-info overlay */
+    int  hud_pos;                /* HudPosition — which corner of the pane */
+    bool hud_show_host;          /* per-field visibility */
+    bool hud_show_ip;
+    bool hud_show_load;
+    bool hud_show_mem;
+    bool hud_show_disk;
 } AppSettings;
 static AppSettings g_app_settings;
 static char        g_settings_status[160]; /* status line in the settings modal */
@@ -265,6 +280,13 @@ static void app_settings_init(void) {
     g_app_settings.key_repeat_rate_ms    = 25;
     g_app_settings.cursor_style          = CURSOR_STYLE_DEFAULT;
     g_app_settings.startup_window        = STARTUP_WINDOW_DEFAULT;
+    g_app_settings.show_hud              = true;
+    g_app_settings.hud_pos               = HUD_POS_TOP_RIGHT;
+    g_app_settings.hud_show_host         = true;
+    g_app_settings.hud_show_ip           = true;
+    g_app_settings.hud_show_load         = true;
+    g_app_settings.hud_show_mem          = true;
+    g_app_settings.hud_show_disk         = true;
     const char *home = getenv("HOME");
 #ifdef _WIN32
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -365,6 +387,19 @@ typedef struct {
     double cwd_poll_at;
     FILE *log_fp;                /* session log file, NULL when disabled */
     char  log_path[PATH_MAX];
+
+    /* HUD: top-right overlay with hostname, IP, load avg, free mem,
+       free disk. For local panes the main loop fills these via cheap
+       syscalls; for SSH panes a dedicated probe thread on the libssh
+       session writes them under hud_lock and the render path reads
+       them lock-free via memcpy from a snapshot. */
+    char   hud_hostname[64];
+    char   hud_ip[48];
+    double hud_load1;            /* 1-min load average; -1 = unknown */
+    long   hud_mem_free_mb;      /* -1 = unknown */
+    int    hud_disk_free_pct;    /* -1 = unknown */
+    double hud_updated_at;       /* GetTime() when stats last refreshed */
+    double hud_next_poll_at;     /* GetTime() at which the next local poll should fire */
 } Pane;
 
 typedef enum {
@@ -2443,9 +2478,86 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
     if (splitter_rect(t, win_w, win_h, &sp)) {
         DrawRectangle(sp.x, sp.y, sp.w, sp.h, (Color){60, 60, 75, 255});
     }
+
+    /* HUD overlay — corner of each pane. Position picked from
+       g_app_settings.hud_pos; per-field visibility filtered by the
+       hud_show_* booleans. Per-pane data is filled by the main
+       loop's local poll (or the SSH probe thread for SSH panes). */
+    if (g_app_settings.show_hud) {
+        for (int pi = 0; pi < t->num_panes; pi++) {
+            Pane *p = &t->panes[pi];
+            PaneRect pr;
+            pane_rect(t, pi, win_w, win_h, &pr);
+            char buf[256];
+            int n = hud_format(buf, sizeof(buf),
+                               p->hud_hostname, p->hud_ip,
+                               p->hud_load1, p->hud_mem_free_mb,
+                               p->hud_disk_free_pct,
+                               g_app_settings.hud_show_host,
+                               g_app_settings.hud_show_ip,
+                               g_app_settings.hud_show_load,
+                               g_app_settings.hud_show_mem,
+                               g_app_settings.hud_show_disk);
+            if (n <= 0) continue;
+            const int fs       = 12;
+            const int line_h   = 14;
+            const int x_pad    = 8;
+            const int y_pad    = 6;
+            const int margin   = 8;
+            int max_w = 0, line_count = 0;
+            char *l = buf;
+            while (l && *l) {
+                char *nl = strchr(l, '\n');
+                if (nl) *nl = 0;
+                int w = MeasureText(l, fs);
+                if (w > max_w) max_w = w;
+                line_count++;
+                if (nl) *nl = '\n';
+                l = nl ? nl + 1 : NULL;
+            }
+            int slab_w = max_w + x_pad * 2;
+            int slab_h = line_count * line_h + y_pad * 2;
+            int slab_x, slab_y;
+            switch (g_app_settings.hud_pos) {
+            case HUD_POS_TOP_LEFT:
+                slab_x = pr.x + margin;
+                slab_y = pr.y + margin;
+                break;
+            case HUD_POS_BOTTOM_RIGHT:
+                slab_x = pr.x + pr.w - slab_w - margin;
+                slab_y = pr.y + pr.h - slab_h - margin;
+                break;
+            case HUD_POS_BOTTOM_LEFT:
+                slab_x = pr.x + margin;
+                slab_y = pr.y + pr.h - slab_h - margin;
+                break;
+            case HUD_POS_TOP_RIGHT:
+            default:
+                slab_x = pr.x + pr.w - slab_w - margin;
+                slab_y = pr.y + margin;
+                break;
+            }
+            DrawRectangle(slab_x, slab_y, slab_w, slab_h,
+                          (Color){10, 12, 18, 175});
+            DrawRectangleLines(slab_x, slab_y, slab_w, slab_h,
+                               (Color){80, 90, 110, 100});
+            int yy = slab_y + y_pad;
+            char *line = buf;
+            while (line && *line) {
+                char *nl = strchr(line, '\n');
+                if (nl) *nl = 0;
+                DrawText(line, slab_x + x_pad, yy, fs,
+                         (Color){205, 215, 230, 230});
+                yy += line_h;
+                if (nl) { *nl = '\n'; line = nl + 1; } else line = NULL;
+            }
+        }
+    }
+
     SetMouseCursor(want_url_cursor ? MOUSE_CURSOR_POINTING_HAND
                                    : MOUSE_CURSOR_DEFAULT);
     (void)win_w; (void)win_h;
+    (void)time_sec;
 }
 
 /* Resize every pane of every tab to fit its current pane rectangle.
@@ -4552,7 +4664,8 @@ typedef enum {
     SETTINGS_TAB_SESSION    = 3,
     SETTINGS_TAB_WINDOW     = 4,
     SETTINGS_TAB_RECORDING  = 5,
-    SETTINGS_TAB_COUNT      = 6,
+    SETTINGS_TAB_HUD        = 6,
+    SETTINGS_TAB_COUNT      = 7,
 } SettingsTab;
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
@@ -4598,6 +4711,14 @@ typedef struct {
     Rect startup_default;    /* startup-window-size picker: three buttons */
     Rect startup_fullscreen;
     Rect startup_maximized;
+    /* HUD tab — system-info overlay configuration. */
+    Rect hud_toggle;          /* enable / disable button */
+    Rect hud_pos_tl, hud_pos_tr, hud_pos_bl, hud_pos_br; /* corner picker */
+    Rect hud_field_host;      /* per-field show/hide toggles */
+    Rect hud_field_ip;
+    Rect hud_field_load;
+    Rect hud_field_mem;
+    Rect hud_field_disk;
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -5013,6 +5134,26 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     } else if (g_settings_tab == SETTINGS_TAB_RECORDING) {
         int row_y = content_y;
         L.rec_dir = (Rect){ L.modal.x + 140, row_y, w - 140 - 22, btn };
+    } else if (g_settings_tab == SETTINGS_TAB_HUD) {
+        /* Master enable, then a 2x2 corner picker, then five field
+           toggles laid out in a horizontal row. */
+        int row_y = content_y;
+        L.hud_toggle = (Rect){ L.modal.x + 140, row_y, 110, btn };
+        row_y += btn + 18;
+        int corner_w = 90, corner_h = btn, corner_gap = 8;
+        L.hud_pos_tl = (Rect){ L.modal.x + 140,                              row_y, corner_w, corner_h };
+        L.hud_pos_tr = (Rect){ L.modal.x + 140 + (corner_w + corner_gap),    row_y, corner_w, corner_h };
+        row_y += corner_h + corner_gap;
+        L.hud_pos_bl = (Rect){ L.modal.x + 140,                              row_y, corner_w, corner_h };
+        L.hud_pos_br = (Rect){ L.modal.x + 140 + (corner_w + corner_gap),    row_y, corner_w, corner_h };
+        row_y += btn + 18;
+        int field_w = 84, field_gap = 6;
+        int fx = L.modal.x + 140;
+        L.hud_field_host = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
+        L.hud_field_ip   = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
+        L.hud_field_load = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
+        L.hud_field_mem  = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
+        L.hud_field_disk = (Rect){ fx, row_y, field_w, btn };
     }
 
     return L;
@@ -5218,6 +5359,29 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                      "Startup window mode set. Save as Default to persist.");
             return;
         }
+    }
+    /* HUD tab — master toggle, corner picker, per-field toggles.
+       Each click flips one boolean or sets the HudPosition; users
+       see the effect immediately on every pane. */
+    if (g_settings_tab == SETTINGS_TAB_HUD) {
+        if (rect_hit(L.hud_toggle, mx, my)) {
+            g_app_settings.show_hud = !g_app_settings.show_hud;
+            return;
+        }
+        int pos = -1;
+        if      (rect_hit(L.hud_pos_tl, mx, my)) pos = HUD_POS_TOP_LEFT;
+        else if (rect_hit(L.hud_pos_tr, mx, my)) pos = HUD_POS_TOP_RIGHT;
+        else if (rect_hit(L.hud_pos_bl, mx, my)) pos = HUD_POS_BOTTOM_LEFT;
+        else if (rect_hit(L.hud_pos_br, mx, my)) pos = HUD_POS_BOTTOM_RIGHT;
+        if (pos >= 0) {
+            g_app_settings.hud_pos = pos;
+            return;
+        }
+        if (rect_hit(L.hud_field_host, mx, my)) { g_app_settings.hud_show_host = !g_app_settings.hud_show_host; return; }
+        if (rect_hit(L.hud_field_ip,   mx, my)) { g_app_settings.hud_show_ip   = !g_app_settings.hud_show_ip;   return; }
+        if (rect_hit(L.hud_field_load, mx, my)) { g_app_settings.hud_show_load = !g_app_settings.hud_show_load; return; }
+        if (rect_hit(L.hud_field_mem,  mx, my)) { g_app_settings.hud_show_mem  = !g_app_settings.hud_show_mem;  return; }
+        if (rect_hit(L.hud_field_disk, mx, my)) { g_app_settings.hud_show_disk = !g_app_settings.hud_show_disk; return; }
     }
     if (rect_hit(L.save_default, mx, my)) {
         if (config_save(r)) {
@@ -6549,7 +6713,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     /* Tab bar. Active tab gets an accent fill; others sit dim. */
     {
         const char *labels[SETTINGS_TAB_COUNT] = {
-            "Font", "Theme", "Cursor", "Session", "Window", "Recording"
+            "Font", "Theme", "Cursor", "Session", "Window", "Recording", "HUD"
         };
         for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
             Rect tr = L.tab[i];
@@ -7013,6 +7177,51 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                12, 0, (Color){140, 150, 170, 255});
     }  /* end Recording tab */
 
+    if (g_settings_tab == SETTINGS_TAB_HUD) {
+        /* Helper for the simple on/off + toggle buttons of this tab.
+           Each button drawn with a label, ON in green / OFF in
+           neutral grey, similar to other settings buttons. */
+        struct { Rect r; const char *lbl; bool on; } btns[] = {
+            { L.hud_toggle,     g_app_settings.show_hud      ? "Enabled" : "Disabled", g_app_settings.show_hud },
+            { L.hud_pos_tl,     "Top-left",                                            g_app_settings.hud_pos == HUD_POS_TOP_LEFT },
+            { L.hud_pos_tr,     "Top-right",                                           g_app_settings.hud_pos == HUD_POS_TOP_RIGHT },
+            { L.hud_pos_bl,     "Bottom-left",                                         g_app_settings.hud_pos == HUD_POS_BOTTOM_LEFT },
+            { L.hud_pos_br,     "Bottom-right",                                        g_app_settings.hud_pos == HUD_POS_BOTTOM_RIGHT },
+            { L.hud_field_host, "Host",     g_app_settings.hud_show_host },
+            { L.hud_field_ip,   "IP",       g_app_settings.hud_show_ip   },
+            { L.hud_field_load, "Load",     g_app_settings.hud_show_load },
+            { L.hud_field_mem,  "Memory",   g_app_settings.hud_show_mem  },
+            { L.hud_field_disk, "Disk",     g_app_settings.hud_show_disk },
+        };
+        DrawTextEx(*f, "Show HUD",
+                   (Vector2){L.modal.x + 22, L.hud_toggle.y + 8},
+                   14, 0, (Color){200, 205, 220, 255});
+        DrawTextEx(*f, "Position",
+                   (Vector2){L.modal.x + 22, L.hud_pos_tl.y + 8},
+                   14, 0, (Color){200, 205, 220, 255});
+        DrawTextEx(*f, "Fields",
+                   (Vector2){L.modal.x + 22, L.hud_field_host.y + 8},
+                   14, 0, (Color){200, 205, 220, 255});
+        for (size_t bi = 0; bi < sizeof(btns) / sizeof(*btns); bi++) {
+            Color bg = btns[bi].on ? (Color){48, 78, 58, 255}
+                                    : (Color){38, 42, 56, 255};
+            Color line = btns[bi].on ? (Color){150, 220, 170, 200}
+                                      : (Color){70, 74, 90, 255};
+            Color tx  = btns[bi].on ? (Color){220, 240, 225, 255}
+                                     : (Color){180, 185, 195, 255};
+            DrawRectangle(btns[bi].r.x, btns[bi].r.y, btns[bi].r.w, btns[bi].r.h, bg);
+            DrawRectangleLines(btns[bi].r.x, btns[bi].r.y, btns[bi].r.w, btns[bi].r.h, line);
+            Vector2 bs = MeasureTextEx(*f, btns[bi].lbl, 13, 0);
+            DrawTextEx(*f, btns[bi].lbl,
+                       (Vector2){btns[bi].r.x + (btns[bi].r.w - bs.x) / 2,
+                                 btns[bi].r.y + (btns[bi].r.h - bs.y) / 2},
+                       13, 0, tx);
+        }
+        DrawTextEx(*f, "System info overlay shown in the corner of every pane.",
+                   (Vector2){L.modal.x + 22, L.hud_field_host.y + L.hud_field_host.h + 12},
+                   12, 0, (Color){140, 150, 170, 255});
+    }  /* end HUD tab */
+
     /* Save-as-Default button. */
     DrawRectangle(L.save_default.x, L.save_default.y,
                   L.save_default.w, L.save_default.h,
@@ -7446,6 +7655,27 @@ int main(int argc, char **argv) {
                     p->cwd[sizeof(p->cwd) - 1] = 0;
                     if (i == g_active && pi == t->active_pane)
                         p->title_dirty = true;
+                }
+            }
+        }
+
+        /* HUD refresh — every 1 sec per pane. Local panes get cheap
+           syscalls on the main thread; SSH panes are filled by their
+           probe thread (wired up alongside ssh_open_impl, see
+           pty_ssh.c). */
+        for (int i = 0; i < g_num_tabs; i++) {
+            Tab *t = g_tabs[i];
+            for (int pi = 0; pi < t->num_panes; pi++) {
+                Pane *p = &t->panes[pi];
+                if (now < p->hud_next_poll_at) continue;
+                p->hud_next_poll_at = now + 1.0;
+                if (pty_is_local(p->pty)) {
+                    hud_local_poll(p->hud_hostname, sizeof(p->hud_hostname),
+                                   p->hud_ip,       sizeof(p->hud_ip),
+                                   &p->hud_load1,
+                                   &p->hud_mem_free_mb,
+                                   &p->hud_disk_free_pct);
+                    p->hud_updated_at = now;
                 }
             }
         }

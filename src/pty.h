@@ -57,6 +57,11 @@ void pty_resize(Pty *p, int cols, int rows);
    shell's OSC 0/2 title instead. */
 bool pty_cwd(Pty *p, char *out, size_t cap);
 
+/* True iff `p` is a local-shell PTY (forkpty / ConPTY); false for
+   SSH sessions. Used by main.c to route the HUD probe to the right
+   data source. */
+bool pty_is_local(Pty *p);
+
 /* Publish the screen's cursor position so the local backend's
    reader thread can fast-path CSI 6n (Device Status Report)
    replies — sending a response from the reader thread the moment

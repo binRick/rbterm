@@ -55,6 +55,7 @@ remain up to date.
 | `src/cast.{c,h}` | Asciinema v2 (.cast) parser — used to replay a recording during render |
 | `src/gif_encoder.{c,h}` | Native GIF89a encoder (LZW, no deps) used by the recording save path |
 | `src/webp_encoder.{c,h}` | Native animated WebP encoder via libwebp + libwebpmux |
+| `src/hud.{c,h}` | System-info overlay (hostname, IP, load, memory, disk) — local probe + format helper |
 | `tools/gen_icon.c` | Procedural app-icon generator (macOS .icns) |
 
 ## Platform notes
@@ -453,6 +454,76 @@ Limitations / intentional gaps:
 - Text mode's CR/BS line cursor doesn't model wide chars or wrap;
   for typical shell output this is fine, but a curses app's TUI
   state will not round-trip cleanly.
+
+## HUD (system-info overlay)
+
+A small slab of system stats — hostname, IP, 1-min load, free
+memory, free disk — overlays one corner of every pane. Per-pane:
+each `Pane` holds its own `hud_*` snapshot (host string, IP
+string, load, mem MB, disk %, last-update timestamp, next-poll
+timestamp), and the data source depends on whether the pane's
+PTY is local or SSH.
+
+### Data flow
+
+- **Local panes (`pty_is_local(p->pty)`)** — main loop polls every
+  second via `hud_local_poll`, which calls cheap syscalls:
+  - `gethostname()` (and strips trailing `.local` from Bonjour
+    names so it doesn't leak into every overlay).
+  - `getifaddrs()` for the first non-loopback IPv4. Falls back to
+    empty if no interface is up.
+  - `getloadavg()` for the 1-minute load average.
+  - macOS: `host_statistics64(HOST_VM_INFO64, ...)` for free + inactive +
+    speculative pages × pagesize → "available" memory in MB.
+    Linux: `/proc/meminfo` `MemAvailable` / 1024.
+  - `statfs("/")` (macOS) or `statvfs("/")` (Linux) → root disk
+    `bavail / blocks` × 100 = % free.
+  All sub-millisecond on a modern host; no measurable CPU at 1 Hz.
+
+- **SSH panes** — TODO. The plan is a dedicated probe thread per
+  SSH session that opens a second libssh channel alongside the
+  shell, runs `hostname; uptime; free -m; df -h /` (or platform
+  equivalent) every ~2 sec, parses the lines, atomic-stores into
+  the same `hud_*` fields. `pthread_mutex_trylock` to avoid
+  starving the shell reader during heavy output. Not wired up yet
+  — SSH panes currently render the slab with whatever zero/empty
+  values they have, and `hud_format` shows `?` for the unknowns.
+
+### Customisation (Settings → HUD tab)
+
+- **Show HUD** — master enable/disable. `g_app_settings.show_hud`.
+- **Position** — TL / TR / BL / BR via `HudPosition` enum and
+  `g_app_settings.hud_pos`. Slab placement in `draw_tab_contents`
+  picks the corner from this.
+- **Fields** — five independent toggles (`hud_show_host`,
+  `hud_show_ip`, `hud_show_load`, `hud_show_mem`, `hud_show_disk`).
+  `hud_format` skips suppressed lines so the slab shrinks to fit.
+  Toggle all five off and you get an empty slab; toggle the
+  master off to make it disappear entirely.
+
+### Render details
+
+- Drawn from `draw_tab_contents` after panes + splitter, so the
+  slab paints on top of terminal content. Translucent black
+  background (`alpha 175`) plus a thin border so legibility holds
+  on both dark and light themes.
+- Uses raylib's bundled `DrawText`/`MeasureText` rather than the
+  app's custom font atlas — the HUD is meant to be informational
+  and the bundled font keeps the layout code simple.
+- 12pt, ~14px line height. Width is measured per-line so the slab
+  hugs the longest line.
+
+### Adding a new field
+
+1. Pull / compute the value in `hud_local_poll` (and eventually
+   the SSH probe).
+2. Add storage to `Pane` (`hud_<field>`).
+3. Pass it into `hud_format`; add a corresponding `show_*` arg
+   and `bool hud_show_<field>` in `AppSettings`.
+4. Plumb a per-field toggle button into the HUD settings tab
+   (`SettingsLayout` has a `Rect hud_field_*` block; mirror the
+   existing five).
+5. Init default in `app_settings_init`.
 
 ## Multi-window (unfinished — future session)
 
