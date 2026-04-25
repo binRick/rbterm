@@ -13,6 +13,8 @@ static Theme   g_themes[THEMES_MAX];
 static int     g_theme_count = 0;
 static bool    g_themes_loaded = false;
 
+/* Hex digit -> 0..15. Returns -1 for non-hex chars so callers can
+   detect malformed colour specs. */
 static int hexval_(int c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -86,6 +88,10 @@ static bool parse_theme_body(const char *body, Theme *t) {
     return got_fg && got_bg;
 }
 
+/* Parse every theme baked into themes_embedded.h into g_themes.
+   Idempotent — guarded by g_themes_loaded so repeated calls are
+   no-ops. Failed parses (themes without a foreground+background)
+   are silently skipped. */
 void themes_load_builtins(void) {
     if (g_themes_loaded) return;
     g_themes_loaded = true;
@@ -98,9 +104,13 @@ void themes_load_builtins(void) {
     }
 }
 
+/* Number of successfully-parsed builtin themes. */
 int          themes_count(void)      { return g_theme_count; }
+/* Heap-stable pointer to the themes array (length = themes_count()). */
 const Theme *themes_all(void)        { return g_themes; }
 
+/* Linear-search lookup by exact name. Returns NULL if not found
+   or `name` is empty. */
 const Theme *theme_find_by_name(const char *name) {
     if (!name || !*name) return NULL;
     for (int i = 0; i < g_theme_count; i++) {
@@ -109,6 +119,9 @@ const Theme *theme_find_by_name(const char *name) {
     return NULL;
 }
 
+/* Push a parsed Theme into a Screen — sets default fg/bg/cursor and
+   the 16-entry colour palette. Per-screen, so applying a theme to
+   one pane doesn't bleed into others. */
 void screen_apply_theme(Screen *s, const Theme *t) {
     if (!s || !t) return;
     screen_set_default_fg(s, t->fg);

@@ -3,6 +3,9 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Append `s` (NUL-terminated) into out[n..cap]. Returns the new
+   length, or n unchanged if it wouldn't fit (silent truncation —
+   one frame's input shouldn't approach the 4 KB buffer). */
 static size_t app(uint8_t *out, size_t cap, size_t n, const char *s) {
     size_t len = strlen(s);
     if (n + len > cap) return n;
@@ -10,12 +13,15 @@ static size_t app(uint8_t *out, size_t cap, size_t n, const char *s) {
     return n + len;
 }
 
+/* Append a single byte to out[n..cap]. */
 static size_t app_byte(uint8_t *out, size_t cap, size_t n, uint8_t b) {
     if (n + 1 > cap) return n;
     out[n++] = b;
     return n;
 }
 
+/* Codepoint -> 1..4 UTF-8 bytes. Caller must reserve >= 4 bytes
+   in `out`; returns the byte count actually written. */
 static size_t encode_utf8(uint32_t cp, uint8_t *out) {
     if (cp < 0x80) { out[0] = (uint8_t)cp; return 1; }
     if (cp < 0x800) { out[0] = 0xC0 | (cp >> 6); out[1] = 0x80 | (cp & 0x3F); return 2; }
@@ -27,12 +33,14 @@ static size_t encode_utf8(uint32_t cp, uint8_t *out) {
     return 4;
 }
 
+/* Real Ctrl only. Cmd (KEY_LEFT_SUPER/RIGHT_SUPER) is tracked
+   separately so Ctrl+C can send SIGINT while Cmd+C copies on macOS. */
 static bool ctrl_down(void) {
-    // Real Ctrl only. Cmd (KEY_LEFT_SUPER/RIGHT_SUPER) is tracked separately
-    // so Ctrl+C can send SIGINT while Cmd+C copies on macOS.
     return IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
 }
 
+/* macOS Command key. Always false on other platforms — they pile UI
+   chords onto Ctrl+Shift instead so bare Ctrl stays free for C0. */
 static bool cmd_down(void) {
 #if defined(__APPLE__)
     return IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
@@ -41,10 +49,12 @@ static bool cmd_down(void) {
 #endif
 }
 
+/* Either Shift modifier currently held. */
 static bool shift_down(void) {
     return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
 }
 
+/* Either Alt / Option modifier currently held. */
 static bool alt_down(void) {
     return IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
 }
@@ -71,6 +81,8 @@ static RepeatState g_repeat_state[REPEAT_TRACK_MAX];
 static int  g_repeat_initial_ms = 300;
 static int  g_repeat_rate_ms    = 25;
 
+/* Reconfigure the auto-repeat tunables (called from settings).
+   `initial_ms` <= 0 disables auto-repeat — only one-shot presses. */
 void input_set_repeat(int initial_ms, int rate_ms) {
     g_repeat_initial_ms = initial_ms;
     g_repeat_rate_ms    = rate_ms;
@@ -148,6 +160,11 @@ static const struct SpecialKey special_keys[] = {
     { KEY_F12, "\x1b[24~", "\x1b[24~" },
 };
 
+/* Drain raylib's per-frame keyboard / mouse-wheel state and
+   synthesise (a) raw bytes for the PTY (typed text, C0 chords,
+   arrow / fn / page keys) and (b) high-level UI actions (copy,
+   paste, font resize, scroll) returned via `actions`. Caller
+   forwards `out[0..return_value]` to pty_write. */
 size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions) {
     actions->font_delta = 100;
     actions->copy = false;

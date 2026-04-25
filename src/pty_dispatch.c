@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Allocate a local-shell Pty (forkpty on Unix, ConPTY on Windows).
+   Returns NULL on backend failure. */
 Pty *pty_open(int cols, int rows, const char *cwd) {
     void *impl = local_open_impl(cols, rows, cwd);
     if (!impl) return NULL;
@@ -18,6 +20,8 @@ Pty *pty_open(int cols, int rows, const char *cwd) {
     return p;
 }
 
+/* Allocate an SSH-backed Pty. On failure writes a libssh error
+   message into `err` (truncated to errsz bytes) and returns NULL. */
 Pty *pty_open_ssh(const char *user, const char *host, int port,
                   const char *password, const char *keyfile,
                   int cols, int rows,
@@ -33,6 +37,8 @@ Pty *pty_open_ssh(const char *user, const char *host, int port,
     return p;
 }
 
+/* Tear down a Pty: routes to the right backend's close + frees the
+   wrapper. NULL-safe. */
 void pty_close(Pty *p) {
     if (!p) return;
     if (p->kind == PTY_SSH) ssh_close_impl(p->impl);
@@ -40,30 +46,40 @@ void pty_close(Pty *p) {
     free(p);
 }
 
+/* True while the underlying shell / SSH session is still up. */
 bool pty_alive(Pty *p) {
     if (!p) return false;
     if (p->kind == PTY_SSH) return ssh_alive_impl(p->impl);
     return local_alive_impl(p->impl);
 }
 
+/* Non-blocking read of up to `cap` bytes. Returns the byte count,
+   0 on EAGAIN/empty, or -1 on EOF / fatal error. */
 int pty_read(Pty *p, uint8_t *buf, size_t cap) {
     if (!p) return -1;
     if (p->kind == PTY_SSH) return ssh_read_impl(p->impl, buf, cap);
     return local_read_impl(p->impl, buf, cap);
 }
 
+/* Send `n` bytes to the shell stdin (typed input, paste, mouse
+   reports, etc.). Best-effort: short writes are not retried here. */
 void pty_write(Pty *p, const uint8_t *buf, size_t n) {
     if (!p) return;
     if (p->kind == PTY_SSH) ssh_write_impl(p->impl, buf, n);
     else                    local_write_impl(p->impl, buf, n);
 }
 
+/* Notify the shell of a new terminal size (TIOCSWINSZ on Unix,
+   ResizePseudoConsole on Windows, "window-change" on SSH). */
 void pty_resize(Pty *p, int cols, int rows) {
     if (!p) return;
     if (p->kind == PTY_SSH) ssh_resize_impl(p->impl, cols, rows);
     else                    local_resize_impl(p->impl, cols, rows);
 }
 
+/* Best-effort current-working-directory lookup of the shell process.
+   Local-only: SSH sessions return false (the remote cwd isn't
+   reachable through libssh); Windows local also returns false. */
 bool pty_cwd(Pty *p, char *out, size_t cap) {
     if (!p) return false;
     if (p->kind == PTY_SSH) return false;

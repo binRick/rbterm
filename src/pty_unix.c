@@ -43,6 +43,10 @@ typedef struct {
     volatile int    eof;
 } LocalPty;
 
+/* Reader thread entry point. Loops on blocking read() from the
+   master fd and copies bytes into the ring under p->lock. Exits on
+   EOF or after p->stop is asserted. Marks p->eof on the way out so
+   the main thread can distinguish "EAGAIN" from "shell hung up". */
 static void *local_reader(void *arg) {
     LocalPty *p = (LocalPty *)arg;
     uint8_t buf[16384];
@@ -68,6 +72,10 @@ static void *local_reader(void *arg) {
     return NULL;
 }
 
+/* forkpty()s a fresh shell, sets up its environment (TERM, locale,
+   PWD), starts the reader thread, and returns the LocalPty. Returns
+   NULL on fork / pthread / alloc failure. The child execs $SHELL
+   with argv[0] prefixed with '-' so it loads as a login shell. */
 void *local_open_impl(int cols, int rows, const char *cwd) {
     struct winsize ws = { .ws_row = (unsigned short)rows,
                           .ws_col = (unsigned short)cols };
@@ -144,6 +152,9 @@ void *local_open_impl(int cols, int rows, const char *cwd) {
     return p;
 }
 
+/* SIGHUP the shell, wait for it, close the master fd (which unblocks
+   the reader thread's pending read()), join the thread, free state.
+   NULL-safe. */
 void local_close_impl(void *impl) {
     LocalPty *p = impl;
     if (!p) return;
@@ -163,6 +174,9 @@ void local_close_impl(void *impl) {
     free(p);
 }
 
+/* Non-blocking waitpid(WNOHANG) check. Caches the "dead" verdict so
+   we don't re-reap and cause "no child processes" warnings on
+   subsequent polls. */
 bool local_alive_impl(void *impl) {
     LocalPty *p = impl;
     if (!p || !p->alive) return false;
@@ -172,6 +186,9 @@ bool local_alive_impl(void *impl) {
     return true;
 }
 
+/* Drain up to `cap` bytes from the ring under the lock. Returns the
+   byte count, 0 if the ring is empty but the shell is still alive,
+   -1 if the reader has hit EOF *and* the shell has exited. */
 int local_read_impl(void *impl, uint8_t *buf, size_t cap) {
     LocalPty *p = impl;
     if (!p) return -1;
@@ -188,6 +205,9 @@ int local_read_impl(void *impl, uint8_t *buf, size_t cap) {
     return 0;
 }
 
+/* Loops over write() retrying on EINTR, gives up on EAGAIN (caller
+   would have to retry next frame, which we don't currently do —
+   shells typically drain the input fast enough). */
 void local_write_impl(void *impl, const uint8_t *buf, size_t n) {
     LocalPty *p = impl;
     if (!p || p->fd < 0) return;
@@ -203,6 +223,8 @@ void local_write_impl(void *impl, const uint8_t *buf, size_t n) {
     }
 }
 
+/* TIOCSWINSZ on the master fd — the kernel turns it into a SIGWINCH
+   on the shell. */
 void local_resize_impl(void *impl, int cols, int rows) {
     LocalPty *p = impl;
     if (!p || p->fd < 0) return;
@@ -211,6 +233,11 @@ void local_resize_impl(void *impl, int cols, int rows) {
     ioctl(p->fd, TIOCSWINSZ, &ws);
 }
 
+/* Look up the shell's current working directory.
+   - macOS: proc_pidinfo(PROC_PIDVNODEPATHINFO) — gives the canonical
+     path even when the dir was renamed since chdir.
+   - Linux: read /proc/<pid>/cwd as a symlink.
+   Used to refresh tab labels and to seed cwd for new tabs. */
 bool local_cwd_impl(void *impl, char *out, size_t cap) {
     LocalPty *p = impl;
     if (!p || !out || cap == 0 || p->pid <= 0) return false;
