@@ -26,3 +26,4 @@ bool ssh_alive_impl(void *impl)                       { (void)impl; return false
 int  ssh_read_impl(void *impl, uint8_t *buf, size_t cap) { (void)impl; (void)buf; (void)cap; return -1; }
 void ssh_write_impl(void *impl, const uint8_t *buf, size_t n) { (void)impl; (void)buf; (void)n; }
 void ssh_resize_impl(void *impl, int cols, int rows)  { (void)impl; (void)cols; (void)rows; }
+bool ssh_hud_snapshot_impl(void *impl, struct PtyHudSnapshot *out) { (void)impl; (void)out; return false; }

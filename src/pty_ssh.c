@@ -19,6 +19,7 @@
  * ~/.ssh/known_hosts; a changed key aborts with an error. */
 
 #include "pty_internal.h"
+#include "pty.h"        /* PtyHudSnapshot */
 
 #include <libssh/libssh.h>
 
@@ -45,6 +46,18 @@ typedef struct {
     size_t          tail;
     volatile int    stop;
     volatile int    eof;
+
+    /* HUD probe thread — runs a small remote command every 2 sec on
+       a dedicated exec channel, parses the output, and stores it in
+       `hud_snap` under hud_lock. main.c reads via
+       ssh_hud_snapshot_impl. trylock against session_lock so heavy
+       shell I/O doesn't get starved. */
+    pthread_t       hud_probe;
+    bool            hud_probe_started;
+    volatile int    hud_probe_stop;
+    pthread_mutex_t hud_lock;
+    PtyHudSnapshot  hud_snap;
+    bool            hud_snap_valid;
 } SshPty;
 
 /* Reader-thread entry. Polls the SSH channel non-blocking under a
@@ -54,6 +67,11 @@ typedef struct {
    and key echo lags noticeably. The session is set non-blocking
    in ssh_open_impl so each call returns immediately with whatever
    libssh has already pumped from the socket. */
+
+/* Forward decl — defined further down (alongside the HUD probe
+   helpers) but ssh_open_impl needs it as a pthread entry point. */
+static void *ssh_hud_probe(void *arg);
+
 static void *ssh_reader(void *arg) {
     SshPty *p = (SshPty *)arg;
     uint8_t buf[16384];
@@ -371,14 +389,23 @@ void *ssh_open_impl(const char *user, const char *host, int port,
     }
     pthread_mutex_init(&p->session_lock, NULL);
     pthread_mutex_init(&p->ring_lock, NULL);
+    pthread_mutex_init(&p->hud_lock, NULL);
     if (pthread_create(&p->reader, NULL, ssh_reader, p) != 0) {
         set_err(err, errsz, "pthread_create");
         pthread_mutex_destroy(&p->session_lock);
         pthread_mutex_destroy(&p->ring_lock);
+        pthread_mutex_destroy(&p->hud_lock);
         free(p->ring);
         goto fail;
     }
     p->reader_started = true;
+    /* HUD probe runs in its own thread so the 100-500ms exec
+       round-trip can't stall the shell reader. Failure is silent —
+       the snapshot just stays !valid and main.c will treat the
+       pane as having no remote stats yet. */
+    if (pthread_create(&p->hud_probe, NULL, ssh_hud_probe, p) == 0) {
+        p->hud_probe_started = true;
+    }
     p->alive = true;
     return p;
 
@@ -395,12 +422,192 @@ fail:
     return NULL;
 }
 
+/* HUD probe shell snippet. Designed to run on any vaguely
+   POSIX-like remote without leaking errors. Each line is `KEY=VALUE`
+   followed by a sentinel ("END=1") so the parser knows when to
+   stop reading. The CPU line is cumulative tick counts (busy +
+   total) — main.c computes % busy as a delta against the previous
+   sample, identical to the local-pane logic. */
+static const char *HUD_PROBE_SCRIPT =
+    "{"
+    "  H=$(hostname 2>/dev/null);"
+    /* IPv4: try `hostname -I` (Linux), then `hostname -i` (older), then ifconfig en0/en1 (BSD/macOS). */
+    "  I=$(hostname -I 2>/dev/null | awk '{print $1}');"
+    "  [ -z \"$I\" ] && I=$(hostname -i 2>/dev/null | awk '{print $1}');"
+    "  [ -z \"$I\" ] && for IF in en0 en1 eth0 ens33; do"
+    "    V=$(ifconfig $IF 2>/dev/null | awk '/inet /{print $2; exit}');"
+    "    [ -n \"$V\" ] && I=$V && break;"
+    "  done;"
+    "  L=$(uptime 2>/dev/null | sed -E 's/.*load averages?: ([0-9.]+).*/\\1/' | awk '{print $1}');"
+    /* Free memory in MB. Linux: free -m; macOS: vm_stat + sysctl. */
+    "  M=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}');"
+    "  if [ -z \"$M\" ]; then"
+    "    PS=$(sysctl -n hw.pagesize 2>/dev/null);"
+    "    if [ -n \"$PS\" ]; then"
+    "      M=$(vm_stat 2>/dev/null | awk -v ps=$PS '/free/{f=$3} /inactive/{i=$3} END{gsub(/\\./,\"\",f); gsub(/\\./,\"\",i); print int((f+i)*ps/1024/1024)}');"
+    "    fi;"
+    "  fi;"
+    "  D=$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,\"\",$5); print 100-$5}');"
+    /* Cumulative CPU ticks: Linux /proc/stat, macOS sysctl. */
+    "  if [ -r /proc/stat ]; then"
+    "    set -- $(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat);"
+    "    USER=$1; NICE=$2; SYSTEM=$3; IDLE=$4; IOWAIT=${5:-0}; IRQ=${6:-0}; SOFTIRQ=${7:-0}; STEAL=${8:-0};"
+    "    BUSY=$((USER+NICE+SYSTEM+IRQ+SOFTIRQ+STEAL));"
+    "    TOTAL=$((BUSY+IDLE+IOWAIT));"
+    "  else"
+    /* macOS fallback: aggregate ticks via sysctl kern.cp_time. */
+    "    CPT=$(sysctl -n kern.cp_time 2>/dev/null);"
+    "    set -- $CPT;"
+    "    USER=$1; NICE=$2; SYSTEM=$3; INTR=$4; IDLE=$5;"
+    "    BUSY=$((USER+NICE+SYSTEM+INTR));"
+    "    TOTAL=$((BUSY+IDLE));"
+    "  fi;"
+    "  echo HOST=$H;"
+    "  echo IP=$I;"
+    "  echo LOAD=$L;"
+    "  echo MEM_MB=$M;"
+    "  echo DISK_PCT=$D;"
+    "  echo CPU_BUSY=$BUSY;"
+    "  echo CPU_TOTAL=$TOTAL;"
+    "  echo END=1;"
+    "} 2>/dev/null";
+
+/* Read the next line from `chan` into `out` (NUL-terminated, no
+   trailing newline). Returns the byte length or -1 on close/error.
+   Reads 1 byte at a time so we can't overshoot past END=1. */
+static int read_line_locked(ssh_channel chan, char *out, size_t cap,
+                            int timeout_ms) {
+    size_t n = 0;
+    if (!chan || cap < 2) return -1;
+    while (n + 1 < cap) {
+        char c;
+        int r = ssh_channel_read_timeout(chan, &c, 1, 0, timeout_ms);
+        if (r <= 0) return (n > 0) ? (int)n : -1;
+        if (c == '\n') break;
+        if (c == '\r') continue;
+        out[n++] = c;
+    }
+    out[n] = 0;
+    return (int)n;
+}
+
+/* Parse one HUD probe response and write it to `*out` under hud_lock.
+   On any parse failure we leave the previous snapshot intact so the
+   render keeps the last-known values rather than flicking to "?". */
+static bool ssh_run_one_probe(SshPty *p) {
+    /* Try-lock: skip this probe cycle if shell I/O is mid-burst.
+       Better to show stale stats than to add 50ms of latency to a
+       cat / find / git log running in the same session. */
+    if (pthread_mutex_trylock(&p->session_lock) != 0) return false;
+    ssh_channel chan = ssh_channel_new(p->session);
+    if (!chan) { pthread_mutex_unlock(&p->session_lock); return false; }
+    int rc = ssh_channel_open_session(chan);
+    if (rc != SSH_OK) {
+        ssh_channel_free(chan);
+        pthread_mutex_unlock(&p->session_lock);
+        return false;
+    }
+    rc = ssh_channel_request_exec(chan, HUD_PROBE_SCRIPT);
+    if (rc != SSH_OK) {
+        ssh_channel_close(chan);
+        ssh_channel_free(chan);
+        pthread_mutex_unlock(&p->session_lock);
+        return false;
+    }
+
+    /* Drain the probe's output line by line. We hold the session
+       lock the whole time which means shell I/O can't interleave
+       — the reader thread will queue up briefly. The probe is
+       sized to be done in <100ms on a typical link. */
+    PtyHudSnapshot snap = {0};
+    snap.load1         = -1;
+    snap.mem_free_mb   = -1;
+    snap.disk_free_pct = -1;
+    bool got_end = false;
+    char line[256];
+    for (int i = 0; i < 16; i++) {   /* hard cap on lines */
+        int n = read_line_locked(chan, line, sizeof(line), 500);
+        if (n <= 0) break;
+        if (strncmp(line, "HOST=", 5) == 0) {
+            strncpy(snap.hostname, line + 5, sizeof(snap.hostname) - 1);
+        } else if (strncmp(line, "IP=", 3) == 0) {
+            strncpy(snap.ip, line + 3, sizeof(snap.ip) - 1);
+        } else if (strncmp(line, "LOAD=", 5) == 0) {
+            snap.load1 = strtod(line + 5, NULL);
+        } else if (strncmp(line, "MEM_MB=", 7) == 0) {
+            snap.mem_free_mb = strtol(line + 7, NULL, 10);
+            if (snap.mem_free_mb == 0 && line[7] != '0') snap.mem_free_mb = -1;
+        } else if (strncmp(line, "DISK_PCT=", 9) == 0) {
+            char *end = NULL;
+            long v = strtol(line + 9, &end, 10);
+            if (end != line + 9) snap.disk_free_pct = (int)v;
+        } else if (strncmp(line, "CPU_BUSY=", 9) == 0) {
+            snap.cpu_busy = strtoull(line + 9, NULL, 10);
+        } else if (strncmp(line, "CPU_TOTAL=", 10) == 0) {
+            snap.cpu_total = strtoull(line + 10, NULL, 10);
+            snap.cpu_valid = (snap.cpu_total > 0);
+        } else if (strncmp(line, "END=", 4) == 0) {
+            got_end = true;
+            break;
+        }
+    }
+
+    ssh_channel_send_eof(chan);
+    ssh_channel_close(chan);
+    ssh_channel_free(chan);
+    pthread_mutex_unlock(&p->session_lock);
+
+    if (!got_end) return false;
+
+    pthread_mutex_lock(&p->hud_lock);
+    p->hud_snap = snap;
+    p->hud_snap_valid = true;
+    pthread_mutex_unlock(&p->hud_lock);
+    return true;
+}
+
+static void *ssh_hud_probe(void *arg) {
+    SshPty *p = (SshPty *)arg;
+    /* Initial 1 sec delay so the channel/auth dust settles before
+       we open a second channel. */
+    for (int slept = 0; slept < 10; slept++) {
+        if (__atomic_load_n(&p->hud_probe_stop, __ATOMIC_RELAXED)) return NULL;
+        struct timespec ts = {0, 100000000};   /* 100ms */
+        nanosleep(&ts, NULL);
+    }
+    while (!__atomic_load_n(&p->hud_probe_stop, __ATOMIC_RELAXED) &&
+           !__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) {
+        ssh_run_one_probe(p);
+        for (int slept = 0; slept < 20; slept++) {
+            if (__atomic_load_n(&p->hud_probe_stop, __ATOMIC_RELAXED)) return NULL;
+            struct timespec ts = {0, 100000000};
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+bool ssh_hud_snapshot_impl(void *impl, struct PtyHudSnapshot *out) {
+    SshPty *p = impl;
+    if (!p || !out) return false;
+    pthread_mutex_lock(&p->hud_lock);
+    bool ok = p->hud_snap_valid;
+    if (ok) *out = p->hud_snap;
+    pthread_mutex_unlock(&p->hud_lock);
+    return ok;
+}
+
 /* Close the channel, signal + join the reader thread, free libssh
    handles. The reader's 50ms timeout caps shutdown latency. */
 void ssh_close_impl(void *impl) {
     SshPty *p = impl;
     if (!p) return;
     __atomic_store_n(&p->stop, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&p->hud_probe_stop, 1, __ATOMIC_RELAXED);
+    if (p->hud_probe_started) {
+        pthread_join(p->hud_probe, NULL);
+        p->hud_probe_started = false;
+    }
     if (p->reader_started) {
         pthread_join(p->reader, NULL);
         p->reader_started = false;
@@ -419,6 +626,7 @@ void ssh_close_impl(void *impl) {
     if (p->ring) {
         pthread_mutex_destroy(&p->ring_lock);
         pthread_mutex_destroy(&p->session_lock);
+        pthread_mutex_destroy(&p->hud_lock);
         free(p->ring);
     }
     free(p);

@@ -480,14 +480,30 @@ PTY is local or SSH.
     `bavail / blocks` × 100 = % free.
   All sub-millisecond on a modern host; no measurable CPU at 1 Hz.
 
-- **SSH panes** — TODO. The plan is a dedicated probe thread per
-  SSH session that opens a second libssh channel alongside the
-  shell, runs `hostname; uptime; free -m; df -h /` (or platform
-  equivalent) every ~2 sec, parses the lines, atomic-stores into
-  the same `hud_*` fields. `pthread_mutex_trylock` to avoid
-  starving the shell reader during heavy output. Not wired up yet
-  — SSH panes currently render the slab with whatever zero/empty
-  values they have, and `hud_format` shows `?` for the unknowns.
+- **SSH panes** — `SshPty` runs a dedicated probe thread next to
+  the existing reader. Every 2 sec it opens a fresh exec channel
+  on the SAME libssh session, runs a small POSIX shell snippet
+  that echoes `KEY=VALUE` lines (`HOST=`, `IP=`, `LOAD=`,
+  `MEM_MB=`, `DISK_PCT=`, `CPU_BUSY=`, `CPU_TOTAL=`, `END=1`),
+  parses them, and stores the result in `hud_snap` under
+  `hud_lock`. The probe uses `pthread_mutex_trylock` against the
+  shared session lock so a busy shell (cat / find / git log)
+  never gets stalled by a probe — it just skips that cycle and
+  shows the previous snapshot for one more second.
+
+  Probe shell is intentionally Linux+macOS portable: tries
+  `hostname -I` then `hostname -i` then ifconfig en0/en1; reads
+  `/proc/stat` if available else falls back to `sysctl -n
+  kern.cp_time`; reads `free -m` then falls back to `vm_stat`
+  + `sysctl -n hw.pagesize`. Failure modes are quiet — anything
+  the probe can't compute stays at the last-known value, never
+  flickers to `?`.
+
+  main.c's HUD poll loop dispatches: local pane → `hud_local_poll`
+  + `hud_read_cpu_ticks` (cheap syscalls); SSH pane →
+  `pty_hud_snapshot` (copy under hud_lock). Both paths feed the
+  same `Pane->hud_*` fields and the same delta-CPU + ring-buffer
+  logic — there's only one render path.
 
 ### Customisation (Settings → HUD tab)
 

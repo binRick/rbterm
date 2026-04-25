@@ -7914,48 +7914,71 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* HUD refresh — every 1 sec per pane. Local panes get cheap
-           syscalls on the main thread; SSH panes are filled by their
-           probe thread (wired up alongside ssh_open_impl, see
-           pty_ssh.c). */
+        /* HUD refresh — every 1 sec per pane. Local panes use cheap
+           main-thread syscalls; SSH panes consume snapshots produced
+           by their probe thread (pty_ssh.c). Both paths feed the
+           same Pane->hud_* fields and the same delta-CPU + ring
+           buffer logic. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
             for (int pi = 0; pi < t->num_panes; pi++) {
                 Pane *p = &t->panes[pi];
                 if (now < p->hud_next_poll_at) continue;
                 p->hud_next_poll_at = now + 1.0;
+
+                unsigned long long busy = 0, total = 0;
+                bool cpu_ok = false;
                 if (pty_is_local(p->pty)) {
                     hud_local_poll(p->hud_hostname, sizeof(p->hud_hostname),
                                    p->hud_ip,       sizeof(p->hud_ip),
                                    &p->hud_load1,
                                    &p->hud_mem_free_mb,
                                    &p->hud_disk_free_pct);
-
-                    /* CPU%: tick counters are cumulative, so derive
-                       % busy from the delta between consecutive
-                       polls. First call (hud_cpu_inited == false)
-                       just primes the previous-tick fields. */
-                    unsigned long long busy = 0, total = 0;
-                    if (hud_read_cpu_ticks(&busy, &total)) {
-                        if (!p->hud_cpu_inited) {
-                            p->hud_cpu_inited = true;
-                            for (int k = 0; k < HUD_CPU_HISTORY; k++)
-                                p->hud_cpu_pct[k] = -1;
-                        } else {
-                            unsigned long long bd = busy  - p->hud_cpu_prev_busy;
-                            unsigned long long td = total - p->hud_cpu_prev_total;
-                            int pct = (td > 0) ? (int)((bd * 100ULL) / td) : 0;
-                            if (pct < 0) pct = 0;
-                            if (pct > 100) pct = 100;
-                            p->hud_cpu_head = (p->hud_cpu_head + 1) % HUD_CPU_HISTORY;
-                            p->hud_cpu_pct[p->hud_cpu_head] = pct;
+                    cpu_ok = hud_read_cpu_ticks(&busy, &total);
+                } else {
+                    PtyHudSnapshot snap = {0};
+                    if (pty_hud_snapshot(p->pty, &snap)) {
+                        if (snap.hostname[0]) {
+                            strncpy(p->hud_hostname, snap.hostname, sizeof(p->hud_hostname) - 1);
+                            p->hud_hostname[sizeof(p->hud_hostname) - 1] = 0;
                         }
-                        p->hud_cpu_prev_busy  = busy;
-                        p->hud_cpu_prev_total = total;
+                        if (snap.ip[0]) {
+                            strncpy(p->hud_ip, snap.ip, sizeof(p->hud_ip) - 1);
+                            p->hud_ip[sizeof(p->hud_ip) - 1] = 0;
+                        }
+                        p->hud_load1         = snap.load1;
+                        p->hud_mem_free_mb   = snap.mem_free_mb;
+                        p->hud_disk_free_pct = snap.disk_free_pct;
+                        if (snap.cpu_valid) {
+                            busy = snap.cpu_busy;
+                            total = snap.cpu_total;
+                            cpu_ok = true;
+                        }
                     }
-
-                    p->hud_updated_at = now;
                 }
+
+                /* CPU%: tick counters are cumulative; derive % busy
+                   from the delta between consecutive samples. First
+                   call just primes the previous-tick fields. Same
+                   code path for local + SSH. */
+                if (cpu_ok) {
+                    if (!p->hud_cpu_inited) {
+                        p->hud_cpu_inited = true;
+                        for (int k = 0; k < HUD_CPU_HISTORY; k++)
+                            p->hud_cpu_pct[k] = -1;
+                    } else if (total > p->hud_cpu_prev_total) {
+                        unsigned long long bd = busy  - p->hud_cpu_prev_busy;
+                        unsigned long long td = total - p->hud_cpu_prev_total;
+                        int pct = (td > 0) ? (int)((bd * 100ULL) / td) : 0;
+                        if (pct < 0) pct = 0;
+                        if (pct > 100) pct = 100;
+                        p->hud_cpu_head = (p->hud_cpu_head + 1) % HUD_CPU_HISTORY;
+                        p->hud_cpu_pct[p->hud_cpu_head] = pct;
+                    }
+                    p->hud_cpu_prev_busy  = busy;
+                    p->hud_cpu_prev_total = total;
+                }
+                p->hud_updated_at = now;
             }
         }
 

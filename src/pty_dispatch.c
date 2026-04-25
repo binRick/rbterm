@@ -90,6 +90,12 @@ bool pty_is_local(Pty *p) {
     return p && p->kind == PTY_LOCAL;
 }
 
+bool pty_hud_snapshot(Pty *p, PtyHudSnapshot *out) {
+    if (!p || !out) return false;
+    if (p->kind != PTY_SSH) return false;
+    return ssh_hud_snapshot_impl(p->impl, out);
+}
+
 /* Publish the screen's cursor position to the backend so it can
    fast-path CSI 6n (DSR) replies from the reader thread. Local-only
    for now; SSH path is no-op since the I/O thread already pushes

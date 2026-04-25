@@ -62,6 +62,32 @@ bool pty_cwd(Pty *p, char *out, size_t cap);
    data source. */
 bool pty_is_local(Pty *p);
 
+/* HUD snapshot — last batch of remote-host stats gathered by an
+   SSH backend probe thread. Local PTYs don't populate this and
+   pty_hud_snapshot returns false for them; main.c polls local
+   stats directly via the syscalls in hud.c. */
+typedef struct PtyHudSnapshot {
+    char hostname[64];
+    char ip[48];
+    double load1;          /* -1 if unknown */
+    long   mem_free_mb;    /* -1 if unknown */
+    int    disk_free_pct;  /* -1 if unknown */
+
+    /* Cumulative CPU tick counters (busy + total). main.c keeps the
+       previous sample and computes % busy as a delta the same way it
+       does for local panes — single-point readings are meaningless. */
+    unsigned long long cpu_busy;
+    unsigned long long cpu_total;
+    bool cpu_valid;        /* false until the probe has parsed at least one CPU line */
+} PtyHudSnapshot;
+
+/* Fill `out` with the most recent HUD snapshot the SSH probe
+   produced. Returns true if a usable snapshot is available
+   (timestamp non-zero), false if the pane isn't SSH or the probe
+   hasn't reported yet. Thread-safe — copies under the session
+   mutex. */
+bool pty_hud_snapshot(Pty *p, PtyHudSnapshot *out);
+
 /* Publish the screen's cursor position so the local backend's
    reader thread can fast-path CSI 6n (Device Status Report)
    replies — sending a response from the reader thread the moment

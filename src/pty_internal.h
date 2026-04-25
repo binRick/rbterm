@@ -40,3 +40,5 @@ bool  ssh_alive_impl(void *impl);
 int   ssh_read_impl(void *impl, uint8_t *buf, size_t cap);
 void  ssh_write_impl(void *impl, const uint8_t *buf, size_t n);
 void  ssh_resize_impl(void *impl, int cols, int rows);
+struct PtyHudSnapshot;   /* declared in pty.h */
+bool  ssh_hud_snapshot_impl(void *impl, struct PtyHudSnapshot *out);
