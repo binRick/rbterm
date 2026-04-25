@@ -41,6 +41,9 @@ remain up to date.
 | `src/emoji.h` | Glyph rasterization interface (CoreText or stub) |
 | `src/emoji_mac.m` | CoreText + CoreGraphics rasterizer (macOS only) |
 | `src/emoji_stub.c` | No-op stub for Linux/Windows |
+| `src/cast.{c,h}` | Asciinema v2 (.cast) parser — used to replay a recording during render |
+| `src/gif_encoder.{c,h}` | Native GIF89a encoder (LZW, no deps) used by the recording save path |
+| `src/webp_encoder.{c,h}` | Native animated WebP encoder via libwebp + libwebpmux |
 | `tools/gen_icon.c` | Procedural app-icon generator (macOS .icns) |
 
 ## Platform notes
@@ -370,6 +373,70 @@ v1 limitations / intentional gaps:
 
 Test: inside an rbterm pane, `img2sixel some.png` (libsixel).
 
+## Recording
+
+Each pane can be captured to a file via the **● Rec** button in
+the tab bar. The capture path:
+
+1. **Tap (`tab_pty_read` in `main.c`)** — every byte the PTY hands
+   back is mirrored into `g_rec.fp` as an asciinema v2 event line:
+   `[<seconds>, "o", "<json-escaped bytes>"]`. The recording starts
+   with a **synthetic snapshot event** at t=0 that emits ANSI to
+   reproduce the screen state at the moment Rec was pressed (clear
+   + per-row cursor positioning + cell codepoints + cursor restore)
+   so playback opens with what the user already saw, not a blank
+   screen waiting for the next byte.
+2. **Stop** moves the live `Rec` into `RecSave`, opens
+   `UI_REC_SAVE`. The modal layout is one row of seven format pills
+   (`cast`, `txt`, `gif`, `mp4`, `webm`, `apng`, `webp`) above a
+   path field, with `[Preview] [Close] [Save]` in the footer.
+3. **Save** dispatches into `rec_render_native(fmt, src_cast, dst)`:
+
+| fmt    | Path |
+|--------|------|
+| cast   | `rename(src, dst)` — no rendering. |
+| txt    | One pass through `strip_feed` — drops CSI/OSC/DCS/APC/PM/SOS escapes, handles CR (cursor=0), BS (cursor--), LF (flush line). No render. |
+| gif    | Native `gif_encoder.c`. Replay events into a hidden `Screen`, render each frame off-screen, encode. |
+| webp   | Native `webp_encoder.c` via libwebp + libwebpmux. Same render loop; `WebPAnimEncoderAdd` per frame, then `WebPAnimEncoderAssemble`. Lossy q=75. |
+| mp4    | Render loop, pipe rawvideo rgba into `ffmpeg -pix_fmt yuv420p -movflags +faststart`. |
+| webm   | Same as mp4 but `-c:v libvpx -b:v 1M -pix_fmt yuv420p`. |
+| apng   | Two-pass: render to a temp gif (native encoder), then `ffmpeg -i tmp.gif -plays 1 dst.apng`. libavcodec's apng encoder is built-in to every brew/distro ffmpeg, so this works with the stock build. |
+
+The render loop is **chunked** (`CHUNK_SZ=6` frames) and presents a
+fresh modal frame between chunks, so the user sees the spinner +
+percentage update live instead of an unresponsive UI. Without this
+the OS overlays its "not responding" beachball during a long save.
+
+Render stack:
+- `cast_load` parses the JSON-line file into `CastEvent[]` (timestamp + un-escaped bytes).
+- A **hidden `Screen`** (no IO callbacks) replays the bytes via `screen_feed`.
+- Frames go to an off-screen `RenderTexture2D` of `cols*cell_w + 2*pad` × `rows*cell_h + 2*pad`.
+- `LoadImageFromTexture` reads back rgba; we Y-flip into `pixels[]` and hand to the encoder.
+- Frame timestamps tick at a fixed `fps=15` (`delay_cs=6` for gif, `delay_ms=66` for webp).
+- Skip every blank frame *before* the first cast event (`t0 = events[0].t`) so the gif opens on real content.
+
+Native encoders avoid the "ffmpeg-not-found" / "encoder-missing"
+class of failures: `gif_encoder.c` is a hand-written LZW with a
+6×6×6 RGB cube + 40-step gray ramp palette; `webp_encoder.c` wraps
+WebPAnimEncoder + WebPMux for play-once loop count. The brew
+`webp` formula ships both libs — the `libwebp` ffmpeg bottle does
+not, which is why we don't go through ffmpeg for WebP.
+
+Limitations / intentional gaps:
+- mp4 / webm / apng still need `ffmpeg` on PATH (the release archive
+  bundles a static build but a from-source brew install needs it
+  separately). gif and webp work without any external binary.
+- The recording snapshot at t=0 preserves cell codepoints + cursor
+  position only — colour / bold / italic attributes from the
+  pre-existing screen are not replayed (they would require emitting
+  full SGR runs per row).
+- One recording at a time globally (`g_rec.active`); switching tabs
+  during recording works but only the originally-selected pane is
+  captured.
+- Text mode's CR/BS line cursor doesn't model wide chars or wrap;
+  for typical shell output this is fine, but a curses app's TUI
+  state will not round-trip cleanly.
+
 ## Multi-window (unfinished — future session)
 
 rbterm runs as one raylib window per OS process today. Cmd+N
@@ -497,6 +564,13 @@ Deliberate v1 limits:
 - Scrollback reflow on resize (only the main screen reflows today; the
   existing scrollback is just re-bucketed at the new width).
 - Linux `.desktop` file + icon install path.
+- Bundle a static, libwebp-enabled `ffmpeg` next to the binary in
+  the CI release archive so mp4 / webm / apng work out of the box
+  on machines without an ffmpeg install. `find_ffmpeg` already
+  prefers `Contents/Resources/ffmpeg` (macOS) / next-to-binary
+  (Linux/Windows) over PATH — the release workflow just needs to
+  drop the static build into place. gif and webp already work
+  without ffmpeg via the native encoders.
 - **Maximized startup window mode is broken.** Settings → Window →
   Maximized (on macOS, "Own Space") is wired up to
   `mac_enter_native_fullscreen` in `emoji_mac.m` which calls

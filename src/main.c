@@ -1,4 +1,7 @@
 #include "raylib.h"
+#include "cast.h"
+#include "gif_encoder.h"
+#include "webp_encoder.h"
 #include <stdarg.h>
 #include "screen.h"
 #include "render.h"
@@ -39,6 +42,8 @@
 
 #ifndef _WIN32
 #include <signal.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 #endif
 
 #ifndef PATH_MAX
@@ -132,6 +137,7 @@ typedef struct {
     int  key_repeat_rate_ms;     /* period between subsequent repeats */
     int  cursor_style;           /* CursorStyle enum — default for new panes */
     int  startup_window;         /* StartupWindowMode */
+    char rec_dir[PATH_MAX];      /* default folder for saved recordings */
 } AppSettings;
 static AppSettings g_app_settings;
 static char        g_settings_status[160]; /* status line in the settings modal */
@@ -182,6 +188,9 @@ static void config_load_into_defaults(void) {
         } else if (strcmp(k, "log_dir") == 0) {
             strncpy(g_app_settings.log_dir, v, sizeof(g_app_settings.log_dir) - 1);
             g_app_settings.log_dir[sizeof(g_app_settings.log_dir) - 1] = 0;
+        } else if (strcmp(k, "rec_dir") == 0) {
+            strncpy(g_app_settings.rec_dir, v, sizeof(g_app_settings.rec_dir) - 1);
+            g_app_settings.rec_dir[sizeof(g_app_settings.rec_dir) - 1] = 0;
         } else if (strcmp(k, "key_repeat_initial_ms") == 0) {
             int vi = atoi(v);
             if (vi >= 0 && vi <= 2000) g_app_settings.key_repeat_initial_ms = vi;
@@ -220,6 +229,7 @@ static bool config_save(Renderer *r) {
     fprintf(fp, "cell_spacing=%d\n", r->cell_extra_w);
     fprintf(fp, "log_enabled=%s\n",  g_app_settings.log_enabled ? "true" : "false");
     if (g_app_settings.log_dir[0]) fprintf(fp, "log_dir=%s\n", g_app_settings.log_dir);
+    if (g_app_settings.rec_dir[0]) fprintf(fp, "rec_dir=%s\n", g_app_settings.rec_dir);
     fprintf(fp, "key_repeat_initial_ms=%d\n", g_app_settings.key_repeat_initial_ms);
     fprintf(fp, "key_repeat_rate_ms=%d\n",    g_app_settings.key_repeat_rate_ms);
     {
@@ -262,9 +272,13 @@ static void app_settings_init(void) {
     if (home && *home) {
         snprintf(g_app_settings.log_dir, sizeof(g_app_settings.log_dir),
                  "%s/.rbterm/logs", home);
+        snprintf(g_app_settings.rec_dir, sizeof(g_app_settings.rec_dir),
+                 "%s/Downloads", home);
     } else {
         strncpy(g_app_settings.log_dir, "./rbterm-logs",
                 sizeof(g_app_settings.log_dir) - 1);
+        strncpy(g_app_settings.rec_dir, "./",
+                sizeof(g_app_settings.rec_dir) - 1);
     }
 }
 
@@ -397,6 +411,7 @@ typedef struct {
 #define TAB_GEAR_W  30
 #define TAB_HELP_W  28
 #define TAB_SPLIT_W 28          /* one split button (two of them — vertical + horizontal) */
+#define TAB_REC_W   26          /* one record button (start + stop, both always visible) */
 #define TAB_SSH_W   48
 
 static Tab *g_tabs[MAX_TABS];
@@ -415,7 +430,7 @@ static int g_active = 0;
    keystrokes edit form fields and mouse clicks focus them instead of
    going to the active tab. Layout is computed on the fly in
    ssh_form_layout() so draw and hit-test share one source of truth. */
-typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP } UiMode;
+typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP, UI_REC_SAVE } UiMode;
 typedef enum {
     F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
     F_NEW, F_CONNECT, F_DELETE, F_SAVE, F_CANCEL,
@@ -814,11 +829,57 @@ static bool pane_open_ssh(Pane *p, const char *user, const char *host, int port,
     return true;
 }
 
+static void open_url(const char *url);
+
+/* Asciinema recording — global singleton. We tap the PTY drain in
+   the main loop and write timestamped events to a .cast file
+   (asciinema v2 spec). Cmd-style buttons in the tab bar start /
+   stop. Pinned to whichever pane was active when start fired so
+   the user can tab around without losing the recording. */
+typedef struct {
+    bool   active;
+    Pane  *pane;
+    FILE  *fp;
+    double start_time;
+    char   path[PATH_MAX];
+} Recording;
+static Recording g_rec;
+static void rec_stop(void);
+
+/* Post-recording save modal state. When the user clicks Stop we
+   close the .cast and pop a modal asking where + what format to
+   save as. Phase 2a only handles `.cast` cleanly; other formats
+   render dim with a "coming soon" tooltip until the converter
+   shell-out lands. */
+typedef enum {
+    REC_FMT_CAST = 0,
+    REC_FMT_TXT,
+    REC_FMT_GIF,
+    REC_FMT_MP4,
+    REC_FMT_WEBM,
+    REC_FMT_APNG,
+    REC_FMT_WEBP,
+    REC_FMT_COUNT
+} RecFmt;
+typedef struct {
+    char   src_path[PATH_MAX];   /* the temp .cast file already on disk */
+    double duration_s;
+    char   dst_path[PATH_MAX];   /* user-editable destination */
+    RecFmt fmt;
+    bool   path_focus;
+    bool   path_sel_all;
+    char   status[256];
+} RecSave;
+static RecSave g_rec_save;
+
 /* Free everything a pane owns: log file, PTY, screen, search-match
    arrays. Idempotent — safe to call on a partially-initialised
    pane (e.g. after a failed pane_open_*). */
 static void pane_free(Pane *p) {
     if (!p) return;
+    /* Stop a recording if its target pane is going away — the file
+       pointer would dangle otherwise. */
+    if (g_rec.active && g_rec.pane == p) rec_stop();
     pane_log_close(p);
     if (p->pty) { pty_close(p->pty); p->pty = NULL; }
     if (p->scr) { screen_free(p->scr); p->scr = NULL; }
@@ -830,6 +891,202 @@ static void pane_free(Pane *p) {
     p->search.caret = 0;
     p->search.sel_anchor = -1;
     p->search.mouse_down = false;
+}
+
+/* JSON-escape `n` bytes from `buf` into `fp`. Per asciinema v2 the
+   data field is a UTF-8 string, so valid multi-byte UTF-8 passes
+   through verbatim; only ASCII control chars + " and \\ get escaped. */
+static void rec_json_escape(FILE *fp, const uint8_t *buf, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = buf[i];
+        switch (c) {
+        case '"':  fputs("\\\"", fp); break;
+        case '\\': fputs("\\\\", fp); break;
+        case '\b': fputs("\\b", fp); break;
+        case '\f': fputs("\\f", fp); break;
+        case '\n': fputs("\\n", fp); break;
+        case '\r': fputs("\\r", fp); break;
+        case '\t': fputs("\\t", fp); break;
+        default:
+            if (c < 0x20 || c == 0x7f) fprintf(fp, "\\u%04x", c);
+            else fputc(c, fp);
+            break;
+        }
+    }
+}
+
+/* Walk every cell of the active screen and emit ANSI bytes that
+   reconstruct what the user sees right now. Used as the first
+   event of a recording so playback doesn't open on a blank screen
+   when the user starts recording mid-session. Best-effort: drops
+   attributes (bold/italic/colours) but preserves the cell text +
+   cursor position, which is what people typically want to see. */
+static void rec_emit_initial_snapshot(FILE *fp, Pane *p) {
+    if (!p || !p->scr) return;
+    Screen *s = p->scr;
+    int cols = screen_cols(s);
+    int rows = screen_rows(s);
+    /* Build the byte stream into a buffer, then JSON-escape it
+       through the existing rec_json_escape so the syntax matches
+       any other "o" event line. */
+    size_t cap = (size_t)cols * rows * 4 + 256;
+    uint8_t *buf = malloc(cap);
+    if (!buf) return;
+    size_t n = 0;
+    /* Reset attrs, clear screen, home cursor. */
+    const char *prefix = "\x1b[0m\x1b[2J\x1b[H";
+    size_t plen = strlen(prefix);
+    if (n + plen < cap) { memcpy(buf + n, prefix, plen); n += plen; }
+    for (int y = 0; y < rows; y++) {
+        /* Position cursor at the start of this row. */
+        int wrote = snprintf((char *)buf + n, cap - n, "\x1b[%d;1H", y + 1);
+        if (wrote < 0 || (size_t)wrote >= cap - n) break;
+        n += (size_t)wrote;
+        /* Find last non-blank column so we don't emit huge tail-runs of spaces. */
+        int last = -1;
+        for (int x = cols - 1; x >= 0; x--) {
+            Cell c = screen_view_cell(s, x, y);
+            uint32_t cp = c.cp;
+            if (cp != 0 && cp != ' ' && !(c.attrs & ATTR_WIDE_CONT)) { last = x; break; }
+        }
+        for (int x = 0; x <= last && n + 4 < cap; x++) {
+            Cell c = screen_view_cell(s, x, y);
+            if (c.attrs & ATTR_WIDE_CONT) continue;
+            uint32_t cp = c.cp ? c.cp : ' ';
+            if (cp < 0x80) {
+                buf[n++] = (uint8_t)cp;
+            } else if (cp < 0x800) {
+                buf[n++] = (uint8_t)(0xC0 | (cp >> 6));
+                buf[n++] = (uint8_t)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                buf[n++] = (uint8_t)(0xE0 | (cp >> 12));
+                buf[n++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                buf[n++] = (uint8_t)(0x80 | (cp & 0x3F));
+            } else {
+                buf[n++] = (uint8_t)(0xF0 | (cp >> 18));
+                buf[n++] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                buf[n++] = (uint8_t)(0x80 | ((cp >> 6)  & 0x3F));
+                buf[n++] = (uint8_t)(0x80 | (cp & 0x3F));
+            }
+        }
+    }
+    /* Move cursor back to where the shell currently has it. */
+    int curx = screen_cursor_x(s) + 1;
+    int cury = screen_cursor_y(s) + 1;
+    int wrote = snprintf((char *)buf + n, cap - n, "\x1b[%d;%dH", cury, curx);
+    if (wrote > 0 && (size_t)wrote < cap - n) n += (size_t)wrote;
+
+    /* Emit as a single t=0 event. */
+    fprintf(fp, "[0.000000, \"o\", \"");
+    rec_json_escape(fp, buf, n);
+    fputs("\"]\n", fp);
+    fflush(fp);
+    free(buf);
+}
+
+/* Begin recording the bytes coming out of pane `p`. Writes the
+   asciinema v2 header (cols, rows, unix timestamp), seeds the
+   recording with a snapshot of the current screen state so
+   playback opens with what the user sees, and pins the pane
+   pointer so they can switch tabs without disturbing the
+   recording. Returns false on file-open failure. */
+static bool rec_start(Pane *p) {
+    if (!p || !p->scr || g_rec.active) return false;
+    char dir[PATH_MAX];
+    /* Use the Settings → Recording directory; fall back to
+       ~/Downloads if it's empty (first run with a stale config). */
+    const char *want = g_app_settings.rec_dir[0]
+                       ? g_app_settings.rec_dir : "~/Downloads";
+    expand_home_path(want, dir, sizeof(dir));
+    mkdir_p(dir);
+    char stamp[64];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tmv);
+    snprintf(g_rec.path, sizeof(g_rec.path),
+             "%s/rbterm-%s.cast", dir, stamp);
+    FILE *fp = fopen(g_rec.path, "wb");
+    if (!fp) {
+        fprintf(stderr, "rbterm: rec_start: %s: %s\n",
+                g_rec.path, strerror(errno));
+        return false;
+    }
+    int cols = screen_cols(p->scr);
+    int rows = screen_rows(p->scr);
+    fprintf(fp,
+            "{\"version\": 2, \"width\": %d, \"height\": %d, "
+            "\"timestamp\": %lld}\n",
+            cols, rows, (long long)now);
+    /* Seed the recording with the current screen so playback opens
+       on what the user already sees, rather than a blank terminal
+       until the next byte happens to arrive. */
+    rec_emit_initial_snapshot(fp, p);
+    g_rec.active = true;
+    g_rec.pane = p;
+    g_rec.fp = fp;
+    g_rec.start_time = GetTime();
+    fprintf(stderr, "rbterm: recording → %s\n", g_rec.path);
+    return true;
+}
+
+/* Default-format extension. Used when seeding the modal's path. */
+static const char *rec_fmt_ext(RecFmt f) {
+    switch (f) {
+    case REC_FMT_TXT:  return "txt";
+    case REC_FMT_GIF:  return "gif";
+    case REC_FMT_MP4:  return "mp4";
+    case REC_FMT_WEBM: return "webm";
+    case REC_FMT_APNG: return "apng";
+    case REC_FMT_WEBP: return "webp";
+    case REC_FMT_CAST:
+    default:           return "cast";
+    }
+}
+
+/* Replace the extension on a path with `new_ext` (no leading dot).
+   If the path has no extension, `new_ext` is appended. Edits in
+   place; caller guarantees `cap` bytes. */
+static void rec_replace_ext(char *path, size_t cap, const char *new_ext) {
+    char *slash = strrchr(path, '/');
+    char *dot   = strrchr(path, '.');
+    if (dot && (!slash || dot > slash)) *dot = 0;
+    size_t cur = strlen(path);
+    snprintf(path + cur, cap - cur, ".%s", new_ext);
+}
+
+/* Close the recording file and pop the post-record save modal so
+   the user can pick a destination path + format. Caller transitions
+   into UI_REC_SAVE; the actual save / discard / cancel work happens
+   in the modal handlers. */
+static void rec_stop(void) {
+    if (!g_rec.active) return;
+    double dur = GetTime() - g_rec.start_time;
+    if (g_rec.fp) { fclose(g_rec.fp); g_rec.fp = NULL; }
+    fprintf(stderr, "rbterm: recording stopped (%.1fs) → %s\n",
+            dur, g_rec.path);
+    /* Stage save-modal state. The .cast file lives at g_rec.path
+       until the user picks a final destination. */
+    memset(&g_rec_save, 0, sizeof(g_rec_save));
+    strncpy(g_rec_save.src_path, g_rec.path, sizeof(g_rec_save.src_path) - 1);
+    g_rec_save.duration_s = dur;
+    g_rec_save.fmt = REC_FMT_CAST;
+    /* Default destination = the temp path itself (user can edit). */
+    strncpy(g_rec_save.dst_path, g_rec.path, sizeof(g_rec_save.dst_path) - 1);
+    g_ui_mode = UI_REC_SAVE;
+    g_rec.active = false;
+    g_rec.pane = NULL;
+}
+
+/* Append a chunk of PTY-output bytes as one asciinema event row.
+   No-op when no recording is active or `p` isn't the pinned pane. */
+static void rec_write(Pane *p, const uint8_t *buf, size_t n) {
+    if (!g_rec.active || g_rec.pane != p || !g_rec.fp || n == 0) return;
+    double t = GetTime() - g_rec.start_time;
+    fprintf(g_rec.fp, "[%.6f, \"o\", \"", t);
+    rec_json_escape(g_rec.fp, buf, n);
+    fputs("\"]\n", g_rec.fp);
+    fflush(g_rec.fp);
 }
 
 static Tab *tab_open(int cols, int rows) {
@@ -2222,6 +2479,8 @@ typedef struct {
     bool on_help;
     bool on_split_v;       /* side-by-side split button */
     bool on_split_h;       /* top/bottom split button */
+    bool on_rec_start;     /* start asciinema recording */
+    bool on_rec_stop;      /* stop asciinema recording */
 } TabBarHit;
 
 /* Split buttons are hidden when the active tab is already split — there's
@@ -2238,7 +2497,8 @@ static bool split_buttons_visible(void) {
    tabs, clamped to TAB_MIN_W..TAB_MAX_W. */
 static int tab_width_for(int win_w) {
     int split_w = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
-    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - TAB_HELP_W - split_w - TAB_SSH_W;
+    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - 2 * TAB_REC_W
+                - TAB_HELP_W - split_w - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -2249,21 +2509,25 @@ static int tab_width_for(int win_w) {
 /* Layout: [ssh] | tab1 | tab2 | ... | [gear] [split-v] [split-h] [?] | [+]
    The split pair disappears entirely when the active tab is split. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false, false, false, false, false };
+    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     bool show_splits = split_buttons_visible();
-    int plus_x    = win_w - TAB_PLUS_W;
-    int help_x    = plus_x - TAB_HELP_W;
-    int split_h_x = show_splits ? help_x - TAB_SPLIT_W     : help_x;
-    int split_v_x = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
-    int gear_x    = split_v_x - TAB_GEAR_W;
+    int plus_x      = win_w - TAB_PLUS_W;
+    int help_x      = plus_x - TAB_HELP_W;
+    int split_h_x   = show_splits ? help_x - TAB_SPLIT_W     : help_x;
+    int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
+    int rec_stop_x  = split_v_x - TAB_REC_W;
+    int rec_start_x = rec_stop_x - TAB_REC_W;
+    int gear_x      = rec_start_x - TAB_GEAR_W;
     int tab_start = TAB_SSH_W;
     if (mx < TAB_SSH_W)     { h.on_ssh     = true; return h; }
     if (mx >= plus_x)       { h.on_plus    = true; return h; }
     if (mx >= help_x)       { h.on_help    = true; return h; }
     if (show_splits && mx >= split_h_x) { h.on_split_h = true; return h; }
     if (show_splits && mx >= split_v_x) { h.on_split_v = true; return h; }
-    if (mx >= gear_x)       { h.on_gear    = true; return h; }
+    if (mx >= rec_stop_x)   { h.on_rec_stop  = true; return h; }
+    if (mx >= rec_start_x)  { h.on_rec_start = true; return h; }
+    if (mx >= gear_x)       { h.on_gear      = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
     if (idx < 0 || idx >= g_num_tabs) return h;
@@ -2361,10 +2625,54 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                    18, 0, (Color){220, 235, 255, 255});
     }
 
-    /* Gear (settings) button — leftmost of the right-cluster (left of
-       the split pair when shown, otherwise left of the help button). */
-    int gear_x = split_buttons_visible() ? (help_x - 2 * TAB_SPLIT_W - TAB_GEAR_W)
-                                         : (help_x - TAB_GEAR_W);
+    /* Right-cluster layout (mirrors tab_bar_hit_test):
+         [REC mm:ss?] [gear] [rec ●] [rec ■] [split-v?] [split-h?] [?] [+]
+       Compute every x from right to left so it stays in sync. The
+       REC pill renders only while a recording is active. */
+    bool show_splits = split_buttons_visible();
+    int split_h_x   = show_splits ? help_x - TAB_SPLIT_W    : help_x;
+    int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W : help_x;
+    int rec_stop_x  = split_v_x - TAB_REC_W;
+    int rec_start_x = rec_stop_x - TAB_REC_W;
+    int gear_x      = rec_start_x - TAB_GEAR_W;
+
+    /* REC pill: shows while a recording is active. Sits just left
+       of the gear and counts up from the recording's start time.
+       The first ~1.5 s pulses brighter so users can tell recording
+       actually engaged. Layout doesn't reserve space when idle —
+       on-recording it overdraws the whitespace between tabs and
+       the gear, which is fine since we never run that close on a
+       reasonable window. */
+    if (g_rec.active) {
+        double elapsed = GetTime() - g_rec.start_time;
+        int  mins = (int)(elapsed / 60.0);
+        int  secs = (int)(elapsed - mins * 60);
+        char label[32];
+        snprintf(label, sizeof(label), "REC %d:%02d", mins, secs);
+        Vector2 lsz = MeasureTextEx(*f, label, 13, 0);
+        int pill_pad = 8;
+        int dot_w = 8;
+        int pill_w = (int)lsz.x + dot_w + 12 + pill_pad * 2;
+        int pill_x = gear_x - pill_w - 6;
+        if (pill_x < TAB_SSH_W + 4) pill_x = TAB_SSH_W + 4;
+        bool pulse = elapsed < 1.5;
+        bool blink = ((long long)(GetTime() * 2.0) & 1) == 0;
+        Color pill_bg = pulse ? (Color){70, 28, 28, 255} : (Color){52, 22, 22, 255};
+        Color pill_outline = (Color){200, 80, 80, 220};
+        Color dot_col = (pulse || blink) ? (Color){255, 80, 80, 255}
+                                         : (Color){180, 60, 60, 255};
+        Color text_col = (Color){240, 200, 200, 255};
+        DrawRectangle(pill_x, 4, pill_w, TAB_BAR_H - 8, pill_bg);
+        DrawRectangleLines(pill_x, 4, pill_w, TAB_BAR_H - 8, pill_outline);
+        DrawCircle(pill_x + pill_pad + dot_w / 2,
+                   TAB_BAR_H / 2, dot_w / 2.0f, dot_col);
+        DrawTextEx(*f, label,
+                   (Vector2){pill_x + pill_pad + dot_w + 6,
+                             (TAB_BAR_H - lsz.y) / 2.0f},
+                   13, 0, text_col);
+    }
+
+    /* Gear (settings). */
     Color gear_bg = (Color){38, 48, 66, 255};
     DrawRectangle(gear_x, 0, TAB_GEAR_W, TAB_BAR_H, gear_bg);
     DrawRectangleLines(gear_x, 2, TAB_GEAR_W - 1, TAB_BAR_H - 4,
@@ -2372,12 +2680,32 @@ static void draw_tab_bar(Renderer *r, int win_w) {
     draw_gear_icon(gear_x + TAB_GEAR_W / 2.0f, TAB_BAR_H / 2.0f,
                    TAB_BAR_H * 0.55f, (Color){220, 235, 255, 255}, gear_bg);
 
-    /* Split buttons — vertical (side-by-side) then horizontal (top/bottom),
-       between gear and help. Hidden once the active tab is already
-       split (clicking them would no-op). */
-    if (split_buttons_visible()) {
-        int split_v_x = gear_x + TAB_GEAR_W;
-        int split_h_x = split_v_x + TAB_SPLIT_W;
+    /* Recording start/stop buttons. Start is a red disc (dim when
+       a recording is already running); Stop is a red square (dim
+       when no recording is active). */
+    {
+        Color rec_bg = (Color){38, 48, 66, 255};
+        Color rec_outline = (Color){125, 207, 255, 200};
+        bool armed = !g_rec.active;
+        Color start_col = armed ? (Color){230, 80, 80, 255}
+                                : (Color){120, 60, 60, 200};
+        DrawRectangle(rec_start_x, 0, TAB_REC_W, TAB_BAR_H, rec_bg);
+        DrawRectangleLines(rec_start_x, 2, TAB_REC_W - 1, TAB_BAR_H - 4, rec_outline);
+        DrawCircle(rec_start_x + TAB_REC_W / 2, TAB_BAR_H / 2, 6.0f, start_col);
+
+        bool can_stop = g_rec.active;
+        Color stop_col = can_stop ? (Color){230, 80, 80, 255}
+                                  : (Color){120, 60, 60, 200};
+        DrawRectangle(rec_stop_x, 0, TAB_REC_W, TAB_BAR_H, rec_bg);
+        DrawRectangleLines(rec_stop_x, 2, TAB_REC_W - 1, TAB_BAR_H - 4, rec_outline);
+        int sq = 10;
+        DrawRectangle(rec_stop_x + (TAB_REC_W - sq) / 2,
+                      (TAB_BAR_H - sq) / 2, sq, sq, stop_col);
+    }
+
+    /* Split buttons — vertical (side-by-side) then horizontal
+       (top/bottom). Hidden once the active tab is already split. */
+    if (show_splits) {
         Color split_bg = (Color){38, 48, 66, 255};
         Color split_outline = (Color){125, 207, 255, 200};
         Color split_icon = (Color){220, 235, 255, 255};
@@ -4218,12 +4546,13 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
  * whichever tab makes sense — keep it boring and extensible. */
 
 typedef enum {
-    SETTINGS_TAB_FONT    = 0,
-    SETTINGS_TAB_THEME   = 1,
-    SETTINGS_TAB_CURSOR  = 2,
-    SETTINGS_TAB_SESSION = 3,
-    SETTINGS_TAB_WINDOW  = 4,
-    SETTINGS_TAB_COUNT   = 5,
+    SETTINGS_TAB_FONT       = 0,
+    SETTINGS_TAB_THEME      = 1,
+    SETTINGS_TAB_CURSOR     = 2,
+    SETTINGS_TAB_SESSION    = 3,
+    SETTINGS_TAB_WINDOW     = 4,
+    SETTINGS_TAB_RECORDING  = 5,
+    SETTINGS_TAB_COUNT      = 6,
 } SettingsTab;
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
@@ -4263,6 +4592,7 @@ typedef struct {
     Rect spc_dec, spc_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
+    Rect rec_dir;    /* editable text box with recording-save directory */
     Rect repeat_initial; /* slider track — initial repeat delay */
     Rect repeat_rate;    /* slider track — per-repeat period */
     Rect startup_default;    /* startup-window-size picker: three buttons */
@@ -4573,6 +4903,9 @@ static void settings_apply_spacing(Renderer *r, int new_extra) {
 
 static bool g_settings_dir_focus = false;
 static bool g_settings_dir_sel_all = false;
+/* Same pattern for the Recording-tab directory field. */
+static bool g_settings_recdir_focus = false;
+static bool g_settings_recdir_sel_all = false;
 
 /* Compute the Settings modal layout: tab-bar buttons, content rects
    for the active tab only (Font / Theme / Session / Window),
@@ -4677,6 +5010,9 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
            macOS here. Users wanting a distraction-free window use
            Maximized (own Space on macOS). */
         L.startup_fullscreen = (Rect){ 0, 0, 0, 0 };
+    } else if (g_settings_tab == SETTINGS_TAB_RECORDING) {
+        int row_y = content_y;
+        L.rec_dir = (Rect){ L.modal.x + 140, row_y, w - 140 - 22, btn };
     }
 
     return L;
@@ -4744,6 +5080,7 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             if (g_settings_tab != i) {
                 g_settings_tab = i;
                 g_settings_dir_focus = false;
+                g_settings_recdir_focus = false;
                 g_settings_focused_list = SETTINGS_FOCUS_NONE;
                 g_slider_drag_track.w = 0;
                 g_slider_drag_target = NULL;
@@ -4863,6 +5200,11 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         g_settings_dir_sel_all = false;
         return;
     }
+    if (rect_hit(L.rec_dir, mx, my)) {
+        g_settings_recdir_focus = true;
+        g_settings_recdir_sel_all = false;
+        return;
+    }
     /* Startup window mode: Default or Maximized. Applied on next
        launch. Fullscreen option removed — raylib's ToggleFullscreen
        misbehaves on macOS. */
@@ -4888,9 +5230,16 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         }
         return;
     }
-    if (rect_hit(L.close, mx, my)) { g_ui_mode = UI_NORMAL; g_settings_dir_focus = false; g_settings_focused_list = SETTINGS_FOCUS_NONE; return; }
+    if (rect_hit(L.close, mx, my)) {
+        g_ui_mode = UI_NORMAL;
+        g_settings_dir_focus = false;
+        g_settings_recdir_focus = false;
+        g_settings_focused_list = SETTINGS_FOCUS_NONE;
+        return;
+    }
     /* Click elsewhere drops focus from the text input + list. */
     g_settings_dir_focus = false;
+    g_settings_recdir_focus = false;
     g_settings_focused_list = SETTINGS_FOCUS_NONE;
 }
 
@@ -4922,11 +5271,69 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
 
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (g_settings_dir_focus) { g_settings_dir_focus = false; return; }
+        if (g_settings_recdir_focus) { g_settings_recdir_focus = false; return; }
         if (g_settings_focused_list != SETTINGS_FOCUS_NONE) {
             g_settings_focused_list = SETTINGS_FOCUS_NONE;
             return;
         }
         g_ui_mode = UI_NORMAL; return;
+    }
+
+    /* Recording-tab directory text input. Same chord set as
+       g_settings_dir_focus / log-dir editing. */
+    if (g_settings_recdir_focus) {
+        if (mod && IsKeyPressed(KEY_A)) { g_settings_recdir_sel_all = true; return; }
+        if (mod && IsKeyPressed(KEY_C) && g_settings_recdir_sel_all
+                && g_app_settings.rec_dir[0]) {
+            SetClipboardText(g_app_settings.rec_dir);
+            return;
+        }
+        if (mod && IsKeyPressed(KEY_V)) {
+            const char *clip = GetClipboardText();
+            if (clip && *clip) {
+                if (g_settings_recdir_sel_all) {
+                    g_app_settings.rec_dir[0] = 0;
+                    g_settings_recdir_sel_all = false;
+                }
+                size_t len = strlen(g_app_settings.rec_dir);
+                for (const char *q = clip; *q; q++) {
+                    unsigned char c = (unsigned char)*q;
+                    if (c == '\r' || c == '\n' || c == '\t') continue;
+                    if (c < 32 || c >= 127) continue;
+                    if (len + 1 >= sizeof(g_app_settings.rec_dir)) break;
+                    g_app_settings.rec_dir[len++] = (char)c;
+                }
+                g_app_settings.rec_dir[len] = 0;
+            }
+            return;
+        }
+        size_t len = strlen(g_app_settings.rec_dir);
+        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+            if (g_settings_recdir_sel_all) {
+                g_app_settings.rec_dir[0] = 0;
+                g_settings_recdir_sel_all = false;
+            } else if (len > 0) {
+                g_app_settings.rec_dir[len - 1] = 0;
+            }
+        }
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+            g_settings_recdir_focus = false;
+            return;
+        }
+        int cp;
+        while ((cp = GetCharPressed()) != 0) {
+            if (mod) continue;
+            if (cp < 32 || cp >= 127) continue;
+            if (g_settings_recdir_sel_all) {
+                g_app_settings.rec_dir[0] = 0;
+                len = 0;
+                g_settings_recdir_sel_all = false;
+            }
+            if (len + 1 >= sizeof(g_app_settings.rec_dir)) continue;
+            g_app_settings.rec_dir[len++] = (char)cp;
+            g_app_settings.rec_dir[len] = 0;
+        }
+        return;
     }
 
     if (g_settings_dir_focus) {
@@ -5013,6 +5420,906 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     if (IsKeyPressed(KEY_SPACE)) {
         g_app_settings.log_enabled = !g_app_settings.log_enabled;
         refresh_tab_logs();
+    }
+}
+
+/* ---------- Save-recording modal ---------- */
+
+typedef struct {
+    Rect modal;
+    Rect path;
+    Rect fmt[REC_FMT_COUNT];
+    Rect save_btn, close_btn, preview_btn;
+} RecSaveLayout;
+
+/* Compute the modal layout: path text field, six format buttons,
+   action buttons. Shared by draw + click hit-test. */
+static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout L);
+
+static RecSaveLayout rec_save_layout(int win_w, int win_h) {
+    RecSaveLayout L = {0};
+    /* Width sized so the typical "wrote NN KB <fmt> to /Users/<user>/<long>/rbterm-….<ext>"
+       status line fits in full at 16pt mono. The status row sits
+       above the button row (separate y), so it can use the full
+       modal interior. Falls back to window-width-minus-margin on
+       small windows; middle-ellipsis kicks in only if even that
+       isn't enough. */
+    int w = 1080, h = 280;
+    if (w > win_w - 40) w = win_w - 40;
+    if (h > win_h - 40) h = win_h - 40;
+    L.modal.x = (win_w - w) / 2;
+    L.modal.y = (win_h - h) / 2;
+    L.modal.w = w;
+    L.modal.h = h;
+    int title_h = 38;
+    int pad = 22;
+    int label_w = 70;
+    int field_x = L.modal.x + pad + label_w;
+    int field_w = w - pad - label_w - pad;
+    int row_y = L.modal.y + title_h + 22;
+    L.path = (Rect){ field_x, row_y, field_w, 28 };
+    int fmt_y = L.path.y + L.path.h + 18;
+    int fmt_gap = 4;
+    int fmt_w = (field_w - (REC_FMT_COUNT - 1) * fmt_gap) / REC_FMT_COUNT;
+    int fmt_h = 30;
+    for (int i = 0; i < REC_FMT_COUNT; i++)
+        L.fmt[i] = (Rect){ field_x + i * (fmt_w + fmt_gap), fmt_y, fmt_w, fmt_h };
+    /* Footer row, right-anchored: [Preview] [Close] [Save].
+       Save / Preview keep the modal open so the user can export the
+       same recording to multiple formats; Close (or Esc) dismisses
+       and leaves the temp .cast in place. */
+    int btn_h = 32;
+    int row_y2 = L.modal.y + h - 22 - btn_h;
+    int save_w = 110, close_w = 90, preview_w = 100;
+    L.save_btn    = (Rect){ L.modal.x + w - 22 - save_w,        row_y2, save_w,    btn_h };
+    L.close_btn   = (Rect){ L.save_btn.x - 8 - close_w,         row_y2, close_w,   btn_h };
+    L.preview_btn = (Rect){ L.close_btn.x - 8 - preview_w,      row_y2, preview_w, btn_h };
+    return L;
+}
+
+/* Look up bundled ffmpeg first (next to the rbterm executable on
+   Linux/Windows, or in Contents/Resources/ on macOS .app bundles),
+   then fall back to whatever is on PATH. Returns the resolved
+   path in `out` (caller's buffer) or false if nothing's available. */
+static bool find_ffmpeg(char *out, size_t cap) {
+#ifndef __EMSCRIPTEN__
+    const char *exe_dir = GetApplicationDirectory();
+    if (exe_dir && *exe_dir) {
+#ifdef __APPLE__
+        snprintf(out, cap, "%s../Resources/ffmpeg", exe_dir);
+        if (access(out, X_OK) == 0) return true;
+#endif
+#ifdef _WIN32
+        snprintf(out, cap, "%sffmpeg.exe", exe_dir);
+#else
+        snprintf(out, cap, "%sffmpeg", exe_dir);
+#endif
+        if (access(out, X_OK) == 0) return true;
+    }
+#endif
+    /* PATH fallback. */
+    snprintf(out, cap, "ffmpeg");
+    return true;
+}
+
+/* Spawn ffmpeg with stdin connected to a write pipe + stderr
+   redirected to `err_log_path` so we can surface the actual error
+   to the user when ffmpeg dies. Caller fcloses the FILE on
+   completion and waits the child via waitpid. */
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
+static FILE *ffmpeg_open_pipe(const char *const argv[], pid_t *out_pid,
+                              const char *err_log_path) {
+#ifdef _WIN32
+    (void)argv; (void)out_pid; (void)err_log_path;
+    return NULL;   /* TODO: CreateProcess + anonymous pipe on Windows. */
+#else
+    int pfd[2];
+    if (pipe(pfd) != 0) return NULL;
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return NULL; }
+    if (pid == 0) {
+        dup2(pfd[0], 0);
+        close(pfd[0]);
+        close(pfd[1]);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, 1); close(dn); }
+        int errfd = err_log_path
+            ? open(err_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0600)
+            : -1;
+        if (errfd >= 0) { dup2(errfd, 2); close(errfd); }
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    close(pfd[0]);
+    *out_pid = pid;
+    FILE *fp = fdopen(pfd[1], "wb");
+    if (!fp) close(pfd[1]);
+    return fp;
+#endif
+}
+
+/* Synchronous fork+exec — runs argv to completion and returns true
+   on exit status 0. Stderr is captured to `err_log_path` if non-
+   NULL so callers can surface ffmpeg's own message. */
+static bool run_argv(const char *const argv[], const char *err_log_path) {
+#ifdef _WIN32
+    (void)argv; (void)err_log_path;
+    return false;
+#else
+    pid_t pid = fork();
+    if (pid == 0) {
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); close(dn); }
+        int errfd = err_log_path
+            ? open(err_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0600)
+            : -1;
+        if (errfd >= 0) { dup2(errfd, 2); close(errfd); }
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    if (pid < 0) return false;
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+/* Read ffmpeg's stderr tail and pull out the most informative line.
+   ffmpeg often prints `Conversion failed!` as the very last line —
+   the actual cause ("Encoder libwebp not found", etc.) sits a few
+   lines above. We scan a generous trailing window for a line that
+   matches a known error pattern; failing that, fall back to the
+   last non-empty line. */
+static void read_tail(const char *path, char *buf, size_t cap) {
+    if (cap == 0) return;
+    buf[0] = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    /* Pull a wider window than `cap` so we can scan across multiple
+       lines for the substantive error. */
+    long want = 4096;
+    if (sz < want) want = sz;
+    char *win = malloc((size_t)want + 1);
+    if (!win) { fclose(fp); return; }
+    fseek(fp, sz - want, SEEK_SET);
+    size_t got = fread(win, 1, (size_t)want, fp);
+    fclose(fp);
+    win[got] = 0;
+    /* Tokenise into lines, scan for a "real" error line. */
+    static const char *patterns[] = {
+        "Encoder ", "encoder not found", "Encoder not found",
+        "Unknown encoder", "not found", "No such file",
+        "Invalid argument", "Cannot find", "Cannot open",
+        "Permission denied", NULL
+    };
+    char *best = NULL;
+    char *last_nonempty = NULL;
+    char *p = win;
+    while (*p) {
+        char *end = strchr(p, '\n');
+        if (end) *end = 0;
+        if (*p) last_nonempty = p;
+        for (int i = 0; patterns[i]; i++) {
+            if (strstr(p, patterns[i])) { best = p; break; }
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    const char *src = best ? best : (last_nonempty ? last_nonempty : "");
+    snprintf(buf, cap, "%s", src);
+    free(win);
+    /* Strip trailing whitespace. */
+    size_t n = strlen(buf);
+    while (n > 0 && (buf[n - 1] == ' ' || buf[n - 1] == '\t' ||
+                     buf[n - 1] == '\r' || buf[n - 1] == '\n')) {
+        buf[--n] = 0;
+    }
+}
+
+/* Walk a captured byte stream and emit a "what was visibly typed
+   to the screen" version: ANSI / OSC / DCS escape sequences are
+   dropped; CR resets the cursor to the start of the current line
+   (so a typical "progress bar overwriting itself" replays as the
+   final line); BS backs up one column; LF flushes the current
+   line. The output is plain UTF-8 text — no control bytes other
+   than '\n' and '\t'. */
+typedef struct {
+    char  *line;
+    size_t line_cap;
+    size_t cursor;     /* write position within the line buffer */
+    size_t line_len;   /* high-water mark — we flush this many bytes */
+    enum {
+        STRIP_NORMAL,
+        STRIP_ESC,         /* saw ESC, awaiting introducer */
+        STRIP_CSI,         /* in CSI parameter run, awaiting final byte */
+        STRIP_STR,         /* OSC/DCS/APC/PM/SOS — wait for BEL or ST */
+        STRIP_STR_ESC,     /* in STR state, just saw ESC */
+    } state;
+    FILE *out;
+} StripCtx;
+
+static void strip_line_putc(StripCtx *c, unsigned char b) {
+    /* Grow the line buffer so cursor + b fits. */
+    if (c->cursor + 1 >= c->line_cap) {
+        size_t nc = c->line_cap ? c->line_cap * 2 : 256;
+        char *nb = realloc(c->line, nc);
+        if (!nb) return;
+        c->line = nb;
+        c->line_cap = nc;
+    }
+    c->line[c->cursor++] = (char)b;
+    if (c->cursor > c->line_len) c->line_len = c->cursor;
+}
+
+static void strip_flush_line(StripCtx *c) {
+    if (c->line_len > 0) fwrite(c->line, 1, c->line_len, c->out);
+    fputc('\n', c->out);
+    c->cursor = 0;
+    c->line_len = 0;
+}
+
+/* Feed one byte through the strip state machine. */
+static void strip_feed(StripCtx *c, unsigned char b) {
+    switch (c->state) {
+    case STRIP_NORMAL:
+        if (b == 0x1B) { c->state = STRIP_ESC; return; }
+        if (b == '\n') { strip_flush_line(c); return; }
+        if (b == '\r') { c->cursor = 0; return; }
+        if (b == '\b') { if (c->cursor > 0) c->cursor--; return; }
+        if (b == '\t') { strip_line_putc(c, '\t'); return; }
+        if (b < 0x20)  return;     /* drop other C0 controls */
+        if (b == 0x7F) return;     /* drop DEL */
+        strip_line_putc(c, b);
+        return;
+    case STRIP_ESC:
+        if (b == '[')                         { c->state = STRIP_CSI; return; }
+        if (b == ']' || b == 'P' || b == '_'
+                     || b == '^' || b == 'X') { c->state = STRIP_STR; return; }
+        /* Two-byte ESC sequence — drop and resume. */
+        c->state = STRIP_NORMAL;
+        return;
+    case STRIP_CSI:
+        /* CSI body: parameter bytes 0x30..0x3F, intermediate 0x20..0x2F,
+           terminated by a final byte 0x40..0x7E. */
+        if (b >= 0x40 && b <= 0x7E) c->state = STRIP_NORMAL;
+        return;
+    case STRIP_STR:
+        if (b == 0x07) { c->state = STRIP_NORMAL; return; }   /* BEL terminator */
+        if (b == 0x1B) { c->state = STRIP_STR_ESC; return; }  /* possible ST */
+        return;
+    case STRIP_STR_ESC:
+        c->state = (b == '\\') ? STRIP_NORMAL : STRIP_STR;
+        return;
+    }
+}
+
+/* Render src_cast → plain text at dst. Fast — single pass, no UI
+   blocking. Returns false on file open failure. */
+static bool rec_render_text(const char *src_cast, const char *dst,
+                            char *err, size_t errsz) {
+    char loaderr[128] = {0};
+    CastFile *cf = cast_load(src_cast, loaderr, sizeof(loaderr));
+    if (!cf) {
+        snprintf(err, errsz, "cast_load: %s", loaderr[0] ? loaderr : "(unknown)");
+        return false;
+    }
+    FILE *fp = fopen(dst, "wb");
+    if (!fp) {
+        snprintf(err, errsz, "open %s: %s", dst, strerror(errno));
+        cast_free(cf);
+        return false;
+    }
+    StripCtx c = {0};
+    c.state = STRIP_NORMAL;
+    c.out = fp;
+    for (size_t i = 0; i < cf->count; i++) {
+        const uint8_t *p = cf->events[i].data;
+        size_t n = cf->events[i].n;
+        for (size_t k = 0; k < n; k++) strip_feed(&c, p[k]);
+    }
+    /* Flush any trailing content that didn't end in LF. */
+    if (c.line_len > 0) strip_flush_line(&c);
+    free(c.line);
+    cast_free(cf);
+    if (fclose(fp) != 0) {
+        snprintf(err, errsz, "close %s: %s", dst, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Native cast → frames → encoder/pipe. Replays the recorded byte
+   stream into a hidden Screen, renders each frame to an off-screen
+   RenderTexture using the existing renderer_draw, reads the pixels
+   back, and either feeds them to the embedded GIF encoder or pipes
+   them to ffmpeg (bundled or on PATH). Blocks the UI for the
+   duration of conversion. */
+static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
+                              char *err, size_t errsz) {
+    if (err && errsz) err[0] = 0;
+    if (fmt == REC_FMT_CAST) {
+        if (strcmp(src_cast, dst) == 0) return true;
+        if (rename(src_cast, dst) == 0) return true;
+        snprintf(err, errsz, "rename failed: %s", strerror(errno));
+        return false;
+    }
+    if (fmt == REC_FMT_TXT) {
+        return rec_render_text(src_cast, dst, err, errsz);
+    }
+    if (!g_renderer) {
+        snprintf(err, errsz, "renderer not initialised");
+        return false;
+    }
+
+    CastFile *cf = cast_load(src_cast, err, errsz);
+    if (!cf) return false;
+
+    int cw = g_renderer->cell_w;
+    int ch_ = g_renderer->cell_h;
+    int px = g_renderer->pad_x;
+    int py = g_renderer->pad_y;
+    int width  = cf->cols * cw + 2 * px;
+    int height = cf->rows * ch_ + 2 * py;
+    /* RenderTexture sizes must be even on some drivers; round up. */
+    if (width  & 1) width  += 1;
+    if (height & 1) height += 1;
+
+    /* Hidden Screen — no IO callbacks needed (no PTY, no clipboard). */
+    ScreenIO sio = {0};
+    Screen *scr = screen_new(cf->cols, cf->rows, 5000, sio);
+    if (!scr) {
+        snprintf(err, errsz, "screen_new failed");
+        cast_free(cf);
+        return false;
+    }
+    screen_set_cell_h_px(scr, ch_);
+
+    RenderTexture2D rt = LoadRenderTexture(width, height);
+    if (rt.id == 0) {
+        snprintf(err, errsz, "couldn't allocate %dx%d render target", width, height);
+        screen_free(scr);
+        cast_free(cf);
+        return false;
+    }
+
+    /* Output sink. Three direct paths + one fallback:
+       - GIF  → native encoder (gif_encoder.c)
+       - WebP → native encoder (webp_encoder.c, libwebp + libwebpmux)
+       - MP4 / WebM → rawvideo straight to ffmpeg
+       - APNG → render to a temp GIF, then ffmpeg gif → apng (libavcodec
+                 has built-in apng so this works on stock brew ffmpeg). */
+    bool two_pass = (fmt == REC_FMT_APNG);
+    char gif_intermediate[PATH_MAX] = {0};
+    GifEnc  *gif  = NULL;
+    WebpEnc *webp = NULL;
+    FILE   *pipe_fp = NULL;
+    pid_t   pipe_pid = 0;
+    int     fps = 15;
+    int     delay_cs = 100 / fps;     /* gif delay is in 1/100s. */
+    int     delay_ms = 1000 / fps;    /* webp delay is in ms. */
+    char    ff_log[PATH_MAX];
+    snprintf(ff_log, sizeof(ff_log), "/tmp/rbterm-ffmpeg-%d.log", (int)getpid());
+    if (fmt == REC_FMT_GIF || two_pass) {
+        const char *gif_dst = (fmt == REC_FMT_GIF) ? dst : gif_intermediate;
+        if (two_pass) {
+            snprintf(gif_intermediate, sizeof(gif_intermediate),
+                     "/tmp/rbterm-conv-%d.gif", (int)getpid());
+            gif_dst = gif_intermediate;
+        }
+        gif = gif_begin(gif_dst, width, height, delay_cs);
+        if (!gif) {
+            snprintf(err, errsz, "couldn't open %s for writing", gif_dst);
+            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            return false;
+        }
+    } else if (fmt == REC_FMT_WEBP) {
+        webp = webp_begin(dst, width, height, delay_ms);
+        if (!webp) {
+            snprintf(err, errsz, "couldn't open %s for webp encoding", dst);
+            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            return false;
+        }
+    } else {
+        char ff[PATH_MAX];
+        find_ffmpeg(ff, sizeof(ff));
+        char size_arg[32];
+        snprintf(size_arg, sizeof(size_arg), "%dx%d", width, height);
+        char rate_arg[16];
+        snprintf(rate_arg, sizeof(rate_arg), "%d", fps);
+        const char *fmt_args[16] = {0};
+        int fmt_n = 0;
+        if (fmt == REC_FMT_MP4) {
+            fmt_args[fmt_n++] = "-pix_fmt"; fmt_args[fmt_n++] = "yuv420p";
+            fmt_args[fmt_n++] = "-movflags"; fmt_args[fmt_n++] = "+faststart";
+        } else if (fmt == REC_FMT_WEBM) {
+            /* libvpx (VP8) ships with every brew/distro ffmpeg.
+               It only accepts yuv420p — we have to pass that
+               explicitly so ffmpeg inserts a colour-space
+               conversion filter between our rgba frames and the
+               encoder. Without it: "Invalid argument" / -22. */
+            fmt_args[fmt_n++] = "-pix_fmt"; fmt_args[fmt_n++] = "yuv420p";
+            fmt_args[fmt_n++] = "-c:v";    fmt_args[fmt_n++] = "libvpx";
+            fmt_args[fmt_n++] = "-b:v";    fmt_args[fmt_n++] = "1M";
+        }
+        const char *argv[32];
+        int n = 0;
+        argv[n++] = ff;
+        argv[n++] = "-y";
+        argv[n++] = "-f"; argv[n++] = "rawvideo";
+        argv[n++] = "-pix_fmt"; argv[n++] = "rgba";
+        argv[n++] = "-s"; argv[n++] = size_arg;
+        argv[n++] = "-framerate"; argv[n++] = rate_arg;
+        argv[n++] = "-i"; argv[n++] = "-";
+        for (int k = 0; k < fmt_n; k++) argv[n++] = fmt_args[k];
+        argv[n++] = dst;
+        argv[n] = NULL;
+        pipe_fp = ffmpeg_open_pipe(argv, &pipe_pid, ff_log);
+        if (!pipe_fp) {
+            snprintf(err, errsz, "couldn't run ffmpeg (bundled: %s)", ff);
+            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            return false;
+        }
+    }
+
+    /* Render the frame sequence. We emit frames at a steady FPS;
+       between events the previous frame is held (gif's per-frame
+       delay does the right thing for free). */
+    uint8_t *pixels = malloc((size_t)width * height * 4);
+    if (!pixels) {
+        snprintf(err, errsz, "out of memory for pixel buffer");
+        if (gif) gif_end(gif);
+        if (pipe_fp) { fclose(pipe_fp); waitpid(pipe_pid, NULL, 0); }
+        UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+        return false;
+    }
+    /* Skip every blank frame before the first event so the gif
+       opens on actual content instead of a couple of seconds of
+       blank screen while the user was thinking. Frame 0 fires
+       events[0] immediately. */
+    double t0 = cf->events[0].t;
+    if (t0 < 0.0) t0 = 0.0;
+    double total = cf->duration_s - t0 + 0.3;
+    if (total < 0.3) total = 0.3;
+    int total_frames = (int)(total * fps) + 1;
+    size_t ev_idx = 0;
+    /* Drive the render in chunks, presenting a fresh modal frame
+       between chunks so the user sees a live progress message + a
+       spinning glyph. Without this the UI freezes for the full
+       conversion duration and the OS overlays its "not responding"
+       beachball. CHUNK_SZ trades latency-per-frame against UI
+       responsiveness; 6 keeps the spinner readable. */
+    const int CHUNK_SZ = 6;
+    int f = 0;
+    while (f < total_frames) {
+        int chunk_end = f + CHUNK_SZ;
+        if (chunk_end > total_frames) chunk_end = total_frames;
+        for (; f < chunk_end; f++) {
+            double frame_t = t0 + (double)f / fps;
+            while (ev_idx < cf->count && cf->events[ev_idx].t <= frame_t) {
+                screen_feed(scr, cf->events[ev_idx].data, cf->events[ev_idx].n);
+                ev_idx++;
+            }
+            BeginTextureMode(rt);
+                ClearBackground(BLACK);
+                renderer_draw(g_renderer, scr, 0.0, false, NULL, 0, 0, -1, -1);
+            EndTextureMode();
+            Image img = LoadImageFromTexture(rt.texture);
+            ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+            int row = width * 4;
+            for (int y = 0; y < height; y++) {
+                memcpy(pixels + (size_t)y * row,
+                       (uint8_t *)img.data + (size_t)(height - 1 - y) * row,
+                       (size_t)row);
+            }
+            UnloadImage(img);
+            if (gif)       gif_add_frame(gif, pixels);
+            else if (webp) webp_add_frame(webp, pixels);
+            else if (pipe_fp) fwrite(pixels, 1, (size_t)width * height * 4, pipe_fp);
+        }
+        /* Live status + UI redraw between chunks. The save modal
+           reads g_rec_save.status, so we update that and redraw the
+           full app frame. The 4-glyph ASCII spinner ticks once per
+           chunk so the user can tell something is happening even
+           when the percentage doesn't change much. */
+        static const char *spin = "|/-\\";
+        int sidx = (f / CHUNK_SZ) & 3;
+        int pct = (int)((double)f * 100.0 / (double)total_frames + 0.5);
+        snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                 "%c rendering %d / %d frames (%d%%)",
+                 spin[sidx], f, total_frames, pct);
+        BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            int win_w = GetScreenWidth();
+            int win_h = GetScreenHeight();
+            Tab *cur = active_tab();
+            draw_tab_bar(g_renderer, win_w);
+            if (cur) draw_tab_contents(g_renderer, cur, win_w, win_h,
+                                       GetTime(), IsWindowFocused());
+            RecSaveLayout RL = rec_save_layout(win_w, win_h);
+            draw_rec_save_modal(g_renderer, win_w, win_h, RL);
+        EndDrawing();
+    }
+
+    free(pixels);
+    if (gif) gif_end(gif);
+    if (webp) {
+        if (!webp_end(webp)) {
+            snprintf(err, errsz, "webp encode failed");
+            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            return false;
+        }
+    }
+    if (pipe_fp) {
+        fclose(pipe_fp);
+#ifndef _WIN32
+        int status = 0;
+        waitpid(pipe_pid, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            char tail[256] = {0};
+            read_tail(ff_log, tail, sizeof(tail));
+            unlink(ff_log);
+            snprintf(err, errsz, "ffmpeg failed: %s",
+                     tail[0] ? tail : "(no stderr captured)");
+            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            return false;
+        }
+        unlink(ff_log);
+#endif
+    }
+    /* Second pass: gif intermediate → final apng via ffmpeg.
+       libavcodec ships an APNG encoder built-in on every brew /
+       distro ffmpeg, so this doesn't need any extra codec. */
+    if (two_pass && gif_intermediate[0]) {
+        char ff[PATH_MAX];
+        find_ffmpeg(ff, sizeof(ff));
+        const char *argv[16];
+        int n = 0;
+        argv[n++] = ff;
+        argv[n++] = "-y";
+        argv[n++] = "-i"; argv[n++] = gif_intermediate;
+        argv[n++] = "-plays"; argv[n++] = "1";   /* play once, no loop. */
+        argv[n++] = dst;
+        argv[n] = NULL;
+        bool ok = run_argv(argv, ff_log);
+        if (!ok) {
+            char tail[256] = {0};
+            read_tail(ff_log, tail, sizeof(tail));
+            unlink(ff_log);
+            unlink(gif_intermediate);
+            snprintf(err, errsz, "ffmpeg %s pass: %s",
+                     rec_fmt_ext(fmt), tail[0] ? tail : "(no stderr)");
+            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            return false;
+        }
+        unlink(ff_log);
+        unlink(gif_intermediate);
+    }
+    UnloadRenderTexture(rt);
+    screen_free(scr);
+    cast_free(cf);
+    return true;
+}
+
+/* Public entry — preserves the old name so call sites keep working. */
+static bool rec_convert(RecFmt fmt, const char *src_cast, const char *dst,
+                        char *err, size_t errsz) {
+    return rec_render_native(fmt, src_cast, dst, err, errsz);
+}
+
+/* Click-handling for the save modal. Tracks consecutive clicks on
+   the path field for double-click-to-select-all (~0.45s gap). */
+static void rec_save_handle_mouse(RecSaveLayout L) {
+    static double last_click_t = -1.0;
+    static int    click_count = 0;
+    Vector2 mp = GetMousePosition();
+    int mx = (int)mp.x, my = (int)mp.y;
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+    if (rect_hit(L.path, mx, my)) {
+        double now = GetTime();
+        if (last_click_t >= 0 && (now - last_click_t) < 0.45) click_count++;
+        else click_count = 1;
+        last_click_t = now;
+        g_rec_save.path_focus = true;
+        if (click_count >= 2 && g_rec_save.dst_path[0]) {
+            g_rec_save.path_sel_all = true;
+        } else {
+            g_rec_save.path_sel_all = false;
+        }
+        return;
+    }
+    /* Click outside the path field — reset multi-click counter. */
+    click_count = 0;
+    last_click_t = -1.0;
+    for (int i = 0; i < REC_FMT_COUNT; i++) {
+        if (rect_hit(L.fmt[i], mx, my)) {
+            g_rec_save.fmt = (RecFmt)i;
+            rec_replace_ext(g_rec_save.dst_path, sizeof(g_rec_save.dst_path),
+                            rec_fmt_ext((RecFmt)i));
+            g_rec_save.status[0] = 0;
+            return;
+        }
+    }
+    if (rect_hit(L.preview_btn, mx, my)) {
+        /* Render the chosen format to a temp file and hand it to
+           the OS default opener. .cast opens whatever the user has
+           registered (often a text editor); the rest get rendered
+           as actual gif/mp4/webm/etc. via agg + ffmpeg. */
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "/tmp/rbterm-preview-%d.%s",
+                 (int)getpid(), rec_fmt_ext(g_rec_save.fmt));
+        if (g_rec_save.fmt == REC_FMT_CAST) {
+            /* Open the live src so previewing doesn't disturb the
+               temp file the user might still want to save. */
+            open_url(g_rec_save.src_path);
+            snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                     "opened %s in default app", g_rec_save.src_path);
+        } else {
+            char err[256];
+            snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                     "rendering preview — please wait…");
+            if (!rec_convert(g_rec_save.fmt, g_rec_save.src_path, tmp,
+                             err, sizeof(err))) {
+                snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                         "preview failed: %s", err);
+                return;
+            }
+            open_url(tmp);
+            snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                     "previewing %s", tmp);
+        }
+        return;
+    }
+    if (rect_hit(L.save_btn, mx, my)) {
+        fprintf(stderr, "rbterm: save → fmt=%s dst=%s src=%s\n",
+                rec_fmt_ext(g_rec_save.fmt), g_rec_save.dst_path,
+                g_rec_save.src_path);
+        snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                 "rendering %s — this can take a few seconds…",
+                 rec_fmt_ext(g_rec_save.fmt));
+        char err[256] = {0};
+        if (!rec_convert(g_rec_save.fmt, g_rec_save.src_path,
+                         g_rec_save.dst_path, err, sizeof(err))) {
+            snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                     "%s", err[0] ? err : "(no error message captured)");
+            fprintf(stderr, "rbterm: save FAILED: %s\n", g_rec_save.status);
+            return;
+        }
+        /* For .cast we just renamed the temp file; everything else
+           leaves the source intact so the user can re-export to
+           another format without re-recording. */
+        if (g_rec_save.fmt == REC_FMT_CAST) {
+            /* The src has moved to dst — point future operations at
+               the new location so they still find data. */
+            strncpy(g_rec_save.src_path, g_rec_save.dst_path,
+                    sizeof(g_rec_save.src_path) - 1);
+            g_rec_save.src_path[sizeof(g_rec_save.src_path) - 1] = 0;
+        }
+        /* Stat the freshly-written file and report a friendly size. */
+        struct stat st;
+        long long sz = 0;
+        if (stat(g_rec_save.dst_path, &st) == 0) sz = (long long)st.st_size;
+        const char *unit = "B"; double v = (double)sz;
+        if (v >= 1024.0)        { v /= 1024.0;        unit = "KB"; }
+        if (v >= 1024.0)        { v /= 1024.0;        unit = "MB"; }
+        snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                 "wrote %.0f %s %s to %s",
+                 v, unit, rec_fmt_ext(g_rec_save.fmt), g_rec_save.dst_path);
+        fprintf(stderr, "rbterm: %s\n", g_rec_save.status);
+        return;
+    }
+    if (rect_hit(L.close_btn, mx, my)) {
+        /* Keep the temp .cast at its original path on Close so a
+           power-user can still rummage for it later. */
+        fprintf(stderr, "rbterm: recording kept at %s\n", g_rec_save.src_path);
+        g_ui_mode = UI_NORMAL;
+        return;
+    }
+    /* Click anywhere else inside the modal drops focus. */
+    g_rec_save.path_focus = false;
+}
+
+/* Keyboard input for the modal: edit the destination path field
+   when focused, Esc closes (= Cancel). */
+static void rec_save_handle_keys(void) {
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        fprintf(stderr, "rbterm: recording kept at %s\n", g_rec_save.src_path);
+        g_ui_mode = UI_NORMAL;
+        return;
+    }
+    if (!g_rec_save.path_focus) return;
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    bool cmd  = IsKeyDown(KEY_LEFT_SUPER)   || IsKeyDown(KEY_RIGHT_SUPER);
+#else
+    bool cmd  = false;
+#endif
+    bool mod = ctrl || cmd;
+    size_t len = strlen(g_rec_save.dst_path);
+    if (mod && IsKeyPressed(KEY_A)) {
+        if (len > 0) g_rec_save.path_sel_all = true;
+        return;
+    }
+    if (mod && IsKeyPressed(KEY_C)) {
+        if (g_rec_save.dst_path[0]) SetClipboardText(g_rec_save.dst_path);
+        return;
+    }
+    if (mod && IsKeyPressed(KEY_V)) {
+        const char *clip = GetClipboardText();
+        if (clip && *clip) {
+            if (g_rec_save.path_sel_all) {
+                g_rec_save.dst_path[0] = 0;
+                g_rec_save.path_sel_all = false;
+                len = 0;
+            }
+            for (const char *q = clip; *q; q++) {
+                unsigned char c = (unsigned char)*q;
+                if (c == '\r' || c == '\n' || c == '\t') continue;
+                if (c < 32 || c >= 127) continue;
+                if (len + 1 >= sizeof(g_rec_save.dst_path)) break;
+                g_rec_save.dst_path[len++] = (char)c;
+            }
+            g_rec_save.dst_path[len] = 0;
+        }
+        return;
+    }
+    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+        if (g_rec_save.path_sel_all) {
+            g_rec_save.dst_path[0] = 0;
+            g_rec_save.path_sel_all = false;
+        } else if (len > 0) {
+            g_rec_save.dst_path[len - 1] = 0;
+        }
+        return;
+    }
+    int cp;
+    while ((cp = GetCharPressed()) != 0) {
+        if (mod) continue;
+        if (cp < 32 || cp >= 127) continue;
+        if (g_rec_save.path_sel_all) {
+            g_rec_save.dst_path[0] = 0;
+            g_rec_save.path_sel_all = false;
+            len = 0;
+        }
+        if (len + 1 >= sizeof(g_rec_save.dst_path)) continue;
+        g_rec_save.dst_path[len++] = (char)cp;
+        g_rec_save.dst_path[len] = 0;
+    }
+}
+
+/* Render the save modal: panel + path field + format picker +
+   Save / Discard / Cancel. */
+static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout L) {
+    DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
+    DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                  (Color){30, 34, 46, 255});
+    DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                       (Color){125, 207, 255, 220});
+    DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
+                  (Color){38, 42, 58, 255});
+    Font *f = (Font *)r->font_data;
+    char title[80];
+    snprintf(title, sizeof(title), "Save recording (%.1fs)", g_rec_save.duration_s);
+    DrawTextEx(*f, title,
+               (Vector2){L.modal.x + 20, L.modal.y + 11},
+               16, 0, (Color){230, 232, 240, 255});
+
+    /* Path label + field. */
+    DrawTextEx(*f, "Path",
+               (Vector2){L.modal.x + 22, L.path.y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    DrawRectangle(L.path.x, L.path.y, L.path.w, L.path.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.path.x, L.path.y, L.path.w, L.path.h,
+                       g_rec_save.path_focus ? (Color){125, 207, 255, 255}
+                                             : (Color){70, 74, 90, 255});
+    BeginScissorMode(L.path.x + 6, L.path.y, L.path.w - 12, L.path.h);
+    if (g_rec_save.path_focus && g_rec_save.path_sel_all && g_rec_save.dst_path[0]) {
+        Vector2 ssz = MeasureTextEx(*f, g_rec_save.dst_path, 13, 0);
+        int sw = (int)ssz.x + 4;
+        if (sw > L.path.w - 12) sw = L.path.w - 12;
+        DrawRectangle(L.path.x + 6, L.path.y + 4, sw, L.path.h - 8,
+                      (Color){64, 100, 150, 200});
+    }
+    DrawTextEx(*f, g_rec_save.dst_path,
+               (Vector2){L.path.x + 8, L.path.y + 8},
+               13, 0, (Color){230, 232, 240, 255});
+    if (g_rec_save.path_focus && !g_rec_save.path_sel_all &&
+        ((long long)(GetTime() * 2.0) & 1) == 0) {
+        Vector2 dsz = MeasureTextEx(*f, g_rec_save.dst_path, 13, 0);
+        DrawRectangle(L.path.x + 8 + (int)dsz.x + 1, L.path.y + 6, 8, 14,
+                      (Color){125, 207, 255, 255});
+    }
+    EndScissorMode();
+
+    /* Format picker. */
+    DrawTextEx(*f, "Format",
+               (Vector2){L.modal.x + 22, L.fmt[0].y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    static const char *labels[REC_FMT_COUNT] = { "cast", "txt", "gif", "mp4", "webm", "apng", "webp" };
+    for (int i = 0; i < REC_FMT_COUNT; i++) {
+        Rect rr = L.fmt[i];
+        bool sel = (g_rec_save.fmt == (RecFmt)i);
+        Color bg = sel ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255};
+        DrawRectangle(rr.x, rr.y, rr.w, rr.h, bg);
+        DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                           (Color){125, 207, 255, sel ? 255 : 120});
+        Vector2 ts = MeasureTextEx(*f, labels[i], 13, 0);
+        Color fg = (Color){230, 232, 240, 255};
+        DrawTextEx(*f, labels[i],
+                   (Vector2){rr.x + (rr.w - ts.x) / 2,
+                             rr.y + (rr.h - ts.y) / 2},
+                   13, 0, fg);
+    }
+
+    /* Action buttons. */
+    struct { Rect r; const char *label; Color bg; Color fg; }
+    btns[3] = {
+        { L.preview_btn, "Preview",
+          (Color){48, 60, 86, 255}, (Color){210, 225, 245, 255} },
+        { L.close_btn,   "Close",
+          (Color){48, 52, 66, 255}, (Color){210, 215, 230, 255} },
+        { L.save_btn,    "Save",
+          (Color){48, 78, 58, 255}, (Color){220, 240, 225, 255} },
+    };
+    for (int i = 0; i < 3; i++) {
+        DrawRectangle(btns[i].r.x, btns[i].r.y, btns[i].r.w, btns[i].r.h, btns[i].bg);
+        DrawRectangleLines(btns[i].r.x, btns[i].r.y, btns[i].r.w, btns[i].r.h,
+                           (Color){150, 160, 180, 200});
+        Vector2 ts = MeasureTextEx(*f, btns[i].label, 14, 0);
+        DrawTextEx(*f, btns[i].label,
+                   (Vector2){btns[i].r.x + (btns[i].r.w - ts.x) / 2,
+                             btns[i].r.y + (btns[i].r.h - ts.y) / 2},
+                   14, 0, btns[i].fg);
+    }
+
+    /* Status / hint line. The status row sits above the button row,
+       so it can use the full modal interior (the buttons aren't
+       next to it horizontally). Middle-ellipsis only kicks in if
+       the message is *still* too wide to fit. */
+    {
+        int text_x = L.modal.x + 22;
+        int text_y = L.save_btn.y - 26;
+        int text_w = L.modal.w - 44;
+        if (text_w < 100) text_w = 100;
+        const char *msg = g_rec_save.status[0]
+            ? g_rec_save.status
+            : "Save keeps the modal open — export to multiple formats. Close dismisses.";
+        Color col = g_rec_save.status[0]
+            ? (Color){240, 200, 120, 255}
+            : (Color){140, 150, 170, 255};
+        /* Keep the font readable — no shrinking. Middle-ellipsis
+           below handles overflow instead, so the user gets a
+           legible "wrote NN KB gif to /Users/…/foo.gif" rather
+           than a tiny 10pt full path. */
+        int fs2 = 16;
+        Vector2 sz = MeasureTextEx(*f, msg, (float)fs2, 0);
+        char buf[512];
+        const char *draw = msg;
+        if (sz.x > text_w) {
+            /* Middle-ellipsis: keep the start (status verb + size)
+               and the tail (path/filename) so both ends stay
+               legible. Grow the cut amount until the result fits. */
+            size_t mlen = strlen(msg);
+            for (size_t cut = 1; cut + 4 < mlen; cut++) {
+                size_t keep = mlen - cut;
+                size_t left = keep / 2;
+                size_t right_len = keep - left;
+                if (left + 4 + right_len >= sizeof(buf)) break;
+                memcpy(buf, msg, left);
+                memcpy(buf + left, "\xE2\x80\xA6", 3);   /* U+2026 … */
+                memcpy(buf + left + 3, msg + mlen - right_len, right_len);
+                buf[left + 3 + right_len] = 0;
+                Vector2 ms = MeasureTextEx(*f, buf, (float)fs2, 0);
+                if (ms.x <= text_w) { draw = buf; break; }
+            }
+        }
+        BeginScissorMode(text_x, text_y - 2, text_w, fs2 + 6);
+        DrawTextEx(*f, draw, (Vector2){text_x, text_y}, (float)fs2, 0, col);
+        EndScissorMode();
     }
 }
 
@@ -5242,7 +6549,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     /* Tab bar. Active tab gets an accent fill; others sit dim. */
     {
         const char *labels[SETTINGS_TAB_COUNT] = {
-            "Font", "Theme", "Cursor", "Session", "Window"
+            "Font", "Theme", "Cursor", "Session", "Window", "Recording"
         };
         for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
             Rect tr = L.tab[i];
@@ -5668,6 +6975,43 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     }
 
     }  /* end Window tab */
+    if (g_settings_tab == SETTINGS_TAB_RECORDING) {
+    /* Recording → default save folder. The path is used both as the
+       initial drop for stop-recording temp .cast files and as the
+       default destination shown in the save modal. */
+    DrawTextEx(*f, "Save folder",
+               (Vector2){L.modal.x + 22, L.rec_dir.y + 8},
+               14, 0, (Color){200, 205, 220, 255});
+    DrawRectangle(L.rec_dir.x, L.rec_dir.y, L.rec_dir.w, L.rec_dir.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.rec_dir.x, L.rec_dir.y, L.rec_dir.w, L.rec_dir.h,
+                       g_settings_recdir_focus ? (Color){125, 207, 255, 255}
+                                               : (Color){70, 74, 90, 255});
+    BeginScissorMode(L.rec_dir.x + 6, L.rec_dir.y,
+                     L.rec_dir.w - 12, L.rec_dir.h);
+    if (g_settings_recdir_focus && g_settings_recdir_sel_all
+        && g_app_settings.rec_dir[0]) {
+        Vector2 ssz = MeasureTextEx(*f, g_app_settings.rec_dir, 13, 0);
+        int sw = (int)ssz.x + 4;
+        if (sw > L.rec_dir.w - 12) sw = L.rec_dir.w - 12;
+        DrawRectangle(L.rec_dir.x + 6, L.rec_dir.y + 4, sw,
+                      L.rec_dir.h - 8, (Color){64, 100, 150, 200});
+    }
+    DrawTextEx(*f, g_app_settings.rec_dir,
+               (Vector2){L.rec_dir.x + 8, L.rec_dir.y + 8},
+               13, 0, (Color){230, 232, 240, 255});
+    if (g_settings_recdir_focus && !g_settings_recdir_sel_all
+        && ((long long)(GetTime() * 2.0) & 1) == 0) {
+        Vector2 dsz = MeasureTextEx(*f, g_app_settings.rec_dir, 13, 0);
+        DrawRectangle(L.rec_dir.x + 8 + (int)dsz.x + 1,
+                      L.rec_dir.y + 8, 8, 14,
+                      (Color){125, 207, 255, 255});
+    }
+    EndScissorMode();
+    DrawTextEx(*f, "New recordings drop a temp .cast here. Save as Default to persist.",
+               (Vector2){L.modal.x + 22, L.rec_dir.y + L.rec_dir.h + 10},
+               12, 0, (Color){140, 150, 170, 255});
+    }  /* end Recording tab */
 
     /* Save-as-Default button. */
     DrawRectangle(L.save_default.x, L.save_default.y,
@@ -5676,11 +7020,11 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     DrawRectangleLines(L.save_default.x, L.save_default.y,
                        L.save_default.w, L.save_default.h,
                        (Color){150, 220, 170, 200});
-    Vector2 sdsz = MeasureTextEx(*f, "Save as Default", 13, 0);
-    DrawTextEx(*f, "Save as Default",
+    Vector2 sdsz = MeasureTextEx(*f, "Save", 14, 0);
+    DrawTextEx(*f, "Save",
                (Vector2){L.save_default.x + (L.save_default.w - sdsz.x) / 2,
                          L.save_default.y + (L.save_default.h - sdsz.y) / 2},
-               13, 0, (Color){220, 240, 225, 255});
+               14, 0, (Color){220, 240, 225, 255});
 
     /* Close button. */
     DrawRectangle(L.close.x, L.close.y, L.close.w, L.close.h,
@@ -6051,6 +7395,7 @@ int main(int argc, char **argv) {
                     if (n > 0) {
                         screen_feed(p->scr, readbuf, (size_t)n);
                         pane_log_write(p, readbuf, (size_t)n);
+                        rec_write(p, readbuf, (size_t)n);
                         drained += (size_t)n;
                         if (drained >= drain_cap) break;
                         continue;
@@ -6119,6 +7464,16 @@ int main(int argc, char **argv) {
                 else if (h.on_help) {
                     g_ui_mode = UI_HELP;
                     g_help_just_opened = true;
+                }
+                else if (h.on_rec_start) {
+                    if (!g_rec.active) {
+                        Tab *_t = active_tab();
+                        Pane *_p = _t ? active_pane_of(_t) : NULL;
+                        if (_p) rec_start(_p);
+                    }
+                }
+                else if (h.on_rec_stop) {
+                    rec_stop();
                 }
                 else if (h.on_split_v || h.on_split_h) {
                     if (cur) {
@@ -6453,6 +7808,24 @@ int main(int argc, char **argv) {
             L = settings_layout(win_w_now, win_h_now);
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_settings(&r, win_w_now, win_h_now, L);
+            EndDrawing();
+            continue;
+        }
+
+        /* Save-recording modal. */
+        if (g_ui_mode == UI_REC_SAVE) {
+            RecSaveLayout RL = rec_save_layout(win_w_now, win_h_now);
+            rec_save_handle_mouse(RL);
+            rec_save_handle_keys();
+            cur = active_tab();
+            if (!cur) break;
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
+            if (g_ui_mode == UI_REC_SAVE) {
+                draw_rec_save_modal(&r, win_w_now, win_h_now, RL);
+            }
             EndDrawing();
             continue;
         }

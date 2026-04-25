@@ -193,6 +193,22 @@ pixels on the GPU.
   fires a real macOS / Linux / Windows notification.
 - **OSC palette** works with the
   [`pal`](https://github.com/binRick/pal) CLI.
+- **Search in scrollback** — Cmd+F opens a per-pane search bar, live
+  substring match across the full history (scrollback + live grid).
+  Enter / F3 jump between hits; Esc restores the previous scroll.
+- **OSC 133 prompt marks** — shell-integration hooks (zsh / bash, in
+  `tools/rbterm-shell-integration.*`) emit FinalTerm A/B/C/D
+  sequences; rbterm paints a green/red gutter badge next to every
+  prompt so success / failure is visible at a glance.
+- **Session recording** — toolbar **● Rec** button captures the
+  active pane to an asciinema v2 `.cast`. Stop opens a save modal
+  with format pills: `cast` (raw), `txt` (plain text, ANSI-stripped
+  with CR/BS-aware overprint), `gif` (native encoder, no
+  dependencies), `webp` (libwebp + libwebpmux, no dependencies),
+  `mp4` / `webm` / `apng` (via ffmpeg). Live progress spinner
+  during render; Preview opens the result in your default app
+  without saving. Recording starts with a snapshot of the current
+  screen so playback opens on what you see, not blank.
 
 ## Keybindings
 
@@ -222,6 +238,8 @@ pixels on the GPU.
 | Mouse wheel | Scroll history |
 | Double-click | Select word (with smart-trim) |
 | Triple-click | Select row |
+| Cmd+F | Search in scrollback (Enter / F3 = next, Esc = close) |
+| ● Rec / ▣ Stop in tab bar | Start / stop recording the active pane |
 | `?` button | Keyboard cheat sheet |
 
 ## Build
@@ -276,8 +294,9 @@ On Linux: DejaVu Sans Mono → Liberation Mono → Noto Sans Mono.
 - Cmd+N spawns a new OS process per window, so macOS shows each as
   a separate Dock icon and Cmd+` only cycles within one window.
   Same-process multi-window is a future project; see CLAUDE.md.
-- No in-scrollback find (Cmd+F), no OSC 133 prompt marks.
 - Splits are limited to two panes per tab; no recursive nesting.
+- Recording's mp4 / webm / apng output paths still require `ffmpeg`
+  on PATH (gif and webp ship with native encoders and always work).
 
 ## Layout
 

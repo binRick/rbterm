@@ -29,8 +29,14 @@ endif
 # libssh: brew install libssh (macOS) / apt install libssh-dev (Linux).
 LDLIBS += -lssh
 
+# libwebp + libwebpmux: brew install webp (macOS) / apt install
+# libwebp-dev (Linux). Used for native animated WebP encoding so
+# we don't depend on a libwebp-enabled ffmpeg build.
+LDLIBS += -lwebp -lwebpmux
+
 SRCS := src/main.c src/screen.c src/render.c src/input.c src/theme.c \
-        src/sixel.c src/kitty.c src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c
+        src/sixel.c src/kitty.c src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c \
+        src/gif_encoder.c src/webp_encoder.c src/cast.c
 OBJS := $(SRCS:.c=.o) $(EMOJI_OBJ) src/fonts_embedded.o
 
 all: rbterm
