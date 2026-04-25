@@ -1107,6 +1107,61 @@ static void copy_selection(Screen *s, const Selection *sel) {
 
 static bool ui_key_down(void);
 
+/* True when the theme's background is bright enough to count as a
+   "light" colour scheme. ITU-R BT.601 luma; threshold at 50% works
+   well in practice — Solarized Light is ~98%, GitHub light is
+   ~96%, atelier-dune (a "lighter dark") sits around 12%. */
+static bool theme_is_light(const Theme *t) {
+    if (!t) return false;
+    uint32_t bg = t->bg;
+    int r = (bg >> 16) & 0xff;
+    int g = (bg >> 8)  & 0xff;
+    int b = (bg)       & 0xff;
+    int y = (299 * r + 587 * g + 114 * b) / 1000;
+    return y >= 128;
+}
+
+/* Active filter for both theme pickers: 0 = Dark, 1 = Light.
+   Persists across opens. */
+static int g_theme_filter = 0;
+
+/* Compute the Dark / Light filter-strip rects inside `list_rect`.
+   Returns the strip's pixel height — callers carve that off the
+   top of the list area before drawing rows. */
+static int theme_filter_strip_layout(int list_x, int list_y, int list_w,
+                                     Rect *out_dark, Rect *out_light) {
+    int strip_h = 26;
+    int gap = 4;
+    int margin = 6;
+    int bw = (list_w - 2 * margin - gap) / 2;
+    int by = list_y + 4;
+    int bh = strip_h - 8;
+    *out_dark  = (Rect){ list_x + margin,                 by, bw, bh };
+    *out_light = (Rect){ list_x + margin + bw + gap,      by, bw, bh };
+    return strip_h;
+}
+
+/* Render the Dark / Light filter strip. Caller draws the list
+   panel first; this paints the two pill buttons on top. */
+static void theme_filter_strip_draw(Font *f, Rect dark_r, Rect light_r) {
+    const char *labels[2] = { "Dark", "Light" };
+    Rect rects[2] = { dark_r, light_r };
+    for (int i = 0; i < 2; i++) {
+        bool on = (g_theme_filter == i);
+        Rect rr = rects[i];
+        DrawRectangle(rr.x, rr.y, rr.w, rr.h,
+                      on ? (Color){46, 92, 150, 255}
+                         : (Color){34, 38, 52, 255});
+        DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                           (Color){125, 207, 255, on ? 255 : 120});
+        Vector2 ts = MeasureTextEx(*f, labels[i], 13, 0);
+        DrawTextEx(*f, labels[i],
+                   (Vector2){rr.x + (rr.w - ts.x) / 2,
+                             rr.y + (rr.h - ts.y) / 2},
+                   13, 0, (Color){230, 232, 240, 255});
+    }
+}
+
 /* Split a theme name like "base16-3024" into category ("base16")
    and bare name ("3024") for the picker's two-column display.
    Only known multi-entry prefixes are recognised; standalone names
@@ -3303,16 +3358,40 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     /* Per-host theme/font pickers. Empty-top-row blanks the selection.
        Click also focuses the list for keyboard nav (Up/Down). */
     if (rect_hit(L.theme_list, mx, my)) {
+        Rect tab_dark, tab_light;
+        int strip_h = theme_filter_strip_layout(
+            L.theme_list.x, L.theme_list.y, L.theme_list.w,
+            &tab_dark, &tab_light);
+        if (rect_hit(tab_dark, mx, my)) {
+            g_theme_filter = 0; g_form_theme_scroll = 0;
+            g_form_focused_list = FORM_FOCUS_THEME; return;
+        }
+        if (rect_hit(tab_light, mx, my)) {
+            g_theme_filter = 1; g_form_theme_scroll = 0;
+            g_form_focused_list = FORM_FOCUS_THEME; return;
+        }
         int row_h = 22;
-        int idx = (my - L.theme_list.y) / row_h + g_form_theme_scroll;
-        if (idx == 0) {
+        int rows_y = L.theme_list.y + strip_h;
+        if (my < rows_y) { g_form_focused_list = FORM_FOCUS_THEME; return; }
+        int v_idx = (my - rows_y) / row_h + g_form_theme_scroll;
+        if (v_idx == 0) {
             g_form.theme[0] = 0;
             g_form_theme_idx = -1;
-        } else if (idx > 0 && idx - 1 < themes_count()) {
-            const Theme *th = &themes_all()[idx - 1];
-            strncpy(g_form.theme, th->name, sizeof(g_form.theme) - 1);
-            g_form.theme[sizeof(g_form.theme) - 1] = 0;
-            g_form_theme_idx = idx - 1;
+        } else {
+            int seen = 1;  /* synthetic "(inherit default)" is index 0 */
+            int tcount = themes_count();
+            const Theme *ts = themes_all();
+            for (int i = 0; i < tcount; i++) {
+                bool light = theme_is_light(&ts[i]);
+                if ((g_theme_filter == 1) != light) continue;
+                if (seen == v_idx) {
+                    strncpy(g_form.theme, ts[i].name, sizeof(g_form.theme) - 1);
+                    g_form.theme[sizeof(g_form.theme) - 1] = 0;
+                    g_form_theme_idx = i;
+                    break;
+                }
+                seen++;
+            }
         }
         g_form_focused_list = FORM_FOCUS_THEME;
         return;
@@ -3769,28 +3848,48 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     DrawRectangleLines(L.theme_list.x, L.theme_list.y, L.theme_list.w, L.theme_list.h,
                        (Color){70, 74, 90, 255});
     {
+        /* Dark / Light filter strip across the top of the list. */
+        Rect tab_dark, tab_light;
+        int strip_h = theme_filter_strip_layout(
+            L.theme_list.x, L.theme_list.y, L.theme_list.w,
+            &tab_dark, &tab_light);
+        theme_filter_strip_draw(f, tab_dark, tab_light);
+
         int row_h = 22;
-        int total = 1 + themes_count();   /* +1 for "(none)" */
-        int visible = L.theme_list.h / row_h;
-        int max_scroll = total - visible;
+        int rows_y = L.theme_list.y + strip_h;
+        int rows_h = L.theme_list.h - strip_h;
+        const Theme *ts = themes_all();
+        int tcount = themes_count();
+        /* Filtered display list. Index 0 is always the synthetic
+           "(inherit default)" row; subsequent entries follow only
+           themes that match the active Dark/Light filter. */
+        int filtered[1024];
+        int n_filt = 1;
+        filtered[0] = -1;  /* sentinel for "(inherit default)" */
+        for (int i = 0; i < tcount && n_filt < (int)(sizeof(filtered)/sizeof(filtered[0])); i++) {
+            bool light = theme_is_light(&ts[i]);
+            if ((g_theme_filter == 1) == light) filtered[n_filt++] = i;
+        }
+        int visible = rows_h / row_h;
+        int max_scroll = n_filt - visible;
         if (max_scroll < 0) max_scroll = 0;
         if (g_form_theme_scroll > max_scroll) g_form_theme_scroll = max_scroll;
         if (g_form_theme_scroll < 0) g_form_theme_scroll = 0;
-        BeginScissorMode(L.theme_list.x + 2, L.theme_list.y + 2,
-                         L.theme_list.w - 4, L.theme_list.h - 4);
-        const Theme *ts = themes_all();
-        for (int i = 0; i < total; i++) {
-            int ry = L.theme_list.y + (i - g_form_theme_scroll) * row_h;
-            if (ry + row_h < L.theme_list.y ||
-                ry > L.theme_list.y + L.theme_list.h) continue;
-            bool sel = (i == 0 && !g_form.theme[0]) ||
-                       (i > 0 && strcmp(ts[i-1].name, g_form.theme) == 0);
+        BeginScissorMode(L.theme_list.x + 2, rows_y,
+                         L.theme_list.w - 4, rows_h - 2);
+        for (int v = 0; v < n_filt; v++) {
+            int real_i = filtered[v];
+            int ry = rows_y + (v - g_form_theme_scroll) * row_h;
+            if (ry + row_h < rows_y ||
+                ry > rows_y + rows_h) continue;
+            bool sel = (real_i < 0 && !g_form.theme[0]) ||
+                       (real_i >= 0 && strcmp(ts[real_i].name, g_form.theme) == 0);
             if (sel) {
                 DrawRectangle(L.theme_list.x + 2, ry,
                               L.theme_list.w - 4, row_h,
                               (Color){46, 62, 90, 220});
             }
-            if (i == 0) {
+            if (real_i < 0) {
                 DrawTextEx(*f, "(inherit default)",
                            (Vector2){L.theme_list.x + 10, ry + 4},
                            13, 0, (Color){150, 155, 170, 255});
@@ -3800,18 +3899,14 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                 int sx = L.theme_list.x + L.theme_list.w - 6 - swatches_w;
                 int sy = ry + (row_h - swatch_h) / 2;
                 for (int k = 0; k < 8; k++) {
-                    uint32_t c = ts[i-1].palette[k];
+                    uint32_t c = ts[real_i].palette[k];
                     Color col = { (unsigned char)((c >> 16) & 0xff),
                                   (unsigned char)((c >> 8)  & 0xff),
                                   (unsigned char)( c        & 0xff), 255 };
                     DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
                                   swatch_w, swatch_h, col);
                 }
-                /* Display the bare name only — the upstream prefix
-                   ("base16-" / "dkeg-" / "sexy-") is hidden so the
-                   list is easier to scan. The underlying theme.name
-                   keeps its prefix so saved profiles still match. */
-                const char *bare = theme_display_split(ts[i-1].name, NULL, 0);
+                const char *bare = theme_display_split(ts[real_i].name, NULL, 0);
                 DrawTextEx(*f, bare,
                            (Vector2){L.theme_list.x + 10, ry + 4},
                            13, 0,
@@ -3820,14 +3915,14 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
             }
         }
         EndScissorMode();
-        if (total > visible) {
+        if (n_filt > visible) {
             int track_x = L.theme_list.x + L.theme_list.w - 5;
-            int bar_h = L.theme_list.h * visible / total;
+            int bar_h = rows_h * visible / n_filt;
             if (bar_h < 24) bar_h = 24;
-            int bar_y = L.theme_list.y +
-                        (L.theme_list.h - bar_h) * g_form_theme_scroll /
+            int bar_y = rows_y +
+                        (rows_h - bar_h) * g_form_theme_scroll /
                         (max_scroll > 0 ? max_scroll : 1);
-            DrawRectangle(track_x, L.theme_list.y, 3, L.theme_list.h,
+            DrawRectangle(track_x, rows_y, 3, rows_h,
                           (Color){40, 45, 58, 255});
             DrawRectangle(track_x, bar_y, 3, bar_h,
                           (Color){110, 130, 170, 255});
@@ -4656,14 +4751,39 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         return;
     }
     if (rect_hit(L.theme_list, mx, my)) {
+        Rect tab_dark, tab_light;
+        int strip_h = theme_filter_strip_layout(
+            L.theme_list.x, L.theme_list.y, L.theme_list.w,
+            &tab_dark, &tab_light);
+        if (rect_hit(tab_dark, mx, my)) {
+            g_theme_filter = 0; g_theme_list_scroll = 0;
+            g_settings_focused_list = SETTINGS_FOCUS_THEME;
+            return;
+        }
+        if (rect_hit(tab_light, mx, my)) {
+            g_theme_filter = 1; g_theme_list_scroll = 0;
+            g_settings_focused_list = SETTINGS_FOCUS_THEME;
+            return;
+        }
         int row_h = 22;
-        int idx = (my - L.theme_list.y) / row_h + g_theme_list_scroll;
-        if (idx >= 0 && idx < themes_count()) {
-            g_theme_list_selected = idx;
-            /* Apply the clicked theme to the active pane only. */
-            Tab *t = active_tab();
-            Pane *p = t ? active_pane_of(t) : NULL;
-            if (p && p->scr) screen_apply_theme(p->scr, &themes_all()[idx]);
+        int rows_y = L.theme_list.y + strip_h;
+        if (my < rows_y) { g_settings_focused_list = SETTINGS_FOCUS_THEME; return; }
+        /* Visible row → filtered-index → real theme index. */
+        int v_idx = (my - rows_y) / row_h + g_theme_list_scroll;
+        const Theme *ts = themes_all();
+        int tcount = themes_count();
+        int seen = 0;
+        for (int i = 0; i < tcount; i++) {
+            bool light = theme_is_light(&ts[i]);
+            if ((g_theme_filter == 1) != light) continue;
+            if (seen == v_idx) {
+                g_theme_list_selected = i;
+                Tab *t = active_tab();
+                Pane *p = t ? active_pane_of(t) : NULL;
+                if (p && p->scr) screen_apply_theme(p->scr, &ts[i]);
+                break;
+            }
+            seen++;
         }
         g_settings_focused_list = SETTINGS_FOCUS_THEME;
         return;
@@ -5087,7 +5207,12 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
    Save-as-Default + Close, and the status / "saved" line above
    them. */
 static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
-    DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
+    /* Backdrop dim — skip on the Theme tab so live theme previews
+       are visible on the terminal behind the modal. The other tabs
+       keep the dim so the modal feels in focus. */
+    if (g_settings_tab != SETTINGS_TAB_THEME) {
+        DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
+    }
     DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
                   (Color){30, 34, 46, 255});
     DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
@@ -5242,27 +5367,43 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                    (Vector2){L.theme_list.x + 10, L.theme_list.y + 10},
                    12, 0, (Color){140, 145, 160, 255});
     } else {
+        /* Dark / Light filter strip across the top of the list. */
+        Rect tab_dark, tab_light;
+        int strip_h = theme_filter_strip_layout(
+            L.theme_list.x, L.theme_list.y, L.theme_list.w,
+            &tab_dark, &tab_light);
+        theme_filter_strip_draw(f, tab_dark, tab_light);
+
         int trow_h = 22;
-        int tvisible = L.theme_list.h / trow_h;
-        int tmax_scroll = tcount - tvisible;
+        int rows_y = L.theme_list.y + strip_h;
+        int rows_h = L.theme_list.h - strip_h;
+        const Theme *ts = themes_all();
+        /* Build the filtered index list once per frame. */
+        int filtered[1024];
+        int n_filt = 0;
+        for (int i = 0; i < tcount && n_filt < (int)(sizeof(filtered)/sizeof(filtered[0])); i++) {
+            bool light = theme_is_light(&ts[i]);
+            if ((g_theme_filter == 1) == light) filtered[n_filt++] = i;
+        }
+        int tvisible = rows_h / trow_h;
+        int tmax_scroll = n_filt - tvisible;
         if (tmax_scroll < 0) tmax_scroll = 0;
         if (g_theme_list_scroll > tmax_scroll) g_theme_list_scroll = tmax_scroll;
         if (g_theme_list_scroll < 0) g_theme_list_scroll = 0;
-        BeginScissorMode(L.theme_list.x + 2, L.theme_list.y + 2,
-                         L.theme_list.w - 4, L.theme_list.h - 4);
-        const Theme *ts = themes_all();
-        for (int i = 0; i < tcount; i++) {
-            int ry = L.theme_list.y + (i - g_theme_list_scroll) * trow_h;
-            if (ry + trow_h < L.theme_list.y ||
-                ry > L.theme_list.y + L.theme_list.h) continue;
+        BeginScissorMode(L.theme_list.x + 2, rows_y,
+                         L.theme_list.w - 4, rows_h - 2);
+        for (int v = 0; v < n_filt; v++) {
+            int i = filtered[v];
+            int ry = rows_y + (v - g_theme_list_scroll) * trow_h;
+            if (ry + trow_h < rows_y ||
+                ry > rows_y + rows_h) continue;
             bool sel = (i == g_theme_list_selected);
             if (sel) {
                 DrawRectangle(L.theme_list.x + 2, ry,
                               L.theme_list.w - 4, trow_h,
                               (Color){46, 62, 90, 220});
             }
-            /* Little colour swatches on the right so the name isn't
-               the only clue to what the theme actually looks like. */
+            /* Colour swatches on the right. */
             int swatch_w = 10, swatch_h = 12, swatch_gap = 1;
             int swatches_w = 8 * (swatch_w + swatch_gap);
             int sx = L.theme_list.x + L.theme_list.w - 8 - swatches_w;
@@ -5275,9 +5416,6 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                 DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
                               swatch_w, swatch_h, col);
             }
-            /* Bare name only — upstream prefix (base16-/dkeg-/sexy-)
-               hidden for readability. Underlying theme.name unchanged
-               so saved profiles still match. */
             const char *bare = theme_display_split(ts[i].name, NULL, 0);
             DrawTextEx(*f, bare,
                        (Vector2){L.theme_list.x + 10, ry + 4},
@@ -5286,14 +5424,14 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                            : (Color){200, 205, 220, 255});
         }
         EndScissorMode();
-        if (tcount > tvisible) {
+        if (n_filt > tvisible) {
             int track_x = L.theme_list.x + L.theme_list.w - 5;
-            int bar_h = L.theme_list.h * tvisible / tcount;
+            int bar_h = rows_h * tvisible / n_filt;
             if (bar_h < 24) bar_h = 24;
-            int bar_y = L.theme_list.y +
-                        (L.theme_list.h - bar_h) * g_theme_list_scroll /
+            int bar_y = rows_y +
+                        (rows_h - bar_h) * g_theme_list_scroll /
                         (tmax_scroll > 0 ? tmax_scroll : 1);
-            DrawRectangle(track_x, L.theme_list.y, 3, L.theme_list.h,
+            DrawRectangle(track_x, rows_y, 3, rows_h,
                           (Color){40, 45, 58, 255});
             DrawRectangle(track_x, bar_y, 3, bar_h,
                           (Color){110, 130, 170, 255});
