@@ -7900,6 +7900,15 @@ int main(int argc, char **argv) {
        at the cursor-blink rate (~2Hz) while idle. */
     Vector2 prev_mp = {0, 0};
     bool prev_focused = true;
+    /* Snapshot of cross-frame UI state so we mark dirty when a
+       chord that changes UI without producing PTY output fires
+       (Cmd+1..9 tab switch, Cmd+[/], Cmd+Shift+Arrow reorder, etc.).
+       Without this, the chord runs, g_active updates, but
+       BeginDrawing is skipped because nothing else dirtied — the
+       screen looked frozen on the old tab until the next mouse
+       move or shell write. */
+    int prev_active = g_active;
+    int prev_ui_mode = (int)g_ui_mode;
 
     while (!WindowShouldClose() && g_num_tabs > 0) {
         bool dirty = false;
@@ -8835,6 +8844,16 @@ int main(int argc, char **argv) {
             }
         }
         if (IsWindowResized()) dirty = true;
+        /* UI-state changes that aren't tied to PTY output need to
+           force a redraw on their own. Cmd+1..9 / Cmd+[/], etc.
+           switch tabs without producing any shell output, so
+           without this the new tab wouldn't paint until the next
+           unrelated dirty trigger (mouse move, etc.) — felt like
+           "extreme sluggishness" on tab switches. */
+        if (g_active != prev_active) dirty = true;
+        if ((int)g_ui_mode != prev_ui_mode) dirty = true;
+        prev_active = g_active;
+        prev_ui_mode = (int)g_ui_mode;
         /* Cursor-blink driven dirty is intentionally NOT a trigger:
            two redraws/sec just to flip cursor colour was the single
            biggest contributor to idle CPU. The cursor stops blinking
