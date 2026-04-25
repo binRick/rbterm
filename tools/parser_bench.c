@@ -71,6 +71,28 @@ static size_t gen_unicode(uint8_t *buf, size_t cap) {
     return n;
 }
 
+/* Long printable-ASCII runs separated by newlines — simulates
+   `cat /usr/share/dict/words` or any program flooding text. This
+   is the workload the NEON printable-run scanner is designed for. */
+static size_t gen_long_text(uint8_t *buf, size_t cap) {
+    static const char *lines[] = {
+        "the quick brown fox jumps over the lazy dog every single morning\n",
+        "abandon abolish abrupt absence absolute abstract abundance accept\n",
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#\n",
+        "loremipsumdolorsitametconsecteturadipiscingelitseddoeiusmodtempor\n",
+    };
+    size_t n = 0;
+    int idx = 0;
+    while (n < cap) {
+        const char *s = lines[idx++ % (sizeof(lines) / sizeof(*lines))];
+        size_t l = strlen(s);
+        if (n + l > cap) break;
+        memcpy(buf + n, s, l);
+        n += l;
+    }
+    return n;
+}
+
 /* y\n repeated, like vtebench's scrolling benchmark. */
 static size_t gen_scrolling(uint8_t *buf, size_t cap) {
     size_t n = 0;
@@ -96,8 +118,10 @@ int main(int argc, char **argv) {
         stream_len = gen_unicode(buf, cap);
     } else if (!strcmp(bench, "scrolling")) {
         stream_len = gen_scrolling(buf, cap);
+    } else if (!strcmp(bench, "long_text")) {
+        stream_len = gen_long_text(buf, cap);
     } else {
-        fprintf(stderr, "unknown bench: %s (try dense_cells / unicode / scrolling)\n", bench);
+        fprintf(stderr, "unknown bench: %s (try dense_cells / unicode / scrolling / long_text)\n", bench);
         free(buf);
         return 1;
     }
