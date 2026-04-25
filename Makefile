@@ -132,7 +132,14 @@ clean:
 VTEBENCH_DIR := third_party/vtebench
 VTEBENCH_BIN := $(VTEBENCH_DIR)/target/release/vtebench
 BENCH_DIR    := bench
-BENCH_DAT    := $(BENCH_DIR)/$(shell hostname -s)-$(shell date +%Y%m%d-%H%M%S).dat
+# TERM_TAG names the terminal under test in the .dat filename so a
+# directory full of runs is self-labelling. Override on the command
+# line to compare across terminals:
+#   make bench                       # auto: $TERM_PROGRAM, lowercased
+#   TERM_TAG=alacritty make bench    # explicit
+#   TERM_TAG=iterm2    make bench
+TERM_TAG     ?= $(shell printf '%s' "$${TERM_PROGRAM:-unknown}" | tr 'A-Z .' 'a-z--')
+BENCH_DAT    := $(BENCH_DIR)/$(shell hostname -s)-$(TERM_TAG)-$(shell date +%Y%m%d-%H%M%S).dat
 
 $(VTEBENCH_BIN):
 	@if [ ! -d $(VTEBENCH_DIR) ] || [ -z "$$(ls $(VTEBENCH_DIR))" ]; then \

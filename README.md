@@ -382,6 +382,13 @@ host shell is in a different terminal than the target. Run `make
 bench` separately inside each terminal you want to compare; the
 plot script combines every `.dat` it can find.
 
+`.dat` filenames auto-include `$TERM_PROGRAM` so most terminals
+self-label. Alacritty and Kitty don't set `$TERM_PROGRAM`, so pass
+`TERM_TAG=alacritty make bench` / `TERM_TAG=kitty make bench`.
+
+For step-by-step instructions across rbterm + iTerm2 + Apple
+Terminal + Kitty + Alacritty, see [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+
 ## Limitations
 
 - No shaping, so ligatures and ZWJ sequences render as components.

@@ -91,7 +91,13 @@ void *local_open_impl(int cols, int rows, const char *cwd) {
         signal(SIGALRM, SIG_DFL);
         setenv("TERM", "xterm-256color", 1);
         setenv("COLORTERM", "truecolor", 1);
-        unsetenv("TERM_PROGRAM");
+        /* Identify ourselves to programs that key off TERM_PROGRAM
+           (vtebench's auto-tagging, iTerm2 shell-integration scripts
+           that gate on the terminal name, prompt themes, etc.).
+           Apps that gated on iTerm/Apple_Terminal previously got
+           neither — now they get "rbterm" and can decide. */
+        setenv("TERM_PROGRAM", "rbterm", 1);
+        setenv("TERM_PROGRAM_VERSION", "0.1.0", 1);
         unsetenv("TERM_SESSION_ID");
         /* Ensure the shell sees a UTF-8 locale so tools like tmux use
            Unicode box-drawing instead of falling back to '-' / '|'.
