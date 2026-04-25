@@ -26,8 +26,23 @@
   #define NOUSER
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
+  #include <io.h>           /* _access */
   #define strcasecmp  _stricmp
   #define strncasecmp _strnicmp
+  /* MSVC's <io.h> _access doesn't accept X_OK — Windows has no
+     execute bit. Map X_OK to 0 (F_OK = "exists"); good enough for
+     our find_ffmpeg probe where the goal is "is there a file at
+     this path". `access` itself is provided as an alias to _access
+     by Microsoft's CRT compatibility headers. */
+  #ifndef X_OK
+    #define X_OK 0
+  #endif
+  /* Windows lacks pid_t. Our subprocess helpers are no-ops on
+     Windows (the bodies are #ifndef _WIN32 guarded), but the
+     function signatures still mention pid_t. Aliasing it to int
+     lets the prototypes parse without dragging in a fork model
+     we don't use here. */
+  typedef int pid_t;
 #else
   #include <strings.h>   /* strcasecmp */
   #include <dirent.h>
