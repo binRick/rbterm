@@ -7,53 +7,6 @@
 #include <ctype.h>
 #include <time.h>
 
-#if defined(__ARM_NEON) && defined(__aarch64__)
-#include <arm_neon.h>
-#endif
-
-/* Find the first byte at or after `data[j]` that is NOT in the
-   printable-ASCII range [0x20, 0x7E]. Returns that index, or `n`
-   if every byte from j..n-1 is printable.
-
-   On ARM64 (the primary target — macOS, Linux M-series, Asahi) we
-   use NEON to scan 16 bytes per iteration: range-compare against
-   the printable bounds, narrow the per-byte 0xFF/0x00 mask to a
-   per-byte nibble in a 64-bit word, and locate the first
-   non-zero nibble with ctzll.
-
-   On x86_64 / Windows / older ARM we fall through to the byte-wise
-   scalar loop. (clang/gcc don't auto-vectorise this loop because
-   the compare-and-break shape doesn't match a recognisable pattern.) */
-static inline size_t scan_printable_run(const uint8_t *data, size_t j, size_t n) {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    /* Scalar prefix (up to 4 bytes) — short runs (vtebench
-       dense_cells: 1 char between SGRs; unicode: short ASCII
-       chunks between multi-byte) bail out before paying NEON
-       setup. Once we've confirmed at least 4 printable bytes,
-       switch to NEON 16-at-a-time. */
-    int prefix = 4;
-    while (prefix-- > 0 && j < n && data[j] >= 0x20 && data[j] < 0x7F) j++;
-    if (prefix < 0) {   /* prefix exhausted — likely a long run */
-        while (j + 16 <= n) {
-            uint8x16_t v = vld1q_u8(data + j);
-            uint8x16_t too_low  = vcltq_u8(v, vdupq_n_u8(0x20));
-            uint8x16_t too_high = vcgtq_u8(v, vdupq_n_u8(0x7E));
-            uint8x16_t bad      = vorrq_u8(too_low, too_high);
-            /* shrn(>>4) packs 16 byte-lanes (each 0xFF or 0x00) into
-               a 64-bit value where each input byte becomes a
-               nibble. ctzll → bit position → lane via >> 2. */
-            uint64_t mask = vget_lane_u64(
-                vreinterpret_u64_u8(
-                    vshrn_n_u16(vreinterpretq_u16_u8(bad), 4)),
-                0);
-            if (mask == 0) { j += 16; continue; }
-            return j + ((size_t)__builtin_ctzll(mask) >> 2);
-        }
-    }
-#endif
-    while (j < n && data[j] >= 0x20 && data[j] < 0x7F) j++;
-    return j;
-}
 
 enum {
     ST_GROUND = 0,
@@ -1751,7 +1704,8 @@ void screen_feed(Screen *s, const uint8_t *data, size_t n) {
         if (s->pstate == ST_GROUND) {
             uint8_t b = data[i];
             if (b >= 0x20 && b < 0x7f) {
-                size_t j = scan_printable_run(data, i + 1, n);
+                size_t j = i + 1;
+                while (j < n && data[j] >= 0x20 && data[j] < 0x7f) j++;
                 for (size_t k = i; k < j; k++) put_cp(s, data[k]);
                 i = j;
                 continue;
