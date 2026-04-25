@@ -687,23 +687,30 @@ static void set_underline_style(Screen *s, UlStyle st) {
    underline-style sub-form, and 58 underline colour. Anything we
    don't recognise is silently skipped. */
 static void sgr(Screen *s) {
+    /* Switch dispatch on the param value lets the compiler emit a
+       jump table for the dense ranges (0..9, 21..29, 30..49, 58..59,
+       90..107) instead of a sequential if/else chain. Hot path on
+       benchmarks that flood per-cell SGR (vtebench dense_cells:
+       9-param SGR + 1 char per cell). */
     int n = s->param_cnt ? s->param_cnt : 1;
     for (int i = 0; i < n; i++) {
-        int p = s->param_set[i] ? s->params[i] : 0;
         /* If this entry is itself a colon sub-param, it was consumed
            by the previous iteration — skip. (Only relevant when the
            sub-param wasn't recognised; else the consumer already
            advanced past it.) */
         if (s->param_colon[i]) continue;
-        if (p == 0) {
+        int p = s->param_set[i] ? s->params[i] : 0;
+        switch (p) {
+        case 0:
             s->cur_attr.fg = s->default_fg;
             s->cur_attr.bg = s->default_bg;
             s->cur_attr.attrs = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
             s->cur_ul_color = 0;
-        } else if (p == 1)  s->cur_attr.attrs |= ATTR_BOLD;
-        else if (p == 2)    s->cur_attr.attrs |= ATTR_DIM;
-        else if (p == 3)    s->cur_attr.attrs |= ATTR_ITALIC;
-        else if (p == 4) {
+            break;
+        case 1: s->cur_attr.attrs |= ATTR_BOLD;   break;
+        case 2: s->cur_attr.attrs |= ATTR_DIM;    break;
+        case 3: s->cur_attr.attrs |= ATTR_ITALIC; break;
+        case 4: {
             /* SGR 4 — plain underline OR 4:N for style variant. */
             int sub;
             if (sgr_has_sub(s, i, n, &sub)) {
@@ -715,77 +722,36 @@ static void sgr(Screen *s) {
                     s->cur_attr.attrs |= ATTR_UNDERLINE;
                     set_underline_style(s, st);
                 }
-                /* Consume any colon-trailing extras (e.g. 4:3:something). */
                 while (i + 1 < n && s->param_colon[i + 1]) i++;
             } else {
                 s->cur_attr.attrs |= ATTR_UNDERLINE;
                 set_underline_style(s, UL_STYLE_SINGLE);
             }
+            break;
         }
-        else if (p == 21) { s->cur_attr.attrs |= ATTR_UNDERLINE; set_underline_style(s, UL_STYLE_DOUBLE); }
-        else if (p == 7)    s->cur_attr.attrs |= ATTR_REVERSE;
-        else if (p == 8)    s->cur_attr.attrs |= ATTR_HIDDEN;
-        else if (p == 9)    s->cur_attr.attrs |= ATTR_STRIKE;
-        else if (p == 22)   s->cur_attr.attrs &= ~(ATTR_BOLD | ATTR_DIM);
-        else if (p == 23)   s->cur_attr.attrs &= ~ATTR_ITALIC;
-        else if (p == 24)   s->cur_attr.attrs &= ~(ATTR_UNDERLINE | ATTR_UL_STYLE_MASK);
-        else if (p == 27)   s->cur_attr.attrs &= ~ATTR_REVERSE;
-        else if (p == 28)   s->cur_attr.attrs &= ~ATTR_HIDDEN;
-        else if (p == 29)   s->cur_attr.attrs &= ~ATTR_STRIKE;
-        else if (p >= 30 && p <= 37) {
-            /* Store the palette INDEX and flag it; rendering resolves the
-               current RGB each frame, so OSC 4 palette changes retro-
-               actively recolour existing cells. */
+        case 7: s->cur_attr.attrs |= ATTR_REVERSE; break;
+        case 8: s->cur_attr.attrs |= ATTR_HIDDEN;  break;
+        case 9: s->cur_attr.attrs |= ATTR_STRIKE;  break;
+        case 21:
+            s->cur_attr.attrs |= ATTR_UNDERLINE;
+            set_underline_style(s, UL_STYLE_DOUBLE);
+            break;
+        case 22: s->cur_attr.attrs &= ~(ATTR_BOLD | ATTR_DIM); break;
+        case 23: s->cur_attr.attrs &= ~ATTR_ITALIC;            break;
+        case 24: s->cur_attr.attrs &= ~(ATTR_UNDERLINE | ATTR_UL_STYLE_MASK); break;
+        case 27: s->cur_attr.attrs &= ~ATTR_REVERSE; break;
+        case 28: s->cur_attr.attrs &= ~ATTR_HIDDEN;  break;
+        case 29: s->cur_attr.attrs &= ~ATTR_STRIKE;  break;
+        case 30: case 31: case 32: case 33:
+        case 34: case 35: case 36: case 37:
+            /* 16-color fg. Store the palette INDEX and flag it;
+               render path resolves the current RGB each frame so
+               OSC 4 palette changes retro-actively recolour existing cells. */
             s->cur_attr.fg = (uint32_t)(p - 30);
             s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_FG) | ATTR_FG_INDEX);
-        }
-        else if (p == 39) {
-            s->cur_attr.fg = s->default_fg;
-            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_FG) & ~ATTR_FG_INDEX);
-        }
-        else if (p >= 40 && p <= 47) {
-            s->cur_attr.bg = (uint32_t)(p - 40);
-            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
-        }
-        else if (p == 49) {
-            s->cur_attr.bg = s->default_bg;
-            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_BG) & ~ATTR_BG_INDEX);
-        }
-        else if (p >= 90 && p <= 97) {
-            s->cur_attr.fg = (uint32_t)(p - 90 + 8);
-            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_FG) | ATTR_FG_INDEX);
-        }
-        else if (p >= 100 && p <= 107) {
-            s->cur_attr.bg = (uint32_t)(p - 100 + 8);
-            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
-        }
-        else if (p == 58) {
-            /* SGR 58 — explicit underline color. Accept both
-               58:2:R:G:B / 58;2;R;G;B (truecolor) and 58:5:N / 58;5;N
-               (256-palette). Sub-params come either via colon (modern,
-               kitty/ish) or via semicolons (legacy xterm-style). */
-            if (i + 1 < n && s->params[i + 1] == 2 && i + 4 < n) {
-                uint32_t r = s->params[i + 2] & 0xff;
-                uint32_t g = s->params[i + 3] & 0xff;
-                uint32_t b = s->params[i + 4] & 0xff;
-                s->cur_ul_color = (r << 16) | (g << 8) | b;
-                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u; /* avoid sentinel */
-                i += 4;
-            } else if (i + 1 < n && s->params[i + 1] == 5 && i + 2 < n) {
-                int idx = s->params[i + 2] & 0xff;
-                s->cur_ul_color = pal(s, idx);
-                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u;
-                i += 2;
-            }
-            /* Skip any further colon-tied params (older format with
-               extra fields like color space). */
-            while (i + 1 < n && s->param_colon[i + 1]) i++;
-        }
-        else if (p == 59) {
-            /* Reset underline color — fall back to fg. */
-            s->cur_ul_color = 0;
-        }
-        else if (p == 38 || p == 48) {
+            break;
+        case 38:
+        case 48: {
             bool is_fg = (p == 38);
             if (i + 1 < n && s->params[i + 1] == 5 && i + 2 < n) {
                 /* 256-color: store index, flag it. */
@@ -813,6 +779,54 @@ static void sgr(Screen *s) {
                 }
                 i += 4;
             }
+            break;
+        }
+        case 39:
+            s->cur_attr.fg = s->default_fg;
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_FG) & ~ATTR_FG_INDEX);
+            break;
+        case 40: case 41: case 42: case 43:
+        case 44: case 45: case 46: case 47:
+            s->cur_attr.bg = (uint32_t)(p - 40);
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
+            break;
+        case 49:
+            s->cur_attr.bg = s->default_bg;
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs | ATTR_DEFAULT_BG) & ~ATTR_BG_INDEX);
+            break;
+        case 58:
+            /* Explicit underline color. Both 58:2:R:G:B / 58;2;R;G;B
+               (truecolor) and 58:5:N / 58;5;N (256). Sub-params come
+               via colon (modern) or semicolon (legacy xterm). */
+            if (i + 1 < n && s->params[i + 1] == 2 && i + 4 < n) {
+                uint32_t r = s->params[i + 2] & 0xff;
+                uint32_t g = s->params[i + 3] & 0xff;
+                uint32_t b = s->params[i + 4] & 0xff;
+                s->cur_ul_color = (r << 16) | (g << 8) | b;
+                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u;
+                i += 4;
+            } else if (i + 1 < n && s->params[i + 1] == 5 && i + 2 < n) {
+                int idx = s->params[i + 2] & 0xff;
+                s->cur_ul_color = pal(s, idx);
+                if (s->cur_ul_color == 0) s->cur_ul_color = 0x010101u;
+                i += 2;
+            }
+            while (i + 1 < n && s->param_colon[i + 1]) i++;
+            break;
+        case 59:
+            /* Reset underline color — fall back to fg. */
+            s->cur_ul_color = 0;
+            break;
+        case 90: case 91: case 92: case 93:
+        case 94: case 95: case 96: case 97:
+            s->cur_attr.fg = (uint32_t)(p - 90 + 8);
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_FG) | ATTR_FG_INDEX);
+            break;
+        case 100: case 101: case 102: case 103:
+        case 104: case 105: case 106: case 107:
+            s->cur_attr.bg = (uint32_t)(p - 100 + 8);
+            s->cur_attr.attrs = (uint16_t)((s->cur_attr.attrs & ~ATTR_DEFAULT_BG) | ATTR_BG_INDEX);
+            break;
         }
     }
 }
