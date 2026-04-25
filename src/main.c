@@ -52,10 +52,12 @@
 static void expand_home_path(const char *in, char *out, size_t cap);
 static void mkdir_p(const char *path);
 
+/* Resolve "~/.config/rbterm/config.ini" with $HOME expansion. */
 static void config_path(char *out, size_t cap) {
     expand_home_path("~/.config/rbterm/config.ini", out, cap);
 }
 
+/* Resolve "~/.config/rbterm/" with $HOME expansion. */
 static void config_dir(char *out, size_t cap) {
     expand_home_path("~/.config/rbterm", out, cap);
 }
@@ -141,6 +143,11 @@ typedef struct {
 } PersistedDefaults;
 static PersistedDefaults g_persisted;
 
+/* Read ~/.config/rbterm/config.ini at startup and seed
+   g_persisted (font path/size, padding, spacing) and a few
+   AppSettings fields directly. main() consumes g_persisted after
+   the renderer is up and tabs are spawned. Missing file is
+   silently fine — defaults stay in place. */
 static void config_load_into_defaults(void) {
     char path[PATH_MAX];
     config_path(path, sizeof(path));
@@ -234,6 +241,10 @@ static bool config_save(Renderer *r) {
     return true;
 }
 
+/* Seed g_app_settings with first-run defaults: logging off,
+   default cursor style, sensible key-repeat rates, log dir
+   under $HOME/.rbterm/logs. Called once before the config-file
+   load potentially overwrites individual fields. */
 static void app_settings_init(void) {
     g_app_settings.log_enabled = false;
     g_app_settings.key_repeat_initial_ms = 300;
@@ -626,21 +637,26 @@ static void pane_log_open(Tab *t, Pane *p, int pane_idx) {
     }
 }
 
+/* Close a pane's open log file (if any). Idempotent. */
 static void pane_log_close(Pane *p) {
     if (!p) return;
     if (p->log_fp) { fclose(p->log_fp); p->log_fp = NULL; }
 }
 
+/* Append raw PTY bytes to the pane's log file. fsync each call so a
+   forced quit still leaves a complete log up to the last byte read. */
 static void pane_log_write(Pane *p, const uint8_t *buf, size_t n) {
     if (!p || !p->log_fp || n == 0) return;
     fwrite(buf, 1, n, p->log_fp);
     fflush(p->log_fp);
 }
 
+/* Open log files on every pane in a tab. */
 static void tab_log_open_all(Tab *t) {
     if (!t) return;
     for (int i = 0; i < t->num_panes; i++) pane_log_open(t, &t->panes[i], i);
 }
+/* Symmetric — close every pane's log in a tab. */
 static void tab_log_close_all(Tab *t) {
     if (!t) return;
     for (int i = 0; i < t->num_panes; i++) pane_log_close(&t->panes[i]);
@@ -657,21 +673,29 @@ static void refresh_tab_logs(void) {
 
 /* ---------- IO glue: screen callbacks route to owning pane's PTY ---------- */
 
+/* Send screen-originated bytes (CSI responses, mouse reports etc.)
+   back to the owning pane's PTY. */
 static void io_write_cb(void *u, const uint8_t *buf, size_t n) {
     Pane *p = (Pane *)u;
     pty_write(p->pty, buf, n);
 }
+/* OSC 0/2 — apply the shell's reported title to the pane and flag
+   it dirty so the tab bar / window title repaints. */
 static void io_set_title_cb(void *u, const char *title) {
     Pane *p = (Pane *)u;
     strncpy(p->title, title, sizeof(p->title) - 1);
     p->title[sizeof(p->title) - 1] = 0;
     p->title_dirty = true;
 }
+/* BEL handler — placeholder. Visual/audio bell is a future feature. */
 static void io_bell_cb(void *u) { (void)u; }
+/* OSC 52 — push a remote-supplied string into the system clipboard. */
 static void io_set_clipboard_cb(void *u, const char *utf8) {
     (void)u;
     if (utf8 && *utf8) SetClipboardText(utf8);
 }
+/* OSC 7 — record the shell's current working directory on the pane
+   for tab-label / new-tab-cwd purposes. */
 static void io_set_cwd_cb(void *u, const char *path) {
     Pane *p = (Pane *)u;
     if (!p || !path || !*path) return;
@@ -733,6 +757,8 @@ static void io_notify_cb(void *u, const char *body) {
 #endif
 }
 
+/* Reset double/triple-click tracking on a fresh pane so the first
+   click in it is never seen as the second of a multi-click. */
 static void pane_init_click_state(Pane *p) {
     p->last_click_time = -1.0;
     p->last_click_col = p->last_click_row = -1;
@@ -748,6 +774,9 @@ static ScreenIO pane_io(Pane *p) {
     return io;
 }
 
+/* Spawn a local shell in a fresh pane: pty_open + screen_new with
+   5000 rows of scrollback + cursor-style seed from app settings.
+   `cwd` is the directory the shell starts in (NULL = $HOME). */
 static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
     pane_init_click_state(p);
     strncpy(p->title, "shell", sizeof(p->title) - 1);
@@ -767,6 +796,9 @@ static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
     return true;
 }
 
+/* Like pane_open_local but the PTY is an SSH session. On failure
+   (handshake / auth / channel) writes the libssh error message
+   into `err` and returns false. */
 static bool pane_open_ssh(Pane *p, const char *user, const char *host, int port,
                           const char *password, const char *keyfile,
                           int cols, int rows, char *err, size_t errsz) {
@@ -778,6 +810,9 @@ static bool pane_open_ssh(Pane *p, const char *user, const char *host, int port,
     return true;
 }
 
+/* Free everything a pane owns: log file, PTY, screen, search-match
+   arrays. Idempotent — safe to call on a partially-initialised
+   pane (e.g. after a failed pane_open_*). */
 static void pane_free(Pane *p) {
     if (!p) return;
     pane_log_close(p);
@@ -899,6 +934,9 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     return t;
 }
 
+/* Close tab at index `idx`: free all panes, scrub stashed SSH
+   creds, free the Tab struct, then shift remaining tabs down to
+   keep the array dense. Clamps g_active. */
 static void tab_close(int idx) {
     if (idx < 0 || idx >= g_num_tabs) return;
     Tab *t = g_tabs[idx];
@@ -913,6 +951,8 @@ static void tab_close(int idx) {
     if (g_active < 0) g_active = 0;
 }
 
+/* Pointer to the currently-focused pane of a tab, or NULL when the
+   tab itself is NULL. Self-corrects an out-of-range active_pane. */
 static inline Pane *active_pane_of(Tab *t) {
     if (!t) return NULL;
     if (t->active_pane < 0 || t->active_pane >= t->num_panes) t->active_pane = 0;
