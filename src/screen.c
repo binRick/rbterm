@@ -1710,49 +1710,47 @@ void screen_feed(Screen *s, const uint8_t *data, size_t n) {
                 continue;
             }
             if (b == 0x1B && i + 1 < n && data[i + 1] == '[') {
-                /* Scan the would-be CSI body. If we see anything
-                   the parameter-only fast path can't handle
-                   (intermediate, private prefix, weird byte) or run
-                   out of buffer before a final byte, bail. */
-                size_t scan = i + 2;
-                bool simple = true;
-                while (scan < n) {
-                    uint8_t c = data[scan];
-                    if ((c >= '0' && c <= '9') || c == ';' || c == ':') {
-                        scan++;
-                        continue;
-                    }
-                    if (c >= 0x40 && c <= 0x7E) break;   /* final byte */
-                    simple = false;
-                    break;
-                }
-                if (simple && scan < n) {
-                    /* Complete simple CSI: parse params inline and
-                       dispatch the final byte through handle_csi
-                       (which falls straight to its dispatch switch
-                       since c >= 0x40 and resets pstate to GROUND). */
-                    reset_params(s);
-                    for (size_t j = i + 2; j < scan; j++) {
-                        uint8_t c = data[j];
-                        if (c >= '0' && c <= '9') {
-                            if (s->param_cnt == 0) s->param_cnt = 1;
-                            int idx = s->param_cnt - 1;
-                            s->params[idx] = s->params[idx] * 10 + (c - '0');
-                            s->param_set[idx] = true;
-                        } else { /* ';' or ':' */
-                            if (s->param_cnt < MAX_PARAMS) {
-                                s->param_cnt++;
-                                if (c == ':' && s->param_cnt > 0) {
-                                    s->param_colon[s->param_cnt - 1] = true;
-                                }
+                /* Single-pass CSI fast path: walk the body
+                   accumulating params directly, dispatch the
+                   final byte through handle_csi, and bail to the
+                   state machine on intermediates / privates /
+                   incomplete sequences. We pre-set pstate=ST_CSI
+                   so the bail-out continues from where we left
+                   off without re-walking the bytes. */
+                reset_params(s);
+                s->pstate = ST_CSI;
+                size_t j = i + 2;
+                while (j < n) {
+                    uint8_t c = data[j];
+                    if (c >= '0' && c <= '9') {
+                        if (s->param_cnt == 0) s->param_cnt = 1;
+                        int idx = s->param_cnt - 1;
+                        s->params[idx] = s->params[idx] * 10 + (c - '0');
+                        s->param_set[idx] = true;
+                        j++;
+                    } else if (c == ';' || c == ':') {
+                        if (s->param_cnt < MAX_PARAMS) {
+                            s->param_cnt++;
+                            if (c == ':' && s->param_cnt > 0) {
+                                s->param_colon[s->param_cnt - 1] = true;
                             }
                         }
+                        j++;
+                    } else if (c >= 0x40 && c <= 0x7E) {
+                        /* Final byte. handle_csi falls through to
+                           dispatch (resets pstate to GROUND). */
+                        handle_csi(s, c);
+                        j++;
+                        break;
+                    } else {
+                        /* Intermediate / private / weird — bail.
+                           State stays ST_CSI with accumulated
+                           params; feed_byte handles it from j. */
+                        break;
                     }
-                    s->pstate = ST_CSI;
-                    handle_csi(s, data[scan]);
-                    i = scan + 1;
-                    continue;
                 }
+                i = j;
+                continue;
             }
         }
         feed_byte(s, data[i]);
