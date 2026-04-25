@@ -1102,7 +1102,11 @@ static bool rec_start(Pane *p) {
     char stamp[64];
     time_t now = time(NULL);
     struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
     localtime_r(&now, &tmv);
+#endif
     strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tmv);
     snprintf(g_rec.path, sizeof(g_rec.path),
              "%s/rbterm-%s.cast", dir, stamp);
