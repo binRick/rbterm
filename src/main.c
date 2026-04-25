@@ -138,6 +138,23 @@ typedef enum {
     HUD_POS_BOTTOM_LEFT  = 3,
 } HudPosition;
 
+/* Per-HUD-field index into the AppSettings.hud_show / hud_color /
+   hud_size parallel arrays. Keep the integer values stable since we
+   persist the indices to disk. */
+typedef enum {
+    HUD_FIELD_HOST = 0,
+    HUD_FIELD_IP   = 1,
+    HUD_FIELD_LOAD = 2,
+    HUD_FIELD_MEM  = 3,
+    HUD_FIELD_DISK = 4,
+    HUD_FIELD_COUNT = 5,
+} HudField;
+
+/* Eight-colour preset palette for HUD fields. Storing an index
+   instead of an RGB triple keeps the click-to-cycle UX cheap and
+   the persisted config tiny. Indices are stable across releases. */
+#define HUD_PALETTE_COUNT 8
+
 typedef struct {
     bool log_enabled;
     char log_dir[PATH_MAX];
@@ -148,12 +165,24 @@ typedef struct {
     char rec_dir[PATH_MAX];      /* default folder for saved recordings */
     bool show_hud;               /* master enable for the system-info overlay */
     int  hud_pos;                /* HudPosition — which corner of the pane */
-    bool hud_show_host;          /* per-field visibility */
-    bool hud_show_ip;
-    bool hud_show_load;
-    bool hud_show_mem;
-    bool hud_show_disk;
+    bool hud_show[HUD_FIELD_COUNT];   /* per-field visibility */
+    int  hud_color[HUD_FIELD_COUNT];  /* index into the preset palette (0..HUD_PALETTE_COUNT-1) */
+    int  hud_size[HUD_FIELD_COUNT];   /* font size in points, clamped 10..18 */
+    bool hud_show_cpu;           /* CPU sparkline (last 60 sec) under the text slab */
 } AppSettings;
+
+/* Indexed palette used for HUD field colours. Keep the order stable
+   — the index is what gets saved to disk. */
+static const Color HUD_PALETTE[HUD_PALETTE_COUNT] = {
+    {205, 215, 230, 230},   /* 0 default light grey */
+    {255, 255, 255, 240},   /* 1 white */
+    {120, 220, 255, 235},   /* 2 cyan */
+    {140, 230, 160, 235},   /* 3 green */
+    {250, 220, 110, 235},   /* 4 yellow */
+    {250, 170, 110, 235},   /* 5 orange */
+    {245, 170, 220, 235},   /* 6 pink */
+    {180, 175, 245, 235},   /* 7 lavender */
+};
 static AppSettings g_app_settings;
 static char        g_settings_status[160]; /* status line in the settings modal */
 
@@ -282,11 +311,12 @@ static void app_settings_init(void) {
     g_app_settings.startup_window        = STARTUP_WINDOW_DEFAULT;
     g_app_settings.show_hud              = true;
     g_app_settings.hud_pos               = HUD_POS_TOP_RIGHT;
-    g_app_settings.hud_show_host         = true;
-    g_app_settings.hud_show_ip           = true;
-    g_app_settings.hud_show_load         = true;
-    g_app_settings.hud_show_mem          = true;
-    g_app_settings.hud_show_disk         = true;
+    for (int i = 0; i < HUD_FIELD_COUNT; i++) {
+        g_app_settings.hud_show[i]  = true;
+        g_app_settings.hud_color[i] = 0;     /* default light grey */
+        g_app_settings.hud_size[i]  = 12;    /* sensible default; range 10..18 */
+    }
+    g_app_settings.hud_show_cpu = true;
     const char *home = getenv("HOME");
 #ifdef _WIN32
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -400,6 +430,20 @@ typedef struct {
     int    hud_disk_free_pct;    /* -1 = unknown */
     double hud_updated_at;       /* GetTime() when stats last refreshed */
     double hud_next_poll_at;     /* GetTime() at which the next local poll should fire */
+
+    /* CPU usage history — circular buffer of the last 60 samples (60
+       sec at 1 Hz). hud_cpu_pct[hud_cpu_head] is the most recent. We
+       store percentages 0..100 (or -1 for "unknown" before the first
+       reading). */
+    #define HUD_CPU_HISTORY 60
+    int    hud_cpu_pct[HUD_CPU_HISTORY];
+    int    hud_cpu_head;
+    bool   hud_cpu_inited;
+    /* Previous CPU tick totals so we can compute % busy as a delta
+       between consecutive polls — single-point readings of CPU
+       counters are meaningless. */
+    unsigned long long hud_cpu_prev_busy;
+    unsigned long long hud_cpu_prev_total;
 } Pane;
 
 typedef enum {
@@ -2479,44 +2523,77 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         DrawRectangle(sp.x, sp.y, sp.w, sp.h, (Color){60, 60, 75, 255});
     }
 
-    /* HUD overlay — corner of each pane. Position picked from
-       g_app_settings.hud_pos; per-field visibility filtered by the
-       hud_show_* booleans. Per-pane data is filled by the main
-       loop's local poll (or the SSH probe thread for SSH panes). */
+    /* HUD overlay — corner of each pane. Per-field colour and size
+       are individually configurable (Settings → HUD), so we don't
+       use hud_format's single-string output anymore — each field is
+       formatted, measured, and drawn separately so it can carry its
+       own size + colour. Slab dimensions are computed from the
+       widest measured line and the sum of per-line heights. */
     if (g_app_settings.show_hud) {
+        const int x_pad  = 8;
+        const int y_pad  = 6;
+        const int margin = 8;
         for (int pi = 0; pi < t->num_panes; pi++) {
             Pane *p = &t->panes[pi];
             PaneRect pr;
             pane_rect(t, pi, win_w, win_h, &pr);
-            char buf[256];
-            int n = hud_format(buf, sizeof(buf),
-                               p->hud_hostname, p->hud_ip,
-                               p->hud_load1, p->hud_mem_free_mb,
-                               p->hud_disk_free_pct,
-                               g_app_settings.hud_show_host,
-                               g_app_settings.hud_show_ip,
-                               g_app_settings.hud_show_load,
-                               g_app_settings.hud_show_mem,
-                               g_app_settings.hud_show_disk);
-            if (n <= 0) continue;
-            const int fs       = 12;
-            const int line_h   = 14;
-            const int x_pad    = 8;
-            const int y_pad    = 6;
-            const int margin   = 8;
-            int max_w = 0, line_count = 0;
-            char *l = buf;
-            while (l && *l) {
-                char *nl = strchr(l, '\n');
-                if (nl) *nl = 0;
-                int w = MeasureText(l, fs);
+
+            /* Build the per-field string + style table. Skipped fields
+               just have show=false. */
+            char host_s[64], ip_s[48], load_s[24], mem_s[24], disk_s[24];
+            snprintf(host_s, sizeof(host_s), "%s",
+                     p->hud_hostname[0] ? p->hud_hostname : "?");
+            snprintf(ip_s,   sizeof(ip_s),   "%s",
+                     p->hud_ip[0] ? p->hud_ip : "?");
+            if (p->hud_load1 < 0)
+                snprintf(load_s, sizeof(load_s), "load ?");
+            else
+                snprintf(load_s, sizeof(load_s), "load %.2f", p->hud_load1);
+            if (p->hud_mem_free_mb < 0)
+                snprintf(mem_s, sizeof(mem_s), "mem ?");
+            else if (p->hud_mem_free_mb < 1024)
+                snprintf(mem_s, sizeof(mem_s), "mem %ld MB", p->hud_mem_free_mb);
+            else
+                snprintf(mem_s, sizeof(mem_s), "mem %.1f GB",
+                         p->hud_mem_free_mb / 1024.0);
+            if (p->hud_disk_free_pct < 0)
+                snprintf(disk_s, sizeof(disk_s), "disk ?");
+            else
+                snprintf(disk_s, sizeof(disk_s), "disk %d%% free",
+                         p->hud_disk_free_pct);
+            const char *texts[HUD_FIELD_COUNT] = {
+                host_s, ip_s, load_s, mem_s, disk_s
+            };
+
+            int max_w = 0;
+            int total_h = 0;
+            int line_h[HUD_FIELD_COUNT] = {0};
+            int line_w[HUD_FIELD_COUNT] = {0};
+            int rendered_count = 0;
+            for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+                if (!g_app_settings.hud_show[fi]) continue;
+                int fs = g_app_settings.hud_size[fi];
+                if (fs < 10) fs = 10;
+                if (fs > 18) fs = 18;
+                int w = MeasureText(texts[fi], fs);
+                int h = fs + 2;   /* 2px line-leading on top of font size */
+                line_w[fi] = w;
+                line_h[fi] = h;
                 if (w > max_w) max_w = w;
-                line_count++;
-                if (nl) *nl = '\n';
-                l = nl ? nl + 1 : NULL;
+                total_h += h;
+                rendered_count++;
             }
-            int slab_w = max_w + x_pad * 2;
-            int slab_h = line_count * line_h + y_pad * 2;
+            /* Reserve a 30px-tall sparkline if CPU history exists and
+               the user hasn't disabled it. The sparkline width is the
+               wider of the slab text or a 100px minimum. */
+            const int spark_h = 30;
+            const int spark_min_w = 100;
+            bool draw_spark = g_app_settings.hud_show_cpu && p->hud_cpu_inited;
+            if (rendered_count == 0 && !draw_spark) continue;
+
+            int spark_w = (max_w > spark_min_w) ? max_w : spark_min_w;
+            int slab_w = (draw_spark ? spark_w : max_w) + x_pad * 2;
+            int slab_h = total_h + (draw_spark ? spark_h + 4 : 0) + y_pad * 2;
             int slab_x, slab_y;
             switch (g_app_settings.hud_pos) {
             case HUD_POS_TOP_LEFT:
@@ -2541,15 +2618,73 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                           (Color){10, 12, 18, 175});
             DrawRectangleLines(slab_x, slab_y, slab_w, slab_h,
                                (Color){80, 90, 110, 100});
+
             int yy = slab_y + y_pad;
-            char *line = buf;
-            while (line && *line) {
-                char *nl = strchr(line, '\n');
-                if (nl) *nl = 0;
-                DrawText(line, slab_x + x_pad, yy, fs,
-                         (Color){205, 215, 230, 230});
-                yy += line_h;
-                if (nl) { *nl = '\n'; line = nl + 1; } else line = NULL;
+            for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+                if (!g_app_settings.hud_show[fi]) continue;
+                int fs = g_app_settings.hud_size[fi];
+                if (fs < 10) fs = 10;
+                if (fs > 18) fs = 18;
+                int ci = g_app_settings.hud_color[fi];
+                if (ci < 0 || ci >= HUD_PALETTE_COUNT) ci = 0;
+                DrawText(texts[fi], slab_x + x_pad, yy, fs,
+                         HUD_PALETTE[ci]);
+                yy += line_h[fi];
+            }
+
+            /* CPU sparkline. Walks the ring buffer in chronological
+               order (oldest sample at the left, newest at the right)
+               and draws one filled bar per sample. */
+            if (draw_spark) {
+                yy += 4;
+                int gx = slab_x + x_pad;
+                int gy = yy;
+                int gw = spark_w;
+                int gh = spark_h;
+                /* Subtle backing so the sparkline reads against the
+                   slab even when bars are short. */
+                DrawRectangle(gx, gy, gw, gh, (Color){0, 0, 0, 100});
+                /* Per-bar layout — leave 1px gap so individual
+                   samples are distinguishable. */
+                int bw = gw / HUD_CPU_HISTORY;
+                if (bw < 1) bw = 1;
+                int extra = gw - bw * HUD_CPU_HISTORY;
+                for (int s = 0; s < HUD_CPU_HISTORY; s++) {
+                    /* Walk oldest-to-newest. head is the most-recent
+                       slot, so the oldest is (head + 1) % CAP. */
+                    int idx = (p->hud_cpu_head + 1 + s) % HUD_CPU_HISTORY;
+                    int pct = p->hud_cpu_pct[idx];
+                    if (pct < 0) continue;       /* unwritten slot */
+                    int bh = (gh * pct) / 100;
+                    if (bh < 1) bh = 1;
+                    int bx = gx + s * bw + (s < extra ? s : extra);
+                    int by = gy + gh - bh;
+                    /* Colour ramp: green at low load, yellow mid,
+                       red high. Cheap interpolation between three
+                       waypoints. */
+                    Color bc;
+                    if (pct < 50) {
+                        float t = pct / 50.0f;
+                        bc = (Color){(unsigned char)(120 + (int)(120 * t)),
+                                     (unsigned char)(220 - (int)(20 * t)),
+                                     120, 220};
+                    } else {
+                        float t = (pct - 50) / 50.0f;
+                        bc = (Color){(unsigned char)(240),
+                                     (unsigned char)(200 - (int)(140 * t)),
+                                     (unsigned char)(80  - (int)(40  * t)), 230};
+                    }
+                    DrawRectangle(bx, by, bw, bh, bc);
+                }
+                /* Latest-value tag in the corner of the sparkline so
+                   the user has an exact number to read. */
+                int latest = p->hud_cpu_pct[p->hud_cpu_head];
+                if (latest >= 0) {
+                    char cb[16];
+                    snprintf(cb, sizeof(cb), "cpu %d%%", latest);
+                    DrawText(cb, gx + 4, gy + 2, 10,
+                             (Color){220, 224, 232, 220});
+                }
             }
         }
     }
@@ -4714,11 +4849,15 @@ typedef struct {
     /* HUD tab — system-info overlay configuration. */
     Rect hud_toggle;          /* enable / disable button */
     Rect hud_pos_tl, hud_pos_tr, hud_pos_bl, hud_pos_br; /* corner picker */
-    Rect hud_field_host;      /* per-field show/hide toggles */
-    Rect hud_field_ip;
-    Rect hud_field_load;
-    Rect hud_field_mem;
-    Rect hud_field_disk;
+    /* Per-field controls: one row per field with [show toggle]
+       [color swatch] [size -] [size value] [size +]. The HUD field
+       enum (HUD_FIELD_HOST..HUD_FIELD_DISK) indexes these. */
+    Rect hud_show_btn[5];
+    Rect hud_color_btn[5];
+    Rect hud_size_dec[5];
+    Rect hud_size_val[5];
+    Rect hud_size_inc[5];
+    Rect hud_cpu_toggle;     /* CPU sparkline enable/disable */
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -5135,25 +5274,36 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         int row_y = content_y;
         L.rec_dir = (Rect){ L.modal.x + 140, row_y, w - 140 - 22, btn };
     } else if (g_settings_tab == SETTINGS_TAB_HUD) {
-        /* Master enable, then a 2x2 corner picker, then five field
-           toggles laid out in a horizontal row. */
+        /* Top row: master toggle. Then 2x2 corner picker. Then a
+           per-field grid: each row has [show] [colour] [- size +]. */
         int row_y = content_y;
         L.hud_toggle = (Rect){ L.modal.x + 140, row_y, 110, btn };
-        row_y += btn + 18;
-        int corner_w = 90, corner_h = btn, corner_gap = 8;
+        row_y += btn + 12;
+        int corner_w = 90, corner_h = btn, corner_gap = 6;
         L.hud_pos_tl = (Rect){ L.modal.x + 140,                              row_y, corner_w, corner_h };
         L.hud_pos_tr = (Rect){ L.modal.x + 140 + (corner_w + corner_gap),    row_y, corner_w, corner_h };
         row_y += corner_h + corner_gap;
         L.hud_pos_bl = (Rect){ L.modal.x + 140,                              row_y, corner_w, corner_h };
         L.hud_pos_br = (Rect){ L.modal.x + 140 + (corner_w + corner_gap),    row_y, corner_w, corner_h };
-        row_y += btn + 18;
-        int field_w = 84, field_gap = 6;
-        int fx = L.modal.x + 140;
-        L.hud_field_host = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
-        L.hud_field_ip   = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
-        L.hud_field_load = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
-        L.hud_field_mem  = (Rect){ fx, row_y, field_w, btn }; fx += field_w + field_gap;
-        L.hud_field_disk = (Rect){ fx, row_y, field_w, btn };
+        row_y += btn + 14;
+
+        /* Per-field grid. Field-name labels are drawn by the draw
+           routine so we only lay out the click targets here. */
+        int label_w = 60;
+        int show_w = 78, swatch_w = 26, sz_w = 22, val_w = 28;
+        int gap_x = 4;
+        int row_h = btn;
+        for (int fi = 0; fi < 5; fi++) {
+            int x = L.modal.x + 140 + label_w;
+            L.hud_show_btn[fi]  = (Rect){ x, row_y, show_w,   row_h }; x += show_w   + gap_x;
+            L.hud_color_btn[fi] = (Rect){ x, row_y, swatch_w, row_h }; x += swatch_w + gap_x;
+            L.hud_size_dec[fi]  = (Rect){ x, row_y, sz_w,     row_h }; x += sz_w     + gap_x;
+            L.hud_size_val[fi]  = (Rect){ x, row_y, val_w,    row_h }; x += val_w    + gap_x;
+            L.hud_size_inc[fi]  = (Rect){ x, row_y, sz_w,     row_h };
+            row_y += row_h + 4;
+        }
+        row_y += 8;
+        L.hud_cpu_toggle = (Rect){ L.modal.x + 140, row_y, 200, btn };
     }
 
     return L;
@@ -5360,9 +5510,9 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             return;
         }
     }
-    /* HUD tab — master toggle, corner picker, per-field toggles.
-       Each click flips one boolean or sets the HudPosition; users
-       see the effect immediately on every pane. */
+    /* HUD tab — master toggle, corner picker, per-field grid.
+       Show toggle flips visibility; colour swatch cycles through
+       the preset palette; size +/- bumps within 10..18. */
     if (g_settings_tab == SETTINGS_TAB_HUD) {
         if (rect_hit(L.hud_toggle, mx, my)) {
             g_app_settings.show_hud = !g_app_settings.show_hud;
@@ -5377,11 +5527,33 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             g_app_settings.hud_pos = pos;
             return;
         }
-        if (rect_hit(L.hud_field_host, mx, my)) { g_app_settings.hud_show_host = !g_app_settings.hud_show_host; return; }
-        if (rect_hit(L.hud_field_ip,   mx, my)) { g_app_settings.hud_show_ip   = !g_app_settings.hud_show_ip;   return; }
-        if (rect_hit(L.hud_field_load, mx, my)) { g_app_settings.hud_show_load = !g_app_settings.hud_show_load; return; }
-        if (rect_hit(L.hud_field_mem,  mx, my)) { g_app_settings.hud_show_mem  = !g_app_settings.hud_show_mem;  return; }
-        if (rect_hit(L.hud_field_disk, mx, my)) { g_app_settings.hud_show_disk = !g_app_settings.hud_show_disk; return; }
+        for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+            if (rect_hit(L.hud_show_btn[fi], mx, my)) {
+                g_app_settings.hud_show[fi] = !g_app_settings.hud_show[fi];
+                return;
+            }
+            if (rect_hit(L.hud_color_btn[fi], mx, my)) {
+                g_app_settings.hud_color[fi] =
+                    (g_app_settings.hud_color[fi] + 1) % HUD_PALETTE_COUNT;
+                return;
+            }
+            if (rect_hit(L.hud_size_dec[fi], mx, my)) {
+                int s = g_app_settings.hud_size[fi] - 1;
+                if (s < 10) s = 10;
+                g_app_settings.hud_size[fi] = s;
+                return;
+            }
+            if (rect_hit(L.hud_size_inc[fi], mx, my)) {
+                int s = g_app_settings.hud_size[fi] + 1;
+                if (s > 18) s = 18;
+                g_app_settings.hud_size[fi] = s;
+                return;
+            }
+        }
+        if (rect_hit(L.hud_cpu_toggle, mx, my)) {
+            g_app_settings.hud_show_cpu = !g_app_settings.hud_show_cpu;
+            return;
+        }
     }
     if (rect_hit(L.save_default, mx, my)) {
         if (config_save(r)) {
@@ -7178,20 +7350,17 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     }  /* end Recording tab */
 
     if (g_settings_tab == SETTINGS_TAB_HUD) {
-        /* Helper for the simple on/off + toggle buttons of this tab.
-           Each button drawn with a label, ON in green / OFF in
-           neutral grey, similar to other settings buttons. */
-        struct { Rect r; const char *lbl; bool on; } btns[] = {
-            { L.hud_toggle,     g_app_settings.show_hud      ? "Enabled" : "Disabled", g_app_settings.show_hud },
-            { L.hud_pos_tl,     "Top-left",                                            g_app_settings.hud_pos == HUD_POS_TOP_LEFT },
-            { L.hud_pos_tr,     "Top-right",                                           g_app_settings.hud_pos == HUD_POS_TOP_RIGHT },
-            { L.hud_pos_bl,     "Bottom-left",                                         g_app_settings.hud_pos == HUD_POS_BOTTOM_LEFT },
-            { L.hud_pos_br,     "Bottom-right",                                        g_app_settings.hud_pos == HUD_POS_BOTTOM_RIGHT },
-            { L.hud_field_host, "Host",     g_app_settings.hud_show_host },
-            { L.hud_field_ip,   "IP",       g_app_settings.hud_show_ip   },
-            { L.hud_field_load, "Load",     g_app_settings.hud_show_load },
-            { L.hud_field_mem,  "Memory",   g_app_settings.hud_show_mem  },
-            { L.hud_field_disk, "Disk",     g_app_settings.hud_show_disk },
+        const char *field_labels[HUD_FIELD_COUNT] = {
+            "Host", "IP", "Load", "Memory", "Disk"
+        };
+
+        /* Master + position. ON = green, OFF / unselected = grey. */
+        struct { Rect r; const char *lbl; bool on; } top_btns[] = {
+            { L.hud_toggle, g_app_settings.show_hud ? "Enabled" : "Disabled", g_app_settings.show_hud },
+            { L.hud_pos_tl, "Top-left",     g_app_settings.hud_pos == HUD_POS_TOP_LEFT     },
+            { L.hud_pos_tr, "Top-right",    g_app_settings.hud_pos == HUD_POS_TOP_RIGHT    },
+            { L.hud_pos_bl, "Bottom-left",  g_app_settings.hud_pos == HUD_POS_BOTTOM_LEFT  },
+            { L.hud_pos_br, "Bottom-right", g_app_settings.hud_pos == HUD_POS_BOTTOM_RIGHT },
         };
         DrawTextEx(*f, "Show HUD",
                    (Vector2){L.modal.x + 22, L.hud_toggle.y + 8},
@@ -7199,26 +7368,112 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         DrawTextEx(*f, "Position",
                    (Vector2){L.modal.x + 22, L.hud_pos_tl.y + 8},
                    14, 0, (Color){200, 205, 220, 255});
-        DrawTextEx(*f, "Fields",
-                   (Vector2){L.modal.x + 22, L.hud_field_host.y + 8},
-                   14, 0, (Color){200, 205, 220, 255});
-        for (size_t bi = 0; bi < sizeof(btns) / sizeof(*btns); bi++) {
-            Color bg = btns[bi].on ? (Color){48, 78, 58, 255}
-                                    : (Color){38, 42, 56, 255};
-            Color line = btns[bi].on ? (Color){150, 220, 170, 200}
-                                      : (Color){70, 74, 90, 255};
-            Color tx  = btns[bi].on ? (Color){220, 240, 225, 255}
-                                     : (Color){180, 185, 195, 255};
-            DrawRectangle(btns[bi].r.x, btns[bi].r.y, btns[bi].r.w, btns[bi].r.h, bg);
-            DrawRectangleLines(btns[bi].r.x, btns[bi].r.y, btns[bi].r.w, btns[bi].r.h, line);
-            Vector2 bs = MeasureTextEx(*f, btns[bi].lbl, 13, 0);
-            DrawTextEx(*f, btns[bi].lbl,
-                       (Vector2){btns[bi].r.x + (btns[bi].r.w - bs.x) / 2,
-                                 btns[bi].r.y + (btns[bi].r.h - bs.y) / 2},
+        for (size_t bi = 0; bi < sizeof(top_btns) / sizeof(*top_btns); bi++) {
+            Color bg   = top_btns[bi].on ? (Color){48, 78, 58, 255}  : (Color){38, 42, 56, 255};
+            Color line = top_btns[bi].on ? (Color){150, 220, 170, 200} : (Color){70, 74, 90, 255};
+            Color tx   = top_btns[bi].on ? (Color){220, 240, 225, 255} : (Color){180, 185, 195, 255};
+            DrawRectangle(top_btns[bi].r.x, top_btns[bi].r.y, top_btns[bi].r.w, top_btns[bi].r.h, bg);
+            DrawRectangleLines(top_btns[bi].r.x, top_btns[bi].r.y, top_btns[bi].r.w, top_btns[bi].r.h, line);
+            Vector2 bs = MeasureTextEx(*f, top_btns[bi].lbl, 13, 0);
+            DrawTextEx(*f, top_btns[bi].lbl,
+                       (Vector2){top_btns[bi].r.x + (top_btns[bi].r.w - bs.x) / 2,
+                                 top_btns[bi].r.y + (top_btns[bi].r.h - bs.y) / 2},
                        13, 0, tx);
         }
+
+        /* Per-field grid: label / show / colour swatch / size +-. */
+        for (int fi = 0; fi < HUD_FIELD_COUNT; fi++) {
+            DrawTextEx(*f, field_labels[fi],
+                       (Vector2){L.modal.x + 22 + 60,
+                                 L.hud_show_btn[fi].y + 8},
+                       13, 0, (Color){200, 205, 220, 255});
+            /* The label should sit to the LEFT of the show button — the
+               row's x starts at L.modal.x + 140 + 60. Pull it back. */
+            DrawTextEx(*f, field_labels[fi],
+                       (Vector2){L.modal.x + 140,
+                                 L.hud_show_btn[fi].y + 8},
+                       13, 0, (Color){200, 205, 220, 255});
+
+            /* Show toggle. */
+            bool sh = g_app_settings.hud_show[fi];
+            Color sbg   = sh ? (Color){48, 78, 58, 255}  : (Color){38, 42, 56, 255};
+            Color sline = sh ? (Color){150, 220, 170, 200} : (Color){70, 74, 90, 255};
+            Color stx   = sh ? (Color){220, 240, 225, 255} : (Color){180, 185, 195, 255};
+            DrawRectangle(L.hud_show_btn[fi].x, L.hud_show_btn[fi].y,
+                          L.hud_show_btn[fi].w, L.hud_show_btn[fi].h, sbg);
+            DrawRectangleLines(L.hud_show_btn[fi].x, L.hud_show_btn[fi].y,
+                               L.hud_show_btn[fi].w, L.hud_show_btn[fi].h, sline);
+            const char *show_lbl = sh ? "Visible" : "Hidden";
+            Vector2 ssz = MeasureTextEx(*f, show_lbl, 12, 0);
+            DrawTextEx(*f, show_lbl,
+                       (Vector2){L.hud_show_btn[fi].x + (L.hud_show_btn[fi].w - ssz.x) / 2,
+                                 L.hud_show_btn[fi].y + (L.hud_show_btn[fi].h - ssz.y) / 2},
+                       12, 0, stx);
+
+            /* Colour swatch — fills with the current palette colour;
+               click to cycle. */
+            int ci = g_app_settings.hud_color[fi];
+            if (ci < 0 || ci >= HUD_PALETTE_COUNT) ci = 0;
+            DrawRectangle(L.hud_color_btn[fi].x, L.hud_color_btn[fi].y,
+                          L.hud_color_btn[fi].w, L.hud_color_btn[fi].h,
+                          HUD_PALETTE[ci]);
+            DrawRectangleLines(L.hud_color_btn[fi].x, L.hud_color_btn[fi].y,
+                               L.hud_color_btn[fi].w, L.hud_color_btn[fi].h,
+                               (Color){90, 95, 110, 255});
+
+            /* Size minus / value / plus. */
+            DrawRectangle(L.hud_size_dec[fi].x, L.hud_size_dec[fi].y,
+                          L.hud_size_dec[fi].w, L.hud_size_dec[fi].h,
+                          (Color){38, 42, 56, 255});
+            DrawRectangleLines(L.hud_size_dec[fi].x, L.hud_size_dec[fi].y,
+                               L.hud_size_dec[fi].w, L.hud_size_dec[fi].h,
+                               (Color){70, 74, 90, 255});
+            Vector2 mns = MeasureTextEx(*f, "-", 14, 0);
+            DrawTextEx(*f, "-",
+                       (Vector2){L.hud_size_dec[fi].x + (L.hud_size_dec[fi].w - mns.x) / 2,
+                                 L.hud_size_dec[fi].y + (L.hud_size_dec[fi].h - mns.y) / 2},
+                       14, 0, (Color){200, 205, 220, 255});
+
+            char szbuf[8];
+            snprintf(szbuf, sizeof(szbuf), "%d", g_app_settings.hud_size[fi]);
+            Vector2 svs = MeasureTextEx(*f, szbuf, 13, 0);
+            DrawTextEx(*f, szbuf,
+                       (Vector2){L.hud_size_val[fi].x + (L.hud_size_val[fi].w - svs.x) / 2,
+                                 L.hud_size_val[fi].y + (L.hud_size_val[fi].h - svs.y) / 2},
+                       13, 0, (Color){220, 224, 232, 255});
+
+            DrawRectangle(L.hud_size_inc[fi].x, L.hud_size_inc[fi].y,
+                          L.hud_size_inc[fi].w, L.hud_size_inc[fi].h,
+                          (Color){38, 42, 56, 255});
+            DrawRectangleLines(L.hud_size_inc[fi].x, L.hud_size_inc[fi].y,
+                               L.hud_size_inc[fi].w, L.hud_size_inc[fi].h,
+                               (Color){70, 74, 90, 255});
+            Vector2 pls = MeasureTextEx(*f, "+", 14, 0);
+            DrawTextEx(*f, "+",
+                       (Vector2){L.hud_size_inc[fi].x + (L.hud_size_inc[fi].w - pls.x) / 2,
+                                 L.hud_size_inc[fi].y + (L.hud_size_inc[fi].h - pls.y) / 2},
+                       14, 0, (Color){200, 205, 220, 255});
+        }
+
+        /* CPU graph toggle. */
+        bool cpu_on = g_app_settings.hud_show_cpu;
+        Color cbg   = cpu_on ? (Color){48, 78, 58, 255}  : (Color){38, 42, 56, 255};
+        Color cline = cpu_on ? (Color){150, 220, 170, 200} : (Color){70, 74, 90, 255};
+        Color ctx   = cpu_on ? (Color){220, 240, 225, 255} : (Color){180, 185, 195, 255};
+        DrawRectangle(L.hud_cpu_toggle.x, L.hud_cpu_toggle.y,
+                      L.hud_cpu_toggle.w, L.hud_cpu_toggle.h, cbg);
+        DrawRectangleLines(L.hud_cpu_toggle.x, L.hud_cpu_toggle.y,
+                           L.hud_cpu_toggle.w, L.hud_cpu_toggle.h, cline);
+        const char *clbl = cpu_on ? "CPU graph: on" : "CPU graph: off";
+        Vector2 cz = MeasureTextEx(*f, clbl, 13, 0);
+        DrawTextEx(*f, clbl,
+                   (Vector2){L.hud_cpu_toggle.x + (L.hud_cpu_toggle.w - cz.x) / 2,
+                             L.hud_cpu_toggle.y + (L.hud_cpu_toggle.h - cz.y) / 2},
+                   13, 0, ctx);
+
         DrawTextEx(*f, "System info overlay shown in the corner of every pane.",
-                   (Vector2){L.modal.x + 22, L.hud_field_host.y + L.hud_field_host.h + 12},
+                   (Vector2){L.modal.x + 22,
+                             L.hud_cpu_toggle.y + L.hud_cpu_toggle.h + 10},
                    12, 0, (Color){140, 150, 170, 255});
     }  /* end HUD tab */
 
@@ -7675,6 +7930,30 @@ int main(int argc, char **argv) {
                                    &p->hud_load1,
                                    &p->hud_mem_free_mb,
                                    &p->hud_disk_free_pct);
+
+                    /* CPU%: tick counters are cumulative, so derive
+                       % busy from the delta between consecutive
+                       polls. First call (hud_cpu_inited == false)
+                       just primes the previous-tick fields. */
+                    unsigned long long busy = 0, total = 0;
+                    if (hud_read_cpu_ticks(&busy, &total)) {
+                        if (!p->hud_cpu_inited) {
+                            p->hud_cpu_inited = true;
+                            for (int k = 0; k < HUD_CPU_HISTORY; k++)
+                                p->hud_cpu_pct[k] = -1;
+                        } else {
+                            unsigned long long bd = busy  - p->hud_cpu_prev_busy;
+                            unsigned long long td = total - p->hud_cpu_prev_total;
+                            int pct = (td > 0) ? (int)((bd * 100ULL) / td) : 0;
+                            if (pct < 0) pct = 0;
+                            if (pct > 100) pct = 100;
+                            p->hud_cpu_head = (p->hud_cpu_head + 1) % HUD_CPU_HISTORY;
+                            p->hud_cpu_pct[p->hud_cpu_head] = pct;
+                        }
+                        p->hud_cpu_prev_busy  = busy;
+                        p->hud_cpu_prev_total = total;
+                    }
+
                     p->hud_updated_at = now;
                 }
             }

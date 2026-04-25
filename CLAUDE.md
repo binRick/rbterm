@@ -495,11 +495,46 @@ PTY is local or SSH.
 - **Position** — TL / TR / BL / BR via `HudPosition` enum and
   `g_app_settings.hud_pos`. Slab placement in `draw_tab_contents`
   picks the corner from this.
-- **Fields** — five independent toggles (`hud_show_host`,
-  `hud_show_ip`, `hud_show_load`, `hud_show_mem`, `hud_show_disk`).
-  `hud_format` skips suppressed lines so the slab shrinks to fit.
-  Toggle all five off and you get an empty slab; toggle the
-  master off to make it disappear entirely.
+- **Per-field grid** — five rows (Host / IP / Load / Memory / Disk),
+  each with:
+  - **Visible** toggle → `g_app_settings.hud_show[HUD_FIELD_*]`.
+    Suppressed fields are skipped during render so the slab shrinks
+    to fit the remaining lines.
+  - **Colour swatch** → `hud_color[]` is an index into the 8-entry
+    `HUD_PALETTE` (light grey / white / cyan / green / yellow /
+    orange / pink / lavender). Click cycles to the next preset.
+    Indices are stable across releases so saved configs roundtrip.
+  - **Size −/+** → `hud_size[]` in points, clamped 10..18. The
+    slab measures each line at its own size; rows can be different
+    heights.
+- **CPU graph** — toggle (`hud_show_cpu`) for a 60-sample sparkline
+  rendered below the text slab. See "CPU sparkline" below.
+
+### CPU sparkline
+
+`Pane` carries a 60-slot ring buffer of percentages
+(`hud_cpu_pct[HUD_CPU_HISTORY]`, head index, init flag) plus the
+previous tick counters needed to compute deltas
+(`hud_cpu_prev_busy`, `hud_cpu_prev_total`). Every 1 sec poll on
+local panes, `hud_read_cpu_ticks` returns cumulative busy + total
+ticks; the percentage is `(busy_delta * 100) / total_delta`,
+clamped to 0..100, pushed at `hud_cpu_head`. First call just
+primes `hud_cpu_prev_*` and seeds the history with `-1` ("no
+sample yet"); render skips negative slots so the sparkline ramps
+up over the first minute.
+
+Render walks the ring oldest→newest and draws one filled bar per
+sample. Bar height = `gh * pct / 100`. Colour ramp interpolates
+green→yellow at 0..50% and yellow→red at 50..100% so high CPU is
+immediately readable. The most-recent value also renders as a
+text tag (`cpu N%`) in the sparkline corner.
+
+Tick sources:
+- macOS: `host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, ...)`
+  → `cpu_ticks[USER + SYSTEM + NICE]` is busy, `+ IDLE` is total.
+- Linux: `/proc/stat`'s `cpu` line; busy =
+  user+nice+system+irq+softirq+steal, idle includes iowait.
+- Windows / web: not yet implemented (sparkline stays empty).
 
 ### Render details
 

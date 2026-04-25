@@ -162,6 +162,49 @@ static void format_mem(long mb, char *buf, int cap) {
     else                   snprintf(buf, (size_t)cap, "%.1f GB", mb / 1024.0);
 }
 
+/* Cumulative CPU ticks across all cores. macOS exposes
+   host_cpu_load_info (USER, SYSTEM, IDLE, NICE counters);
+   Linux exposes /proc/stat with the same buckets plus a few
+   extras we lump into "busy". */
+bool hud_read_cpu_ticks(unsigned long long *out_busy,
+                        unsigned long long *out_total) {
+    if (out_busy)  *out_busy = 0;
+    if (out_total) *out_total = 0;
+#if defined(__APPLE__)
+    host_cpu_load_info_data_t info;
+    mach_msg_type_number_t cnt = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
+                        (host_info_t)&info, &cnt) != KERN_SUCCESS) {
+        return false;
+    }
+    unsigned long long user = info.cpu_ticks[CPU_STATE_USER];
+    unsigned long long sys  = info.cpu_ticks[CPU_STATE_SYSTEM];
+    unsigned long long nice = info.cpu_ticks[CPU_STATE_NICE];
+    unsigned long long idle = info.cpu_ticks[CPU_STATE_IDLE];
+    unsigned long long busy = user + sys + nice;
+    if (out_busy)  *out_busy = busy;
+    if (out_total) *out_total = busy + idle;
+    return true;
+#elif defined(__linux__)
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return false;
+    /* "cpu  user nice system idle iowait irq softirq steal guest guest_nice" */
+    unsigned long long user, nice, sys, idle;
+    unsigned long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+    int n = fscanf(fp, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &user, &nice, &sys, &idle,
+                   &iowait, &irq, &softirq, &steal);
+    fclose(fp);
+    if (n < 4) return false;
+    unsigned long long busy = user + nice + sys + irq + softirq + steal;
+    if (out_busy)  *out_busy = busy;
+    if (out_total) *out_total = busy + idle + iowait;
+    return true;
+#else
+    return false;
+#endif
+}
+
 int hud_format(char *buf, int cap,
                const char *hostname, const char *ip,
                double load1, long mem_free_mb, int disk_free_pct,

@@ -28,3 +28,13 @@ int  hud_format(char *buf, int cap,
                 double load1, long mem_free_mb, int disk_free_pct,
                 bool show_host, bool show_ip, bool show_load,
                 bool show_mem,  bool show_disk);
+
+/* Read the cumulative CPU tick counts from the kernel and split into
+   "busy" (user + system + nice) vs "total" (busy + idle). The caller
+   keeps the previous values and computes %CPU as a delta:
+       busy_delta / total_delta * 100
+   On macOS uses host_processor_info; on Linux reads /proc/stat. Both
+   are sub-millisecond. Returns true on success, false if the platform
+   probe failed (caller should keep the last percentage in that case). */
+bool hud_read_cpu_ticks(unsigned long long *out_busy,
+                        unsigned long long *out_total);
