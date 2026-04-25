@@ -7,3 +7,6 @@
 [submodule "third_party/ansi"]
 	path = third_party/ansi
 	url = https://github.com/fidian/ansi.git
+[submodule "third_party/vtebench"]
+	path = third_party/vtebench
+	url = https://github.com/alacritty/vtebench.git
