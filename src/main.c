@@ -483,10 +483,13 @@ static void render_secondary_windows(void) {
         int fw, fh;
         multiwin_get_fbsize(gw, &fw, &fh);
         ClearBackground((Color){26, 28, 38, 255});
-        DrawText("rbterm — extra window", 24, 24, 22, (Color){200, 210, 230, 255});
-        DrawText("Cmd+` cycles between rbterm windows.",
+        /* raylib's bundled DrawText font is ASCII-only — em-dashes
+           and other typography render as missing-glyph boxes. */
+        DrawText("rbterm extra window",
+                 24, 24, 22, (Color){200, 210, 230, 255});
+        DrawText("Cmd-backtick cycles between rbterm windows.",
                  24, 60, 16, (Color){140, 150, 170, 255});
-        DrawText("Per-window terminal content coming next.",
+        DrawText("Per-window terminal coming in a follow-up.",
                  24, 84, 16, (Color){140, 150, 170, 255});
         multiwin_end(gw);
     }
