@@ -191,6 +191,18 @@ add_dependencies(rbterm rbterm_themes)
 if(NOT EMSCRIPTEN)
     add_dependencies(rbterm rbterm_fonts)
 endif()
+# Two-window POC built against the same raylib + GLFW so we can
+# validate the multi-window context-switching pattern in isolation
+# before integrating it into main.c. Run via:
+#   cmake --build build --target multiwin_poc
+#   ./build/multiwin_poc
+add_executable(multiwin_poc EXCLUDE_FROM_ALL tools/multiwin_poc.c)
+target_link_libraries(multiwin_poc PRIVATE raylib)
+if(APPLE)
+    target_link_libraries(multiwin_poc PRIVATE
+        "-framework Cocoa" "-framework IOKit" "-framework CoreVideo" "-framework OpenGL")
+endif()
+
 target_include_directories(rbterm PRIVATE src)
 target_link_libraries(rbterm PRIVATE raylib)
 if(RBTERM_SSH)
