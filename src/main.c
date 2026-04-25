@@ -5223,12 +5223,9 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
    Save-as-Default + Close, and the status / "saved" line above
    them. */
 static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
-    /* Backdrop dim — skip on the Theme tab so live theme previews
-       are visible on the terminal behind the modal. The other tabs
-       keep the dim so the modal feels in focus. */
-    if (g_settings_tab != SETTINGS_TAB_THEME) {
-        DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
-    }
+    /* No backdrop dim — the user wants to keep terminal contents
+       visible at full brightness while changing settings (mainly so
+       theme/font/cursor changes preview live behind the modal). */
     DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
                   (Color){30, 34, 46, 255});
     DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
