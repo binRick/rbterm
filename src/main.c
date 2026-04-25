@@ -1834,10 +1834,11 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
                       pr.x, pr.y, hcol, hrow);
 
-        /* Cmd/Ctrl-hover over a plain-text URL: underline it and
-           switch the mouse cursor to pointer so the user knows it's
-           clickable. OSC 8 hyperlinks are already brightened by
-           renderer_draw via the link_id path. */
+        /* Cmd/Ctrl-hover over a plain-text URL: tint the URL cells
+           and paint a 2px underline, and switch the mouse cursor to
+           a pointer so the user knows it's clickable. OSC 8
+           hyperlinks are already brightened by renderer_draw via the
+           link_id path. */
         if (ui_key_down() && hcol >= 0 && hrow >= 0) {
             int uc0, uc1;
             Cell hc = screen_view_cell(p->scr, hcol, hrow);
@@ -1845,8 +1846,15 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             if (!has_osc8 && url_at_view_pos(p->scr, hcol, hrow, &uc0, &uc1)) {
                 int ux = pr.x + r->pad_x + uc0 * r->cell_w;
                 int uw = (uc1 - uc0 + 1) * r->cell_w;
-                int uy = pr.y + r->pad_y + hrow * r->cell_h + r->cell_h - 2;
-                DrawRectangle(ux, uy, uw, 1, (Color){125, 207, 255, 220});
+                int uy_top = pr.y + r->pad_y + hrow * r->cell_h;
+                int uy_bot = uy_top + r->cell_h - 2;
+                /* Translucent blue tint behind the text — unambiguous
+                   "this is a link" cue even on dense displays. */
+                DrawRectangle(ux, uy_top, uw, r->cell_h,
+                              (Color){60, 120, 200, 70});
+                /* 2px underline at cell bottom. */
+                DrawRectangle(ux, uy_bot, uw, 2,
+                              (Color){125, 207, 255, 255});
                 want_url_cursor = true;
             } else if (has_osc8) {
                 want_url_cursor = true;
