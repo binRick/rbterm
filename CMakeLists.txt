@@ -49,7 +49,18 @@ set(RBTERM_SOURCES
     src/sixel.c
     src/kitty.c
     src/pty_dispatch.c
+    src/cast.c
+    src/gif_encoder.c
+    src/hud.c
 )
+# Native webp + libwebpmux on desktop; stub on Emscripten where the
+# wasm libwebp port isn't worth pulling in (the recording feature
+# itself is inert in the demo since there's no PTY to record).
+if(EMSCRIPTEN)
+    list(APPEND RBTERM_SOURCES src/webp_encoder_stub.c)
+else()
+    list(APPEND RBTERM_SOURCES src/webp_encoder.c)
+endif()
 
 # Embedded fonts. Three platform paths share one fonts_embedded.h:
 #   * Mac/Linux  → fonts_embedded.S (.incbin into __TEXT/.rodata).
@@ -182,6 +193,22 @@ target_include_directories(rbterm PRIVATE src)
 target_link_libraries(rbterm PRIVATE raylib)
 if(RBTERM_SSH)
     target_link_libraries(rbterm PRIVATE ssh)
+endif()
+
+# Native animated WebP encoding on desktop builds. webp_encoder.c
+# expects -lwebp + -lwebpmux to resolve. Skipped on Emscripten —
+# the stub above keeps the link clean.
+if(NOT EMSCRIPTEN)
+    find_library(WEBP_LIB    webp)
+    find_library(WEBPMUX_LIB webpmux)
+    if(WEBP_LIB AND WEBPMUX_LIB)
+        target_link_libraries(rbterm PRIVATE ${WEBP_LIB} ${WEBPMUX_LIB})
+        if(APPLE)
+            target_include_directories(rbterm PRIVATE /opt/homebrew/include /usr/local/include)
+        endif()
+    else()
+        message(WARNING "libwebp / libwebpmux not found — recording's WebP output will fail at runtime. brew install webp / apt install libwebp-dev.")
+    endif()
 endif()
 
 if(APPLE)
