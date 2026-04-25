@@ -190,6 +190,19 @@ PARSER_BENCH_OBJS := src/screen.o src/sixel.o src/kitty.o src/theme.o
 parser_bench: tools/parser_bench.c $(PARSER_BENCH_OBJS) src/themes_embedded.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/parser_bench.c $(PARSER_BENCH_OBJS) -lraylib -lm
 
+# ---------- echo_bench (round-trip latency, no GUI, no Java) ----------
+#
+# Sends CSI 6n queries and times until the terminal responds.
+# Single C file, no deps. Run inside any terminal:
+#
+#   make echo_bench && ./echo_bench
+#   make echo_bench && ./echo_bench 5000   # more samples
+#
+# Compare across terminals: run the binary inside each one,
+# pipe outputs to a file. Lower min/median = snappier.
+echo_bench: tools/echo_bench.c
+	$(CC) $(CFLAGS) -o $@ tools/echo_bench.c
+
 # ---------- latency benchmark (typometer) ----------
 #
 # vtebench measures PTY drain throughput; typometer measures the
@@ -243,7 +256,16 @@ latency-bench: $(TYPOMETER_JAR)
 	@echo "  Recording permission. Grant both, then re-run."
 	@echo "─────────────────────────────────────────────────────────────"
 	@echo ""
-	java -jar $(TYPOMETER_JAR)
+	@# Typometer is from 2017 and uses reflection to poke at
+	@# private fields of java.awt.Component / java.awt.Color (it
+	@# subclasses ColoredRenderer at startup). Java 17+ blocks
+	@# that with an InaccessibleObjectException unless we opt
+	@# back into the pre-modules behaviour with --add-opens.
+	java \
+	  --add-opens=java.desktop/java.awt=ALL-UNNAMED \
+	  --add-opens=java.desktop/javax.swing=ALL-UNNAMED \
+	  --add-opens=java.desktop/sun.awt=ALL-UNNAMED \
+	  -jar $(TYPOMETER_JAR)
 
 latency-bench-clean:
 	rm -rf $(TYPOMETER_DIR)

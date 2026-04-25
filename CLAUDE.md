@@ -4,6 +4,17 @@ Terminal emulator in C, rendered with raylib. Unix + Windows. The design
 leans on a thin abstraction (`pty.h`) so the rest of the code is
 platform-agnostic.
 
+## Keep the README in sync as code grows
+
+The README (`## Pure C99 — fast, lean, no runtime`) cites a rough total
+line count for `src/`. After any change that materially adds or removes
+code, re-run `wc -l src/*.c src/*.h src/*.m` and update the figure if
+the existing number is off by more than ~1k lines. Round to the nearest
+thousand. Same goes for any other figures in the README that describe
+code size, file counts, or feature lists — if a session ships a new
+subsystem (recording formats, graphics protocols, etc.), update the
+relevant README section in the same commit.
+
 ## Architecture
 
 ```
@@ -221,9 +232,12 @@ than a one-off shortcut or CLI flag. Current controls:
       index at open time, so multiple tabs opened in the same second
       don't collide. Closing a tab lower in the index doesn't rename
       remaining files.
-    - Settings (logging on/off + path) live in `AppSettings` which is
-      process-local: nothing is persisted to disk yet. Restarting
-      rbterm loses both toggle state and any custom log directory.
+    - Settings (logging on/off + path) live in `AppSettings`. They
+      persist when the user clicks **Save as Default** in the
+      settings modal — `config_save` writes
+      `~/.config/rbterm/config.ini` and `config_load_into_defaults`
+      reads it back at startup. Without that click, edits are
+      process-local and restarting loses them.
 
 The layout is computed once per frame in `settings_layout` so draw +
 hit-test share rects. Modifier chords (`Cmd+A` / `Ctrl+A` for select
@@ -242,7 +256,10 @@ directory field owns keyboard input.
 4. Draw it in `draw_settings`.
 5. Wire any runtime side-effects (e.g. `refresh_tab_logs` for logging).
 
-Persisting settings between runs is still TODO — everything's in-memory.
+Persistence is wired up via `config_save` / `config_load_into_defaults`
+(`~/.config/rbterm/config.ini`); the **Save as Default** button in the
+settings modal triggers it. New settings should be added to both the
+load and save paths if they're meant to survive restarts.
 
 ## SSH
 
@@ -651,8 +668,8 @@ Not a roadmap — a shopping list to prioritise from.
 - **True-color background gradients** per pane.
 
 ### Configuration
-- **Persisted settings** (rbterm's `AppSettings` is in-memory only —
-  already noted).
+- (was: persisted settings — shipped via `~/.config/rbterm/config.ini`
+  and the "Save as Default" button in the settings modal.)
 - **Config file** (TOML / conf / Lua) — Alacritty, kitty, iTerm2 all
   have one. rbterm has only the modal.
 - **Live config reload** on file change — Alacritty, kitty.
