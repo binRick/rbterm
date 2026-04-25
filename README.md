@@ -2,10 +2,10 @@
 
 <p align="center">
   <img src="assets/icon.png" width="96" alt="rbterm icon"><br>
-  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary with split panes, inline sixel + kitty graphics, OSC 8 hyperlinks, 252 themes and 31 monospace fonts baked in.</em>
+  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary with split panes, inline sixel + kitty graphics, session recording (native gif + webp), live system-info HUD (local + remote-over-SSH), OSC 8 hyperlinks, OSC 133 success/failure gutter, 252 themes and 31 monospace fonts baked in.</em>
 </p>
 
-<p align="center"><img src="docs/screenshot.png" alt="rbterm screenshot — two tabs, live CWD in the tab label, coloured ➜ prompt"></p>
+<p align="center"><img src="docs/screenshot.png" alt="rbterm screenshot — two panes, system-info HUD in the corner, prompt-status gutter badges, baked-in theme and font"></p>
 
 ## Why
 
@@ -367,20 +367,40 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 - **Search in scrollback** — Cmd+F opens a per-pane search bar, live
   substring match across the full history (scrollback + live grid).
   Enter / F3 jump between hits; Esc restores the previous scroll.
-- **OSC 133 prompt marks** — shell-integration hooks (zsh / bash, in
-  `tools/rbterm-shell-integration.*`) emit FinalTerm A/B/C/D
-  sequences; rbterm paints a green/red gutter badge next to every
-  prompt so success / failure is visible at a glance.
-- **Session recording** — toolbar **● Rec** button captures the
-  active pane to an asciinema v2 `.cast`. Stop opens a save modal
-  with format pills: `cast` (raw), `txt` (plain text, ANSI-stripped
-  with CR/BS-aware overprint), `gif` (native encoder, no
-  dependencies), `webp` (libwebp + libwebpmux, no dependencies),
-  `mp4` / `webm` / `apng` (via ffmpeg). Live progress spinner
-  during render; Preview opens the result in your default app
-  without saving. Recording starts with a snapshot of the current
-  screen so playback opens on what you see, not blank. Default
-  save folder is configurable in Settings → Recording.
+- **OSC 133 prompt marks with success / failure gutter** — when the
+  shell sources `tools/rbterm-shell-integration.zsh` (or `.bash`),
+  rbterm paints a small **green** badge in the left gutter next to
+  every successful command's prompt and a **red** one next to any
+  command that exited non-zero. No squinting at exit codes — bad
+  commands jump out from a screenful of output. Per-row
+  `pmark`/`pexit` storage means the marks scroll with their content
+  and stick around through scrollback.
+- **System-info HUD** — translucent overlay in the corner of every
+  pane: hostname, IP, 1-min load average, free memory, free disk,
+  and a 60-second CPU sparkline (green→yellow→red ramp). Per-field
+  colour and font size, choose any of the four corners, toggle
+  individual fields off in Settings → HUD. **Local panes** poll
+  via direct syscalls (`getloadavg`, `getifaddrs`,
+  `host_statistics64` / `/proc/meminfo`, `statfs` / `statvfs`).
+  **SSH panes** automatically show the *remote* host's stats — a
+  dedicated probe thread runs an auxiliary exec channel on the
+  existing libssh session every 2 sec, parses the output, and
+  feeds the same render path. Probe uses `pthread_mutex_trylock`
+  against the shared session lock so a busy shell never gets
+  stalled — it just shows the previous-second's data for one
+  extra second.
+- **Session recording with native encoders — no ffmpeg required for
+  most outputs.** Toolbar **● Rec** button captures the active pane
+  to an asciinema v2 `.cast`. Stop opens a save modal with format
+  pills: `cast` (raw), `txt` (plain text, ANSI-stripped with
+  CR/BS-aware overprint), `gif` (native encoder bundled into the
+  binary — LZW + 6×6×6 RGB cube + 40-step gray ramp, no deps),
+  `webp` (native libwebp + libwebpmux, no ffmpeg), `mp4` / `webm` /
+  `apng` (via ffmpeg, optional). Live progress spinner during
+  render; Preview opens the result in your default app without
+  saving. Recording starts with a snapshot of the current screen
+  so playback opens on what you see, not blank. Default save
+  folder is configurable in Settings → Recording.
 
   ```mermaid
   flowchart TB
