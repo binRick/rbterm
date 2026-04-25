@@ -1107,6 +1107,35 @@ static void copy_selection(Screen *s, const Selection *sel) {
 
 static bool ui_key_down(void);
 
+/* Split a theme name like "base16-3024" into category ("base16")
+   and bare name ("3024") for the picker's two-column display.
+   Only known multi-entry prefixes are recognised; standalone names
+   ("3024", "monokai", "tempus_summer") return cat="" and bare =
+   the full name. The underlying theme name (used for matching in
+   saved profiles, OSC writes, etc.) is unchanged — this is purely
+   a display split. Caller supplies a small `cat_buf` (>= 16 bytes)
+   that holds the category string after the call; returns a pointer
+   into `name` for the bare-name portion. */
+static const char *theme_display_split(const char *name,
+                                       char *cat_buf, size_t cat_cap) {
+    if (cat_buf && cat_cap > 0) cat_buf[0] = 0;
+    if (!name) return "";
+    static const char *known[] = { "base16-", "dkeg-", "sexy-", NULL };
+    for (int i = 0; known[i]; i++) {
+        size_t n = strlen(known[i]);
+        if (strncmp(name, known[i], n) == 0) {
+            if (cat_buf && cat_cap > 0) {
+                size_t cn = n - 1;            /* drop trailing '-' */
+                if (cn >= cat_cap) cn = cat_cap - 1;
+                memcpy(cat_buf, known[i], cn);
+                cat_buf[cn] = 0;
+            }
+            return name + n;
+        }
+    }
+    return name;
+}
+
 /* Treat a cell as part of a "word" for double-click selection:
    any non-blank, non-tab, non-empty cell. Position checks first
    so out-of-range cells don't crash. */
@@ -3778,8 +3807,19 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                     DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
                                   swatch_w, swatch_h, col);
                 }
-                DrawTextEx(*f, ts[i-1].name,
-                           (Vector2){L.theme_list.x + 10, ry + 4},
+                /* Two-column: category prefix in a dim left gutter,
+                   bare name in the main column. */
+                char catbuf[16];
+                const char *bare = theme_display_split(ts[i-1].name,
+                                                       catbuf, sizeof(catbuf));
+                int cat_w = 56;
+                if (catbuf[0]) {
+                    DrawTextEx(*f, catbuf,
+                               (Vector2){L.theme_list.x + 10, ry + 4},
+                               12, 0, (Color){130, 140, 160, 220});
+                }
+                DrawTextEx(*f, bare,
+                           (Vector2){L.theme_list.x + 10 + cat_w, ry + 4},
                            13, 0,
                            sel ? (Color){230, 232, 240, 255}
                                : (Color){200, 205, 220, 255});
@@ -4075,9 +4115,10 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
 typedef enum {
     SETTINGS_TAB_FONT    = 0,
     SETTINGS_TAB_THEME   = 1,
-    SETTINGS_TAB_SESSION = 2,
-    SETTINGS_TAB_WINDOW  = 3,
-    SETTINGS_TAB_COUNT   = 4,
+    SETTINGS_TAB_CURSOR  = 2,
+    SETTINGS_TAB_SESSION = 3,
+    SETTINGS_TAB_WINDOW  = 4,
+    SETTINGS_TAB_COUNT   = 5,
 } SettingsTab;
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
@@ -4486,12 +4527,14 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         L.spc_inc  = (Rect){ L.modal.x + w - 60,  spc_row_y, btn, btn };
     } else if (g_settings_tab == SETTINGS_TAB_THEME) {
         int theme_list_y = content_y;
-        int theme_h = footer_y - 22 - theme_list_y - (30 + 16);  /* leave room for cursor row */
+        /* Theme tab now uses the full content height — cursor moved
+           to its own tab. */
+        int theme_h = footer_y - 22 - theme_list_y;
         if (theme_h < 120) theme_h = 120;
         L.theme_list = (Rect){ L.modal.x + 140, theme_list_y, w - 140 - 22, theme_h };
-
-        int cur_row_y = theme_list_y + L.theme_list.h + 12;
-        int bwidth = L.theme_list.w;
+    } else if (g_settings_tab == SETTINGS_TAB_CURSOR) {
+        int cur_row_y = content_y;
+        int bwidth = w - 140 - 22;
         int gap_sty = 6;
         int bw = (bwidth - 3 * gap_sty) / 4;
         int bx = L.modal.x + 140;
@@ -5066,7 +5109,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     /* Tab bar. Active tab gets an accent fill; others sit dim. */
     {
         const char *labels[SETTINGS_TAB_COUNT] = {
-            "Font", "Theme", "Session", "Window"
+            "Font", "Theme", "Cursor", "Session", "Window"
         };
         for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
             Rect tr = L.tab[i];
@@ -5238,8 +5281,19 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                 DrawRectangle(sx + k * (swatch_w + swatch_gap), sy,
                               swatch_w, swatch_h, col);
             }
-            DrawTextEx(*f, ts[i].name,
-                       (Vector2){L.theme_list.x + 10, ry + 4},
+            /* Two-column: dim category prefix on the left, bare name
+               in the main column. Underlying theme.name unchanged. */
+            char catbuf[16];
+            const char *bare = theme_display_split(ts[i].name,
+                                                   catbuf, sizeof(catbuf));
+            int cat_w = 64;
+            if (catbuf[0]) {
+                DrawTextEx(*f, catbuf,
+                           (Vector2){L.theme_list.x + 10, ry + 4},
+                           13, 0, (Color){130, 140, 160, 220});
+            }
+            DrawTextEx(*f, bare,
+                       (Vector2){L.theme_list.x + 10 + cat_w, ry + 4},
                        14, 0,
                        sel ? (Color){230, 232, 240, 255}
                            : (Color){200, 205, 220, 255});
@@ -5259,6 +5313,8 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         }
     }
 
+    }  /* end Theme tab */
+    if (g_settings_tab == SETTINGS_TAB_CURSOR) {
     /* Cursor-style row. Shows the currently-selected style of the
        *active* pane so the picker reflects state; clicking a button
        changes just that pane. */
@@ -5293,7 +5349,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         }
     }
 
-    }  /* end Theme tab */
+    }  /* end Cursor tab */
     if (g_settings_tab == SETTINGS_TAB_FONT) {
     /* Padding row. */
     DrawTextEx(*f, "Padding",
