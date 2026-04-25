@@ -1683,12 +1683,21 @@ static void feed_byte(Screen *s, uint8_t b) {
    the per-byte parser dispatch when commands flood the PTY (e.g.
    `find /usr`). */
 void screen_feed(Screen *s, const uint8_t *data, size_t n) {
-    /* Hot path: when we're in GROUND state and the next bytes are all
-       printable ASCII, write them straight into the current row without
-       the state-machine per-byte dispatch. This matters for commands
-       like `find /usr` that flood the PTY with newline-terminated text
-       — the vanilla loop pays ~5x the cycles per byte and then the
-       shell stalls on full PTY buffers. */
+    /* Two hot paths bypass per-byte feed_byte() dispatch when the
+       parser is sitting in GROUND state:
+
+         1. Runs of printable ASCII flow straight into put_cp.
+            Wins on text-flooding commands (`find /usr`, `cat
+            largefile`).
+         2. A complete "simple" CSI sequence (ESC '[' followed by
+            only digits, ';', or ':' until a final byte 0x40..0x7E)
+            is parsed inline directly into s->params and dispatched
+            via handle_csi. Wins on benchmarks like vtebench
+            dense_cells where every cell emits a 9-param SGR.
+
+       Anything more interesting (intermediates, privates, OSC, DCS,
+       APC, partial sequences) falls through to the byte-wise state
+       machine. */
     size_t i = 0;
     while (i < n) {
         if (s->pstate == ST_GROUND) {
@@ -1699,6 +1708,51 @@ void screen_feed(Screen *s, const uint8_t *data, size_t n) {
                 for (size_t k = i; k < j; k++) put_cp(s, data[k]);
                 i = j;
                 continue;
+            }
+            if (b == 0x1B && i + 1 < n && data[i + 1] == '[') {
+                /* Scan the would-be CSI body. If we see anything
+                   the parameter-only fast path can't handle
+                   (intermediate, private prefix, weird byte) or run
+                   out of buffer before a final byte, bail. */
+                size_t scan = i + 2;
+                bool simple = true;
+                while (scan < n) {
+                    uint8_t c = data[scan];
+                    if ((c >= '0' && c <= '9') || c == ';' || c == ':') {
+                        scan++;
+                        continue;
+                    }
+                    if (c >= 0x40 && c <= 0x7E) break;   /* final byte */
+                    simple = false;
+                    break;
+                }
+                if (simple && scan < n) {
+                    /* Complete simple CSI: parse params inline and
+                       dispatch the final byte through handle_csi
+                       (which falls straight to its dispatch switch
+                       since c >= 0x40 and resets pstate to GROUND). */
+                    reset_params(s);
+                    for (size_t j = i + 2; j < scan; j++) {
+                        uint8_t c = data[j];
+                        if (c >= '0' && c <= '9') {
+                            if (s->param_cnt == 0) s->param_cnt = 1;
+                            int idx = s->param_cnt - 1;
+                            s->params[idx] = s->params[idx] * 10 + (c - '0');
+                            s->param_set[idx] = true;
+                        } else { /* ';' or ':' */
+                            if (s->param_cnt < MAX_PARAMS) {
+                                s->param_cnt++;
+                                if (c == ':' && s->param_cnt > 0) {
+                                    s->param_colon[s->param_cnt - 1] = true;
+                                }
+                            }
+                        }
+                    }
+                    s->pstate = ST_CSI;
+                    handle_csi(s, data[scan]);
+                    i = scan + 1;
+                    continue;
+                }
             }
         }
         feed_byte(s, data[i]);
