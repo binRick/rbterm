@@ -2124,6 +2124,10 @@ static bool split_buttons_visible(void) {
     return t && t->split == SPLIT_NONE;
 }
 
+/* Compute the per-tab pixel width in the tab bar from the
+   available room (window width minus the SSH/help/+/-/split
+   buttons). Splits the leftover width evenly across the open
+   tabs, clamped to TAB_MIN_W..TAB_MAX_W. */
 static int tab_width_for(int win_w) {
     int split_w = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
     int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - TAB_HELP_W - split_w - TAB_SSH_W;
@@ -2181,6 +2185,8 @@ static void draw_split_icon(float cx, float cy, float size, bool vertical, Color
     }
 }
 
+/* Render the settings-button gear icon: outer ring, inner hole, and
+   the cog teeth. Pure shape primitives — no texture / glyph. */
 static void draw_gear_icon(float cx, float cy, float size, Color c, Color hole_bg) {
     float r_body = size * 0.32f;
     float r_hole = size * 0.14f;
@@ -2199,6 +2205,10 @@ static void draw_gear_icon(float cx, float cy, float size, Color c, Color hole_b
     DrawCircle((int)cx, (int)cy, r_hole, hole_bg);
 }
 
+/* Paint the strip across the very top of the window: SSH-connect
+   button on the left, then per-tab buttons (with activity dot or
+   command-running spinner where applicable), then the gear (settings),
+   help (?), help/split icons on the right. */
 static void draw_tab_bar(Renderer *r, int win_w) {
     Color bar_bg = (Color){24, 24, 32, 255};
     DrawRectangle(0, 0, win_w, TAB_BAR_H, bar_bg);
@@ -2366,6 +2376,7 @@ static const char *skip_ws(const char *s) {
     return s;
 }
 
+/* Trim trailing whitespace + CR/LF from a NUL-terminated string. */
 static void trim_end(char *s) {
     size_t n = strlen(s);
     while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t' ||
@@ -2373,6 +2384,11 @@ static void trim_end(char *s) {
         s[--n] = 0;
 }
 
+/* Parse ~/.ssh/config into g_ssh_profiles. Reads HostName / User /
+   Port / IdentityFile + the rbterm-specific # comment fields used
+   by the SSH form. Wildcard stanzas (`Host *`, `Host !foo`) are
+   skipped. Called every time the SSH form opens so live edits to
+   the user's config show up without restarting rbterm. */
 static void ssh_profiles_load(void) {
     g_ssh_profile_count = 0;
     g_ssh_list_scroll = 0;
@@ -2499,6 +2515,9 @@ static void ssh_profiles_load(void) {
 
 static void form_undo_clear_all(void);
 
+/* Pre-fill the SSH connect form from a saved-host profile (or
+   clear it if `prof` is NULL). Called when the user clicks a row
+   in the saved-hosts sidebar. */
 static void ssh_form_apply_profile(const SshProfile *prof) {
     if (!prof) return;
     /* Name is the ssh_config alias ("Host <name>"); Host is the real
@@ -2581,6 +2600,9 @@ static void ssh_form_clear(void) {
 
 static void fonts_load(const char *current_path);
 
+/* Open the SSH connect modal. Reloads ~/.ssh/config + the font
+   list (so the per-host font picker is populated) and clears any
+   leftover form state. */
 static void ssh_form_open(void) {
     g_ui_mode = UI_SSH_FORM;
     ssh_form_clear();
@@ -2621,11 +2643,15 @@ typedef struct {
 static UndoStack g_form_undo[UNDO_SLOT_COUNT];
 static UndoStack g_form_redo[UNDO_SLOT_COUNT];
 
+/* Free every snapshot in an undo stack and reset its count. */
 static void undo_stack_clear(UndoStack *st) {
     for (int i = 0; i < st->count; i++) { free(st->items[i]); st->items[i] = NULL; }
     st->count = 0;
 }
 
+/* Push a strdup'd snapshot of `val` onto the stack. Deduplicates
+   against the top so rejected / no-op edits don't pile up; evicts
+   the oldest when the stack is full (cap = UNDO_CAP). */
 static void undo_stack_push(UndoStack *st, const char *val) {
     /* Dedup against the top so rejected / no-op edits don't pile up. */
     if (st->count > 0 && strcmp(st->items[st->count - 1], val) == 0) return;
@@ -2642,6 +2668,9 @@ static char *undo_stack_pop(UndoStack *st) {
     return st->items[--st->count];
 }
 
+/* Reset both undo and redo stacks for every SSH-form text field.
+   Called on form open / clear / apply-profile, since those events
+   wipe the whole form and any in-progress undo history is moot. */
 static void form_undo_clear_all(void) {
     for (int i = 0; i < UNDO_SLOT_COUNT; i++) {
         undo_stack_clear(&g_form_undo[i]);
@@ -2654,6 +2683,9 @@ static char *form_undo_slot_buf(int slot, size_t *cap) {
     return form_buf(F_NAME + slot, cap);
 }
 
+/* Map the currently-focused SSH-form text field to its undo-stack
+   slot index. -1 when keyboard focus is on a non-text widget
+   (button / list / dropdown). */
 static int form_undo_current_slot(void) {
     if (g_form_logdir_focus) return UNDO_SLOT_LOGDIR;
     if (g_form.focus >= F_NAME && g_form.focus < F_NAME + F_TEXT_FIELDS)
@@ -2695,6 +2727,9 @@ static bool form_undo_apply(int slot, int dir) {
     return true;
 }
 
+/* Compute the SSH-form modal layout: every clickable rect (text
+   inputs, list panels, picker buttons, save/connect/cancel) for
+   the current window size. Shared by draw + click hit-test. */
 static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     SshFormLayout L = {0};
     int w = 860, h = 780;
@@ -2796,10 +2831,16 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     return L;
 }
 
+/* Is (x, y) inside `r`? Half-open rectangle so adjacent buttons
+   share an edge cleanly. */
 static bool rect_hit(Rect r, int x, int y) {
     return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
 }
 
+/* Validate the SSH-form fields and try to connect. On success
+   spawns a new SSH tab + closes the modal. On failure writes a
+   libssh error message into the form's error line so the user
+   can see what went wrong (bad host / auth fail / etc). */
 static void ssh_form_submit(int cols, int rows) {
 #ifdef __EMSCRIPTEN__
     /* Web demo: SSH is stubbed out and the browser can't open sockets
@@ -2845,6 +2886,9 @@ static void ssh_form_submit(int cols, int rows) {
 #endif
 }
 
+/* Move keyboard focus through the SSH form's tab order by `delta`
+   (+1 forward / -1 backward). Skips zero-sized rects so e.g. the
+   Delete button is hidden until a saved host is selected. */
 static void ssh_form_advance_focus(int delta) {
     /* Skip F_DELETE while the button is hidden (no host selected). */
     bool can_del = (g_ssh_list_selected >= 0 && g_form.name[0]);
@@ -3138,6 +3182,11 @@ static bool ssh_form_delete_from_config(const char *name) {
     return true;
 }
 
+/* Dispatch a single frame's mouse activity inside the SSH form
+   modal: hit-test buttons, text inputs, list rows, and the
+   picker controls. Updates form state in-place; calls back into
+   ssh_form_submit / ssh_form_save_to_config / ssh_form_clear etc.
+   on the corresponding button hits. */
 static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     /* Wheel-scroll whichever list the pointer is over. */
     Vector2 mph = GetMousePosition();
@@ -3291,6 +3340,10 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     }
 }
 
+/* Keyboard handler for the SSH form modal: Tab advances focus,
+   Enter triggers the focused button (or submit on text-field),
+   Esc cancels, plus per-text-field editing chords (Cmd+A
+   select-all, Cmd+C/V copy/paste, Cmd+Z undo). */
 static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
@@ -3534,6 +3587,10 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     (void)L;
 }
 
+/* Render the entire SSH connect modal: panel, title, every text
+   field with its label and (where focused) caret, the saved-host
+   list, theme/font pickers, cursor-style + log-mode buttons,
+   action buttons, and the status / error line at the bottom. */
 static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 150});
     DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
