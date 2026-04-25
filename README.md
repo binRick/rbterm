@@ -124,6 +124,57 @@ job each frame is walking the cell grid, parsing PTY input through a
 hand-written DFA, and handing rlgl the vertex data; the rest is
 pixels on the GPU.
 
+## Architecture
+
+Three layers wired together by a thin platform abstraction. Bytes
+flow left-to-right, frames flow back through the renderer:
+
+```mermaid
+flowchart LR
+    KB[Keyboard / Mouse] --> RL[raylib events]
+    RL --> Input["input.c<br/>events → bytes"]
+    Input -->|"PTY write"| PTY["pty_unix · pty_win · pty_ssh"]
+    PTY -->|"forkpty / ConPTY / libssh"| Shell[("zsh · bash · pwsh · ssh")]
+    Shell -->|stdout| PTY
+    PTY -->|"PTY read"| Screen["screen.c<br/>VT500 parser · grid · scrollback"]
+    Screen --> Render["render.c<br/>raylib · glyph atlas · emoji"]
+    Render --> Window[Window pixels]
+
+    classDef io fill:#1e2a44,stroke:#5a8,stroke-width:1px,color:#dfe;
+    classDef parse fill:#2a1e44,stroke:#a58,stroke-width:1px,color:#fde;
+    classDef draw fill:#44321e,stroke:#fa5,stroke-width:1px,color:#fed;
+    class Input,PTY,Shell io;
+    class Screen parse;
+    class Render,Window draw;
+```
+
+A single keystroke round-trips like this:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant R as raylib
+    participant I as input.c
+    participant P as pty_*
+    participant S as screen.c
+    participant G as render.c
+
+    U->>R: keypress
+    R->>I: GetCharPressed / IsKeyPressed
+    I->>P: pty_write(bytes)
+    Note right of P: shell processes input
+    P-->>S: pty_read → screen_feed
+    S->>S: VT DFA updates grid + scrollback
+    G->>S: read cells, cursor, images
+    G->>R: DrawTextEx / DrawRectangle / DrawTexture
+    R-->>U: pixels (vsync-gated)
+```
+
+Each tab owns a `Pty *`, a `Screen *`, a `Selection`, and a `title`
+/ `cwd`. Splits add a second pane with the same set. The main loop
+drains every pane's PTY each frame so background tabs stay live.
+
 ## Features
 
 - **Shell in a PTY** via `forkpty` on macOS/Linux and **ConPTY** on
@@ -209,6 +260,33 @@ pixels on the GPU.
   during render; Preview opens the result in your default app
   without saving. Recording starts with a snapshot of the current
   screen so playback opens on what you see, not blank.
+
+  ```mermaid
+  flowchart TB
+      Tap["PTY tap<br/>(every byte the shell prints)"] -->|"asciinema v2 events"| Cast[("temp .cast")]
+      Cast --> Pick{"Save format?"}
+      Pick -->|cast| Mv["rename → dst"]
+      Pick -->|txt| Strip["strip ANSI · CR/BS cursor<br/>(one pass, no render)"]
+      Pick -->|"gif · webp · mp4 · webm · apng"| Replay["Replay events into hidden Screen<br/>off-screen RenderTexture · 15fps · chunked 6 frames"]
+      Replay --> Enc{encoder}
+      Enc -->|gif| GE["gif_encoder.c<br/>(LZW · 6×6×6 cube)"]
+      Enc -->|webp| WE["webp_encoder.c<br/>(libwebp + libwebpmux)"]
+      Enc -->|"mp4 · webm"| FF["ffmpeg pipe<br/>(rawvideo → x264 / vpx)"]
+      Enc -->|apng| TP["temp gif → ffmpeg apng"]
+      Mv --> Out[("dst.<ext>")]
+      Strip --> Out
+      GE --> Out
+      WE --> Out
+      FF --> Out
+      TP --> Out
+
+      classDef src fill:#1e2a44,stroke:#5a8,color:#dfe;
+      classDef enc fill:#44321e,stroke:#fa5,color:#fed;
+      classDef out fill:#2a1e44,stroke:#a58,color:#fde;
+      class Tap,Cast src;
+      class GE,WE,FF,TP,Strip,Mv enc;
+      class Out out;
+  ```
 
 ## Keybindings
 
