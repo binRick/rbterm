@@ -44,9 +44,23 @@ bool multiwin_is_focused(GLFWwindow *w);
    pass. */
 void multiwin_get_fbsize(GLFWwindow *w, int *w_out, int *h_out);
 
+/* Window size in screen-points. Match raylib's GetScreenWidth/Height
+   convention — what app-level layout code expects. On Retina this
+   is the framebuffer divided by ~2. */
+void multiwin_get_winsize(GLFWwindow *w, int *w_out, int *h_out);
+
 /* Begin / end a render pass to a non-primary window. Sandwiches
    the user's draw calls between the rlgl batch flush + context
    swap on entry and the matching swap-buffers + context-restore
    on exit. */
 void multiwin_begin(GLFWwindow *w);
 void multiwin_end(GLFWwindow *w);
+
+/* Mirror the GLFW input callbacks raylib registered on the primary
+   window onto `w`, so keystrokes / clicks / scroll wheel / mouse
+   motion in `w` flow into raylib's CORE input state the same way
+   they would from the primary. Without this, raylib's
+   IsKeyPressed/GetCharPressed/etc. don't see input in any window
+   except the one InitWindow created. Call once per secondary
+   window after multiwin_create. */
+void multiwin_install_input_callbacks(GLFWwindow *w);

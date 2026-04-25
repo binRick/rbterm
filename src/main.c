@@ -455,20 +455,31 @@ static Window *g_focused = &g_windows[0];
 #define g_tab_press_mx   (g_focused->tab_press_mx)
 #define g_tab_dragging   (g_focused->tab_dragging)
 
-/* Render every non-primary Window after the primary frame has been
-   presented. Called from each EndDrawing site in the main loop. For
-   now secondary windows show a placeholder ("rbterm — extra
-   window") so we can verify macOS Cmd+` cycles between them. The
-   per-window terminal content is the next step (each Window getting
-   its own active tab + render — currently g_focused dictates which
-   window's tabs draw, and that's always windows[0] until input
-   routing wakes up to refocus on click). */
+/* Forward decls — these are defined further down in this file but
+   render_secondary_windows needs them. */
+static void      draw_tab_bar(Renderer *r, int win_w);
+static void      draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
+                                   double now, bool focused);
+static Tab      *active_tab(void);
+static void      tab_close(int idx);
+static Renderer *g_renderer;
+
+/* Render every non-primary Window after the primary's frame is
+   presented. For each window we swap g_focused so the macros
+   (g_tabs / g_active / etc.) redirect to *that* window's tabs,
+   then call the same draw_tab_bar + draw_tab_contents the primary
+   uses. Restores g_focused so the next frame's input routes to
+   whichever Window the OS treats as focused. */
 static void render_secondary_windows(void) {
+    Window *saved = g_focused;
     for (int wi = 1; wi < g_window_count; wi++) {
         GLFWwindow *gw = g_windows[wi].handle;
         if (!gw) continue;
         if (multiwin_should_close(gw)) {
-            /* User clicked the close button — collapse the slot. */
+            /* User clicked the close button. Tear down its tabs
+               (closing PTYs etc.) then collapse the slot. */
+            g_focused = &g_windows[wi];
+            while (g_focused->num_tabs > 0) tab_close(g_focused->num_tabs - 1);
             multiwin_destroy(gw);
             g_windows[wi].handle = NULL;
             for (int j = wi; j + 1 < g_window_count; j++) {
@@ -476,23 +487,31 @@ static void render_secondary_windows(void) {
             }
             memset(&g_windows[g_window_count - 1], 0, sizeof(Window));
             g_window_count--;
+            /* If the closed window was `saved`, fall back to primary. */
+            if (saved == &g_windows[wi] || saved >= &g_windows[g_window_count]) {
+                saved = &g_windows[0];
+            }
             wi--;
             continue;
         }
+        g_focused = &g_windows[wi];
         multiwin_begin(gw);
-        int fw, fh;
-        multiwin_get_fbsize(gw, &fw, &fh);
-        ClearBackground((Color){26, 28, 38, 255});
-        /* raylib's bundled DrawText font is ASCII-only — em-dashes
-           and other typography render as missing-glyph boxes. */
-        DrawText("rbterm extra window",
-                 24, 24, 22, (Color){200, 210, 230, 255});
-        DrawText("Cmd-backtick cycles between rbterm windows.",
-                 24, 60, 16, (Color){140, 150, 170, 255});
-        DrawText("Per-window terminal coming in a follow-up.",
-                 24, 84, 16, (Color){140, 150, 170, 255});
+        int sw, sh;
+        multiwin_get_winsize(gw, &sw, &sh);
+        ClearBackground((Color){0, 0, 0, 255});
+        if (g_focused->num_tabs > 0 && g_renderer) {
+            Tab *t = active_tab();
+            draw_tab_bar(g_renderer, sw);
+            if (t) draw_tab_contents(g_renderer, t, sw, sh,
+                                     GetTime(),
+                                     multiwin_is_focused(gw));
+        } else {
+            DrawText("rbterm (no tabs)", 24, 24, 18,
+                     (Color){200, 210, 230, 255});
+        }
         multiwin_end(gw);
     }
+    g_focused = saved;
 }
 
 /* Modal SSH connection form. When non-NORMAL, the terminal is locked:
@@ -7442,6 +7461,17 @@ int main(int argc, char **argv) {
     int  prev_mouse_col = -1, prev_mouse_row = -1;
 
     while (!WindowShouldClose() && g_num_tabs > 0) {
+        /* Track which Window the OS treats as focused. raylib's
+           input events flow into one shared CORE state regardless
+           of which GLFWwindow they came from (we mirrored callbacks
+           in multiwin_install_input_callbacks), so g_focused is
+           how we route those events to the right Window's tabs. */
+        for (int wi = 0; wi < g_window_count; wi++) {
+            if (multiwin_is_focused(g_windows[wi].handle)) {
+                g_focused = &g_windows[wi];
+                break;
+            }
+        }
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
@@ -7466,54 +7496,57 @@ int main(int argc, char **argv) {
         /* Clear activity on whichever tab is currently foregrounded
            — whether it got there by click, chord, or the dirty dance
            in tab_close. Simpler than patching every site that writes
-           g_active. */
-        if (g_active >= 0 && g_active < g_num_tabs)
-            g_tabs[g_active]->activity = false;
-        for (int i = 0; i < g_num_tabs; i++) {
-            Tab *t = g_tabs[i];
-            bool pane_dead[2] = { false, false };
-            for (int pi = 0; pi < t->num_panes; pi++) {
-                Pane *p = &t->panes[pi];
-                size_t drained = 0;
-                const size_t drain_cap = 16 * 1024 * 1024;
-                for (;;) {
-                    int n = pty_read(p->pty, readbuf, sizeof(readbuf));
-                    if (n > 0) {
-                        screen_feed(p->scr, readbuf, (size_t)n);
-                        pane_log_write(p, readbuf, (size_t)n);
-                        rec_write(p, readbuf, (size_t)n);
-                        drained += (size_t)n;
-                        if (drained >= drain_cap) break;
-                        continue;
+           g_active.
+
+           Iterates over EVERY window's tabs so background windows
+           keep their shells fed even when not focused. Briefly
+           swaps g_focused for each window so the macros (g_tabs /
+           g_num_tabs / g_active) redirect correctly. */
+        {
+            Window *_drain_saved = g_focused;
+            for (int wi = 0; wi < g_window_count; wi++) {
+                g_focused = &g_windows[wi];
+                if (g_active >= 0 && g_active < g_num_tabs)
+                    g_tabs[g_active]->activity = false;
+                for (int i = 0; i < g_num_tabs; i++) {
+                    Tab *t = g_tabs[i];
+                    bool pane_dead[2] = { false, false };
+                    for (int pi = 0; pi < t->num_panes; pi++) {
+                        Pane *p = &t->panes[pi];
+                        size_t drained = 0;
+                        const size_t drain_cap = 16 * 1024 * 1024;
+                        for (;;) {
+                            int n = pty_read(p->pty, readbuf, sizeof(readbuf));
+                            if (n > 0) {
+                                screen_feed(p->scr, readbuf, (size_t)n);
+                                pane_log_write(p, readbuf, (size_t)n);
+                                rec_write(p, readbuf, (size_t)n);
+                                drained += (size_t)n;
+                                if (drained >= drain_cap) break;
+                                continue;
+                            }
+                            if (n < 0) pane_dead[pi] = true;
+                            break;
+                        }
+                        if (drained > 0) {
+                            pty_snap_cursor(p->pty,
+                                            screen_cursor_y(p->scr),
+                                            screen_cursor_x(p->scr));
+                        }
+                        if (!pty_alive(p->pty)) pane_dead[pi] = true;
+                        if (drained > 0 && i != g_active) t->activity = true;
                     }
-                    if (n < 0) pane_dead[pi] = true;
-                    break;
+                    for (int pi = t->num_panes - 1; pi >= 0; pi--) {
+                        if (pane_dead[pi]) tab_close_pane(t, pi);
+                    }
                 }
-                /* Refresh the PTY's cursor snapshot so the reader
-                   thread can fast-path CSI 6n responses without
-                   waiting for the next frame. Cheap (two relaxed
-                   atomic stores). */
-                if (drained > 0) {
-                    pty_snap_cursor(p->pty,
-                                    screen_cursor_y(p->scr),
-                                    screen_cursor_x(p->scr));
+                for (int i = g_num_tabs - 1; i >= 0; i--) {
+                    if (g_tabs[i]->dead) tab_close(i);
                 }
-                if (!pty_alive(p->pty)) pane_dead[pi] = true;
-                /* Activity on a background tab lights the tab-bar
-                   indicator until the user switches to it. */
-                if (drained > 0 && i != g_active) t->activity = true;
             }
-            /* Close dead panes in reverse so indices stay valid during
-               the sweep. A single-pane tab promotes to t->dead inside
-               tab_close_pane. */
-            for (int pi = t->num_panes - 1; pi >= 0; pi--) {
-                if (pane_dead[pi]) tab_close_pane(t, pi);
-            }
+            g_focused = _drain_saved;
         }
-        for (int i = g_num_tabs - 1; i >= 0; i--) {
-            if (g_tabs[i]->dead) tab_close(i);
-        }
-        if (g_num_tabs == 0) break;
+        if (g_focused->num_tabs == 0 && g_focused == &g_windows[0]) break;
 
         /* CWD label refresh (no-op on Windows — pty_cwd returns false).
            Track per pane; only the active pane's change bumps the tab
@@ -7861,6 +7894,11 @@ int main(int argc, char **argv) {
             SshFormLayout L = ssh_form_layout(win_w_now, win_h_now);
             ssh_form_handle_mouse(L, content_cols, content_rows);
             if (g_ui_mode != UI_SSH_FORM) {
+                /* Render the *primary* window's content (always
+                   g_windows[0]). The OS-focused window may be a
+                   different one — render_secondary_windows below
+                   handles that one. */
+                g_focused = &g_windows[0];
                 cur = active_tab();
                 if (!cur) break;
                 BeginDrawing();
@@ -7881,6 +7919,9 @@ int main(int argc, char **argv) {
                     ap->title_dirty = false;
                 }
             }
+            g_focused = &g_windows[0];
+            cur = active_tab();
+            if (!cur) break;
             BeginDrawing();
             ClearBackground((Color){0, 0, 0, 255});
             draw_tab_bar(&r, win_w_now);
@@ -7896,6 +7937,7 @@ int main(int argc, char **argv) {
             SettingsLayout L = settings_layout(win_w_now, win_h_now);
             settings_handle_mouse(&r, L);
             settings_handle_keys(&r, L);
+            g_focused = &g_windows[0];
             cur = active_tab();
             if (!cur) break;
             BeginDrawing();
@@ -7915,6 +7957,7 @@ int main(int argc, char **argv) {
             RecSaveLayout RL = rec_save_layout(win_w_now, win_h_now);
             rec_save_handle_mouse(RL);
             rec_save_handle_keys();
+            g_focused = &g_windows[0];
             cur = active_tab();
             if (!cur) break;
             BeginDrawing();
@@ -7971,6 +8014,9 @@ int main(int argc, char **argv) {
                        (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !inside)) {
                 g_ui_mode = UI_NORMAL;
             }
+            g_focused = &g_windows[0];
+            cur = active_tab();
+            if (!cur) break;
             BeginDrawing();
             ClearBackground((Color){0, 0, 0, 255});
             draw_tab_bar(&r, win_w_now);
@@ -8094,9 +8140,9 @@ int main(int argc, char **argv) {
                 cur = active_tab();
             }
             /* Cmd+N opens a new rbterm window in the SAME process so
-               macOS Cmd+` cycles between them natively (one
-               NSApplication, multiple GLFWwindows sharing the GL
-               context). New window starts with one tab. */
+               macOS Cmd+` cycles them natively (one NSApplication,
+               multiple GLFWwindows sharing the GL context). The
+               new window gets its own initial tab + shell. */
             else if (IsKeyPressed(KEY_N)) {
 #if !defined(__EMSCRIPTEN__)
                 if (g_window_count < MAX_WINDOWS) {
@@ -8105,11 +8151,17 @@ int main(int argc, char **argv) {
                         Window *nw = &g_windows[g_window_count++];
                         nw->handle = gw;
                         nw->tab_press_idx = -1;
-                        /* Future: open an initial tab in the new window.
-                           For now the new window is a placeholder so the
-                           Cmd+` cycle works; per-window tabs land in a
-                           follow-up commit (state migration is mostly
-                           done; render path needs the per-window switch). */
+                        /* Mirror raylib's callbacks onto the new
+                           window so its keystrokes / mouse events
+                           reach raylib's input state. */
+                        multiwin_install_input_callbacks(gw);
+                        /* Open an initial tab in the new window.
+                           Swap g_focused so tab_open's macros land
+                           in the new window's array, then restore. */
+                        Window *prev = g_focused;
+                        g_focused = nw;
+                        tab_open(content_cols, content_rows);
+                        g_focused = prev;
                     }
                 }
 #endif
@@ -8279,6 +8331,12 @@ int main(int argc, char **argv) {
             ap->title_dirty = false;
         }
 
+        /* Primary window always renders g_windows[0]'s tabs.
+           Secondary windows render their own tabs via
+           render_secondary_windows below. */
+        g_focused = &g_windows[0];
+        cur = active_tab();
+        if (!cur) break;
         BeginDrawing();
         ClearBackground((Color){0, 0, 0, 255});
         draw_tab_bar(&r, win_w_now);

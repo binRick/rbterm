@@ -44,15 +44,39 @@ if pgrep -x rbterm >/dev/null 2>&1; then
 fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  make app
-  # Launching the binary directly (rather than via `open`) keeps
-  # stdout/stderr attached to this terminal so you can see the SSH
-  # auth trace and any libssh warnings live. macOS still reads the
-  # enclosing Info.plist for Cmd+Tab label and Dock icon since the
-  # binary is inside rbterm.app. `exec` replaces the shell so Ctrl+C
-  # in this terminal sends SIGINT directly to rbterm.
+  # Multi-window needs raylib built with USE_EXTERNAL_GLFW so it
+  # links against brew's libglfw rather than its own bundled copy
+  # (the Makefile path uses brew's prebuilt raylib which has GLFW
+  # bundled — two GLFW runtimes in one process produce
+  # GLFWApplicationDelegate class-collision warnings and break
+  # secondary windows). CMake fetches raylib from source and
+  # passes the flag, so this is the build path that works.
+  cmake -S . -B build >/dev/null
+  cmake --build build -j
+
+  # Hand-package the .app so macOS sees a Bundle ID + icon
+  # (Cmd+Tab shows "rbterm" with the rbterm icon, not "exec").
+  # We inline this rather than calling `make app` because the
+  # Makefile target's deps trigger a recompile against brew raylib
+  # which fails on multi-window symbols. Icon + Info.plist still
+  # come from the build the Makefile produced earlier — if you
+  # ever clean assets/, run `make app` once to regenerate, then
+  # this script keeps using the existing assets.
+  if [[ ! -f assets/rbterm.icns || ! -f Info.plist ]]; then
+    echo "run.sh: assets/rbterm.icns or Info.plist missing — running 'make app' once to bootstrap…"
+    cp build/rbterm rbterm
+    make app
+  else
+    rm -rf rbterm.app
+    mkdir -p rbterm.app/Contents/MacOS rbterm.app/Contents/Resources
+    cp build/rbterm rbterm.app/Contents/MacOS/rbterm
+    cp assets/rbterm.icns rbterm.app/Contents/Resources/rbterm.icns
+    cp Info.plist rbterm.app/Contents/Info.plist
+    touch rbterm.app
+  fi
   exec ./rbterm.app/Contents/MacOS/rbterm "$@"
 else
-  make
-  exec ./rbterm "$@"
+  cmake -S . -B build >/dev/null
+  cmake --build build -j
+  exec ./build/rbterm "$@"
 fi
