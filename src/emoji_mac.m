@@ -256,41 +256,68 @@ bool mac_pick_save_file(const char *suggested, char *out, size_t cap) {
     return ok;
 }
 
-/* Quake-style hotkey: Cmd+` toggles rbterm visibility globally,
-   so the user can summon / dismiss the terminal from any other
-   app without leaving the current Space. We use an NSEvent
-   global monitor (catches the chord while another app is
-   focused) plus a local monitor (catches it while rbterm is
-   focused, AND swallows it so the chord doesn't leak into the
-   shell as a backtick). Both flip the same atomic flag the main
-   loop polls. */
+/* Quake-style hotkey: Cmd+CapsLock toggles rbterm visibility
+   globally. Caps Lock isn't a keyDown event on macOS — it
+   arrives as a flagsChanged event (keyCode 57) so we monitor
+   that mask. We also flip caps-lock back off afterwards via
+   IOHIDSetModifierLockState so the user's keyboard doesn't get
+   stuck in ALL CAPS every time they summon rbterm.
+
+   The global monitor catches the chord while another app is
+   focused; the local monitor catches it while rbterm is focused
+   and swallows the event so the toggle doesn't propagate. */
 static volatile int g_quake_toggle_flag = 0;
 static id           g_quake_global_monitor = nil;
 static id           g_quake_local_monitor  = nil;
 
+#include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/hidsystem/IOHIDParameter.h>
+#include <IOKit/IOKitLib.h>
+
+/* Force the caps-lock LED + modifier state off. Used right after
+   the Cmd+CapsLock chord fires so the keyboard doesn't drift
+   into all-caps. Best-effort — if the IOKit service refuses
+   (sandbox / permission) we silently skip. */
+static void reset_caps_lock_off(void) {
+    io_service_t srv = IOServiceGetMatchingService(
+        kIOMasterPortDefault, IOServiceMatching(kIOHIDSystemClass));
+    if (!srv) return;
+    io_connect_t conn;
+    if (IOServiceOpen(srv, mach_task_self(),
+                      kIOHIDParamConnectType, &conn) == KERN_SUCCESS) {
+        IOHIDSetModifierLockState(conn, kIOHIDCapsLockState, false);
+        IOServiceClose(conn);
+    }
+    IOObjectRelease(srv);
+}
+
 static bool quake_chord_match(NSEvent *e) {
-    if (([e modifierFlags] & NSEventModifierFlagCommand) == 0) return false;
-    NSString *chars = [e charactersIgnoringModifiers];
-    if (!chars || [chars length] == 0) return false;
-    /* Match `, ~ (Cmd+Shift+`), and the tilde fallback some
-       keyboards emit. */
-    unichar c = [chars characterAtIndex:0];
-    return c == '`' || c == '~';
+    /* Caps Lock has keyCode 57 (kVK_CapsLock). Each press fires
+       a flagsChanged event; the Cmd held check ensures bare
+       Caps Lock presses (typical "lock my keyboard for shouting")
+       don't summon the terminal. */
+    if ([e type] != NSEventTypeFlagsChanged) return false;
+    if ([e keyCode] != 57) return false;
+    return ([e modifierFlags] & NSEventModifierFlagCommand) != 0;
 }
 
 void mac_install_quake_hotkey(void) {
     if (g_quake_global_monitor || g_quake_local_monitor) return;
-    NSEventMask mask = NSEventMaskKeyDown;
+    NSEventMask mask = NSEventMaskFlagsChanged;
     g_quake_global_monitor =
         [NSEvent addGlobalMonitorForEventsMatchingMask:mask
                                                handler:^(NSEvent *e) {
-            if (quake_chord_match(e)) g_quake_toggle_flag = 1;
+            if (quake_chord_match(e)) {
+                g_quake_toggle_flag = 1;
+                reset_caps_lock_off();
+            }
         }];
     g_quake_local_monitor =
         [NSEvent addLocalMonitorForEventsMatchingMask:mask
                                               handler:^NSEvent *(NSEvent *e) {
             if (quake_chord_match(e)) {
                 g_quake_toggle_flag = 1;
+                reset_caps_lock_off();
                 return nil;   /* swallow the chord */
             }
             return e;
