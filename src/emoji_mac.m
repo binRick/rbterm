@@ -321,36 +321,40 @@ static void quake_log(const char *what) {
     fclose(fp);
 }
 
-/* Run the visibility toggle inline from inside an NSEvent /
-   Carbon block. Both fire on the main thread, so hide: /
-   unhide: are safe to call directly. We previously latched a
-   flag for the main loop to drain, but raylib pauses its loop
-   while the window is hidden — so the flag set by the global
-   monitor never got consumed and a second Cmd+CapsLock did
-   nothing. Acting in the block sidesteps the pause. */
+/* Track our own visibility state. We can't use [NSApp isHidden]
+   here because we no longer call [NSApp hide:] / unhide: —
+   those throttle the process via App Nap and queue events for
+   1-2 s. Instead we orderOut: the window and re-orderFront: it.
+   That keeps the app foreground-ish (run loop runs at normal
+   speed) so subsequent chords dispatch instantly. */
+static bool g_quake_was_hidden = false;
+
 static void quake_toggle_inline(void) {
     @autoreleasepool {
-        bool was_hidden = [NSApp isHidden];
-        quake_log(was_hidden ? "toggle:show-start" : "toggle:hide-start");
-        if (was_hidden) {
-            /* Order matters here: unhide before activate so the
-               window becomes the foreground app cleanly. Some
-               macOS builds report isHidden=NO after unhide but
-               leave the windows below the front of the layer
-               unless we activate as well. */
-            [NSApp unhide:nil];
+        quake_log(g_quake_was_hidden ? "toggle:show-start" : "toggle:hide-start");
+        if (g_quake_was_hidden) {
             [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
-            /* Belt-and-braces: bring whichever key window we have
-               to the front. raylib's GLFW window is the only one
-               in our process. */
             for (NSWindow *w in [NSApp windows]) {
                 [w orderFrontRegardless];
                 [w makeKeyWindow];
             }
+            g_quake_was_hidden = false;
         } else {
-            [NSApp hide:nil];
+            /* orderOut + deactivate, but DON'T call [NSApp hide:].
+               hide: pushes the process into App Nap deep-sleep
+               (SIGSTOP-like) which buffers Cocoa events for 1-2 s
+               before they dispatch — that's the "queued up"
+               behaviour the user saw. orderOut just removes the
+               window; deactivate tells the system to pick a new
+               foreground app (so the user's keystrokes go to
+               their previously-focused app, not into a void). */
+            for (NSWindow *w in [NSApp windows]) {
+                [w orderOut:nil];
+            }
+            [NSApp deactivate];
+            g_quake_was_hidden = true;
         }
-        quake_log(was_hidden ? "toggle:show-end" : "toggle:hide-end");
+        quake_log(g_quake_was_hidden ? "toggle:hide-end" : "toggle:show-end");
     }
     g_quake_toggle_flag = 1;
     reset_caps_lock_off();
