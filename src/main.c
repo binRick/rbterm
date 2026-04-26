@@ -10238,18 +10238,22 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Skip the auto-fit / centre block when the user picked a
-       size that should be set by the OS. MaximizeWindow / Own
-       Space / Borderless all want to keep the OS-chosen
-       geometry — calling SetWindowSize / SetWindowPosition here
-       would resize back to the renderer-derived default, which
-       was the symptom "window goes fullscreen then snaps to
-       normal size". */
-    bool window_is_os_sized =
-        g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED ||
-        g_app_settings.startup_window == STARTUP_WINDOW_FILL      ||
-        g_app_settings.startup_window == STARTUP_WINDOW_BORDERLESS;
-    if (!window_is_os_sized) {
+    /* Skip the auto-fit / centre block when the user explicitly
+       set the window size via Settings → Window. MaximizeWindow /
+       Own Space / Borderless want the OS-chosen geometry kept; the
+       Small / Medium / Large presets want the pixel dimensions we
+       set above kept. Without this gate the unconditional
+       SetWindowSize(win_w, win_h) clobbers all of them — Medium /
+       Large fell through to the renderer-derived default and
+       looked identical at boot. */
+    bool window_is_explicitly_sized =
+        g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED  ||
+        g_app_settings.startup_window == STARTUP_WINDOW_FILL       ||
+        g_app_settings.startup_window == STARTUP_WINDOW_BORDERLESS ||
+        g_app_settings.startup_window == STARTUP_WINDOW_SMALL      ||
+        g_app_settings.startup_window == STARTUP_WINDOW_MEDIUM     ||
+        g_app_settings.startup_window == STARTUP_WINDOW_LARGE;
+    if (!window_is_explicitly_sized) {
         SetWindowSize(win_w, win_h);
     }
     SetWindowMinSize(r.cell_w * 20 + 2 * r.pad_x, r.cell_h * 5 + TAB_BAR_H + 2 * r.pad_y);
@@ -10261,7 +10265,7 @@ int main(int argc, char **argv) {
        default position on Windows; on macOS / Linux the monitor
        metrics are trustworthy enough to use. */
 #ifndef _WIN32
-    if (!window_is_os_sized && mw > 0 && mh > 0) {
+    if (!window_is_explicitly_sized && mw > 0 && mh > 0) {
         Vector2 mp = GetMonitorPosition(mi);
         int x = (int)mp.x + (mw - win_w) / 2;
         int y = (int)mp.y + (mh - win_h) / 2;
