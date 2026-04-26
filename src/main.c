@@ -3777,7 +3777,10 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     }
 
     int list_w = (g_ssh_profile_count > 0) ? 210 : 0;
-    int content_top = tab_bar_y + tab_bar_h + 14;
+    /* 28 px below the tab bar leaves room for the "Saved hosts (~/.ssh/config)"
+       caption that sits 18 px above the list — at the previous 14 px gap
+       the caption overlapped the Connection tab button. */
+    int content_top = tab_bar_y + tab_bar_h + 28;
     if (list_w > 0) {
         L.list.x = L.modal.x + pad;
         L.list.y = content_top;
