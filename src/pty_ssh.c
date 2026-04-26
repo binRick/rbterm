@@ -372,6 +372,35 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         set_err(err, errsz, "request pty: %s", ssh_get_error(p->session));
         goto fail;
     }
+
+    /* Forward enough of the local environment that the remote shell
+       behaves the same way it would if the user had typed `ssh host`
+       from rbterm's local PTY (where pty_unix sets these directly).
+       In particular COLORTERM=truecolor is what tells tmux + starship
+       on the remote to emit 24-bit truecolor escapes — without it
+       tmux falls back to 256-colour approximations and `pal random`
+       leaves cells looking inconsistent because the colour pipeline
+       is different on the two paths.
+
+       Failures are silent: many sshd configs only accept env names
+       listed in AcceptEnv (default: LANG and LC_*). If the request
+       is denied the shell still starts; we just don't get the env.
+       Users wanting the full effect can add `AcceptEnv COLORTERM
+       TERM_PROGRAM TERM_PROGRAM_VERSION` to the remote sshd_config. */
+    {
+        struct { const char *name; const char *value; } envs[] = {
+            { "COLORTERM",            "truecolor" },
+            { "TERM_PROGRAM",         "rbterm"    },
+            { "TERM_PROGRAM_VERSION", "0.1.0"     },
+            { "LANG",                 "en_US.UTF-8" },
+            { "LC_CTYPE",             "en_US.UTF-8" },
+        };
+        for (size_t i = 0; i < sizeof(envs) / sizeof(envs[0]); i++) {
+            (void)ssh_channel_request_env(p->channel,
+                                          envs[i].name, envs[i].value);
+        }
+    }
+
     if (ssh_channel_request_shell(p->channel) != SSH_OK) {
         set_err(err, errsz, "request shell: %s", ssh_get_error(p->session));
         goto fail;
