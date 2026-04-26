@@ -340,7 +340,11 @@ static void run_line(FakePty *p, const char *line) {
     else if (!strcmp(argv[0], "history")) cmd_history(p);
     else if (!strcmp(argv[0], "rainbow")) cmd_rainbow(p);
     else if (!strcmp(argv[0], "fortune")) cmd_fortune(p);
-    else if (!strcmp(argv[0], "exit"))    out_str(p, "This demo runs in your browser — there's nothing to exit to. Try 'help'.\r\n");
+    else if (!strcmp(argv[0], "exit") ||
+             !strcmp(argv[0], "logout")) {
+        out_str(p, "logout (demo)\r\n");
+        p->alive = false;
+    }
     else                                  out_fmt(p, "rbterm: command not found: %s\r\n", argv[0]);
 }
 
@@ -416,10 +420,11 @@ static void feed_char(FakePty *p, uint8_t b) {
         prompt(p);
         return;
     }
-    if (b == 0x04) {   /* Ctrl+D */
+    if (b == 0x04) {   /* Ctrl+D — EOF on empty line closes the
+                          pane, matching how a real shell behaves. */
         if (p->line_len == 0) {
             out_str(p, "logout (demo)\r\n");
-            prompt(p);
+            p->alive = false;
         }
         return;
     }
@@ -540,7 +545,8 @@ static FNode *build_demo_fs(void) {
 
 /* ---------- pty_internal.h backend ---------- */
 
-void *local_open_impl(int cols, int rows) {
+void *local_open_impl(int cols, int rows, const char *cwd) {
+    (void)cwd;   /* fake fs is virtual; cwd is always /home/demo */
     FakePty *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
     p->root = build_demo_fs();
@@ -603,4 +609,10 @@ bool local_cwd_impl(void *impl, char *out, size_t cap) {
     if (!p || !out || cap == 0) return false;
     fnode_path(p->cwd, out, cap);
     return true;
+}
+
+/* No reader thread on the wasm path → no fast-path DSR replies to
+   support. Stub keeps the dispatch layer linkable. */
+void local_snap_cursor_impl(void *impl, int cy, int cx) {
+    (void)impl; (void)cy; (void)cx;
 }
