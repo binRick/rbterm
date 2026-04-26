@@ -596,6 +596,10 @@ typedef struct {
        fall back to g_app_settings; render code goes through
        hud_effective(t) so it doesn't have to branch. */
     HudConfig ssh_hud;
+    /* Per-host startup commands, sent to the shell right after the
+       channel opens. Empty = no-op. See ssh_form's matching fields. */
+    char  ssh_init_cwd[256];
+    char  ssh_init_cmd[256];
     /* Background-tab activity: set when any pane of a non-active tab
        receives PTY output. Cleared when the tab becomes active. */
     bool  activity;
@@ -646,10 +650,11 @@ typedef enum {
 } UiMode;
 typedef enum {
     F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
+    F_INIT_CWD, F_INIT_CMD,
     F_NEW, F_CONNECT, F_DELETE, F_SAVE, F_CANCEL,
     F_COUNT
 } SshField;
-#define F_TEXT_FIELDS 6    /* name, host, port, user, pass, key */
+#define F_TEXT_FIELDS 8    /* name, host, port, user, pass, key, init_cwd, init_cmd */
 typedef struct {
     char name[128];
     char host[256];
@@ -665,6 +670,12 @@ typedef struct {
     char color[16];          /* "#rrggbb" tab accent colour; empty = none */
     HudConfig hud;           /* per-host HUD override (override flag gates use) */
     char key[512];
+    /* Per-host startup commands. After the SSH session opens we
+       send `cd <init_cwd>; <init_cmd>\\r` to the remote shell so
+       new tabs land in a known location and optionally launch a
+       program (vim, tmux attach, etc.). Empty = no-op. */
+    char init_cwd[256];
+    char init_cmd[256];
     int  focus;              /* SshField */
     bool sel_all;            /* focused text field's contents are fully selected */
     char error[256];
@@ -727,6 +738,10 @@ typedef struct {
     int  log_mode;
     char color[16];          /* "#rrggbb" tab accent; empty = none */
     HudConfig hud;           /* per-host HUD override */
+    /* Run-on-connect commands. Sent verbatim to the remote shell
+       right after the channel opens. */
+    char init_cwd[256];
+    char init_cmd[256];
 } SshProfile;
 
 /* Curated palette for SSH tab accents. 8 saturated colours that all
@@ -1447,6 +1462,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const char *log_dir, int log_mode,
                          const char *color,
                          const HudConfig *hud,
+                         const char *init_cwd, const char *init_cmd,
                          int cols, int rows,
                          char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
@@ -1480,6 +1496,14 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     t->ssh_log_mode = log_mode;
     if (color)    { strncpy(t->ssh_color, color, sizeof(t->ssh_color) - 1); t->ssh_color[sizeof(t->ssh_color) - 1] = 0; }
     if (hud) t->ssh_hud = *hud;
+    if (init_cwd) {
+        strncpy(t->ssh_init_cwd, init_cwd, sizeof(t->ssh_init_cwd) - 1);
+        t->ssh_init_cwd[sizeof(t->ssh_init_cwd) - 1] = 0;
+    }
+    if (init_cmd) {
+        strncpy(t->ssh_init_cmd, init_cmd, sizeof(t->ssh_init_cmd) - 1);
+        t->ssh_init_cmd[sizeof(t->ssh_init_cmd) - 1] = 0;
+    }
     t->ssh_port = port;
     snprintf(t->panes[0].title, sizeof(t->panes[0].title), "%s", t->ssh_target);
     if (!pane_open_ssh(&t->panes[0], user, host, port, password, keyfile,
@@ -1487,6 +1511,31 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
         free(t); return NULL;
     }
     pane_apply_tab_appearance(t, &t->panes[0]);
+    /* Send per-host startup commands now that the channel is up.
+       Composed as a single line: `cd <dir>; <cmd>\r`. The shell
+       reads from its stdin queue when it's ready, so even if the
+       prompt hasn't drawn yet the bytes land in the right order.
+       Quoting init_cwd guards against spaces; init_cmd is sent
+       verbatim — power users can pipe / chain however they like. */
+    if (t->ssh_init_cwd[0] || t->ssh_init_cmd[0]) {
+        char init_buf[768];
+        int n = 0;
+        if (t->ssh_init_cwd[0]) {
+            n = snprintf(init_buf, sizeof(init_buf), "cd \"%s\"",
+                         t->ssh_init_cwd);
+            if (t->ssh_init_cmd[0] && n > 0 && n < (int)sizeof(init_buf)) {
+                int m = snprintf(init_buf + n, sizeof(init_buf) - n,
+                                 "; %s", t->ssh_init_cmd);
+                if (m > 0) n += m;
+            }
+        } else {
+            n = snprintf(init_buf, sizeof(init_buf), "%s", t->ssh_init_cmd);
+        }
+        if (n > 0 && n < (int)sizeof(init_buf) - 1) {
+            init_buf[n++] = '\r';
+            pty_write(t->panes[0].pty, (const uint8_t *)init_buf, (size_t)n);
+        }
+    }
     /* Per-host font / font-size applied globally when we connect. Windows
        runs a single renderer so this affects every pane for the rest of
        the session — the user can override via Settings. */
@@ -3584,6 +3633,8 @@ static void ssh_profiles_load(void) {
                 const char *ldir_pfx     = "rbterm-log-dir:";
                 const char *log_pfx      = "rbterm-log:";
                 const char *color_pfx    = "rbterm-color:";
+                const char *icwd_pfx     = "rbterm-init-cwd:";
+                const char *icmd_pfx     = "rbterm-init-cmd:";
                 const char *hud_pfx      = "rbterm-hud:";
                 const char *hud_pos_pfx  = "rbterm-hud-pos:";
                 const char *hud_cpu_pfx  = "rbterm-hud-cpu:";
@@ -3614,6 +3665,18 @@ static void ssh_profiles_load(void) {
                     trim_end(q);
                     strncpy(cur->color, q, sizeof(cur->color) - 1);
                     cur->color[sizeof(cur->color) - 1] = 0;
+                } else if (strncmp(q, icwd_pfx, strlen(icwd_pfx)) == 0) {
+                    q += strlen(icwd_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    strncpy(cur->init_cwd, q, sizeof(cur->init_cwd) - 1);
+                    cur->init_cwd[sizeof(cur->init_cwd) - 1] = 0;
+                } else if (strncmp(q, icmd_pfx, strlen(icmd_pfx)) == 0) {
+                    q += strlen(icmd_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    strncpy(cur->init_cmd, q, sizeof(cur->init_cmd) - 1);
+                    cur->init_cmd[sizeof(cur->init_cmd) - 1] = 0;
                 /* Any rbterm-hud-* presence implies an override is in
                    effect. We seed the rest of cur->hud once on first
                    sight so unspecified fields take sensible defaults
@@ -3779,6 +3842,10 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     g_form.log_mode = prof->log_mode;
     strncpy(g_form.color, prof->color, sizeof(g_form.color) - 1);
     g_form.color[sizeof(g_form.color) - 1] = 0;
+    strncpy(g_form.init_cwd, prof->init_cwd, sizeof(g_form.init_cwd) - 1);
+    g_form.init_cwd[sizeof(g_form.init_cwd) - 1] = 0;
+    strncpy(g_form.init_cmd, prof->init_cmd, sizeof(g_form.init_cmd) - 1);
+    g_form.init_cmd[sizeof(g_form.init_cmd) - 1] = 0;
     /* If this profile has any HUD override, copy it; otherwise seed
        the form's per-host HUD from the global app settings so the
        user starts editing from a sensible baseline if they enable
@@ -4737,7 +4804,9 @@ static char *form_buf(int field, size_t *cap) {
     case F_PORT:  *cap = sizeof(g_form.port);  return g_form.port;
     case F_USER:  *cap = sizeof(g_form.user);  return g_form.user;
     case F_PASS:  *cap = sizeof(g_form.pass);  return g_form.pass;
-    case F_KEY:   *cap = sizeof(g_form.key);   return g_form.key;
+    case F_KEY:      *cap = sizeof(g_form.key);      return g_form.key;
+    case F_INIT_CWD: *cap = sizeof(g_form.init_cwd); return g_form.init_cwd;
+    case F_INIT_CMD: *cap = sizeof(g_form.init_cmd); return g_form.init_cmd;
     default: *cap = 0; return NULL;
     }
 }
@@ -5055,6 +5124,8 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.log_mode,
         g_form.color[0]   ? g_form.color   : NULL,
         g_form.hud.override ? &g_form.hud  : NULL,
+        g_form.init_cwd[0] ? g_form.init_cwd : NULL,
+        g_form.init_cmd[0] ? g_form.init_cmd : NULL,
         cols, rows, err, sizeof(err));
     if (t) {
         /* Clear the password from memory as soon as we no longer need it. */
@@ -5121,6 +5192,10 @@ static void emit_form_managed_lines(FILE *fp) {
         fprintf(fp, "    # rbterm-log: off\n");
     if (g_form.color[0])
         fprintf(fp, "    # rbterm-color: %s\n", g_form.color);
+    if (g_form.init_cwd[0])
+        fprintf(fp, "    # rbterm-init-cwd: %s\n", g_form.init_cwd);
+    if (g_form.init_cmd[0])
+        fprintf(fp, "    # rbterm-init-cmd: %s\n", g_form.init_cmd);
     /* Per-host HUD override. Writes a few lines so plain ssh still
        parses it cleanly. We write the master toggle + position +
        per-field rows + the cpu-graph toggle so the round-trip is
@@ -5968,15 +6043,19 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
 
     /* Fields. */
     const char *labels[F_TEXT_FIELDS] = {
-        "Name", "Host", "Port", "Username", "Password", "Key file"
+        "Name", "Host", "Port", "Username", "Password", "Key file",
+        "Init dir", "Init command"
     };
     const char *hints[F_TEXT_FIELDS]  = {
         "(ssh_config alias, e.g. mia)", "example.com", "22", getenv("USER"),
         "(leave blank to use key)",
-        "(default: ssh-agent + ~/.ssh/id_*)"
+        "(default: ssh-agent + ~/.ssh/id_*)",
+        "(optional: cd here on connect, e.g. ~/projects)",
+        "(optional: command to run, e.g. tmux attach)"
     };
     const char *values[F_TEXT_FIELDS] = {
-        g_form.name, g_form.host, g_form.port, g_form.user, g_form.pass, g_form.key
+        g_form.name, g_form.host, g_form.port, g_form.user, g_form.pass, g_form.key,
+        g_form.init_cwd, g_form.init_cmd
     };
 
     /* Saved-hosts sidebar. */
@@ -10035,6 +10114,8 @@ int main(int argc, char **argv) {
                         prof ? prof->log_mode : 0,
                         prof && prof->color[0]    ? prof->color    : NULL,
                         prof && prof->hud.override ? &prof->hud    : NULL,
+                        prof && prof->init_cwd[0] ? prof->init_cwd : NULL,
+                        prof && prof->init_cmd[0] ? prof->init_cmd : NULL,
                         init_cols, init_rows, err, sizeof(err));
                     if (!t) {
                         fprintf(stderr,
