@@ -1252,6 +1252,7 @@ struct PtyDownload {
     char              err[256];
 
     volatile int      cancel;
+    bool              is_dir;     /* set after the initial stat */
 };
 
 static void download_set_err(struct PtyDownload *d, const char *fmt, ...) {
@@ -1285,66 +1286,19 @@ static void download_log(const char *fmt, ...) {
     fclose(fp);
 }
 
-static void *sftp_download_worker(void *arg) {
-    struct PtyDownload *d = arg;
+/* Stream a single remote file (already-resolved absolute path) into
+   the local FILE *. Caller holds session_lock and has the SFTP
+   session open. Updates `d->bytes_done`. Returns true on success. */
+static bool sftp_download_file(struct PtyDownload *d, sftp_session sftp,
+                               const char *remote, FILE *out) {
     SshPty *p = d->ssh;
-    download_log("---- start: remote=%s local=%s", d->remote_path, d->local_path);
-
-    char remote[PATH_MAX_FALLBACK];
-    sftp_strip_tilde(d->remote_path, remote, sizeof(remote));
-
-    FILE *out = fopen(d->local_path, "wb");
-    if (!out) {
-        download_set_err(d, "open local: %s", strerror(errno));
-        download_log("FAIL %s", d->err);
-        d->status = -1;
-        return NULL;
-    }
-
-    pthread_mutex_lock(&p->session_lock);
-    bool was_blocking = ssh_is_blocking(p->session);
-    ssh_set_blocking(p->session, 1);
-
-    sftp_session sftp = sftp_new(p->session);
-    if (!sftp) {
-        download_set_err(d, "sftp_new: %s", ssh_get_error(p->session));
-        download_log("FAIL %s", d->err);
-        if (!was_blocking) ssh_set_blocking(p->session, 0);
-        pthread_mutex_unlock(&p->session_lock);
-        fclose(out);
-        d->status = -1;
-        return NULL;
-    }
-    if (sftp_init(sftp) != SSH_OK) {
-        download_set_err(d, "sftp_init: %s", ssh_get_error(p->session));
-        download_log("FAIL %s", d->err);
-        sftp_free(sftp);
-        if (!was_blocking) ssh_set_blocking(p->session, 0);
-        pthread_mutex_unlock(&p->session_lock);
-        fclose(out);
-        d->status = -1;
-        return NULL;
-    }
-
-    sftp_attributes a = sftp_stat(sftp, remote);
-    if (a) {
-        d->bytes_total = (uint64_t)a->size;
-        sftp_attributes_free(a);
-    }
-
     sftp_file rf = sftp_open(sftp, remote, O_RDONLY, 0);
     if (!rf) {
         download_set_err(d, "sftp_open %s: %s", remote, ssh_get_error(p->session));
         download_log("FAIL sftp_open: sftp_err=%d ssh_err=%s",
                      sftp_get_error(sftp), ssh_get_error(p->session));
-        sftp_free(sftp);
-        if (!was_blocking) ssh_set_blocking(p->session, 0);
-        pthread_mutex_unlock(&p->session_lock);
-        fclose(out);
-        d->status = -1;
-        return NULL;
+        return false;
     }
-
     uint8_t buf[SFTP_CHUNK_SZ];
     bool ok = true;
     int chunk_count = 0;
@@ -1376,12 +1330,147 @@ static void *sftp_download_worker(void *arg) {
                          (unsigned long long)d->bytes_total);
         }
     }
-
     sftp_close(rf);
+    return ok;
+}
+
+/* Recursively walk a remote directory, accumulating total bytes
+   and downloading each entry. `remote_dir` and `local_dir` are
+   already absolute. Creates `local_dir` if it doesn't exist.
+   Returns false on the first hard error (set in d->err). */
+static bool sftp_download_dir_recursive(struct PtyDownload *d,
+                                        sftp_session sftp,
+                                        const char *remote_dir,
+                                        const char *local_dir) {
+    SshPty *p = d->ssh;
+    if (d->cancel) {
+        download_set_err(d, "cancelled");
+        return false;
+    }
+    /* Ensure the local target dir exists. */
+    if (mkdir(local_dir, 0755) != 0 && errno != EEXIST) {
+        download_set_err(d, "mkdir %s: %s", local_dir, strerror(errno));
+        download_log("FAIL %s", d->err);
+        return false;
+    }
+    sftp_dir rd = sftp_opendir(sftp, remote_dir);
+    if (!rd) {
+        download_set_err(d, "opendir %s: %s",
+                         remote_dir, ssh_get_error(p->session));
+        download_log("FAIL %s", d->err);
+        return false;
+    }
+    /* Snapshot the listing so we don't hold the directory handle
+       across a recursive call (libssh's SFTP isn't reentrant). */
+    typedef struct { char name[256]; bool is_dir; uint64_t size; } DLEnt;
+    DLEnt *list = NULL;
+    int n = 0, cap = 0;
+    sftp_attributes a;
+    while ((a = sftp_readdir(sftp, rd)) != NULL) {
+        const char *nm = a->name ? a->name : "";
+        if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) {
+            sftp_attributes_free(a); continue;
+        }
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 16;
+            DLEnt *grow = realloc(list, (size_t)nc * sizeof(*list));
+            if (!grow) { sftp_attributes_free(a); break; }
+            list = grow;
+            cap = nc;
+        }
+        snprintf(list[n].name, sizeof(list[n].name), "%s", nm);
+        list[n].is_dir = (a->type == SSH_FILEXFER_TYPE_DIRECTORY);
+        list[n].size   = (uint64_t)a->size;
+        if (!list[n].is_dir) d->bytes_total += list[n].size;
+        n++;
+        sftp_attributes_free(a);
+    }
+    sftp_closedir(rd);
+
+    bool ok = true;
+    for (int i = 0; i < n && ok && !d->cancel; i++) {
+        char remote_child[PATH_MAX_FALLBACK];
+        char local_child[PATH_MAX_FALLBACK];
+        snprintf(remote_child, sizeof(remote_child), "%s/%s",
+                 remote_dir, list[i].name);
+        snprintf(local_child, sizeof(local_child), "%s/%s",
+                 local_dir, list[i].name);
+        if (list[i].is_dir) {
+            ok = sftp_download_dir_recursive(d, sftp, remote_child, local_child);
+        } else {
+            FILE *out = fopen(local_child, "wb");
+            if (!out) {
+                download_set_err(d, "open local: %s", strerror(errno));
+                download_log("FAIL open %s: %s", local_child, strerror(errno));
+                ok = false;
+                break;
+            }
+            ok = sftp_download_file(d, sftp, remote_child, out);
+            fclose(out);
+        }
+    }
+    free(list);
+    return ok;
+}
+
+static void *sftp_download_worker(void *arg) {
+    struct PtyDownload *d = arg;
+    SshPty *p = d->ssh;
+    download_log("---- start: remote=%s local=%s", d->remote_path, d->local_path);
+
+    char remote[PATH_MAX_FALLBACK];
+    sftp_strip_tilde(d->remote_path, remote, sizeof(remote));
+
+    pthread_mutex_lock(&p->session_lock);
+    bool was_blocking = ssh_is_blocking(p->session);
+    ssh_set_blocking(p->session, 1);
+
+    sftp_session sftp = sftp_new(p->session);
+    if (!sftp) {
+        download_set_err(d, "sftp_new: %s", ssh_get_error(p->session));
+        download_log("FAIL %s", d->err);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        d->status = -1;
+        return NULL;
+    }
+    if (sftp_init(sftp) != SSH_OK) {
+        download_set_err(d, "sftp_init: %s", ssh_get_error(p->session));
+        download_log("FAIL %s", d->err);
+        sftp_free(sftp);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        d->status = -1;
+        return NULL;
+    }
+
+    /* Decide file vs directory from sftp_stat. */
+    bool ok = true;
+    sftp_attributes a = sftp_stat(sftp, remote);
+    if (a && a->type == SSH_FILEXFER_TYPE_DIRECTORY) {
+        d->is_dir = true;
+        sftp_attributes_free(a);
+        download_log("recursive download into %s", d->local_path);
+        ok = sftp_download_dir_recursive(d, sftp, remote, d->local_path);
+    } else {
+        if (a) {
+            d->bytes_total = (uint64_t)a->size;
+            sftp_attributes_free(a);
+        }
+        FILE *out = fopen(d->local_path, "wb");
+        if (!out) {
+            download_set_err(d, "open local: %s", strerror(errno));
+            download_log("FAIL %s", d->err);
+            ok = false;
+        } else {
+            ok = sftp_download_file(d, sftp, remote, out);
+            fclose(out);
+        }
+    }
+
     sftp_free(sftp);
     if (!was_blocking) ssh_set_blocking(p->session, 0);
     pthread_mutex_unlock(&p->session_lock);
-    fclose(out);
 
     if (ok && !d->bytes_total) d->bytes_total = d->bytes_done;
     d->status = ok ? 1 : -1;

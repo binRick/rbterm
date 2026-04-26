@@ -56,6 +56,7 @@
   void mac_enter_native_fullscreen(void);
   bool mac_pick_open_file(char *out, size_t cap);
   bool mac_pick_save_file(const char *suggested, char *out, size_t cap);
+  bool mac_pick_open_directory(const char *prompt_title, char *out, size_t cap);
 #endif
 
 #ifndef _WIN32
@@ -4262,22 +4263,23 @@ static void download_form_parent_dir(const char *in, char *out, size_t cap) {
     }
 }
 
-/* Submit: fire NSSavePanel for local dest, kick off the download.
-   Closes the modal on success; leaves it open with status set on
-   error. */
-static void download_form_submit_selected(void) {
+static void download_form_submit_selected(void);
+
+/* "Activate" the selected entry — fired by double-click and Enter.
+   Folders navigate; files trigger a save dialog + download. The
+   Download button uses download_form_submit_selected below, which
+   downloads both. Two separate paths so that double-clicking a
+   folder feels like a file manager rather than starting a big
+   recursive transfer. */
+static void download_form_activate_selected(void) {
     g_download_form.status[0] = 0;
     int idxs[1024];
     int fcount = download_filtered_indices(idxs, (int)(sizeof(idxs) / sizeof(idxs[0])));
     if (g_download_form.selected < 0 || g_download_form.selected >= fcount) {
-        snprintf(g_download_form.status, sizeof(g_download_form.status),
-                 "select a file first");
         return;
     }
     PtyDirEntry *e = &g_download_form.entries[idxs[g_download_form.selected]];
     if (e->is_dir) {
-        /* Activating a directory navigates into it instead of
-           downloading. ".." pops up; everything else descends. */
         char next[sizeof(g_download_form.remote_dir)];
         if (strcmp(e->name, "..") == 0) {
             download_form_parent_dir(g_download_form.remote_dir,
@@ -4293,24 +4295,77 @@ static void download_form_submit_selected(void) {
         download_form_refresh();
         return;
     }
-    /* Pick local destination. */
-    char local[4096] = {0};
-#ifdef __APPLE__
-    if (!mac_pick_save_file(e->name, local, sizeof(local))) {
-        return;   /* user cancelled */
+    /* File — fall through to the same code path the Download
+       button takes, which prompts for a local destination and
+       starts the SFTP read. */
+    download_form_submit_selected();
+}
+
+/* Submit: fire NSSavePanel for local dest, kick off the download.
+   Closes the modal on success; leaves it open with status set on
+   error. */
+static void download_form_submit_selected(void) {
+    g_download_form.status[0] = 0;
+    int idxs[1024];
+    int fcount = download_filtered_indices(idxs, (int)(sizeof(idxs) / sizeof(idxs[0])));
+    if (g_download_form.selected < 0 || g_download_form.selected >= fcount) {
+        snprintf(g_download_form.status, sizeof(g_download_form.status),
+                 "select a file first");
+        return;
     }
-#else
-    /* Headless fallback: drop into ~/Downloads/<name>. */
-    const char *home = getenv("HOME");
-    if (!home || !*home) home = ".";
-    snprintf(local, sizeof(local), "%s/Downloads/%s", home, e->name);
-#endif
-    /* Compose absolute remote path. */
+    PtyDirEntry *e = &g_download_form.entries[idxs[g_download_form.selected]];
+    /* Compose the absolute remote path once — same for the file
+       and the directory branches. */
     char remote[4096];
-    size_t cl = strlen(g_download_form.remote_dir);
-    const char *sep = (cl > 0 && g_download_form.remote_dir[cl - 1] == '/') ? "" : "/";
-    snprintf(remote, sizeof(remote), "%s%s%s",
-             g_download_form.remote_dir, sep, e->name);
+    {
+        size_t cl = strlen(g_download_form.remote_dir);
+        const char *sep = (cl > 0 && g_download_form.remote_dir[cl - 1] == '/') ? "" : "/";
+        snprintf(remote, sizeof(remote), "%s%s%s",
+                 g_download_form.remote_dir, sep, e->name);
+    }
+
+    char local[4096] = {0};
+    if (e->is_dir) {
+        /* Special-case ".." — that's just "navigate up" in the
+           listing UI; never download a parent dir. */
+        if (strcmp(e->name, "..") == 0) {
+            char next[sizeof(g_download_form.remote_dir)];
+            download_form_parent_dir(g_download_form.remote_dir,
+                                     next, sizeof(next));
+            snprintf(g_download_form.remote_dir,
+                     sizeof(g_download_form.remote_dir), "%s", next);
+            download_form_refresh();
+            return;
+        }
+        /* Pick a local *parent* directory; the remote folder name
+           is appended so the user ends up with parent/<name>/<...>
+           as a faithful mirror of the remote tree. */
+        char parent[4096] = {0};
+#ifdef __APPLE__
+        char prompt[256];
+        snprintf(prompt, sizeof(prompt),
+                 "Choose where to save '%s'", e->name);
+        if (!mac_pick_open_directory(prompt, parent, sizeof(parent))) {
+            return;   /* user cancelled */
+        }
+#else
+        const char *home = getenv("HOME");
+        if (!home || !*home) home = ".";
+        snprintf(parent, sizeof(parent), "%s/Downloads", home);
+#endif
+        snprintf(local, sizeof(local), "%s/%s", parent, e->name);
+    } else {
+        /* Plain file: NSSavePanel pre-fills with the remote name. */
+#ifdef __APPLE__
+        if (!mac_pick_save_file(e->name, local, sizeof(local))) {
+            return;
+        }
+#else
+        const char *home = getenv("HOME");
+        if (!home || !*home) home = ".";
+        snprintf(local, sizeof(local), "%s/Downloads/%s", home, e->name);
+#endif
+    }
 
     Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
     Pane *ap = t ? &t->panes[t->active_pane] : NULL;
@@ -4396,7 +4451,7 @@ static void download_form_handle_mouse(DownloadFormLayout L) {
         if (g_download_form.selected == rel &&
             GetTime() - last_click_t < 0.45 &&
             last_click_i == rel) {
-            download_form_submit_selected();
+            download_form_activate_selected();
             last_click_i = -1;
             return;
         }
@@ -4446,7 +4501,7 @@ static void download_form_handle_keys(void) {
             download_form_refresh();
             g_download_form.dir_focus = false;
         } else {
-            download_form_submit_selected();
+            download_form_activate_selected();
         }
         return;
     }

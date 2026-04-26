@@ -256,6 +256,40 @@ bool mac_pick_save_file(const char *suggested, char *out, size_t cap) {
     return ok;
 }
 
+/* Open a modal NSOpenPanel that picks a directory. Used by the
+   SFTP download flow to choose where to drop a recursively-
+   downloaded folder; the remote folder name is appended on the
+   caller's side. */
+bool mac_pick_open_directory(const char *prompt_title, char *out, size_t cap) {
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+    __block bool ok = false;
+    @autoreleasepool {
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        [panel setCanChooseFiles:NO];
+        [panel setCanChooseDirectories:YES];
+        [panel setAllowsMultipleSelection:NO];
+        [panel setCanCreateDirectories:YES];
+        [panel setResolvesAliases:YES];
+        if (prompt_title && *prompt_title) {
+            [panel setTitle:[NSString stringWithUTF8String:prompt_title]];
+        } else {
+            [panel setTitle:@"Choose a destination folder"];
+        }
+        [panel setPrompt:@"Choose"];
+        if ([panel runModal] == NSModalResponseOK) {
+            NSURL *url = [[panel URLs] firstObject];
+            const char *p = [[url path] UTF8String];
+            if (p && strlen(p) + 1 <= cap) {
+                strncpy(out, p, cap - 1);
+                out[cap - 1] = 0;
+                ok = true;
+            }
+        }
+    }
+    return ok;
+}
+
 /* Open a modal NSOpenPanel and return the chosen file's POSIX path
    in `out` (NUL-terminated). Returns true if the user picked a file,
    false on cancel or buffer overflow. Single-file selection only. */
