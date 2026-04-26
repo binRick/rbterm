@@ -5769,7 +5769,7 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     bool cmd   = false;
 #endif
     bool mod   = ctrl || cmd;
-    bool is_text_field = (g_form.focus >= F_NAME && g_form.focus <= F_KEY);
+    bool is_text_field = (g_form.focus >= F_NAME && g_form.focus <= F_INIT_CMD);
 
     if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
 
