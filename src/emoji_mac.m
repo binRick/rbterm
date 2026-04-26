@@ -302,8 +302,27 @@ static bool quake_chord_match(NSEvent *e) {
     return ([e modifierFlags] & NSEventModifierFlagCommand) != 0;
 }
 
-/* Run the visibility toggle inline from inside an NSEvent block.
-   Both monitor callbacks fire on the main thread, so hide: /
+/* Trace each step to /tmp/rbterm-quake.log when RBTERM_DEBUG is
+   set. Lets us tell whether a missed toggle is the chord not
+   firing at all (no log line) vs hide/unhide silently failing
+   (line with the post-toggle isHidden state). */
+static void quake_log(const char *what) {
+    const char *dbg = getenv("RBTERM_DEBUG");
+    if (!dbg || !*dbg || strcmp(dbg, "0") == 0) return;
+    FILE *fp = fopen("/tmp/rbterm-quake.log", "a");
+    if (!fp) return;
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(fp, "[%s] %s isHidden=%d isActive=%d\n",
+            ts, what, [NSApp isHidden] ? 1 : 0, [NSApp isActive] ? 1 : 0);
+    fclose(fp);
+}
+
+/* Run the visibility toggle inline from inside an NSEvent /
+   Carbon block. Both fire on the main thread, so hide: /
    unhide: are safe to call directly. We previously latched a
    flag for the main loop to drain, but raylib pauses its loop
    while the window is hidden — so the flag set by the global
@@ -311,15 +330,28 @@ static bool quake_chord_match(NSEvent *e) {
    nothing. Acting in the block sidesteps the pause. */
 static void quake_toggle_inline(void) {
     @autoreleasepool {
-        if ([NSApp isHidden]) {
-            [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+        bool was_hidden = [NSApp isHidden];
+        quake_log(was_hidden ? "toggle:show-start" : "toggle:hide-start");
+        if (was_hidden) {
+            /* Order matters here: unhide before activate so the
+               window becomes the foreground app cleanly. Some
+               macOS builds report isHidden=NO after unhide but
+               leave the windows below the front of the layer
+               unless we activate as well. */
             [NSApp unhide:nil];
+            [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+            /* Belt-and-braces: bring whichever key window we have
+               to the front. raylib's GLFW window is the only one
+               in our process. */
+            for (NSWindow *w in [NSApp windows]) {
+                [w orderFrontRegardless];
+                [w makeKeyWindow];
+            }
         } else {
             [NSApp hide:nil];
         }
+        quake_log(was_hidden ? "toggle:show-end" : "toggle:hide-end");
     }
-    /* Keep the polled flag for callers that still want it (and
-       so a future pre-hide check can see "user just chord'd"). */
     g_quake_toggle_flag = 1;
     reset_caps_lock_off();
 }
@@ -332,6 +364,7 @@ static void quake_toggle_inline(void) {
 static OSStatus quake_carbon_hotkey_handler(EventHandlerCallRef nextHandler,
                                             EventRef event, void *userData) {
     (void)nextHandler; (void)event; (void)userData;
+    quake_log("carbon-hotkey-fired");
     quake_toggle_inline();
     return noErr;
 }
@@ -361,17 +394,22 @@ void mac_install_quake_hotkey(void) {
     g_quake_global_monitor =
         [NSEvent addGlobalMonitorForEventsMatchingMask:mask
                                                handler:^(NSEvent *e) {
-            if (quake_chord_match(e)) quake_toggle_inline();
+            if (quake_chord_match(e)) {
+                quake_log("nsevent-global-fired");
+                quake_toggle_inline();
+            }
         }];
     g_quake_local_monitor =
         [NSEvent addLocalMonitorForEventsMatchingMask:mask
                                               handler:^NSEvent *(NSEvent *e) {
             if (quake_chord_match(e)) {
+                quake_log("nsevent-local-fired");
                 quake_toggle_inline();
                 return nil;   /* swallow */
             }
             return e;
         }];
+    quake_log("quake-hotkey-installed");
 }
 
 int mac_consume_quake_toggle(void) {
