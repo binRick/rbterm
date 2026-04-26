@@ -807,6 +807,88 @@ The CPU is being charged to the process for `PollInputEvents`
 work that runs synchronously inside the call but doesn't show up
 on any individual thread sample.
 
+## SFTP upload + download
+
+Each SSH tab grows two tab-bar buttons in the right cluster:
+**↑** upload, **↓** download. Both ride the existing libssh
+session — no second auth, no scp/rsync wrapper.
+
+### Upload (`pty_upload_*` in `pty_ssh.c`)
+- `pty_upload_start` spawns a worker thread; the worker takes
+  `session_lock` cooperatively (alongside reader / writer / HUD
+  probe) and runs `sftp_new` → `sftp_init` → `sftp_open(O_WRONLY|
+  O_CREAT|O_TRUNC, 0644)` → 32 KB chunked `sftp_write`.
+- Handles `~/foo` by stripping the `~/` (SFTP cwd is already the
+  user's home; SFTP doesn't know about tildes — that's a shell
+  thing).
+- If the remote path is a directory (trailing `/` or `sftp_stat`
+  says so), the local basename is appended.
+
+### Download (`pty_download_*` in `pty_ssh.c`)
+- Same pattern in the opposite direction.
+- The worker `sftp_stat`s the target first and branches: regular
+  file → `sftp_open(O_RDONLY)` + chunked read; directory →
+  `sftp_download_dir_recursive` walks the tree, snapshots each
+  directory's listing before recursing (libssh's SFTP isn't
+  reentrant on the same dir handle), `mkdir(0755)`s locally,
+  accumulates `bytes_total` on the way down so the toast %
+  reflects the whole tree.
+
+### UI
+- Modal types: `UI_SFTP_UPLOAD`, `UI_SFTP_DOWNLOAD`. The
+  download modal does `pty_listdir` (sorted dirs-first, alpha)
+  on open; refreshes on path change. Double-click a folder to
+  navigate; single-click + Download to download (a folder ⇒
+  picks a local **parent** dir via `mac_pick_open_directory`).
+- Per-pane state: `Pane.upload`, `Pane.download` (both `Pty*Upload`/`Pty*Download`).
+  Toasts render at bottom-left of the pane, stacked when both
+  active. `pane_free` cancels + joins workers before tearing
+  down the PTY.
+- Native pickers in `emoji_mac.m`: `mac_pick_open_file`
+  (NSOpenPanel files), `mac_pick_save_file` (NSSavePanel),
+  `mac_pick_open_directory` (NSOpenPanel directories).
+
+### Debug logging
+`run.sh` exports `RBTERM_DEBUG=1`. When set, every transfer step
+appends to `~/rbterm-upload.log` with libssh + sftp error codes
+on failure. Released `open -a rbterm` users see no log file.
+
+## Per-host SSH startup commands
+
+`SshProfile` / `Tab` / `SshForm` carry `init_cwd` and `init_cmd`
+strings. After `pane_open_ssh` succeeds, `tab_open_ssh` writes
+`cd "<cwd>"; <cmd>\r` to the channel as the very first input —
+the remote shell processes it as if the user typed it. Either
+field can be empty; the missing one is omitted from the
+composed line. The `cwd` is quoted to survive spaces; `cmd` is
+sent verbatim so users can pipe / chain.
+
+Persisted in `~/.ssh/config` as `# rbterm-init-cwd:` /
+`# rbterm-init-cmd:` so the saved-host list and Settings →
+Launch see the same values.
+
+## Settings → Launch
+
+`AppSettings.launch[]` (max 16 entries) drives which tabs open
+on startup. Each entry has `kind` (0 = local shell, 1 = SSH) and
+`host` (the `~/.ssh/config` alias for SSH entries; empty for
+local). Persisted as `launch.<i>=local` or `launch.<i>=ssh:<alias>`
+lines in `~/.config/rbterm/config.ini`.
+
+UI: a Settings tab with one row per entry — `[kind pill]
+[host picker] [▲] [▼] [×]`. The host picker is a click-to-open
+dropdown of saved profiles (refreshed on each open via
+`ssh_profiles_load`). ▲/▼ swap with the neighbouring row;
+they're zero-width at the ends of the list. ▲/▼ also follow
+the open dropdown anchor across swaps so the picker doesn't
+snap to a different row when you reorder underneath it.
+
+At startup `main()` walks the entries and opens each. SSH
+connect failures log to stderr and skip the entry — a single
+typo can't lock a user out of rbterm. SSH entries pick up the
+matching `SshProfile`'s overrides (theme/font/cursor/colour/log/
+HUD/init-cwd/init-cmd).
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt

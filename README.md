@@ -275,6 +275,58 @@ it's covering text you care about; click again to roll back
 down. State is per-process; persistence sits with the rest of
 the settings under "Save as Default".
 
+## SFTP upload + download — built into every SSH tab
+
+Two arrow buttons appear in the tab bar's right cluster whenever
+the active tab is an SSH session: **↑** uploads a local file,
+**↓** opens a directory picker for downloads. Both run on the
+existing libssh session — no second auth, no scp/rsync wrapper.
+
+**Upload (↑)** — fires `NSOpenPanel`, then a small modal lets
+you edit the remote path (defaults to the pane's tracked cwd
+from OSC 7, or `~/`). Hit Upload, the modal closes, and a
+`[up] file.png 53%` toast renders at the bottom-left of the
+pane while the worker thread streams the file in 32 KB chunks.
+Toast turns into `[ok] file.png 1.2 MB` (or `[err] …`) and
+fades after 4 s.
+
+**Download (↓)** — opens a modal listing the pane's cwd over
+SFTP, sorted directories-first then alphabetically. Type to
+filter, double-click to descend into a folder. Single-click +
+Download supports both files (NSSavePanel for the destination)
+and **whole directories** (NSOpenPanel for a parent, then
+recursive walk mirroring the tree). The toast accumulates total
+bytes across all files in the tree.
+
+```mermaid
+flowchart LR
+    Click["↑/↓ button on SSH tab"] --> Modal["modal: pick file/dir + remote/local path"]
+    Modal --> Worker["worker thread<br/>session_lock cooperative"]
+    Worker --> Sftp["sftp_new + sftp_init<br/>+ sftp_open / sftp_read / sftp_write"]
+    Sftp --> Stream["32 KB chunks<br/>atomic progress counters"]
+    Stream --> Toast["[up|dn|ok|err] toast<br/>bottom-left of pane"]
+
+    classDef src fill:#1e2a44,stroke:#5a8,color:#dfe;
+    classDef worker fill:#44321e,stroke:#fa5,color:#fed;
+    classDef toast fill:#2a1e44,stroke:#a58,color:#fde;
+    class Click,Modal src;
+    class Worker,Sftp,Stream worker;
+    class Toast toast;
+```
+
+Implementation notes:
+- One worker thread per transfer; cooperates with the SSH
+  reader / writer / HUD probe via the same `session_lock`.
+- SFTP doesn't expand `~` (that's a shell thing) — we strip
+  leading `~/` because the SFTP session opens with `cwd` =
+  the auth'd user's home, so `~/foo` lands the same place.
+- Per-pane `Pane.upload` / `Pane.download` slots; both can
+  run concurrently (toasts stack vertically). `pane_free`
+  cancels + joins workers before tearing down the PTY.
+- `RBTERM_DEBUG=1` (set automatically by `run.sh`) traces
+  every transfer step — including libssh + sftp error codes —
+  to `~/rbterm-upload.log`.
+
 ## Architecture
 
 Three layers wired together by a thin platform abstraction. Bytes
@@ -567,6 +619,24 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   without ffmpeg; `mp4` / `webm` / `apng` use ffmpeg if it's on
   PATH. See **[Session recording](#session-recording--seven-formats-two-of-them-ffmpeg-free)**
   above for the pipeline.
+- **SFTP upload + download** — every SSH tab grows ↑/↓ buttons
+  in the tab bar's right cluster. Upload streams a local file
+  via NSOpenPanel + a remote-path modal; Download lists the
+  pane's cwd, supports filtering, navigation, and recursive
+  directory transfers. Both run on the existing libssh session.
+  See **[SFTP upload + download](#sftp-upload--download--built-into-every-ssh-tab)**
+  above.
+- **SSH host overrides** — every saved host in `~/.ssh/config`
+  can specify its own theme, font + size, cursor shape, tab
+  accent colour, log dir, HUD overrides, and `init dir` /
+  `init command` (run on connect: `cd ~/projects; tmux attach`,
+  etc.). All persisted as `# rbterm-…:` comments inside the
+  host's stanza so plain `ssh` keeps working.
+- **Configurable launch tabs** — Settings → Launch lets you pick
+  which tabs open on startup: any mix of local shells and SSH
+  hosts, in any order (▲/▼ to reorder, × to delete). Each SSH
+  row is a dropdown of the saved hosts from `~/.ssh/config`.
+  Persisted to `~/.config/rbterm/config.ini`.
 
 ## Keybindings
 
