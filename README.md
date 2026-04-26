@@ -634,9 +634,28 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   host's stanza so plain `ssh` keeps working.
 - **Configurable launch tabs** — Settings → Launch lets you pick
   which tabs open on startup: any mix of local shells and SSH
-  hosts, in any order (▲/▼ to reorder, × to delete). Each SSH
-  row is a dropdown of the saved hosts from `~/.ssh/config`.
-  Persisted to `~/.config/rbterm/config.ini`.
+  hosts, in any order (▲/▼ to reorder, × to delete, radio per row
+  for which tab is foreground). Each SSH row is a dropdown of the
+  saved hosts from `~/.ssh/config`. Persisted to
+  `~/.config/rbterm/config.ini`.
+- **Settings → Window startup modes** — Default / Small / Medium /
+  Large / Fill screen / Fullscreen / Own Space. Fullscreen is a
+  borderless windowed-fullscreen on the current Space (no Space-
+  jump like macOS native fullscreen does); Fill screen is the
+  green-button zoom; Small / Medium / Large are 720×480 / 1024×720
+  / 1280×900 centred.
+- **Quake-style global hotkey** (Fullscreen mode only) — **Cmd +
+  Caps Lock** from any app summons or dismisses rbterm without
+  leaving your current Space. Carbon `RegisterEventHotKey` for
+  reliability without Input Monitoring permission, IOPM assertion
+  + NSActivityLatencyCritical to defeat App Nap throttling, and
+  the previously-frontmost app gets focus back automatically when
+  rbterm is dismissed.
+- **Cursor colour** — Settings → Cursor has an 8-swatch palette
+  with a "default" tile that uses the cell's natural fg colour.
+  SSH hosts can override it per-host (Appearance tab on the SSH
+  form), persisted as `# rbterm-cursor-color: #rrggbb` in
+  `~/.ssh/config`.
 
 ## Keybindings
 

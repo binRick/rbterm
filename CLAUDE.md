@@ -889,6 +889,90 @@ typo can't lock a user out of rbterm. SSH entries pick up the
 matching `SshProfile`'s overrides (theme/font/cursor/colour/log/
 HUD/init-cwd/init-cmd).
 
+## Settings → Window startup modes
+
+`AppSettings.startup_window` is a `StartupWindowMode` enum with 8
+values (back-compat: index 1 is the legacy FULLSCREEN that's now
+remapped to BORDERLESS at load time). The dispatch happens once
+in `main()` between `InitWindow` and the renderer-init block:
+
+| mode | what it does |
+|---|---|
+| DEFAULT | leave whatever raylib's `InitWindow` chose |
+| SMALL / MEDIUM / LARGE | `SetWindowSize` + centre on current monitor |
+| FILL | `MaximizeWindow()` — green-button zoom (work area) |
+| BORDERLESS | `SetWindowState(FLAG_WINDOW_UNDECORATED)` + `MaximizeWindow()` — fills the screen, no title bar, NOT macOS native fullscreen so Cmd+Tab still cycles |
+| MAXIMIZED (Own Space on macOS) | `mac_enter_native_fullscreen()` — `[NSWindow toggleFullScreen:]`, separate Space |
+
+**Critical gate**: the renderer-init block below the dispatch
+unconditionally calls `SetWindowSize(win_w, win_h)` to fit the
+default 100×30 grid. Without `window_is_explicitly_sized`, that
+clobbers all the size presets — Medium / Large rendered identical
+to Default until we gated the auto-fit. If you add a new mode
+that wants the OS / explicit size to stick, add it to the
+`window_is_explicitly_sized` test.
+
+## Quake hotkey (Cmd+CapsLock)
+
+When `STARTUP_WINDOW_BORDERLESS` is the chosen window mode,
+`mac_install_quake_hotkey` registers a system-wide toggle that
+summons / dismisses rbterm from any app. The implementation
+fights several layers of macOS scheduling that all conspired to
+make naïve approaches feel laggy or unresponsive:
+
+1. **Chord delivery — Carbon `RegisterEventHotKey`** (not just
+   NSEvent). NSEvent's global monitor needs Input Monitoring
+   permission and silently fails to fire if the user hasn't
+   granted it. Carbon's hotkey API is older but doesn't require
+   IM permission. We register both — Carbon as the reliable
+   fallback, NSEvent as a swallow-the-chord-when-rbterm-has-focus
+   path.
+2. **App Nap throttling**. Once rbterm loses foreground status,
+   macOS happily buffers Cocoa events for 1-2 s at a time. Two
+   defenses, both required: `NSProcessInfo.beginActivityWithOptions:
+   NSActivityUserInitiated | NSActivityLatencyCritical` and an
+   `IOPMAssertion` of type `kIOPMAssertionTypePreventUserIdleSystemSleep`.
+   Either alone wasn't enough.
+3. **Hide via `[NSApp hide:]` deep-suspends the process**. Even
+   with the activity tokens above, calling `hide:` puts us into
+   a state where Cocoa events never dispatch. Replaced with
+   `orderOut:` per window + explicit `activateWithOptions:` of
+   the previously-frontmost app (tracked via
+   `NSWorkspaceDidActivateApplicationNotification`). Keeps our
+   run loop hot.
+4. **Toggle source-of-truth is `[NSApp isActive]`**, not our own
+   `g_quake_was_hidden` flag — the user might have Cmd+Tab'd
+   away (we lost focus without anyone calling our hide path) and
+   the chord still needs to summon us.
+5. **Caps Lock state reset**. Caps Lock is a stateful toggle;
+   each press flips the LED. After detecting the chord we call
+   `IOHIDSetModifierLockState(kIOHIDCapsLockState, false)` so
+   the user's keyboard doesn't drift into ALL CAPS.
+
+The toggle runs inline from the NSEvent / Carbon block, not via
+a polled flag — raylib's main loop pauses while hidden and a
+flag-based handoff was the original "queues up for 1-2 s" bug.
+
+Need `-framework Carbon` linked. Both Makefile and CMakeLists
+have it.
+
+## Cursor colour (Settings → Cursor + per-host)
+
+`AppSettings.cursor_color[16]` holds an `#rrggbb` hex string;
+empty means "use the cell's natural fg colour". Persisted as
+`cursor_color=` in `~/.config/rbterm/config.ini`. Applied at
+`pane_open_local` time via `screen_set_cursor_color`; live updates
+from the Settings click handler walk every open pane.
+
+`SshProfile.cursor_color[16]` mirrors the field for per-host
+overrides, persisted as `# rbterm-cursor-color:`. Applied in
+`pane_apply_tab_appearance`; takes precedence over the app-wide
+setting when set.
+
+The picker uses `SSH_COLOR_PRESETS` (the same 8-tile palette as
+the SSH tab-accent picker) plus a 9th "default" tile that clears
+the override.
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt
@@ -932,7 +1016,7 @@ Not a roadmap — a shopping list to prioritise from.
 - **Per-tab / per-pane title override** that survives shell rewrites.
 - **Tab bar styles** (top/bottom/left, powerline separators) — kitty.
 - **Hotkey window** — system-wide drop-down terminal (iTerm2).
-- **Quake-style fullscreen toggle** with animation (iTerm2).
+- (was: Quake-style fullscreen toggle — shipped; see "Quake hotkey" below.)
 - **Session restore** on relaunch (iTerm2: restore tabs + scrollback).
 
 ### Scrollback / search
