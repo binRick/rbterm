@@ -10124,18 +10124,17 @@ int main(int argc, char **argv) {
         }
         break;
     }
-    case STARTUP_WINDOW_FILL: {
-        /* Maximise inside the current monitor — still a windowed
-           app (with title bar / borders) but covering the screen. */
-        int mi = GetCurrentMonitor();
-        int mw = GetMonitorWidth(mi);
-        int mh = GetMonitorHeight(mi);
-        if (mw > 100 && mh > 100) {
-            SetWindowPosition(0, 0);
-            SetWindowSize(mw, mh);
-        }
+    case STARTUP_WINDOW_FILL:
+        /* Native green-button "zoom" — on macOS GLFW dispatches to
+           NSWindow's zoom: which fills the visible work area (below
+           the menu bar, above the dock). On Linux/Windows
+           glfwMaximizeWindow does the equivalent maximise. Manual
+           SetWindowSize+SetWindowPosition is unreliable on macOS
+           because raylib's monitor dimensions don't account for
+           the menu bar / DPI scaling, leaving the bottom of the
+           window clipped under the dock. */
+        MaximizeWindow();
         break;
-    }
     case STARTUP_WINDOW_BORDERLESS:
         /* Borderless windowed-fullscreen on the current monitor.
            Stays in the user's current Space (does not split off
