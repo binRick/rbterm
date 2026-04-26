@@ -9620,9 +9620,26 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     }  /* end HUD tab */
 
     if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
+        /* Caption anchored just above the first row so it doesn't
+           collide with the row pills (which sit at content_top).
+           When no rows are configured, fall back to a fixed y
+           below the tab bar so it still renders. */
+        int cap_y = (g_app_settings.launch_count > 0)
+                    ? (L.launch_kind[0].y - 22)
+                    : (L.modal.y + 76);
         DrawTextEx(*f, "Open these on launch",
-                   (Vector2){L.modal.x + 22, L.modal.y + 80},
+                   (Vector2){L.modal.x + 22, cap_y},
                    14, 0, (Color){200, 205, 220, 255});
+        /* "Active" column header — centred over the radio column.
+           Only meaningful when there's at least one row to label. */
+        if (g_app_settings.launch_count > 0) {
+            const char *hdr = "Active";
+            Vector2 hsz = MeasureTextEx(*f, hdr, 11, 0);
+            Rect ab = L.launch_active[0];
+            DrawTextEx(*f, hdr,
+                       (Vector2){ab.x + (ab.w - hsz.x) / 2, cap_y + 2},
+                       11, 0, (Color){170, 175, 195, 255});
+        }
         for (int i = 0; i < g_app_settings.launch_count; i++) {
             Rect kb = L.launch_kind[i];
             Rect hb = L.launch_host[i];
