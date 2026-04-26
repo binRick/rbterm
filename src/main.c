@@ -10238,7 +10238,20 @@ int main(int argc, char **argv) {
         }
     }
 
-    SetWindowSize(win_w, win_h);
+    /* Skip the auto-fit / centre block when the user picked a
+       size that should be set by the OS. MaximizeWindow / Own
+       Space / Borderless all want to keep the OS-chosen
+       geometry — calling SetWindowSize / SetWindowPosition here
+       would resize back to the renderer-derived default, which
+       was the symptom "window goes fullscreen then snaps to
+       normal size". */
+    bool window_is_os_sized =
+        g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED ||
+        g_app_settings.startup_window == STARTUP_WINDOW_FILL      ||
+        g_app_settings.startup_window == STARTUP_WINDOW_BORDERLESS;
+    if (!window_is_os_sized) {
+        SetWindowSize(win_w, win_h);
+    }
     SetWindowMinSize(r.cell_w * 20 + 2 * r.pad_x, r.cell_h * 5 + TAB_BAR_H + 2 * r.pad_y);
 
     /* Windows + VMs can report wildly wrong monitor dimensions through
@@ -10248,7 +10261,7 @@ int main(int argc, char **argv) {
        default position on Windows; on macOS / Linux the monitor
        metrics are trustworthy enough to use. */
 #ifndef _WIN32
-    if (mw > 0 && mh > 0) {
+    if (!window_is_os_sized && mw > 0 && mh > 0) {
         Vector2 mp = GetMonitorPosition(mi);
         int x = (int)mp.x + (mw - win_w) / 2;
         int y = (int)mp.y + (mh - win_h) / 2;
