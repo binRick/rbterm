@@ -57,6 +57,11 @@
   bool mac_pick_open_file(char *out, size_t cap);
   bool mac_pick_save_file(const char *suggested, char *out, size_t cap);
   bool mac_pick_open_directory(const char *prompt_title, char *out, size_t cap);
+  /* Quake-style global hotkey — installed when STARTUP_WINDOW_BORDERLESS
+     is in force. Cmd+` toggles rbterm visibility from any app. */
+  void mac_install_quake_hotkey(void);
+  int  mac_consume_quake_toggle(void);
+  void mac_toggle_quake_visibility(void);
 #endif
 
 #ifndef _WIN32
@@ -10162,6 +10167,13 @@ int main(int argc, char **argv) {
        NSEvent monitor swallows the key and latches a flag we read
        each frame via mac_consume_ctrl_tab(). */
     mac_install_ctrl_tab_monitor();
+    /* Quake-style global toggle is opt-in: we only install the
+       NSEvent monitor when the user picked Fullscreen
+       (STARTUP_WINDOW_BORDERLESS). In other modes Cmd+` would
+       just be a confusing system-wide hotkey nobody asked for. */
+    if (g_app_settings.startup_window == STARTUP_WINDOW_BORDERLESS) {
+        mac_install_quake_hotkey();
+    }
 #endif
     /* Resolve the font:
          1. "embedded:NAME" → look up in the embedded table.
@@ -11272,6 +11284,12 @@ int main(int argc, char **argv) {
            latches a flag we drain here each frame. */
         int cycle_dir = 0;   /* +1 forward, -1 backward */
 #ifdef __APPLE__
+        /* Quake-style hide/show is wired off the same NSEvent
+           bus and only installed in BORDERLESS mode; this poll is
+           a cheap atomic load otherwise. */
+        if (mac_consume_quake_toggle()) {
+            mac_toggle_quake_visibility();
+        }
         int mct = mac_consume_ctrl_tab();
         if (mct == 1) cycle_dir = +1;
         else if (mct == 2) cycle_dir = -1;

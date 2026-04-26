@@ -256,6 +256,67 @@ bool mac_pick_save_file(const char *suggested, char *out, size_t cap) {
     return ok;
 }
 
+/* Quake-style hotkey: Cmd+` toggles rbterm visibility globally,
+   so the user can summon / dismiss the terminal from any other
+   app without leaving the current Space. We use an NSEvent
+   global monitor (catches the chord while another app is
+   focused) plus a local monitor (catches it while rbterm is
+   focused, AND swallows it so the chord doesn't leak into the
+   shell as a backtick). Both flip the same atomic flag the main
+   loop polls. */
+static volatile int g_quake_toggle_flag = 0;
+static id           g_quake_global_monitor = nil;
+static id           g_quake_local_monitor  = nil;
+
+static bool quake_chord_match(NSEvent *e) {
+    if (([e modifierFlags] & NSEventModifierFlagCommand) == 0) return false;
+    NSString *chars = [e charactersIgnoringModifiers];
+    if (!chars || [chars length] == 0) return false;
+    /* Match `, ~ (Cmd+Shift+`), and the tilde fallback some
+       keyboards emit. */
+    unichar c = [chars characterAtIndex:0];
+    return c == '`' || c == '~';
+}
+
+void mac_install_quake_hotkey(void) {
+    if (g_quake_global_monitor || g_quake_local_monitor) return;
+    NSEventMask mask = NSEventMaskKeyDown;
+    g_quake_global_monitor =
+        [NSEvent addGlobalMonitorForEventsMatchingMask:mask
+                                               handler:^(NSEvent *e) {
+            if (quake_chord_match(e)) g_quake_toggle_flag = 1;
+        }];
+    g_quake_local_monitor =
+        [NSEvent addLocalMonitorForEventsMatchingMask:mask
+                                              handler:^NSEvent *(NSEvent *e) {
+            if (quake_chord_match(e)) {
+                g_quake_toggle_flag = 1;
+                return nil;   /* swallow the chord */
+            }
+            return e;
+        }];
+}
+
+int mac_consume_quake_toggle(void) {
+    int v = g_quake_toggle_flag;
+    g_quake_toggle_flag = 0;
+    return v;
+}
+
+/* Hide the app (slides off / minimises in Cocoa's standard way)
+   if it's currently visible, or unhide + activate it if hidden.
+   Called from the main loop after mac_consume_quake_toggle() returns 1. */
+void mac_toggle_quake_visibility(void) {
+    @autoreleasepool {
+        if ([NSApp isHidden]) {
+            [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+            [NSApp unhide:nil];
+        } else {
+            [NSApp hide:nil];
+        }
+    }
+}
+
 /* Open a modal NSOpenPanel that picks a directory. Used by the
    SFTP download flow to choose where to drop a recursively-
    downloaded folder; the remote folder name is appended on the
