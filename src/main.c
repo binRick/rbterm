@@ -4153,6 +4153,15 @@ static bool ssh_form_update_in_config(const char *name) {
              "Updated '%s' in %s", name, path);
     g_form.error[0] = 0;
     ssh_profiles_load();
+    /* Re-anchor the selection by name so the host the user just
+       saved stays highlighted in the sidebar. */
+    g_ssh_list_selected = -1;
+    for (int i = 0; i < g_ssh_profile_count; i++) {
+        if (strcmp(g_ssh_profiles[i].name, name) == 0) {
+            g_ssh_list_selected = i;
+            break;
+        }
+    }
     return true;
 }
 
@@ -4211,8 +4220,18 @@ static bool ssh_form_save_to_config(void) {
     snprintf(g_form_status, sizeof(g_form_status),
              "Saved '%s' to %s", g_form.name, path);
     g_form.error[0] = 0;
-    /* Refresh the sidebar so the new entry shows immediately. */
+    /* Refresh the sidebar so the new entry shows immediately, then
+       re-anchor the selection by name — without this the list shows
+       the new entry but the highlight collapses to "nothing
+       selected", which looks like the save was reverted. */
     ssh_profiles_load();
+    g_ssh_list_selected = -1;
+    for (int i = 0; i < g_ssh_profile_count; i++) {
+        if (strcmp(g_ssh_profiles[i].name, g_form.name) == 0) {
+            g_ssh_list_selected = i;
+            break;
+        }
+    }
     return true;
 }
 
