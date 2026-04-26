@@ -327,7 +327,35 @@ static void quake_log(const char *what) {
    1-2 s. Instead we orderOut: the window and re-orderFront: it.
    That keeps the app foreground-ish (run loop runs at normal
    speed) so subsequent chords dispatch instantly. */
-static bool g_quake_was_hidden = false;
+static bool         g_quake_was_hidden = false;
+/* Bundle ID of whatever app was frontmost just before rbterm
+   gained focus — we re-activate it on hide so the user's
+   keystrokes go somewhere meaningful instead of into the
+   "no app focused" void. Set by an NSWorkspace observer that
+   notes the outgoing app on every "rbterm became active" notice. */
+static NSString    *g_quake_prev_app_bundle = nil;
+static id           g_quake_prev_app_observer = nil;
+
+static void quake_install_prev_app_tracker(void) {
+    if (g_quake_prev_app_observer) return;
+    NSNotificationCenter *nc = [[NSWorkspace sharedWorkspace] notificationCenter];
+    g_quake_prev_app_observer = [nc
+        addObserverForName:NSWorkspaceDidActivateApplicationNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *note) {
+            NSRunningApplication *app =
+                [[note userInfo] objectForKey:NSWorkspaceApplicationKey];
+            if (!app) return;
+            /* Only record OTHER apps as candidates; when rbterm
+               itself activates, leave the previous value alone
+               (that's what we want to flip back to on hide). */
+            NSString *bid = [app bundleIdentifier];
+            if (bid && ![bid isEqualToString:[[NSBundle mainBundle] bundleIdentifier]]) {
+                g_quake_prev_app_bundle = [bid copy];
+            }
+        }];
+}
 
 static void quake_toggle_inline(void) {
     @autoreleasepool {
@@ -340,18 +368,35 @@ static void quake_toggle_inline(void) {
             }
             g_quake_was_hidden = false;
         } else {
-            /* orderOut + deactivate, but DON'T call [NSApp hide:].
-               hide: pushes the process into App Nap deep-sleep
-               (SIGSTOP-like) which buffers Cocoa events for 1-2 s
-               before they dispatch — that's the "queued up"
-               behaviour the user saw. orderOut just removes the
-               window; deactivate tells the system to pick a new
-               foreground app (so the user's keystrokes go to
-               their previously-focused app, not into a void). */
+            /* orderOut + activate-previous, but DON'T call
+               [NSApp hide:]. hide: pushes the process into App Nap
+               deep-sleep (SIGSTOP-like) which buffers Cocoa events
+               for 1-2 s before they dispatch. orderOut just
+               removes the window; we then explicitly activate the
+               app that was frontmost before the user summoned
+               rbterm so their keystrokes go there. Falls back to
+               Finder if we don't have a tracked previous. */
             for (NSWindow *w in [NSApp windows]) {
                 [w orderOut:nil];
             }
-            [NSApp deactivate];
+            NSRunningApplication *target = nil;
+            if (g_quake_prev_app_bundle) {
+                NSArray<NSRunningApplication *> *apps =
+                    [NSRunningApplication runningApplicationsWithBundleIdentifier:
+                                              g_quake_prev_app_bundle];
+                target = [apps firstObject];
+            }
+            if (!target) {
+                NSArray<NSRunningApplication *> *apps =
+                    [NSRunningApplication runningApplicationsWithBundleIdentifier:
+                                              @"com.apple.finder"];
+                target = [apps firstObject];
+            }
+            if (target) {
+                [target activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+            } else {
+                [NSApp deactivate];
+            }
             g_quake_was_hidden = true;
         }
         quake_log(g_quake_was_hidden ? "toggle:hide-end" : "toggle:show-end");
@@ -433,6 +478,9 @@ void mac_install_quake_hotkey(void) {
         beginActivityWithOptions:(NSActivityUserInitiated |
                                   NSActivityLatencyCritical)
                           reason:@"rbterm global hotkey"];
+
+    /* Note who's frontmost so we can flip back to them on hide. */
+    quake_install_prev_app_tracker();
 
     quake_log("quake-hotkey-installed");
 }
