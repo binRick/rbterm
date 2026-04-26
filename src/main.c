@@ -9779,6 +9779,12 @@ int main(int argc, char **argv) {
         } else if (in_tab_bar) {
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 TabBarHit h = tab_bar_hit_test(win_w_now, (int)mp.x, (int)mp.y);
+                if (getenv("RBTERM_DEBUG"))
+                    fprintf(stderr, "[hit] mx=%d hit: tab=%d close=%d plus=%d ssh=%d gear=%d help=%d "
+                                    "split_v=%d split_h=%d rec_start=%d rec_stop=%d upload=%d download=%d\n",
+                            (int)mp.x, h.tab_idx, h.on_close, h.on_plus, h.on_ssh,
+                            h.on_gear, h.on_help, h.on_split_v, h.on_split_h,
+                            h.on_rec_start, h.on_rec_stop, h.on_upload, h.on_download);
                 if (h.on_plus) tab_open(content_cols, content_rows);
                 else if (h.on_ssh) ssh_form_open();
                 else if (h.on_gear) settings_open(&r);
@@ -9800,7 +9806,15 @@ int main(int argc, char **argv) {
                     upload_form_open();
                 }
                 else if (h.on_download) {
+                    if (getenv("RBTERM_DEBUG"))
+                        fprintf(stderr, "[dl] tab-bar click: on_download fired, calling download_form_open()\n");
                     download_form_open();
+                    if (getenv("RBTERM_DEBUG"))
+                        fprintf(stderr, "[dl] after open: g_ui_mode=%d entry_count=%d status='%s' remote_dir='%s'\n",
+                                (int)g_ui_mode,
+                                g_download_form.entry_count,
+                                g_download_form.status,
+                                g_download_form.remote_dir);
                 }
                 else if (h.on_split_v || h.on_split_h) {
                     if (cur) {
@@ -10141,6 +10155,12 @@ int main(int argc, char **argv) {
 
         /* SFTP download modal. */
         if (g_ui_mode == UI_SFTP_DOWNLOAD) {
+            static int s_dl_modal_first = 1;
+            if (s_dl_modal_first && getenv("RBTERM_DEBUG")) {
+                fprintf(stderr, "[dl] entering UI_SFTP_DOWNLOAD render branch\n");
+                s_dl_modal_first = 0;
+            }
+            if (g_ui_mode != UI_SFTP_DOWNLOAD) s_dl_modal_first = 1;
             DownloadFormLayout DL = download_form_layout(win_w_now, win_h_now);
             download_form_handle_mouse(DL);
             download_form_handle_keys();
