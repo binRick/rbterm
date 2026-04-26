@@ -7003,9 +7003,10 @@ static void settings_apply_spacing(Renderer *r, int new_extra) {
 }
 
 static bool g_settings_dir_focus = false;
-/* -1 = no field focused, otherwise the index of the launch-entry
-   row whose host text input is accepting keystrokes. */
-static int  g_settings_launch_focus = -1;
+/* Launch tab host picker: -1 = no dropdown open, otherwise the
+   row whose dropdown panel is currently visible. */
+static int  g_settings_launch_dropdown = -1;
+static int  g_settings_launch_scroll   = 0;
 static bool g_settings_dir_sel_all = false;
 /* Same pattern for the Recording-tab directory field. */
 static bool g_settings_recdir_focus = false;
@@ -7245,7 +7246,7 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 g_settings_tab = i;
                 g_settings_dir_focus = false;
                 g_settings_recdir_focus = false;
-                g_settings_launch_focus = -1;
+                g_settings_launch_dropdown = -1;
                 g_settings_focused_list = SETTINGS_FOCUS_NONE;
                 g_slider_drag_track.w = 0;
                 g_slider_drag_target = NULL;
@@ -7429,9 +7430,56 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             return;
         }
     }
-    /* Launch tab — add / delete entries, toggle kind, focus host
-       text input. */
+    /* Launch tab — add / delete entries, toggle kind, open the
+       saved-host dropdown for SSH rows, pick from it. */
     if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
+        /* If a dropdown is open, route this click to it first.
+           Click inside → pick a host; click outside → close. */
+        if (g_settings_launch_dropdown >= 0 &&
+            g_settings_launch_dropdown < g_app_settings.launch_count) {
+            int i = g_settings_launch_dropdown;
+            Rect hb = L.launch_host[i];
+            int row_h = 22;
+            int n = g_ssh_profile_count;
+            int dh = n * row_h;
+            int max_dh = 220;
+            if (dh > max_dh) dh = max_dh;
+            Rect dd = (Rect){ hb.x, hb.y + hb.h, hb.w, dh };
+            if (rect_hit(dd, mx, my)) {
+                int rel = (my - dd.y) / row_h + g_settings_launch_scroll;
+                if (rel >= 0 && rel < n) {
+                    snprintf(g_app_settings.launch[i].host,
+                             sizeof(g_app_settings.launch[i].host),
+                             "%s", g_ssh_profiles[rel].name);
+                    g_settings_launch_dropdown = -1;
+                }
+                return;
+            }
+            /* Wheel scroll inside the dropdown. */
+            {
+                Vector2 hover = GetMousePosition();
+                if (rect_hit(dd, (int)hover.x, (int)hover.y)) {
+                    float wheel = GetMouseWheelMove();
+                    if (wheel != 0.0f) {
+                        g_settings_launch_scroll -= (int)(wheel * 3.0f);
+                        if (g_settings_launch_scroll < 0)
+                            g_settings_launch_scroll = 0;
+                    }
+                }
+            }
+            /* Click on the same host field again → close. Anything
+               outside both the field and the panel also closes. */
+            if (!rect_hit(hb, mx, my)) {
+                g_settings_launch_dropdown = -1;
+                /* Fall through so the click can still hit other
+                   controls (e.g. delete button on a different
+                   row). */
+            } else {
+                g_settings_launch_dropdown = -1;
+                return;
+            }
+        }
+
         if (rect_hit(L.launch_add_local, mx, my)) {
             if (g_app_settings.launch_count < LAUNCH_ENTRY_MAX) {
                 int i = g_app_settings.launch_count++;
@@ -7452,19 +7500,19 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 } else {
                     g_app_settings.launch[i].host[0] = 0;
                 }
-                g_settings_launch_focus = i;
             }
             return;
         }
         for (int i = 0; i < g_app_settings.launch_count; i++) {
             if (rect_hit(L.launch_del[i], mx, my)) {
-                /* Shift left over the deleted slot. */
                 for (int j = i; j + 1 < g_app_settings.launch_count; j++) {
                     g_app_settings.launch[j] = g_app_settings.launch[j + 1];
                 }
                 g_app_settings.launch_count--;
-                if (g_settings_launch_focus == i)        g_settings_launch_focus = -1;
-                else if (g_settings_launch_focus > i)    g_settings_launch_focus--;
+                if (g_settings_launch_dropdown == i)
+                    g_settings_launch_dropdown = -1;
+                else if (g_settings_launch_dropdown > i)
+                    g_settings_launch_dropdown--;
                 return;
             }
             if (rect_hit(L.launch_kind[i], mx, my)) {
@@ -7472,15 +7520,20 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 if (g_app_settings.launch[i].kind == 0) {
                     g_app_settings.launch[i].host[0] = 0;
                 }
+                g_settings_launch_dropdown = -1;
                 return;
             }
             if (rect_hit(L.launch_host[i], mx, my)) {
-                g_settings_launch_focus = i;
+                if (g_app_settings.launch[i].kind != 1) return;
+                /* Open the saved-hosts list for this row. Refresh
+                   the cached profile list so newly-added hosts
+                   show up without restarting Settings. */
+                ssh_profiles_load();
+                g_settings_launch_dropdown = i;
+                g_settings_launch_scroll = 0;
                 return;
             }
         }
-        /* Click anywhere else inside the launch tab drops focus. */
-        g_settings_launch_focus = -1;
     }
     if (rect_hit(L.save_default, mx, my)) {
         if (config_save(r)) {
@@ -7535,41 +7588,14 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (g_settings_dir_focus) { g_settings_dir_focus = false; return; }
         if (g_settings_recdir_focus) { g_settings_recdir_focus = false; return; }
-        if (g_settings_launch_focus >= 0) {
-            g_settings_launch_focus = -1; return;
+        if (g_settings_launch_dropdown >= 0) {
+            g_settings_launch_dropdown = -1; return;
         }
         if (g_settings_focused_list != SETTINGS_FOCUS_NONE) {
             g_settings_focused_list = SETTINGS_FOCUS_NONE;
             return;
         }
         g_ui_mode = UI_NORMAL; return;
-    }
-
-    /* Launch-tab host text input. Plain ASCII; no clipboard for
-       brevity — paste a hostname via the SSH form's saved-list
-       picker if you've got an unwieldy alias. */
-    if (g_settings_launch_focus >= 0 &&
-        g_settings_launch_focus < g_app_settings.launch_count &&
-        g_app_settings.launch[g_settings_launch_focus].kind == 1) {
-        char *buf = g_app_settings.launch[g_settings_launch_focus].host;
-        size_t cap = sizeof(g_app_settings.launch[g_settings_launch_focus].host);
-        size_t len = strlen(buf);
-        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
-            if (len > 0) buf[len - 1] = 0;
-            return;
-        }
-        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) ||
-            IsKeyPressed(KEY_TAB)) {
-            g_settings_launch_focus = -1;
-            return;
-        }
-        int cp;
-        while ((cp = GetCharPressed()) != 0) {
-            if (cp < 32 || cp >= 127) continue;
-            if (len + 1 >= cap) continue;
-            buf[len++] = (char)cp;
-            buf[len] = 0;
-        }
     }
 
     /* Recording-tab directory text input. Same chord set as
@@ -9456,30 +9482,36 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                                  kb.y + (kb.h - ksz.y) / 2},
                        13, 0, (Color){230, 232, 240, 255});
 
-            /* Host text input — disabled / dim for Local entries. */
+            /* Host picker — for SSH rows it's a click-to-open
+               dropdown of saved hosts; for Local rows it's just a
+               disabled label. */
             DrawRectangle(hb.x, hb.y, hb.w, hb.h, (Color){22, 25, 34, 255});
-            bool host_focus = (g_settings_launch_focus == i && is_ssh);
+            bool dd_open = (g_settings_launch_dropdown == i && is_ssh);
             DrawRectangleLines(hb.x, hb.y, hb.w, hb.h,
-                               host_focus ? (Color){125, 207, 255, 255}
-                                          : (Color){70, 74, 90, 255});
+                               dd_open ? (Color){125, 207, 255, 255}
+                                       : (Color){70, 74, 90, 255});
             BeginScissorMode(hb.x + 6, hb.y, hb.w - 12, hb.h);
             const char *htext = is_ssh
                 ? (g_app_settings.launch[i].host[0]
                     ? g_app_settings.launch[i].host
-                    : "(SSH alias from ~/.ssh/config)")
+                    : "(click to choose a saved host)")
                 : "(default shell — no remote host)";
             Color htcol = (is_ssh && g_app_settings.launch[i].host[0])
                            ? (Color){230, 232, 240, 255}
                            : (Color){110, 115, 130, 255};
             DrawTextEx(*f, htext, (Vector2){hb.x + 8, hb.y + 7},
                        14, 0, htcol);
-            if (host_focus && g_app_settings.launch[i].host[0] &&
-                ((long long)(GetTime() * 2.0) & 1) == 0) {
-                Vector2 vsz = MeasureTextEx(*f, g_app_settings.launch[i].host, 14, 0);
-                DrawRectangle(hb.x + 8 + (int)vsz.x + 1, hb.y + 6, 8, 16,
-                              (Color){125, 207, 255, 255});
-            }
             EndScissorMode();
+            /* Chevron on the right edge for SSH rows so users
+               recognise it as a picker. */
+            if (is_ssh) {
+                float cx = hb.x + hb.w - 14, cy = hb.y + hb.h / 2;
+                Color ch = (Color){180, 195, 220, 220};
+                DrawLineEx((Vector2){cx - 4, cy - 2},
+                           (Vector2){cx,     cy + 2}, 1.6f, ch);
+                DrawLineEx((Vector2){cx + 4, cy - 2},
+                           (Vector2){cx,     cy + 2}, 1.6f, ch);
+            }
 
             /* Delete (×) button. */
             DrawRectangle(xb.x, xb.y, xb.w, xb.h, (Color){48, 30, 30, 255});
@@ -9514,6 +9546,50 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
             DrawTextEx(*f, "(no entries — rbterm opens one local shell on launch)",
                        (Vector2){L.modal.x + 22, L.launch_add_local.y - 26},
                        12, 0, (Color){140, 150, 170, 255});
+        }
+
+        /* Dropdown panel — drawn last so it overlays the rows
+           below it. Only one is open at a time. */
+        if (g_settings_launch_dropdown >= 0 &&
+            g_settings_launch_dropdown < g_app_settings.launch_count &&
+            g_app_settings.launch[g_settings_launch_dropdown].kind == 1) {
+            int i = g_settings_launch_dropdown;
+            Rect hb = L.launch_host[i];
+            int row_h = 22;
+            int n = g_ssh_profile_count;
+            int dh = n * row_h;
+            int max_dh = 220;
+            if (dh > max_dh) dh = max_dh;
+            Rect dd = (Rect){ hb.x, hb.y + hb.h, hb.w, dh };
+            DrawRectangle(dd.x, dd.y, dd.w, dd.h, (Color){22, 25, 34, 255});
+            DrawRectangleLines(dd.x, dd.y, dd.w, dd.h, (Color){125, 207, 255, 220});
+            BeginScissorMode(dd.x + 1, dd.y + 1, dd.w - 2, dd.h - 2);
+            int visible = dd.h / row_h;
+            int max_scroll = n - visible;
+            if (max_scroll < 0) max_scroll = 0;
+            if (g_settings_launch_scroll > max_scroll)
+                g_settings_launch_scroll = max_scroll;
+            for (int k = 0; k < n; k++) {
+                int ry = dd.y + (k - g_settings_launch_scroll) * row_h;
+                if (ry + row_h < dd.y || ry > dd.y + dd.h) continue;
+                bool current = (strcmp(g_ssh_profiles[k].name,
+                                       g_app_settings.launch[i].host) == 0);
+                if (current) {
+                    DrawRectangle(dd.x + 2, ry, dd.w - 4, row_h,
+                                  (Color){46, 62, 90, 220});
+                }
+                DrawTextEx(*f, g_ssh_profiles[k].name,
+                           (Vector2){dd.x + 10, ry + 4},
+                           13, 0,
+                           current ? (Color){230, 232, 240, 255}
+                                   : (Color){200, 205, 220, 255});
+            }
+            if (n == 0) {
+                DrawTextEx(*f, "(no saved hosts in ~/.ssh/config)",
+                           (Vector2){dd.x + 10, dd.y + 6},
+                           12, 0, (Color){140, 145, 160, 255});
+            }
+            EndScissorMode();
         }
     }
 
