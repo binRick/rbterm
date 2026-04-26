@@ -194,13 +194,17 @@ typedef struct {
        Otherwise we open one tab per entry, in order. SSH entries
        resolve `host` against ~/.ssh/config via libssh's normal
        parsing; the user's saved-host appearance overrides apply.
-       Persisted as `launch.<i>=local` or `launch.<i>=ssh:<alias>`. */
+       Persisted as `launch.<i>=local` or `launch.<i>=ssh:<alias>`.
+       `launch_active` is the index of the entry whose tab should
+       be focused once the launch sweep finishes (clamped at boot
+       to a valid index). */
 #define LAUNCH_ENTRY_MAX 16
     struct {
         int  kind;          /* 0 = local, 1 = ssh */
         char host[128];     /* ssh alias from ~/.ssh/config; "" for local */
     } launch[LAUNCH_ENTRY_MAX];
     int  launch_count;
+    int  launch_active;     /* row index that becomes the active tab on startup */
 } AppSettings;
 
 /* Per-instance HUD configuration. Used both as the per-SSH-host
@@ -320,6 +324,10 @@ static void config_load_into_defaults(void) {
                ToggleFullscreen call was broken. */
             if      (!strcmp(v, "maximized"))  g_app_settings.startup_window = STARTUP_WINDOW_MAXIMIZED;
             else                               g_app_settings.startup_window = STARTUP_WINDOW_DEFAULT;
+        } else if (strcmp(k, "launch_active") == 0) {
+            int vi = atoi(v);
+            if (vi < 0) vi = 0;
+            g_app_settings.launch_active = vi;
         } else if (strncmp(k, "launch.", 7) == 0) {
             /* launch.<i>=local | ssh:<alias>. Index is informational
                for humans editing the file; we always append in the
@@ -385,6 +393,9 @@ static bool config_save(Renderer *r) {
         } else {
             fprintf(fp, "launch.%d=local\n", i);
         }
+    }
+    if (g_app_settings.launch_count > 0) {
+        fprintf(fp, "launch_active=%d\n", g_app_settings.launch_active);
     }
     fclose(fp);
 #ifndef _WIN32
@@ -6772,14 +6783,17 @@ typedef struct {
     Rect hud_cpu_toggle;     /* CPU sparkline enable/disable */
     /* Launch tab — list of "open these on startup" entries plus
        Add buttons. One row per slot:
-         [kind pill] [host picker] [▲] [▼] [×]
-       Up/Down swap the entry with its neighbour; both go dim
-       (zero-w) at the ends of the list so clicks fall through. */
-    Rect launch_kind[LAUNCH_ENTRY_MAX];
-    Rect launch_host[LAUNCH_ENTRY_MAX];
-    Rect launch_up  [LAUNCH_ENTRY_MAX];
-    Rect launch_down[LAUNCH_ENTRY_MAX];
-    Rect launch_del [LAUNCH_ENTRY_MAX];
+         [kind pill] [host picker] [active radio] [▲] [▼] [×]
+       Active radio: clicking it makes that row the foreground
+       tab once the launch sweep finishes. Up/Down swap the
+       entry with its neighbour; both go dim (zero-w) at the
+       ends of the list so clicks fall through. */
+    Rect launch_kind  [LAUNCH_ENTRY_MAX];
+    Rect launch_host  [LAUNCH_ENTRY_MAX];
+    Rect launch_active[LAUNCH_ENTRY_MAX];
+    Rect launch_up    [LAUNCH_ENTRY_MAX];
+    Rect launch_down  [LAUNCH_ENTRY_MAX];
+    Rect launch_del   [LAUNCH_ENTRY_MAX];
     Rect launch_add_local;
     Rect launch_add_ssh;
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
@@ -7241,17 +7255,19 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         int row_h = btn;
         int kind_w = 72;
         int reorder_w = 26;          /* up / down buttons */
+        int active_w = 26;
         int del_w  = 32;
         int gap = 6;
         int field_x = L.modal.x + 22;
         int field_w_total = w - 22 - 22;
         int host_w = field_w_total
-                     - kind_w - 2 * reorder_w - del_w - 4 * gap;
+                     - kind_w - active_w - 2 * reorder_w - del_w - 5 * gap;
         for (int i = 0; i < LAUNCH_ENTRY_MAX; i++) {
             if (i < g_app_settings.launch_count) {
                 int x = field_x;
-                L.launch_kind[i] = (Rect){ x, row_y, kind_w,    row_h }; x += kind_w + gap;
-                L.launch_host[i] = (Rect){ x, row_y, host_w,    row_h }; x += host_w + gap;
+                L.launch_kind  [i] = (Rect){ x, row_y, kind_w,   row_h }; x += kind_w   + gap;
+                L.launch_host  [i] = (Rect){ x, row_y, host_w,   row_h }; x += host_w   + gap;
+                L.launch_active[i] = (Rect){ x, row_y, active_w, row_h }; x += active_w + gap;
                 /* ▲ / ▼ collapse to zero width at the ends so the
                    click handler can't flip them off the edges. */
                 bool can_up   = (i > 0);
@@ -7263,11 +7279,12 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
                 L.launch_del [i] = (Rect){ x, row_y, del_w,    row_h };
                 row_y += row_h + 6;
             } else {
-                L.launch_kind[i] = (Rect){0,0,0,0};
-                L.launch_host[i] = (Rect){0,0,0,0};
-                L.launch_up  [i] = (Rect){0,0,0,0};
-                L.launch_down[i] = (Rect){0,0,0,0};
-                L.launch_del [i] = (Rect){0,0,0,0};
+                L.launch_kind  [i] = (Rect){0,0,0,0};
+                L.launch_host  [i] = (Rect){0,0,0,0};
+                L.launch_active[i] = (Rect){0,0,0,0};
+                L.launch_up    [i] = (Rect){0,0,0,0};
+                L.launch_down  [i] = (Rect){0,0,0,0};
+                L.launch_del   [i] = (Rect){0,0,0,0};
             }
         }
         row_y += 6;
@@ -7609,6 +7626,19 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                     g_settings_launch_dropdown = -1;
                 else if (g_settings_launch_dropdown > i)
                     g_settings_launch_dropdown--;
+                /* Keep launch_active in range. If the deleted row
+                   was the active one, fall back to the new first
+                   row; otherwise shift down to track the same
+                   entry. */
+                if (g_app_settings.launch_active == i) {
+                    g_app_settings.launch_active = 0;
+                } else if (g_app_settings.launch_active > i) {
+                    g_app_settings.launch_active--;
+                }
+                return;
+            }
+            if (L.launch_active[i].w > 0 && rect_hit(L.launch_active[i], mx, my)) {
+                g_app_settings.launch_active = i;
                 return;
             }
             if (L.launch_up[i].w > 0 && rect_hit(L.launch_up[i], mx, my)) {
@@ -7625,6 +7655,8 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                     memcpy(&g_app_settings.launch[i], tmp, sizeof(tmp));
                     if (g_settings_launch_dropdown == i)        g_settings_launch_dropdown = i - 1;
                     else if (g_settings_launch_dropdown == i-1) g_settings_launch_dropdown = i;
+                    if (g_app_settings.launch_active == i)        g_app_settings.launch_active = i - 1;
+                    else if (g_app_settings.launch_active == i-1) g_app_settings.launch_active = i;
                 }
                 return;
             }
@@ -7637,6 +7669,8 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                     memcpy(&g_app_settings.launch[i], tmp, sizeof(tmp));
                     if (g_settings_launch_dropdown == i)        g_settings_launch_dropdown = i + 1;
                     else if (g_settings_launch_dropdown == i+1) g_settings_launch_dropdown = i;
+                    if (g_app_settings.launch_active == i)        g_app_settings.launch_active = i + 1;
+                    else if (g_app_settings.launch_active == i+1) g_app_settings.launch_active = i;
                 }
                 return;
             }
@@ -9638,6 +9672,28 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                            (Vector2){cx,     cy + 2}, 1.6f, ch);
             }
 
+            /* "Active" radio — clicking marks this row as the
+               focused tab once the launch sweep finishes. Drawn
+               as a small circle outline; filled when selected. */
+            {
+                Rect ab = L.launch_active[i];
+                if (ab.w > 0) {
+                    bool is_active = (g_app_settings.launch_active == i);
+                    DrawRectangle(ab.x, ab.y, ab.w, ab.h, (Color){38, 42, 56, 255});
+                    DrawRectangleLines(ab.x, ab.y, ab.w, ab.h,
+                                       is_active ? (Color){255, 220, 100, 220}
+                                                 : (Color){90, 95, 110, 200});
+                    float cx = ab.x + ab.w / 2.0f;
+                    float cy = ab.y + ab.h / 2.0f;
+                    DrawCircleLines((int)cx, (int)cy, 6.0f,
+                                    is_active ? (Color){255, 220, 100, 240}
+                                              : (Color){180, 185, 200, 200});
+                    if (is_active) {
+                        DrawCircle((int)cx, (int)cy, 3.5f, (Color){255, 220, 100, 255});
+                    }
+                }
+            }
+
             /* Up / Down reorder buttons. Drawn from raylib line
                primitives so they don't depend on the active font
                having ▲/▼ codepoints. Edge rows have one of the
@@ -10135,6 +10191,16 @@ int main(int argc, char **argv) {
                 CloseWindow();
                 return 1;
             }
+        }
+        /* Honour the user's "launch_active" choice. Some tabs may
+           have failed to open (e.g. an SSH host went away); we
+           clamp into the surviving range and skip the focus shift
+           entirely if zero entries actually opened. */
+        if (g_num_tabs > 0 &&
+            g_app_settings.launch_count > 0 &&
+            g_app_settings.launch_active >= 0 &&
+            g_app_settings.launch_active < g_num_tabs) {
+            g_active = g_app_settings.launch_active;
         }
     }
 

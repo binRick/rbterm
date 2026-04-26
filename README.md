@@ -17,7 +17,7 @@ how the OS, the shell, and a graphics library all meet.
 
 ## Pure C99 — fast, lean, no runtime
 
-The whole thing is ~16,000 lines of straight C99 — no C++, no
+The whole thing is ~21,000 lines of straight C99 — no C++, no
 garbage collector, no Electron, no JavaScript engine, no embedded
 scripting language. Every keystroke goes from raylib's input → a
 fixed-state-machine parser → a flat cell-grid → a single glyph atlas
@@ -380,7 +380,7 @@ drains every pane's PTY each frame so background tabs stay live.
 
 ## Performance — fastest of the field on 9 of 10 benchmarks
 
-A few thousand lines of straight C99, hand-tuned, no GPU shaders, no
+~21k lines of straight C99, hand-tuned, no GPU shaders, no
 runtime, no scripting language — and on real
 [alacritty/vtebench](https://github.com/alacritty/vtebench) numbers
 **rbterm beats every other terminal on 9 of 10 PTY-drain
