@@ -376,17 +376,15 @@ void *ssh_open_impl(const char *user, const char *host, int port,
     /* Forward enough of the local environment that the remote shell
        behaves the same way it would if the user had typed `ssh host`
        from rbterm's local PTY (where pty_unix sets these directly).
-       In particular COLORTERM=truecolor is what tells tmux + starship
-       on the remote to emit 24-bit truecolor escapes — without it
-       tmux falls back to 256-colour approximations and `pal random`
-       leaves cells looking inconsistent because the colour pipeline
-       is different on the two paths.
-
-       Best-effort: many sshd configs only accept env names listed in
-       AcceptEnv (default: LANG and LC_*). If the channel rejects
-       it, we fall back to sending `export …; clear` as the first
-       input bytes after the shell is up — that doesn't require any
-       remote-side configuration. */
+       Best-effort: many sshd configs only accept names listed in
+       AcceptEnv (default: LANG and LC_*) and silently drop the rest.
+       That used to leave `pal random` over libssh broken because
+       tmux on the remote ran in 256-colour mode without COLORTERM
+       — but pal itself is now tmux-aware (DCS-tmux passthrough),
+       so the remaining missing env on stock sshd is cosmetic only.
+       No visible-stdin fallback: writing `export …; clear` as the
+       first input flashed the export line before the prompt cleared
+       it, which the user noticed. */
     {
         struct { const char *name; const char *value; } envs[] = {
             { "COLORTERM",            "truecolor" },
@@ -404,31 +402,6 @@ void *ssh_open_impl(const char *user, const char *host, int port,
     if (ssh_channel_request_shell(p->channel) != SSH_OK) {
         set_err(err, errsz, "request shell: %s", ssh_get_error(p->session));
         goto fail;
-    }
-
-    /* Belt-and-braces fallback: write `export …; clear` as the
-       first input the remote shell sees. If ssh_channel_request_env
-       worked, this is a redundant noop (vars already set in env);
-       if it was denied (the common case on stock sshd configs),
-       this still sets the vars before tmux/starship run. POSIX
-       form so it works in bash, zsh, dash, ash; csh/fish users
-       will see a syntax error but the rest of the connection still
-       works. `clear` at the end hides the export line so the user
-       just sees a fresh prompt. */
-    {
-        const char *init =
-            "export COLORTERM=truecolor"
-            " TERM_PROGRAM=rbterm"
-            " TERM_PROGRAM_VERSION=0.1.0"
-            "; clear\r";
-        size_t init_len = strlen(init);
-        size_t off = 0;
-        while (off < init_len) {
-            int n = ssh_channel_write(p->channel, init + off,
-                                      (uint32_t)(init_len - off));
-            if (n <= 0) break;
-            off += (size_t)n;
-        }
     }
 
     /* Non-blocking session so the reader thread's
