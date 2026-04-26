@@ -220,7 +220,8 @@ endif()
 if(APPLE)
   target_link_libraries(rbterm PRIVATE
     "-framework Cocoa" "-framework IOKit" "-framework CoreVideo" "-framework OpenGL"
-    "-framework CoreText" "-framework CoreGraphics" "-framework Foundation")
+    "-framework CoreText" "-framework CoreGraphics" "-framework Foundation"
+    "-framework Carbon")
   set_source_files_properties(src/emoji_mac.m PROPERTIES LANGUAGE OBJC)
   target_compile_options(rbterm PRIVATE $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>)
 endif()

@@ -273,6 +273,7 @@ static id           g_quake_local_monitor  = nil;
 #include <IOKit/hidsystem/IOHIDLib.h>
 #include <IOKit/hidsystem/IOHIDParameter.h>
 #include <IOKit/IOKitLib.h>
+#import <Carbon/Carbon.h>
 
 /* Force the caps-lock LED + modifier state off. Used right after
    the Cmd+CapsLock chord fires so the keyboard doesn't drift
@@ -323,8 +324,39 @@ static void quake_toggle_inline(void) {
     reset_caps_lock_off();
 }
 
+/* Carbon Event Manager handler. Fires when the registered
+   hotkey (Cmd+CapsLock) is pressed system-wide. Doesn't need
+   Input Monitoring permission, unlike NSEvent global monitors —
+   so the toggle works even from inside other apps without the
+   user explicitly approving rbterm in System Settings. */
+static OSStatus quake_carbon_hotkey_handler(EventHandlerCallRef nextHandler,
+                                            EventRef event, void *userData) {
+    (void)nextHandler; (void)event; (void)userData;
+    quake_toggle_inline();
+    return noErr;
+}
+
+static EventHotKeyRef  g_quake_hotkey_ref  = NULL;
+static EventHandlerRef g_quake_handler_ref = NULL;
+
 void mac_install_quake_hotkey(void) {
     if (g_quake_global_monitor || g_quake_local_monitor) return;
+
+    /* Carbon path — system-wide, works without Input Monitoring
+       permission. Fires for Cmd+CapsLock anywhere. */
+    EventTypeSpec ev = { kEventClassKeyboard, kEventHotKeyPressed };
+    InstallApplicationEventHandler(&quake_carbon_hotkey_handler,
+                                   1, &ev, NULL, &g_quake_handler_ref);
+    EventHotKeyID hkid = { .signature = 'rbtm', .id = 1 };
+    /* kVK_CapsLock = 0x39, cmdKey = 0x100. */
+    RegisterEventHotKey(0x39, cmdKey, hkid,
+                        GetApplicationEventTarget(), 0,
+                        &g_quake_hotkey_ref);
+
+    /* NSEvent monitors — local catches it when rbterm has focus
+       (and swallows so the chord doesn't hit our shell input);
+       global is a redundant fallback for users who have already
+       granted Input Monitoring permission. */
     NSEventMask mask = NSEventMaskFlagsChanged;
     g_quake_global_monitor =
         [NSEvent addGlobalMonitorForEventsMatchingMask:mask
@@ -336,7 +368,7 @@ void mac_install_quake_hotkey(void) {
                                               handler:^NSEvent *(NSEvent *e) {
             if (quake_chord_match(e)) {
                 quake_toggle_inline();
-                return nil;   /* swallow the chord */
+                return nil;   /* swallow */
             }
             return e;
         }];

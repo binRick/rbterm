@@ -217,6 +217,18 @@ typedef struct {
     int  launch_active;     /* row index that becomes the active tab on startup */
 } AppSettings;
 
+/* Deferred-SSH-launch queue. main() opens local entries before
+   the first frame so the window appears immediately; SSH entries
+   land here and the main loop drains one per frame so the user
+   sees their window populate progressively rather than staring
+   at a black screen for 1-2 s × N hosts. */
+static struct {
+    char host[128];
+    bool is_active;        /* this entry's row was Settings → Launch's "active" pick */
+} g_launch_pending[16];
+static int g_launch_pending_count = 0;
+static int g_launch_pending_pos   = 0;
+
 /* Per-instance HUD configuration. Used both as the per-SSH-host
    override (Tab/SshProfile/SshForm) and as the value returned by
    hud_effective(active_tab) — render code reads from it uniformly
@@ -10291,68 +10303,47 @@ int main(int argc, char **argv) {
         bool any = false;
         if (g_app_settings.launch_count > 0) {
             ssh_profiles_load();
+            /* Open locals up front (cheap — forkpty) and queue
+               SSH entries for after the first frame so the user
+               sees a window in <500 ms instead of waiting for
+               every libssh handshake (~1-2 s each). */
             for (int i = 0; i < g_app_settings.launch_count; i++) {
                 if (g_app_settings.launch[i].kind == 1) {
-                    /* SSH — resolve the alias against ~/.ssh/config. */
-                    const char *alias = g_app_settings.launch[i].host;
-                    if (!alias[0]) continue;
-                    /* Try to find a matching profile so we pick up
-                       saved per-host theme/font/cursor/log/colour
-                       overrides. Fall back to alias-as-host with
-                       defaults. */
-                    const SshProfile *prof = NULL;
-                    for (int k = 0; k < g_ssh_profile_count; k++) {
-                        if (strcmp(g_ssh_profiles[k].name, alias) == 0) {
-                            prof = &g_ssh_profiles[k]; break;
-                        }
+                    if (g_launch_pending_count <
+                        (int)(sizeof(g_launch_pending) / sizeof(g_launch_pending[0]))) {
+                        int q = g_launch_pending_count++;
+                        snprintf(g_launch_pending[q].host,
+                                 sizeof(g_launch_pending[q].host),
+                                 "%s", g_app_settings.launch[i].host);
+                        g_launch_pending[q].is_active =
+                            (i == g_app_settings.launch_active);
                     }
-                    char err[256] = {0};
-                    Tab *t = tab_open_ssh(
-                        prof && prof->user[0]     ? prof->user     : NULL,
-                        prof && prof->hostname[0] ? prof->hostname : alias,
-                        prof ? prof->port : 0,
-                        NULL,
-                        prof && prof->identity[0] ? prof->identity : NULL,
-                        prof && prof->theme[0]    ? prof->theme    : NULL,
-                        prof ? prof->cursor_style : 0,
-                        prof && prof->font[0]     ? prof->font     : NULL,
-                        prof ? prof->font_size : 0,
-                        prof && prof->log_dir[0]  ? prof->log_dir  : NULL,
-                        prof ? prof->log_mode : 0,
-                        prof && prof->color[0]    ? prof->color    : NULL,
-                        prof && prof->hud.override ? &prof->hud    : NULL,
-                        prof && prof->init_cwd[0] ? prof->init_cwd : NULL,
-                        prof && prof->init_cmd[0] ? prof->init_cmd : NULL,
-                        init_cols, init_rows, err, sizeof(err));
-                    if (!t) {
-                        fprintf(stderr,
-                                "rbterm: launch ssh '%s' failed: %s\n",
-                                alias, err[0] ? err : "(unknown)");
-                        continue;
-                    }
+                    /* Count as "any" — the deferred drain will open
+                       the tab; we don't want the fallback default
+                       local pane to clutter the window. */
                     any = true;
                 } else {
-                    if (tab_open(init_cols, init_rows)) any = true;
+                    bool was_active = (i == g_app_settings.launch_active);
+                    if (tab_open(init_cols, init_rows)) {
+                        any = true;
+                        if (was_active) g_active = g_num_tabs - 1;
+                    }
                 }
             }
         }
-        if (!any) {
+        /* Always end up with at least one open tab so the main
+           loop has something to render — if every launch entry
+           is SSH (and they're all deferred to the post-frame
+           drain), open a fallback default local now so the
+           window isn't empty during the handshake wait. */
+        if (g_num_tabs == 0) {
             if (!tab_open(init_cols, init_rows)) {
                 renderer_shutdown(&r);
                 CloseWindow();
                 return 1;
             }
         }
-        /* Honour the user's "launch_active" choice. Some tabs may
-           have failed to open (e.g. an SSH host went away); we
-           clamp into the surviving range and skip the focus shift
-           entirely if zero entries actually opened. */
-        if (g_num_tabs > 0 &&
-            g_app_settings.launch_count > 0 &&
-            g_app_settings.launch_active >= 0 &&
-            g_app_settings.launch_active < g_num_tabs) {
-            g_active = g_app_settings.launch_active;
-        }
+        (void)any;
     }
 
     SetTargetFPS(60);
@@ -10392,6 +10383,60 @@ int main(int argc, char **argv) {
         prev_focused = focused;
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
+
+        /* Deferred SSH-launch drain. Open one queued host per loop
+           iteration so the user sees the window up immediately
+           and remote tabs pop in over the next 1-2 s × N hosts.
+           pty_open_ssh blocks during the handshake — running it
+           after the first frame keeps the startup-blank-screen
+           window short. */
+        if (g_launch_pending_pos < g_launch_pending_count) {
+            int q = g_launch_pending_pos++;
+            const char *alias = g_launch_pending[q].host;
+            if (alias[0]) {
+                const SshProfile *prof = NULL;
+                for (int k = 0; k < g_ssh_profile_count; k++) {
+                    if (strcmp(g_ssh_profiles[k].name, alias) == 0) {
+                        prof = &g_ssh_profiles[k]; break;
+                    }
+                }
+                int derive_cols, derive_rows;
+                {
+                    int win_w_dr = GetScreenWidth();
+                    int win_h_dr = GetScreenHeight();
+                    derive_cols = (win_w_dr - 2 * r.pad_x) / r.cell_w;
+                    derive_rows = (win_h_dr - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
+                    if (derive_cols < 20) derive_cols = 20;
+                    if (derive_rows < 5)  derive_rows = 5;
+                }
+                char err[256] = {0};
+                Tab *t = tab_open_ssh(
+                    prof && prof->user[0]     ? prof->user     : NULL,
+                    prof && prof->hostname[0] ? prof->hostname : alias,
+                    prof ? prof->port : 0,
+                    NULL,
+                    prof && prof->identity[0] ? prof->identity : NULL,
+                    prof && prof->theme[0]    ? prof->theme    : NULL,
+                    prof ? prof->cursor_style : 0,
+                    prof && prof->font[0]     ? prof->font     : NULL,
+                    prof ? prof->font_size : 0,
+                    prof && prof->log_dir[0]  ? prof->log_dir  : NULL,
+                    prof ? prof->log_mode : 0,
+                    prof && prof->color[0]    ? prof->color    : NULL,
+                    prof && prof->hud.override ? &prof->hud    : NULL,
+                    prof && prof->init_cwd[0] ? prof->init_cwd : NULL,
+                    prof && prof->init_cmd[0] ? prof->init_cmd : NULL,
+                    derive_cols, derive_rows, err, sizeof(err));
+                if (!t) {
+                    fprintf(stderr,
+                            "rbterm: launch ssh '%s' failed: %s\n",
+                            alias, err[0] ? err : "(unknown)");
+                } else if (g_launch_pending[q].is_active) {
+                    g_active = g_num_tabs - 1;
+                }
+                dirty = true;   /* tab list changed; force a render */
+            }
+        }
 
         /* Whole-window content cell dims — still used by tab_open for
            its initial PTY size; individual pane resizing goes through

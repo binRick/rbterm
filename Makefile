@@ -16,7 +16,8 @@ ifeq ($(UNAME_S),Darwin)
     LDFLAGS += -L$(BREW_PREFIX)/lib     -L$(BREW_PREFIX)/opt/libssh/lib
   endif
   LDLIBS += -framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL \
-            -framework CoreText -framework CoreGraphics -framework Foundation
+            -framework CoreText -framework CoreGraphics -framework Foundation \
+            -framework Carbon
   EMOJI_OBJ := src/emoji_mac.o
 else
   EMOJI_OBJ := src/emoji_stub.o
