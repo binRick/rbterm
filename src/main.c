@@ -6692,10 +6692,14 @@ typedef struct {
     Rect hud_size_inc[5];
     Rect hud_cpu_toggle;     /* CPU sparkline enable/disable */
     /* Launch tab — list of "open these on startup" entries plus
-       Add buttons. One row per slot: [kind pill] [host text input]
-       [×]. Plus two add-buttons at the bottom. */
+       Add buttons. One row per slot:
+         [kind pill] [host picker] [▲] [▼] [×]
+       Up/Down swap the entry with its neighbour; both go dim
+       (zero-w) at the ends of the list so clicks fall through. */
     Rect launch_kind[LAUNCH_ENTRY_MAX];
     Rect launch_host[LAUNCH_ENTRY_MAX];
+    Rect launch_up  [LAUNCH_ENTRY_MAX];
+    Rect launch_down[LAUNCH_ENTRY_MAX];
     Rect launch_del [LAUNCH_ENTRY_MAX];
     Rect launch_add_local;
     Rect launch_add_ssh;
@@ -7150,27 +7154,40 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         row_y += 8;
         L.hud_cpu_toggle = (Rect){ L.modal.x + 140, row_y, 200, btn };
     } else if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
-        /* One row per launch entry: [kind pill] [host text input] [×].
-           Then "+ Add local shell" / "+ Add SSH host" buttons at the
-           bottom. We render at most LAUNCH_ENTRY_MAX rows. */
+        /* One row per launch entry:
+             [kind pill] [host picker] [▲] [▼] [×]
+           Then "+ Add local shell" / "+ Add SSH host" buttons at
+           the bottom. We render at most LAUNCH_ENTRY_MAX rows. */
         int row_y = content_y;
         int row_h = btn;
         int kind_w = 72;
+        int reorder_w = 26;          /* up / down buttons */
         int del_w  = 32;
         int gap = 6;
         int field_x = L.modal.x + 22;
         int field_w_total = w - 22 - 22;
-        int host_w = field_w_total - kind_w - del_w - 2 * gap;
+        int host_w = field_w_total
+                     - kind_w - 2 * reorder_w - del_w - 4 * gap;
         for (int i = 0; i < LAUNCH_ENTRY_MAX; i++) {
             if (i < g_app_settings.launch_count) {
                 int x = field_x;
-                L.launch_kind[i] = (Rect){ x, row_y, kind_w, row_h }; x += kind_w + gap;
-                L.launch_host[i] = (Rect){ x, row_y, host_w, row_h }; x += host_w + gap;
-                L.launch_del [i] = (Rect){ x, row_y, del_w,  row_h };
+                L.launch_kind[i] = (Rect){ x, row_y, kind_w,    row_h }; x += kind_w + gap;
+                L.launch_host[i] = (Rect){ x, row_y, host_w,    row_h }; x += host_w + gap;
+                /* ▲ / ▼ collapse to zero width at the ends so the
+                   click handler can't flip them off the edges. */
+                bool can_up   = (i > 0);
+                bool can_down = (i < g_app_settings.launch_count - 1);
+                L.launch_up  [i] = (Rect){ x, row_y, can_up   ? reorder_w : 0, row_h };
+                x += reorder_w + gap;
+                L.launch_down[i] = (Rect){ x, row_y, can_down ? reorder_w : 0, row_h };
+                x += reorder_w + gap;
+                L.launch_del [i] = (Rect){ x, row_y, del_w,    row_h };
                 row_y += row_h + 6;
             } else {
                 L.launch_kind[i] = (Rect){0,0,0,0};
                 L.launch_host[i] = (Rect){0,0,0,0};
+                L.launch_up  [i] = (Rect){0,0,0,0};
+                L.launch_down[i] = (Rect){0,0,0,0};
                 L.launch_del [i] = (Rect){0,0,0,0};
             }
         }
@@ -7513,6 +7530,35 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                     g_settings_launch_dropdown = -1;
                 else if (g_settings_launch_dropdown > i)
                     g_settings_launch_dropdown--;
+                return;
+            }
+            if (L.launch_up[i].w > 0 && rect_hit(L.launch_up[i], mx, my)) {
+                /* Swap with the row above; follow the dropdown
+                   focus so it stays anchored to the same entry.
+                   memcpy through a byte buffer because the entry
+                   type is an anonymous struct inside AppSettings —
+                   no name to give a temp variable. */
+                if (i > 0) {
+                    char tmp[sizeof(g_app_settings.launch[0])];
+                    memcpy(tmp, &g_app_settings.launch[i - 1], sizeof(tmp));
+                    memcpy(&g_app_settings.launch[i - 1],
+                           &g_app_settings.launch[i], sizeof(tmp));
+                    memcpy(&g_app_settings.launch[i], tmp, sizeof(tmp));
+                    if (g_settings_launch_dropdown == i)        g_settings_launch_dropdown = i - 1;
+                    else if (g_settings_launch_dropdown == i-1) g_settings_launch_dropdown = i;
+                }
+                return;
+            }
+            if (L.launch_down[i].w > 0 && rect_hit(L.launch_down[i], mx, my)) {
+                if (i + 1 < g_app_settings.launch_count) {
+                    char tmp[sizeof(g_app_settings.launch[0])];
+                    memcpy(tmp, &g_app_settings.launch[i + 1], sizeof(tmp));
+                    memcpy(&g_app_settings.launch[i + 1],
+                           &g_app_settings.launch[i], sizeof(tmp));
+                    memcpy(&g_app_settings.launch[i], tmp, sizeof(tmp));
+                    if (g_settings_launch_dropdown == i)        g_settings_launch_dropdown = i + 1;
+                    else if (g_settings_launch_dropdown == i+1) g_settings_launch_dropdown = i;
+                }
                 return;
             }
             if (rect_hit(L.launch_kind[i], mx, my)) {
@@ -9511,6 +9557,35 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                            (Vector2){cx,     cy + 2}, 1.6f, ch);
                 DrawLineEx((Vector2){cx + 4, cy - 2},
                            (Vector2){cx,     cy + 2}, 1.6f, ch);
+            }
+
+            /* Up / Down reorder buttons. Drawn from raylib line
+               primitives so they don't depend on the active font
+               having ▲/▼ codepoints. Edge rows have one of the
+               two collapsed to width 0 (set in the layout); skip
+               drawing for them. */
+            for (int dir = 0; dir < 2; dir++) {
+                Rect rb = (dir == 0) ? L.launch_up[i] : L.launch_down[i];
+                if (rb.w == 0) continue;
+                DrawRectangle(rb.x, rb.y, rb.w, rb.h, (Color){38, 42, 56, 255});
+                DrawRectangleLines(rb.x, rb.y, rb.w, rb.h, (Color){125, 207, 255, 200});
+                float cx = rb.x + rb.w / 2.0f;
+                float cy = rb.y + rb.h / 2.0f;
+                float s  = rb.h * 0.30f;
+                Color glyph = (Color){220, 235, 255, 255};
+                if (dir == 0) {
+                    /* Up chevron. */
+                    DrawLineEx((Vector2){cx - s, cy + s/2},
+                               (Vector2){cx,     cy - s/2}, 1.8f, glyph);
+                    DrawLineEx((Vector2){cx + s, cy + s/2},
+                               (Vector2){cx,     cy - s/2}, 1.8f, glyph);
+                } else {
+                    /* Down chevron. */
+                    DrawLineEx((Vector2){cx - s, cy - s/2},
+                               (Vector2){cx,     cy + s/2}, 1.8f, glyph);
+                    DrawLineEx((Vector2){cx + s, cy - s/2},
+                               (Vector2){cx,     cy + s/2}, 1.8f, glyph);
+                }
             }
 
             /* Delete (×) button. */
