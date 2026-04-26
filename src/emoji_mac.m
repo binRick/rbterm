@@ -301,23 +301,41 @@ static bool quake_chord_match(NSEvent *e) {
     return ([e modifierFlags] & NSEventModifierFlagCommand) != 0;
 }
 
+/* Run the visibility toggle inline from inside an NSEvent block.
+   Both monitor callbacks fire on the main thread, so hide: /
+   unhide: are safe to call directly. We previously latched a
+   flag for the main loop to drain, but raylib pauses its loop
+   while the window is hidden — so the flag set by the global
+   monitor never got consumed and a second Cmd+CapsLock did
+   nothing. Acting in the block sidesteps the pause. */
+static void quake_toggle_inline(void) {
+    @autoreleasepool {
+        if ([NSApp isHidden]) {
+            [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+            [NSApp unhide:nil];
+        } else {
+            [NSApp hide:nil];
+        }
+    }
+    /* Keep the polled flag for callers that still want it (and
+       so a future pre-hide check can see "user just chord'd"). */
+    g_quake_toggle_flag = 1;
+    reset_caps_lock_off();
+}
+
 void mac_install_quake_hotkey(void) {
     if (g_quake_global_monitor || g_quake_local_monitor) return;
     NSEventMask mask = NSEventMaskFlagsChanged;
     g_quake_global_monitor =
         [NSEvent addGlobalMonitorForEventsMatchingMask:mask
                                                handler:^(NSEvent *e) {
-            if (quake_chord_match(e)) {
-                g_quake_toggle_flag = 1;
-                reset_caps_lock_off();
-            }
+            if (quake_chord_match(e)) quake_toggle_inline();
         }];
     g_quake_local_monitor =
         [NSEvent addLocalMonitorForEventsMatchingMask:mask
                                               handler:^NSEvent *(NSEvent *e) {
             if (quake_chord_match(e)) {
-                g_quake_toggle_flag = 1;
-                reset_caps_lock_off();
+                quake_toggle_inline();
                 return nil;   /* swallow the chord */
             }
             return e;

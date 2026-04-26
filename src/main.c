@@ -11284,12 +11284,13 @@ int main(int argc, char **argv) {
            latches a flag we drain here each frame. */
         int cycle_dir = 0;   /* +1 forward, -1 backward */
 #ifdef __APPLE__
-        /* Quake-style hide/show is wired off the same NSEvent
-           bus and only installed in BORDERLESS mode; this poll is
-           a cheap atomic load otherwise. */
-        if (mac_consume_quake_toggle()) {
-            mac_toggle_quake_visibility();
-        }
+        /* Quake-style hide/show fires inline from inside the
+           NSEvent monitor (raylib pauses our loop while the
+           window is hidden, so a polled flag wouldn't get
+           drained). We still consume the flag here so any
+           leftover state stays consistent — the toggle has
+           already happened by the time we get here. */
+        (void)mac_consume_quake_toggle();
         int mct = mac_consume_ctrl_tab();
         if (mct == 1) cycle_dir = +1;
         else if (mct == 2) cycle_dir = -1;
