@@ -382,11 +382,11 @@ void *ssh_open_impl(const char *user, const char *host, int port,
        leaves cells looking inconsistent because the colour pipeline
        is different on the two paths.
 
-       Failures are silent: many sshd configs only accept env names
-       listed in AcceptEnv (default: LANG and LC_*). If the request
-       is denied the shell still starts; we just don't get the env.
-       Users wanting the full effect can add `AcceptEnv COLORTERM
-       TERM_PROGRAM TERM_PROGRAM_VERSION` to the remote sshd_config. */
+       Best-effort: many sshd configs only accept env names listed in
+       AcceptEnv (default: LANG and LC_*). If the channel rejects
+       it, we fall back to sending `export …; clear` as the first
+       input bytes after the shell is up — that doesn't require any
+       remote-side configuration. */
     {
         struct { const char *name; const char *value; } envs[] = {
             { "COLORTERM",            "truecolor" },
@@ -404,6 +404,31 @@ void *ssh_open_impl(const char *user, const char *host, int port,
     if (ssh_channel_request_shell(p->channel) != SSH_OK) {
         set_err(err, errsz, "request shell: %s", ssh_get_error(p->session));
         goto fail;
+    }
+
+    /* Belt-and-braces fallback: write `export …; clear` as the
+       first input the remote shell sees. If ssh_channel_request_env
+       worked, this is a redundant noop (vars already set in env);
+       if it was denied (the common case on stock sshd configs),
+       this still sets the vars before tmux/starship run. POSIX
+       form so it works in bash, zsh, dash, ash; csh/fish users
+       will see a syntax error but the rest of the connection still
+       works. `clear` at the end hides the export line so the user
+       just sees a fresh prompt. */
+    {
+        const char *init =
+            "export COLORTERM=truecolor"
+            " TERM_PROGRAM=rbterm"
+            " TERM_PROGRAM_VERSION=0.1.0"
+            "; clear\r";
+        size_t init_len = strlen(init);
+        size_t off = 0;
+        while (off < init_len) {
+            int n = ssh_channel_write(p->channel, init + off,
+                                      (uint32_t)(init_len - off));
+            if (n <= 0) break;
+            off += (size_t)n;
+        }
     }
 
     /* Non-blocking session so the reader thread's
