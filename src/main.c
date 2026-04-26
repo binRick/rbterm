@@ -145,8 +145,13 @@ static void rl_trace_log(int logType, const char *text, va_list args) {
    no own Space. */
 typedef enum {
     STARTUP_WINDOW_DEFAULT    = 0,
-    STARTUP_WINDOW_FULLSCREEN = 1,
-    STARTUP_WINDOW_MAXIMIZED  = 2,
+    STARTUP_WINDOW_FULLSCREEN = 1,   /* (back-compat, treated as DEFAULT) */
+    STARTUP_WINDOW_MAXIMIZED  = 2,   /* macOS: native fullscreen / "Own Space" */
+    STARTUP_WINDOW_SMALL      = 3,   /* fixed 720x480 centred */
+    STARTUP_WINDOW_MEDIUM     = 4,   /* fixed 1024x720 centred */
+    STARTUP_WINDOW_LARGE      = 5,   /* fixed 1280x900 centred */
+    STARTUP_WINDOW_FILL       = 6,   /* fill the current monitor (still windowed) */
+    STARTUP_WINDOW_BORDERLESS = 7,   /* borderless windowed-fullscreen (no own-Space) */
 } StartupWindowMode;
 
 typedef enum {
@@ -319,10 +324,17 @@ static void config_load_into_defaults(void) {
             else if (!strcmp(v, "bar"))       g_app_settings.cursor_style = CURSOR_STYLE_BAR;
             else if (!strcmp(v, "blink"))     g_app_settings.cursor_style = CURSOR_STYLE_BLOCK_BLINK;
         } else if (strcmp(k, "startup_window") == 0) {
-            /* "fullscreen" is accepted for back-compat but demoted to
-               default — the option was removed because the backing
-               ToggleFullscreen call was broken. */
             if      (!strcmp(v, "maximized"))  g_app_settings.startup_window = STARTUP_WINDOW_MAXIMIZED;
+            else if (!strcmp(v, "small"))      g_app_settings.startup_window = STARTUP_WINDOW_SMALL;
+            else if (!strcmp(v, "medium"))     g_app_settings.startup_window = STARTUP_WINDOW_MEDIUM;
+            else if (!strcmp(v, "large"))      g_app_settings.startup_window = STARTUP_WINDOW_LARGE;
+            else if (!strcmp(v, "fill"))       g_app_settings.startup_window = STARTUP_WINDOW_FILL;
+            else if (!strcmp(v, "borderless")) g_app_settings.startup_window = STARTUP_WINDOW_BORDERLESS;
+            /* "fullscreen" is accepted for back-compat but demoted to
+               borderless — the original option ran ToggleFullscreen
+               which misbehaves on macOS; borderless gives the same
+               distraction-free effect without the bugs. */
+            else if (!strcmp(v, "fullscreen")) g_app_settings.startup_window = STARTUP_WINDOW_BORDERLESS;
             else                               g_app_settings.startup_window = STARTUP_WINDOW_DEFAULT;
         } else if (strcmp(k, "launch_active") == 0) {
             int vi = atoi(v);
@@ -381,8 +393,16 @@ static bool config_save(Renderer *r) {
         if (cs) fprintf(fp, "cursor_style=%s\n", cs);
     }
     {
-        const char *sw = (g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED)
-                             ? "maximized" : "default";
+        const char *sw = "default";
+        switch (g_app_settings.startup_window) {
+        case STARTUP_WINDOW_MAXIMIZED:  sw = "maximized";  break;
+        case STARTUP_WINDOW_SMALL:      sw = "small";      break;
+        case STARTUP_WINDOW_MEDIUM:     sw = "medium";     break;
+        case STARTUP_WINDOW_LARGE:      sw = "large";      break;
+        case STARTUP_WINDOW_FILL:       sw = "fill";       break;
+        case STARTUP_WINDOW_BORDERLESS: sw = "borderless"; break;
+        default: break;
+        }
         fprintf(fp, "startup_window=%s\n", sw);
     }
     /* Launch entries — one line per slot, in order. We rewrite all
@@ -6766,9 +6786,18 @@ typedef struct {
     Rect rec_dir;    /* editable text box with recording-save directory */
     Rect repeat_initial; /* slider track — initial repeat delay */
     Rect repeat_rate;    /* slider track — per-repeat period */
-    Rect startup_default;    /* startup-window-size picker: three buttons */
+    /* Startup-window picker. The original three rects (default /
+       fullscreen / maximized) stay for back-compat in the click
+       handler. New rects below cover the size presets and the
+       borderless-fullscreen / fill-monitor extras. */
+    Rect startup_default;
     Rect startup_fullscreen;
     Rect startup_maximized;
+    Rect startup_small;
+    Rect startup_medium;
+    Rect startup_large;
+    Rect startup_fill;
+    Rect startup_borderless;
     /* HUD tab — system-info overlay configuration. */
     Rect hud_toggle;          /* enable / disable button */
     Rect hud_pos_tl, hud_pos_tr, hud_pos_bl, hud_pos_br; /* corner picker */
@@ -7200,17 +7229,32 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         int log_row2_y = log_row1_y + btn + 10;
         L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
     } else if (g_settings_tab == SETTINGS_TAB_WINDOW) {
-        int sw_row_y = content_y;
+        /* Two rows of size presets:
+             row 1: Default | Small | Medium | Large
+             row 2: Fill | Fullscreen | Own Space
+           "Own Space" is the existing macOS native-fullscreen path;
+           "Fullscreen" is a borderless windowed-fullscreen that
+           stays in the current Space. "Fill" maximises within the
+           current monitor without going fullscreen at all. */
         int bwidth = w - 140 - 22;
         int gap_sty = 6;
-        int bw = (bwidth - gap_sty) / 2;
-        int bx = L.modal.x + 140;
         int bh = 30;
-        L.startup_default    = (Rect){ bx,                   sw_row_y, bw, bh };
-        L.startup_maximized  = (Rect){ bx + (bw + gap_sty),  sw_row_y, bw, bh };
-        /* Fullscreen removed — raylib's ToggleFullscreen is buggy on
-           macOS here. Users wanting a distraction-free window use
-           Maximized (own Space on macOS). */
+        int bx = L.modal.x + 140;
+        int row_y = content_y;
+        int bw_r1 = (bwidth - 3 * gap_sty) / 4;
+        L.startup_default = (Rect){ bx,                              row_y, bw_r1, bh };
+        L.startup_small   = (Rect){ bx + 1 * (bw_r1 + gap_sty),       row_y, bw_r1, bh };
+        L.startup_medium  = (Rect){ bx + 2 * (bw_r1 + gap_sty),       row_y, bw_r1, bh };
+        L.startup_large   = (Rect){ bx + 3 * (bw_r1 + gap_sty),       row_y, bw_r1, bh };
+        row_y += bh + gap_sty;
+        int bw_r2 = (bwidth - 2 * gap_sty) / 3;
+        L.startup_fill       = (Rect){ bx,                              row_y, bw_r2, bh };
+        L.startup_borderless = (Rect){ bx + 1 * (bw_r2 + gap_sty),       row_y, bw_r2, bh };
+        L.startup_maximized  = (Rect){ bx + 2 * (bw_r2 + gap_sty),       row_y, bw_r2, bh };
+        /* Legacy rect — back-compat config still parses
+           "fullscreen" but the option no longer has its own pill;
+           we keep the rect zero-sized so the click handler skips
+           it and falls through to the others. */
         L.startup_fullscreen = (Rect){ 0, 0, 0, 0 };
     } else if (g_settings_tab == SETTINGS_TAB_RECORDING) {
         int row_y = content_y;
@@ -7484,13 +7528,16 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         g_settings_recdir_sel_all = false;
         return;
     }
-    /* Startup window mode: Default or Maximized. Applied on next
-       launch. Fullscreen option removed — raylib's ToggleFullscreen
-       misbehaves on macOS. */
+    /* Startup window mode pickers — applied on next launch. */
     {
         int pick = -1;
-        if      (rect_hit(L.startup_default,   mx, my)) pick = STARTUP_WINDOW_DEFAULT;
-        else if (rect_hit(L.startup_maximized, mx, my)) pick = STARTUP_WINDOW_MAXIMIZED;
+        if      (rect_hit(L.startup_default,    mx, my)) pick = STARTUP_WINDOW_DEFAULT;
+        else if (rect_hit(L.startup_small,      mx, my)) pick = STARTUP_WINDOW_SMALL;
+        else if (rect_hit(L.startup_medium,     mx, my)) pick = STARTUP_WINDOW_MEDIUM;
+        else if (rect_hit(L.startup_large,      mx, my)) pick = STARTUP_WINDOW_LARGE;
+        else if (rect_hit(L.startup_fill,       mx, my)) pick = STARTUP_WINDOW_FILL;
+        else if (rect_hit(L.startup_borderless, mx, my)) pick = STARTUP_WINDOW_BORDERLESS;
+        else if (rect_hit(L.startup_maximized,  mx, my)) pick = STARTUP_WINDOW_MAXIMIZED;
         if (pick >= 0) {
             g_app_settings.startup_window = pick;
             snprintf(g_settings_status, sizeof(g_settings_status),
@@ -9422,23 +9469,31 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
 
     }  /* end Session tab */
     if (g_settings_tab == SETTINGS_TAB_WINDOW) {
-    /* Startup window mode row. Three mutually-exclusive buttons;
-       applied on next launch so we don't fight the user's current
-       window state. Save as Default persists the pick. */
+    /* Startup window mode — two rows.
+       Row 1: Default | Small | Medium | Large
+       Row 2: Fill | Fullscreen | Own Space
+       Applied on next launch; Save as Default persists. */
     {
         DrawTextEx(*f, "On launch",
                    (Vector2){L.modal.x + 22, L.startup_default.y + 8},
                    14, 0, (Color){200, 205, 220, 255});
         struct { Rect r; const char *label; int mode; } opts[] = {
-            { L.startup_default,    "Default",    STARTUP_WINDOW_DEFAULT },
+            { L.startup_default,    "Default",      STARTUP_WINDOW_DEFAULT },
+            { L.startup_small,      "Small",        STARTUP_WINDOW_SMALL },
+            { L.startup_medium,     "Medium",       STARTUP_WINDOW_MEDIUM },
+            { L.startup_large,      "Large",        STARTUP_WINDOW_LARGE },
+            { L.startup_fill,       "Fill screen",  STARTUP_WINDOW_FILL },
+            { L.startup_borderless, "Fullscreen",   STARTUP_WINDOW_BORDERLESS },
 #ifdef __APPLE__
-            { L.startup_maximized,  "Own Space",  STARTUP_WINDOW_MAXIMIZED },
+            { L.startup_maximized,  "Own Space",    STARTUP_WINDOW_MAXIMIZED },
 #else
-            { L.startup_maximized,  "Maximized",  STARTUP_WINDOW_MAXIMIZED },
+            { L.startup_maximized,  "Maximized",    STARTUP_WINDOW_MAXIMIZED },
 #endif
         };
-        for (int i = 0; i < 2; i++) {
+        int n = (int)(sizeof(opts) / sizeof(opts[0]));
+        for (int i = 0; i < n; i++) {
             Rect rr = opts[i].r;
+            if (rr.w == 0) continue;
             bool on = (g_app_settings.startup_window == opts[i].mode);
             DrawRectangle(rr.x, rr.y, rr.w, rr.h,
                           on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255});
@@ -10037,16 +10092,76 @@ int main(int argc, char **argv) {
        On macOS, MAXIMIZED means native fullscreen in its own Space
        so three-finger swipe crosses between it and other desktops. */
 #ifndef __EMSCRIPTEN__
-    if (g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED) {
+    switch (g_app_settings.startup_window) {
+    case STARTUP_WINDOW_MAXIMIZED:
+        /* macOS: native fullscreen in its own Space. Three-finger
+           swipe will jump between rbterm and other desktops. */
 #ifdef __APPLE__
         mac_enter_native_fullscreen();
 #else
         MaximizeWindow();
 #endif
+        break;
+    case STARTUP_WINDOW_SMALL:
+    case STARTUP_WINDOW_MEDIUM:
+    case STARTUP_WINDOW_LARGE: {
+        int sw_w =
+            g_app_settings.startup_window == STARTUP_WINDOW_SMALL  ? 720  :
+            g_app_settings.startup_window == STARTUP_WINDOW_MEDIUM ? 1024 :
+                                                                    1280;
+        int sw_h =
+            g_app_settings.startup_window == STARTUP_WINDOW_SMALL  ? 480  :
+            g_app_settings.startup_window == STARTUP_WINDOW_MEDIUM ? 720  :
+                                                                    900;
+        SetWindowSize(sw_w, sw_h);
+        /* Centre on the current monitor so the user gets a clean
+           fresh-window position, not whatever raylib decided. */
+        int mi = GetCurrentMonitor();
+        int mw = GetMonitorWidth(mi);
+        int mh = GetMonitorHeight(mi);
+        if (mw > sw_w && mh > sw_h) {
+            SetWindowPosition((mw - sw_w) / 2, (mh - sw_h) / 2);
+        }
+        break;
     }
-    /* STARTUP_WINDOW_FULLSCREEN is accepted by config parsing for
-       back-compat but is now treated as DEFAULT — raylib's
-       ToggleFullscreen misbehaves on our macOS GLFW build. */
+    case STARTUP_WINDOW_FILL: {
+        /* Maximise inside the current monitor — still a windowed
+           app (with title bar / borders) but covering the screen. */
+        int mi = GetCurrentMonitor();
+        int mw = GetMonitorWidth(mi);
+        int mh = GetMonitorHeight(mi);
+        if (mw > 100 && mh > 100) {
+            SetWindowPosition(0, 0);
+            SetWindowSize(mw, mh);
+        }
+        break;
+    }
+    case STARTUP_WINDOW_BORDERLESS:
+        /* Borderless windowed-fullscreen on the current monitor.
+           Stays in the user's current Space (does not split off
+           into its own desktop the way macOS native fullscreen
+           does). raylib 5 exposes ToggleBorderlessWindowed for
+           this; on older builds we fall back to a manual fill. */
+#if defined(RAYLIB_VERSION_MAJOR) && RAYLIB_VERSION_MAJOR >= 5
+        ToggleBorderlessWindowed();
+#else
+        {
+            int mi = GetCurrentMonitor();
+            int mw = GetMonitorWidth(mi);
+            int mh = GetMonitorHeight(mi);
+            if (mw > 100 && mh > 100) {
+                SetWindowPosition(0, 0);
+                SetWindowSize(mw, mh);
+            }
+        }
+#endif
+        break;
+    default:
+        break;
+    }
+    /* STARTUP_WINDOW_FULLSCREEN (the legacy enum value, mode=1) is
+       accepted by config parsing for back-compat — config_load
+       remaps it to BORDERLESS, so it never reaches this switch. */
 #endif
 
 #ifdef __APPLE__
