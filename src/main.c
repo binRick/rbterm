@@ -10137,23 +10137,14 @@ int main(int argc, char **argv) {
         break;
     case STARTUP_WINDOW_BORDERLESS:
         /* Borderless windowed-fullscreen on the current monitor.
-           Stays in the user's current Space (does not split off
-           into its own desktop the way macOS native fullscreen
-           does). raylib 5 exposes ToggleBorderlessWindowed for
-           this; on older builds we fall back to a manual fill. */
-#if defined(RAYLIB_VERSION_MAJOR) && RAYLIB_VERSION_MAJOR >= 5
-        ToggleBorderlessWindowed();
-#else
-        {
-            int mi = GetCurrentMonitor();
-            int mw = GetMonitorWidth(mi);
-            int mh = GetMonitorHeight(mi);
-            if (mw > 100 && mh > 100) {
-                SetWindowPosition(0, 0);
-                SetWindowSize(mw, mh);
-            }
-        }
-#endif
+           Stays in the user's current Space and (crucially) at
+           the normal window level so Cmd+Tab still cycles to
+           other apps. We don't use ToggleBorderlessWindowed —
+           that path puts the NSWindow at NSMainMenuWindowLevel
+           on macOS and blocks system window switching. Strip
+           decorations + maximise instead; keeps normal level. */
+        SetWindowState(FLAG_WINDOW_UNDECORATED);
+        MaximizeWindow();
         break;
     default:
         break;
