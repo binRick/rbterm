@@ -886,9 +886,26 @@ static void *sftp_worker(void *arg) {
 
     /* Decide the final remote path. If the user gave a directory
        (trailing slash or libssh stat says it's one), append the
-       basename. */
+       basename.
+
+       SFTP itself has no concept of `~` — that's a shell expansion.
+       The SFTP session opens with cwd = the auth'd user's home, so
+       we can rewrite a leading `~/` (or bare `~`) into a relative
+       path that lands in the same place. `~user/...` would need
+       sftp_canonicalize_path which is more involved; skip for now. */
     char final_remote[PATH_MAX_FALLBACK];
-    snprintf(final_remote, sizeof(final_remote), "%s", u->remote_path);
+    {
+        const char *src = u->remote_path;
+        if (src[0] == '~' && (src[1] == '/' || src[1] == 0)) {
+            /* Skip "~" + optional "/". An empty result means "the
+               cwd itself" (home), which we'll pair with the local
+               basename below to form e.g. "foo.png". */
+            src += 1;
+            while (*src == '/') src++;
+        }
+        snprintf(final_remote, sizeof(final_remote), "%s", src);
+        upload_log("remote path after ~ expansion: '%s'", final_remote);
+    }
 
     /* libssh calls — all under session_lock. */
     pthread_mutex_lock(&p->session_lock);
@@ -922,6 +939,11 @@ static void *sftp_worker(void *arg) {
     }
     upload_log("sftp_init ok");
 
+    /* Empty path after ~ stripping = "upload to home dir", same as
+       a trailing slash. Force the basename-append branch below. */
+    if (!final_remote[0]) {
+        snprintf(final_remote, sizeof(final_remote), "./");
+    }
     /* If remote path looks like a directory (trailing /), or the
        stat says it is, append the basename of the local file. */
     {
