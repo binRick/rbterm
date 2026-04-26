@@ -6691,6 +6691,14 @@ typedef struct {
     Rect hud_size_val[5];
     Rect hud_size_inc[5];
     Rect hud_cpu_toggle;     /* CPU sparkline enable/disable */
+    /* Launch tab — list of "open these on startup" entries plus
+       Add buttons. One row per slot: [kind pill] [host text input]
+       [×]. Plus two add-buttons at the bottom. */
+    Rect launch_kind[LAUNCH_ENTRY_MAX];
+    Rect launch_host[LAUNCH_ENTRY_MAX];
+    Rect launch_del [LAUNCH_ENTRY_MAX];
+    Rect launch_add_local;
+    Rect launch_add_ssh;
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -6995,6 +7003,9 @@ static void settings_apply_spacing(Renderer *r, int new_extra) {
 }
 
 static bool g_settings_dir_focus = false;
+/* -1 = no field focused, otherwise the index of the launch-entry
+   row whose host text input is accepting keystrokes. */
+static int  g_settings_launch_focus = -1;
 static bool g_settings_dir_sel_all = false;
 /* Same pattern for the Recording-tab directory field. */
 static bool g_settings_recdir_focus = false;
@@ -7137,6 +7148,35 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         }
         row_y += 8;
         L.hud_cpu_toggle = (Rect){ L.modal.x + 140, row_y, 200, btn };
+    } else if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
+        /* One row per launch entry: [kind pill] [host text input] [×].
+           Then "+ Add local shell" / "+ Add SSH host" buttons at the
+           bottom. We render at most LAUNCH_ENTRY_MAX rows. */
+        int row_y = content_y;
+        int row_h = btn;
+        int kind_w = 72;
+        int del_w  = 32;
+        int gap = 6;
+        int field_x = L.modal.x + 22;
+        int field_w_total = w - 22 - 22;
+        int host_w = field_w_total - kind_w - del_w - 2 * gap;
+        for (int i = 0; i < LAUNCH_ENTRY_MAX; i++) {
+            if (i < g_app_settings.launch_count) {
+                int x = field_x;
+                L.launch_kind[i] = (Rect){ x, row_y, kind_w, row_h }; x += kind_w + gap;
+                L.launch_host[i] = (Rect){ x, row_y, host_w, row_h }; x += host_w + gap;
+                L.launch_del [i] = (Rect){ x, row_y, del_w,  row_h };
+                row_y += row_h + 6;
+            } else {
+                L.launch_kind[i] = (Rect){0,0,0,0};
+                L.launch_host[i] = (Rect){0,0,0,0};
+                L.launch_del [i] = (Rect){0,0,0,0};
+            }
+        }
+        row_y += 6;
+        int add_w = (field_w_total - gap) / 2;
+        L.launch_add_local = (Rect){ field_x,             row_y, add_w, row_h };
+        L.launch_add_ssh   = (Rect){ field_x + add_w + gap, row_y, add_w, row_h };
     }
 
     return L;
@@ -7205,6 +7245,7 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 g_settings_tab = i;
                 g_settings_dir_focus = false;
                 g_settings_recdir_focus = false;
+                g_settings_launch_focus = -1;
                 g_settings_focused_list = SETTINGS_FOCUS_NONE;
                 g_slider_drag_track.w = 0;
                 g_slider_drag_target = NULL;
@@ -7388,6 +7429,59 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             return;
         }
     }
+    /* Launch tab — add / delete entries, toggle kind, focus host
+       text input. */
+    if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
+        if (rect_hit(L.launch_add_local, mx, my)) {
+            if (g_app_settings.launch_count < LAUNCH_ENTRY_MAX) {
+                int i = g_app_settings.launch_count++;
+                g_app_settings.launch[i].kind = 0;
+                g_app_settings.launch[i].host[0] = 0;
+            }
+            return;
+        }
+        if (rect_hit(L.launch_add_ssh, mx, my)) {
+            if (g_app_settings.launch_count < LAUNCH_ENTRY_MAX) {
+                int i = g_app_settings.launch_count++;
+                g_app_settings.launch[i].kind = 1;
+                /* Pre-fill with first saved profile if any. */
+                if (g_ssh_profile_count > 0) {
+                    snprintf(g_app_settings.launch[i].host,
+                             sizeof(g_app_settings.launch[i].host),
+                             "%s", g_ssh_profiles[0].name);
+                } else {
+                    g_app_settings.launch[i].host[0] = 0;
+                }
+                g_settings_launch_focus = i;
+            }
+            return;
+        }
+        for (int i = 0; i < g_app_settings.launch_count; i++) {
+            if (rect_hit(L.launch_del[i], mx, my)) {
+                /* Shift left over the deleted slot. */
+                for (int j = i; j + 1 < g_app_settings.launch_count; j++) {
+                    g_app_settings.launch[j] = g_app_settings.launch[j + 1];
+                }
+                g_app_settings.launch_count--;
+                if (g_settings_launch_focus == i)        g_settings_launch_focus = -1;
+                else if (g_settings_launch_focus > i)    g_settings_launch_focus--;
+                return;
+            }
+            if (rect_hit(L.launch_kind[i], mx, my)) {
+                g_app_settings.launch[i].kind = !g_app_settings.launch[i].kind;
+                if (g_app_settings.launch[i].kind == 0) {
+                    g_app_settings.launch[i].host[0] = 0;
+                }
+                return;
+            }
+            if (rect_hit(L.launch_host[i], mx, my)) {
+                g_settings_launch_focus = i;
+                return;
+            }
+        }
+        /* Click anywhere else inside the launch tab drops focus. */
+        g_settings_launch_focus = -1;
+    }
     if (rect_hit(L.save_default, mx, my)) {
         if (config_save(r)) {
             snprintf(g_settings_status, sizeof(g_settings_status),
@@ -7441,11 +7535,41 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (g_settings_dir_focus) { g_settings_dir_focus = false; return; }
         if (g_settings_recdir_focus) { g_settings_recdir_focus = false; return; }
+        if (g_settings_launch_focus >= 0) {
+            g_settings_launch_focus = -1; return;
+        }
         if (g_settings_focused_list != SETTINGS_FOCUS_NONE) {
             g_settings_focused_list = SETTINGS_FOCUS_NONE;
             return;
         }
         g_ui_mode = UI_NORMAL; return;
+    }
+
+    /* Launch-tab host text input. Plain ASCII; no clipboard for
+       brevity — paste a hostname via the SSH form's saved-list
+       picker if you've got an unwieldy alias. */
+    if (g_settings_launch_focus >= 0 &&
+        g_settings_launch_focus < g_app_settings.launch_count &&
+        g_app_settings.launch[g_settings_launch_focus].kind == 1) {
+        char *buf = g_app_settings.launch[g_settings_launch_focus].host;
+        size_t cap = sizeof(g_app_settings.launch[g_settings_launch_focus].host);
+        size_t len = strlen(buf);
+        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+            if (len > 0) buf[len - 1] = 0;
+            return;
+        }
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) ||
+            IsKeyPressed(KEY_TAB)) {
+            g_settings_launch_focus = -1;
+            return;
+        }
+        int cp;
+        while ((cp = GetCharPressed()) != 0) {
+            if (cp < 32 || cp >= 127) continue;
+            if (len + 1 >= cap) continue;
+            buf[len++] = (char)cp;
+            buf[len] = 0;
+        }
     }
 
     /* Recording-tab directory text input. Same chord set as
@@ -8718,7 +8842,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     /* Tab bar. Active tab gets an accent fill; others sit dim. */
     {
         const char *labels[SETTINGS_TAB_COUNT] = {
-            "Font", "Theme", "Cursor", "Session", "Window", "Recording", "HUD"
+            "Font", "Theme", "Cursor", "Session", "Window", "Recording", "HUD", "Launch"
         };
         for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
             Rect tr = L.tab[i];
@@ -9310,6 +9434,89 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                    12, 0, (Color){140, 150, 170, 255});
     }  /* end HUD tab */
 
+    if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
+        DrawTextEx(*f, "Open these on launch",
+                   (Vector2){L.modal.x + 22, L.modal.y + 80},
+                   14, 0, (Color){200, 205, 220, 255});
+        for (int i = 0; i < g_app_settings.launch_count; i++) {
+            Rect kb = L.launch_kind[i];
+            Rect hb = L.launch_host[i];
+            Rect xb = L.launch_del[i];
+            bool is_ssh = (g_app_settings.launch[i].kind == 1);
+
+            /* Kind pill — Local (grey) vs SSH (cyan). */
+            Color kbg   = is_ssh ? (Color){46, 92, 150, 255} : (Color){48, 52, 66, 255};
+            Color kline = is_ssh ? (Color){125, 207, 255, 220} : (Color){150, 155, 170, 200};
+            DrawRectangle(kb.x, kb.y, kb.w, kb.h, kbg);
+            DrawRectangleLines(kb.x, kb.y, kb.w, kb.h, kline);
+            const char *klbl = is_ssh ? "SSH" : "Local";
+            Vector2 ksz = MeasureTextEx(*f, klbl, 13, 0);
+            DrawTextEx(*f, klbl,
+                       (Vector2){kb.x + (kb.w - ksz.x) / 2,
+                                 kb.y + (kb.h - ksz.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+
+            /* Host text input — disabled / dim for Local entries. */
+            DrawRectangle(hb.x, hb.y, hb.w, hb.h, (Color){22, 25, 34, 255});
+            bool host_focus = (g_settings_launch_focus == i && is_ssh);
+            DrawRectangleLines(hb.x, hb.y, hb.w, hb.h,
+                               host_focus ? (Color){125, 207, 255, 255}
+                                          : (Color){70, 74, 90, 255});
+            BeginScissorMode(hb.x + 6, hb.y, hb.w - 12, hb.h);
+            const char *htext = is_ssh
+                ? (g_app_settings.launch[i].host[0]
+                    ? g_app_settings.launch[i].host
+                    : "(SSH alias from ~/.ssh/config)")
+                : "(default shell — no remote host)";
+            Color htcol = (is_ssh && g_app_settings.launch[i].host[0])
+                           ? (Color){230, 232, 240, 255}
+                           : (Color){110, 115, 130, 255};
+            DrawTextEx(*f, htext, (Vector2){hb.x + 8, hb.y + 7},
+                       14, 0, htcol);
+            if (host_focus && g_app_settings.launch[i].host[0] &&
+                ((long long)(GetTime() * 2.0) & 1) == 0) {
+                Vector2 vsz = MeasureTextEx(*f, g_app_settings.launch[i].host, 14, 0);
+                DrawRectangle(hb.x + 8 + (int)vsz.x + 1, hb.y + 6, 8, 16,
+                              (Color){125, 207, 255, 255});
+            }
+            EndScissorMode();
+
+            /* Delete (×) button. */
+            DrawRectangle(xb.x, xb.y, xb.w, xb.h, (Color){48, 30, 30, 255});
+            DrawRectangleLines(xb.x, xb.y, xb.w, xb.h, (Color){200, 110, 110, 200});
+            Vector2 xsz = MeasureTextEx(*f, "x", 16, 0);
+            DrawTextEx(*f, "x",
+                       (Vector2){xb.x + (xb.w - xsz.x) / 2,
+                                 xb.y + (xb.h - xsz.y) / 2},
+                       16, 0, (Color){240, 200, 200, 255});
+        }
+
+        /* Add buttons. Disabled (dim) when the slot list is full. */
+        bool full = (g_app_settings.launch_count >= LAUNCH_ENTRY_MAX);
+        struct { Rect r; const char *label; } adds[] = {
+            { L.launch_add_local, "+ Add local shell" },
+            { L.launch_add_ssh,   "+ Add SSH host"    },
+        };
+        for (size_t ai = 0; ai < sizeof(adds) / sizeof(*adds); ai++) {
+            Color ab   = full ? (Color){34, 38, 52, 255} : (Color){48, 52, 70, 255};
+            Color al   = full ? (Color){70, 74, 90, 200} : (Color){125, 207, 255, 200};
+            Color at   = full ? (Color){110, 115, 130, 255} : (Color){220, 235, 255, 255};
+            DrawRectangle(adds[ai].r.x, adds[ai].r.y, adds[ai].r.w, adds[ai].r.h, ab);
+            DrawRectangleLines(adds[ai].r.x, adds[ai].r.y, adds[ai].r.w, adds[ai].r.h, al);
+            Vector2 az = MeasureTextEx(*f, adds[ai].label, 13, 0);
+            DrawTextEx(*f, adds[ai].label,
+                       (Vector2){adds[ai].r.x + (adds[ai].r.w - az.x) / 2,
+                                 adds[ai].r.y + (adds[ai].r.h - az.y) / 2},
+                       13, 0, at);
+        }
+
+        if (g_app_settings.launch_count == 0) {
+            DrawTextEx(*f, "(no entries — rbterm opens one local shell on launch)",
+                       (Vector2){L.modal.x + 22, L.launch_add_local.y - 26},
+                       12, 0, (Color){140, 150, 170, 255});
+        }
+    }
+
     /* Save-as-Default button. */
     DrawRectangle(L.save_default.x, L.save_default.y,
                   L.save_default.w, L.save_default.h,
@@ -9638,10 +9845,65 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    if (!tab_open(init_cols, init_rows)) {
-        renderer_shutdown(&r);
-        CloseWindow();
-        return 1;
+    /* Open whatever the user has configured under Settings →
+       Launch. If there are no launch entries, fall back to a single
+       local shell. SSH entries that fail to connect are skipped
+       with a stderr message; we don't want a typo in one entry to
+       block the whole startup. */
+    {
+        bool any = false;
+        if (g_app_settings.launch_count > 0) {
+            ssh_profiles_load();
+            for (int i = 0; i < g_app_settings.launch_count; i++) {
+                if (g_app_settings.launch[i].kind == 1) {
+                    /* SSH — resolve the alias against ~/.ssh/config. */
+                    const char *alias = g_app_settings.launch[i].host;
+                    if (!alias[0]) continue;
+                    /* Try to find a matching profile so we pick up
+                       saved per-host theme/font/cursor/log/colour
+                       overrides. Fall back to alias-as-host with
+                       defaults. */
+                    const SshProfile *prof = NULL;
+                    for (int k = 0; k < g_ssh_profile_count; k++) {
+                        if (strcmp(g_ssh_profiles[k].name, alias) == 0) {
+                            prof = &g_ssh_profiles[k]; break;
+                        }
+                    }
+                    char err[256] = {0};
+                    Tab *t = tab_open_ssh(
+                        prof && prof->user[0]     ? prof->user     : NULL,
+                        prof && prof->hostname[0] ? prof->hostname : alias,
+                        prof ? prof->port : 0,
+                        NULL,
+                        prof && prof->identity[0] ? prof->identity : NULL,
+                        prof && prof->theme[0]    ? prof->theme    : NULL,
+                        prof ? prof->cursor_style : 0,
+                        prof && prof->font[0]     ? prof->font     : NULL,
+                        prof ? prof->font_size : 0,
+                        prof && prof->log_dir[0]  ? prof->log_dir  : NULL,
+                        prof ? prof->log_mode : 0,
+                        prof && prof->color[0]    ? prof->color    : NULL,
+                        prof && prof->hud.override ? &prof->hud    : NULL,
+                        init_cols, init_rows, err, sizeof(err));
+                    if (!t) {
+                        fprintf(stderr,
+                                "rbterm: launch ssh '%s' failed: %s\n",
+                                alias, err[0] ? err : "(unknown)");
+                        continue;
+                    }
+                    any = true;
+                } else {
+                    if (tab_open(init_cols, init_rows)) any = true;
+                }
+            }
+        }
+        if (!any) {
+            if (!tab_open(init_cols, init_rows)) {
+                renderer_shutdown(&r);
+                CloseWindow();
+                return 1;
+            }
+        }
     }
 
     SetTargetFPS(60);
