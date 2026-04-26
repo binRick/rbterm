@@ -371,6 +371,13 @@ static OSStatus quake_carbon_hotkey_handler(EventHandlerCallRef nextHandler,
 
 static EventHotKeyRef  g_quake_hotkey_ref  = NULL;
 static EventHandlerRef g_quake_handler_ref = NULL;
+/* Token returned by NSProcessInfo's beginActivityWithOptions —
+   keeps macOS App Nap from throttling our main thread once the
+   user hides the window. Without it, hidden rbterm only wakes
+   up every 1-2s to dispatch buffered Cocoa events, so the
+   second Cmd+CapsLock had a 1-2s lag before unhide kicked in.
+   We hold the token for the lifetime of the hotkey. */
+static id g_quake_no_nap_token = nil;
 
 void mac_install_quake_hotkey(void) {
     if (g_quake_global_monitor || g_quake_local_monitor) return;
@@ -409,6 +416,20 @@ void mac_install_quake_hotkey(void) {
             }
             return e;
         }];
+
+    /* Disable App Nap. Without this, macOS throttles hidden apps
+       so aggressively that our main thread only wakes every
+       1-2 s — the user pressed Cmd+CapsLock to unhide and saw a
+       multi-second lag before the chord registered. We're an
+       interactive utility users expect to summon instantly, so
+       opt out of the energy-saver entirely. NSActivityLatencyCritical
+       is the strongest level; perfectly fine on a desktop /
+       wall-power Mac. */
+    g_quake_no_nap_token = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:(NSActivityUserInitiated |
+                                  NSActivityLatencyCritical)
+                          reason:@"rbterm global hotkey"];
+
     quake_log("quake-hotkey-installed");
 }
 
