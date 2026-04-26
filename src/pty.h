@@ -126,3 +126,34 @@ const char *pty_upload_name(PtyUpload *u);
    call before completion (cancels by best-effort: the worker will
    notice on its next chunk boundary and bail). */
 void pty_upload_release(PtyUpload *u);
+
+/* SFTP listdir — synchronous; returns a heap-allocated array of
+   entries (caller frees via pty_listdir_free). Sorted directories-
+   first, then files alphabetically. Hidden entries ("." / "..")
+   are excluded except "..", which is included so the picker can
+   navigate up. NULL on failure, with `err` populated. */
+typedef struct {
+    char     name[256];
+    uint64_t size;
+    long     mtime;       /* unix seconds; 0 if unknown */
+    bool     is_dir;
+    bool     is_symlink;
+} PtyDirEntry;
+
+PtyDirEntry *pty_listdir(Pty *p, const char *remote_dir, int *count_out,
+                         char *err, size_t errsz);
+void pty_listdir_free(PtyDirEntry *entries);
+
+/* SFTP download — same pattern as pty_upload_*. Caller polls
+   pty_download_status and frees with pty_download_release once
+   it's done with status display. */
+typedef struct PtyDownload PtyDownload;
+
+PtyDownload *pty_download_start(Pty *p, const char *remote_path,
+                                const char *local_path,
+                                char *err, size_t errsz);
+int  pty_download_status(PtyDownload *d,
+                         uint64_t *bytes_done, uint64_t *bytes_total,
+                         char *err, size_t errsz);
+const char *pty_download_name(PtyDownload *d);
+void pty_download_release(PtyDownload *d);

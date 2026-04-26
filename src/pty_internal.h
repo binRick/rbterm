@@ -54,3 +54,19 @@ int  ssh_upload_status_impl(struct PtyUpload *u,
                             char *err, size_t errsz);
 const char *ssh_upload_name_impl(struct PtyUpload *u);
 void ssh_upload_release_impl(struct PtyUpload *u);
+
+/* SFTP listdir + download — same pattern, SSH-only. */
+struct PtyDirEntry;
+struct PtyDirEntry *ssh_listdir_impl(void *impl, const char *remote_dir,
+                                     int *count_out,
+                                     char *err, size_t errsz);
+struct PtyDownload;
+struct PtyDownload *ssh_download_start_impl(void *impl,
+                                            const char *remote_path,
+                                            const char *local_path,
+                                            char *err, size_t errsz);
+int  ssh_download_status_impl(struct PtyDownload *d,
+                              uint64_t *bytes_done, uint64_t *bytes_total,
+                              char *err, size_t errsz);
+const char *ssh_download_name_impl(struct PtyDownload *d);
+void ssh_download_release_impl(struct PtyDownload *d);

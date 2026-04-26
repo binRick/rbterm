@@ -229,6 +229,33 @@ bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
     return true;
 }
 
+/* Open a modal NSSavePanel and return the chosen save path in
+   `out`. `suggested` pre-fills the filename field. Returns true on
+   confirm, false on cancel or overflow. Used by the SFTP download
+   modal to pick where to put the downloaded file. */
+bool mac_pick_save_file(const char *suggested, char *out, size_t cap) {
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+    __block bool ok = false;
+    @autoreleasepool {
+        NSSavePanel *panel = [NSSavePanel savePanel];
+        if (suggested && *suggested) {
+            [panel setNameFieldStringValue:[NSString stringWithUTF8String:suggested]];
+        }
+        [panel setTitle:@"Save downloaded file"];
+        [panel setPrompt:@"Save"];
+        if ([panel runModal] == NSModalResponseOK) {
+            const char *p = [[[panel URL] path] UTF8String];
+            if (p && strlen(p) + 1 <= cap) {
+                strncpy(out, p, cap - 1);
+                out[cap - 1] = 0;
+                ok = true;
+            }
+        }
+    }
+    return ok;
+}
+
 /* Open a modal NSOpenPanel and return the chosen file's POSIX path
    in `out` (NUL-terminated). Returns true if the user picked a file,
    false on cancel or buffer overflow. Single-file selection only. */

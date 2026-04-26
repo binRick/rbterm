@@ -55,6 +55,7 @@
   int  mac_consume_ctrl_tab(void);
   void mac_enter_native_fullscreen(void);
   bool mac_pick_open_file(char *out, size_t cap);
+  bool mac_pick_save_file(const char *suggested, char *out, size_t cap);
 #endif
 
 #ifndef _WIN32
@@ -508,6 +509,11 @@ typedef struct {
        while in flight. Used to keep the toast on screen for a few
        seconds after completion before releasing the handle. */
     double     upload_done_at;
+
+    /* Download mirror of the upload slot. Both can run
+       concurrently; the toast block renders both stacked. */
+    PtyDownload *download;
+    double       download_done_at;
 } Pane;
 
 typedef enum {
@@ -576,6 +582,7 @@ static HudConfig hud_effective(const Tab *t) {
 #define TAB_REC_W   26          /* one record button (start + stop, both always visible) */
 #define TAB_SSH_W   48
 #define TAB_UPLOAD_W 28         /* SFTP upload button (only visible on SSH tabs) */
+#define TAB_DOWNLOAD_W 28       /* SFTP download button (only visible on SSH tabs) */
 
 static Tab *g_tabs[MAX_TABS];
 
@@ -593,7 +600,10 @@ static int g_active = 0;
    keystrokes edit form fields and mouse clicks focus them instead of
    going to the active tab. Layout is computed on the fly in
    ssh_form_layout() so draw and hit-test share one source of truth. */
-typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP, UI_REC_SAVE, UI_SFTP_UPLOAD } UiMode;
+typedef enum {
+    UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP, UI_REC_SAVE,
+    UI_SFTP_UPLOAD, UI_SFTP_DOWNLOAD
+} UiMode;
 typedef enum {
     F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
     F_NEW, F_CONNECT, F_DELETE, F_SAVE, F_CANCEL,
@@ -633,6 +643,26 @@ typedef struct {
     char  status[256];   /* error from pty_upload_start, if any */
 } SftpUploadForm;
 static SftpUploadForm g_upload_form;
+
+/* SFTP download form state. The user navigates a remote directory,
+   filters by name, and picks a file. We hold the listing in memory
+   until the modal closes or a different dir is loaded. */
+typedef struct {
+    char  remote_dir[4096];     /* current dir being viewed */
+    char  filter[128];          /* live-filter substring */
+    bool  filter_focus;         /* true while keystrokes edit the filter */
+    bool  dir_focus;            /* true while keystrokes edit remote_dir */
+    int   selected;             /* index in the filtered view, -1 = none */
+    int   scroll;               /* row offset for the listing */
+    char  status[256];          /* errors / "loading…" */
+
+    /* Heap-allocated listing of `remote_dir`. Refreshed each time
+       the user navigates or hits Refresh. NULL means we haven't
+       loaded yet (or it's still loading). */
+    PtyDirEntry *entries;
+    int          entry_count;
+} SftpDownloadForm;
+static SftpDownloadForm g_download_form;
 
 typedef struct {
     int x, y, w, h;
@@ -1123,9 +1153,10 @@ static void pane_free(Pane *p) {
     /* Stop a recording if its target pane is going away — the file
        pointer would dangle otherwise. */
     if (g_rec.active && g_rec.pane == p) rec_stop();
-    /* Cancel + join any in-flight SFTP upload before tearing down
-       the PTY (the worker thread holds the session lock). */
-    if (p->upload) { pty_upload_release(p->upload); p->upload = NULL; }
+    /* Cancel + join any in-flight SFTP transfers before tearing
+       down the PTY (the worker threads hold the session lock). */
+    if (p->upload)   { pty_upload_release(p->upload);     p->upload = NULL; }
+    if (p->download) { pty_download_release(p->download); p->download = NULL; }
     pane_log_close(p);
     if (p->pty) { pty_close(p->pty); p->pty = NULL; }
     if (p->scr) { screen_free(p->scr); p->scr = NULL; }
@@ -2922,52 +2953,68 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         }
     }
 
-    /* SFTP upload toast — bottom-left of each pane with an active
-       transfer or one that finished within the last few seconds.
-       Reads atomic state from the worker thread so this is safe to
-       call every frame without locking. */
+    /* SFTP transfer toasts — bottom-left of each pane. Upload (if
+       any) draws first, download stacks above it. Reads atomic
+       state from the worker so this is safe to call every frame
+       without locking. ASCII-only labels because raylib's bundled
+       font doesn't carry ↑/✓/✗ codepoints. */
     for (int pi = 0; pi < t->num_panes; pi++) {
         Pane *p = &t->panes[pi];
-        if (!p->upload) continue;
-        uint64_t done = 0, total = 0;
-        char err[256] = {0};
-        int st = pty_upload_status(p->upload, &done, &total, err, sizeof(err));
-        const char *name = pty_upload_name(p->upload);
-        char label[320];
-        Color outline = (Color){80, 90, 110, 255};
-        /* ASCII-only — raylib's bundled font (used for this toast)
-           doesn't carry ↑/✓/✗ codepoints; "?" was rendering instead. */
-        if (st == 0) {
-            int pct = (total > 0) ? (int)((done * 100ULL) / total) : 0;
-            if (pct > 99) pct = 99;
-            snprintf(label, sizeof(label), "[up] %s  %d%%", name, pct);
-            outline = (Color){125, 207, 255, 220};
-        } else if (st == 1) {
-            double mb = (double)total / (1024.0 * 1024.0);
-            if (mb >= 1.0) snprintf(label, sizeof(label), "[ok] %s  %.1f MB", name, mb);
-            else           snprintf(label, sizeof(label), "[ok] %s  %llu KB",
-                                    name, (unsigned long long)(total / 1024));
-            outline = (Color){140, 230, 160, 220};
-        } else {
-            snprintf(label, sizeof(label), "[err] %s: %s",
-                     name, err[0] ? err : "failed");
-            outline = (Color){240, 120, 120, 220};
-        }
+        struct { void *handle; const char *prefix; bool is_upload; } slots[2] = {
+            { p->upload,   "up",  true  },
+            { p->download, "dn",  false },
+        };
         PaneRect pr;
         pane_rect(t, pi, win_w, win_h, &pr);
-        int fs = 12;
-        int tw = MeasureText(label, fs);
-        int x_pad = 8, y_pad = 4;
-        int slab_w = tw + x_pad * 2;
+        int fs = 12, x_pad = 8, y_pad = 4, margin = 8;
         int slab_h = fs + y_pad * 2;
-        int margin = 8;
-        int slab_x = pr.x + margin;
-        int slab_y = pr.y + pr.h - slab_h - margin;
-        DrawRectangle(slab_x, slab_y, slab_w, slab_h,
-                      (Color){10, 12, 18, 200});
-        DrawRectangleLines(slab_x, slab_y, slab_w, slab_h, outline);
-        DrawText(label, slab_x + x_pad, slab_y + y_pad, fs,
-                 (Color){230, 235, 245, 255});
+        int stack_offset = 0;
+        for (int si = 0; si < 2; si++) {
+            if (!slots[si].handle) continue;
+            uint64_t done = 0, total = 0;
+            char err[256] = {0};
+            int st;
+            const char *name;
+            if (slots[si].is_upload) {
+                st   = pty_upload_status((PtyUpload *)slots[si].handle,
+                                         &done, &total, err, sizeof(err));
+                name = pty_upload_name((PtyUpload *)slots[si].handle);
+            } else {
+                st   = pty_download_status((PtyDownload *)slots[si].handle,
+                                           &done, &total, err, sizeof(err));
+                name = pty_download_name((PtyDownload *)slots[si].handle);
+            }
+            char label[320];
+            Color outline = (Color){80, 90, 110, 255};
+            if (st == 0) {
+                int pct = (total > 0) ? (int)((done * 100ULL) / total) : 0;
+                if (pct > 99) pct = 99;
+                snprintf(label, sizeof(label), "[%s] %s  %d%%",
+                         slots[si].prefix, name, pct);
+                outline = (Color){125, 207, 255, 220};
+            } else if (st == 1) {
+                double mb = (double)total / (1024.0 * 1024.0);
+                if (mb >= 1.0) snprintf(label, sizeof(label), "[ok] %s  %.1f MB",
+                                        name, mb);
+                else           snprintf(label, sizeof(label), "[ok] %s  %llu KB",
+                                        name, (unsigned long long)(total / 1024));
+                outline = (Color){140, 230, 160, 220};
+            } else {
+                snprintf(label, sizeof(label), "[err] %s: %s",
+                         name, err[0] ? err : "failed");
+                outline = (Color){240, 120, 120, 220};
+            }
+            int tw = MeasureText(label, fs);
+            int slab_w = tw + x_pad * 2;
+            int slab_x = pr.x + margin;
+            int slab_y = pr.y + pr.h - slab_h - margin - stack_offset;
+            DrawRectangle(slab_x, slab_y, slab_w, slab_h,
+                          (Color){10, 12, 18, 200});
+            DrawRectangleLines(slab_x, slab_y, slab_w, slab_h, outline);
+            DrawText(label, slab_x + x_pad, slab_y + y_pad, fs,
+                     (Color){230, 235, 245, 255});
+            stack_offset += slab_h + 4;
+        }
     }
 
     SetMouseCursor(hud_hover ? MOUSE_CURSOR_POINTING_HAND
@@ -3011,6 +3058,7 @@ typedef struct {
     bool on_rec_start;     /* start asciinema recording */
     bool on_rec_stop;      /* stop asciinema recording */
     bool on_upload;        /* SFTP upload — only present on SSH tabs */
+    bool on_download;      /* SFTP download — only present on SSH tabs */
 } TabBarHit;
 
 /* Split buttons are hidden when the active tab is already split — there's
@@ -3022,11 +3070,14 @@ static bool split_buttons_visible(void) {
 }
 
 /* True iff the active tab is an SSH session — controls visibility of
-   the SFTP upload tab-bar button. */
+   the SFTP upload + download tab-bar buttons. */
 static bool upload_button_visible(void) {
     if (g_active < 0 || g_active >= g_num_tabs) return false;
     Tab *t = g_tabs[g_active];
     return t && t->is_ssh;
+}
+static bool download_button_visible(void) {
+    return upload_button_visible();
 }
 
 /* Compute the per-tab pixel width in the tab bar from the
@@ -3036,8 +3087,9 @@ static bool upload_button_visible(void) {
 static int tab_width_for(int win_w) {
     int split_w  = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
     int upload_w = upload_button_visible()  ? TAB_UPLOAD_W   : 0;
+    int dl_w     = download_button_visible() ? TAB_DOWNLOAD_W : 0;
     int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - 2 * TAB_REC_W
-                - TAB_HELP_W - split_w - upload_w - TAB_SSH_W;
+                - TAB_HELP_W - split_w - upload_w - dl_w - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -3050,17 +3102,19 @@ static int tab_width_for(int win_w) {
    The "+" was on the far right; moved next to [ssh] so the two
    "open something" buttons live together. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false, false };
+    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     bool show_splits = split_buttons_visible();
     bool show_up     = upload_button_visible();
+    bool show_dl     = download_button_visible();
     int help_x      = win_w - TAB_HELP_W;
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W     : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
     int rec_stop_x  = split_v_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
     int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
-    int gear_x      = upload_x - TAB_GEAR_W;
+    int dl_x        = show_dl ? upload_x - TAB_DOWNLOAD_W  : upload_x;
+    int gear_x      = dl_x - TAB_GEAR_W;
     int plus_x      = TAB_SSH_W;
     int tab_start   = TAB_SSH_W + TAB_PLUS_W;
     if (mx < TAB_SSH_W)                       { h.on_ssh  = true; return h; }
@@ -3072,6 +3126,7 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     if (mx >= rec_stop_x)   { h.on_rec_stop  = true; return h; }
     if (mx >= rec_start_x)  { h.on_rec_start = true; return h; }
     if (show_up && mx >= upload_x) { h.on_upload = true; return h; }
+    if (show_dl && mx >= dl_x)     { h.on_download = true; return h; }
     if (mx >= gear_x)       { h.on_gear      = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
@@ -3177,12 +3232,14 @@ static void draw_tab_bar(Renderer *r, int win_w) {
        REC pill renders only while a recording is active. */
     bool show_splits = split_buttons_visible();
     bool show_up     = upload_button_visible();
+    bool show_dl     = download_button_visible();
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W    : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W : help_x;
     int rec_stop_x  = split_v_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
     int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
-    int gear_x      = upload_x - TAB_GEAR_W;
+    int dl_x        = show_dl ? upload_x - TAB_DOWNLOAD_W  : upload_x;
+    int gear_x      = dl_x - TAB_GEAR_W;
 
     /* REC pill: shows while a recording is active. Sits just left
        of the gear and counts up from the recording's start time.
@@ -3271,6 +3328,24 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                    (Vector2){cx, cy - size * 0.55f}, 2.0f, up_glyph);
         DrawLineEx((Vector2){cx + size * 0.45f, cy - size * 0.10f},
                    (Vector2){cx, cy - size * 0.55f}, 2.0f, up_glyph);
+    }
+
+    /* SFTP download button — same shape, chevron pointing down. */
+    if (show_dl) {
+        Color dl_bg = (Color){38, 48, 66, 255};
+        Color dl_outline = (Color){125, 207, 255, 200};
+        Color dl_glyph = (Color){220, 235, 255, 255};
+        DrawRectangle(dl_x, 0, TAB_DOWNLOAD_W, TAB_BAR_H, dl_bg);
+        DrawRectangleLines(dl_x, 2, TAB_DOWNLOAD_W - 1, TAB_BAR_H - 4, dl_outline);
+        float cx = dl_x + TAB_DOWNLOAD_W / 2.0f;
+        float cy = TAB_BAR_H / 2.0f;
+        float size = TAB_BAR_H * 0.42f;
+        DrawLineEx((Vector2){cx, cy - size * 0.55f},
+                   (Vector2){cx, cy + size * 0.55f}, 2.0f, dl_glyph);
+        DrawLineEx((Vector2){cx - size * 0.45f, cy + size * 0.10f},
+                   (Vector2){cx, cy + size * 0.55f}, 2.0f, dl_glyph);
+        DrawLineEx((Vector2){cx + size * 0.45f, cy + size * 0.10f},
+                   (Vector2){cx, cy + size * 0.55f}, 2.0f, dl_glyph);
     }
 
     /* Split buttons — vertical (side-by-side) then horizontal
@@ -4017,6 +4092,530 @@ static void draw_upload_form(Renderer *r, int win_w, int win_h, UploadFormLayout
     DrawTextEx(*f, "Upload",
                (Vector2){L.upload_btn.x + (L.upload_btn.w - usz.x) / 2,
                          L.upload_btn.y + (L.upload_btn.h - usz.y) / 2},
+               14, 0, (Color){230, 240, 255, 255});
+}
+
+/* ---------------- SFTP download modal ---------------- */
+
+typedef struct {
+    Rect modal;
+    Rect dir_field;
+    Rect refresh_btn;
+    Rect filter_field;
+    Rect list;
+    Rect download_btn;
+    Rect cancel_btn;
+} DownloadFormLayout;
+
+/* Recompute the rects for the download modal. The modal is a bit
+   larger than the upload one — needs to fit the directory listing.
+   Layout: title bar | dir field + refresh | filter | list | btns. */
+static DownloadFormLayout download_form_layout(int win_w, int win_h) {
+    DownloadFormLayout L = {0};
+    int w = 720, h = 520;
+    if (w > win_w - 40) w = win_w - 40;
+    if (h > win_h - 40) h = win_h - 40;
+    L.modal.x = (win_w - w) / 2;
+    L.modal.y = (win_h - h) / 2;
+    L.modal.w = w;
+    L.modal.h = h;
+    int pad = 22;
+    int title_h = 38;
+    int field_x = L.modal.x + pad;
+    int row_y = L.modal.y + title_h + 14;
+
+    /* Directory bar: editable path + Refresh button. */
+    int btn_w = 90, btn_h = 28;
+    L.dir_field   = (Rect){ field_x, row_y, w - 2 * pad - btn_w - 8, btn_h };
+    L.refresh_btn = (Rect){ L.dir_field.x + L.dir_field.w + 8,
+                            row_y, btn_w, btn_h };
+    row_y += btn_h + 10;
+    L.filter_field = (Rect){ field_x, row_y, w - 2 * pad, btn_h };
+    row_y += btn_h + 10;
+
+    int footer_h = 32;
+    int footer_y = L.modal.y + h - 22 - footer_h;
+    L.list = (Rect){ field_x, row_y,
+                     w - 2 * pad,
+                     footer_y - row_y - 14 };
+
+    L.download_btn = (Rect){ L.modal.x + w - 22 - 110, footer_y, 110, footer_h };
+    L.cancel_btn   = (Rect){ L.download_btn.x - 8 - 90, footer_y, 90, footer_h };
+    return L;
+}
+
+/* Refresh the directory listing for g_download_form.remote_dir. */
+static void download_form_refresh(void) {
+    if (g_download_form.entries) {
+        pty_listdir_free(g_download_form.entries);
+        g_download_form.entries = NULL;
+        g_download_form.entry_count = 0;
+    }
+    g_download_form.selected = -1;
+    g_download_form.scroll = 0;
+    g_download_form.status[0] = 0;
+    Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
+    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    if (!ap || !ap->pty) {
+        snprintf(g_download_form.status, sizeof(g_download_form.status),
+                 "no active pane");
+        return;
+    }
+    char err[256] = {0};
+    int n = 0;
+    g_download_form.entries = pty_listdir(ap->pty, g_download_form.remote_dir,
+                                          &n, err, sizeof(err));
+    if (!g_download_form.entries) {
+        snprintf(g_download_form.status, sizeof(g_download_form.status),
+                 "%s", err[0] ? err : "listdir failed");
+        g_download_form.entry_count = 0;
+        return;
+    }
+    g_download_form.entry_count = n;
+}
+
+/* Filter predicate: returns true iff entry matches the live filter. */
+static bool download_filter_match(const PtyDirEntry *e) {
+    if (!g_download_form.filter[0]) return true;
+    /* Case-insensitive substring match. */
+    const char *needle = g_download_form.filter;
+    const char *hay = e->name;
+    size_t nl = strlen(needle);
+    size_t hl = strlen(hay);
+    if (nl > hl) return false;
+    for (size_t i = 0; i + nl <= hl; i++) {
+        bool ok = true;
+        for (size_t j = 0; j < nl; j++) {
+            char a = hay[i + j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) { ok = false; break; }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+/* Compose the filtered view: out is filled with indices into
+   g_download_form.entries[]; returns count. */
+static int download_filtered_indices(int *out, int cap) {
+    int n = 0;
+    for (int i = 0; i < g_download_form.entry_count && n < cap; i++) {
+        if (download_filter_match(&g_download_form.entries[i])) {
+            out[n++] = i;
+        }
+    }
+    return n;
+}
+
+/* Open the download modal anchored on the active pane's tracked
+   cwd (falls back to "~/"). */
+static void download_form_open(void) {
+    /* Free previous listing if any. */
+    if (g_download_form.entries) {
+        pty_listdir_free(g_download_form.entries);
+    }
+    memset(&g_download_form, 0, sizeof(g_download_form));
+    g_download_form.selected = -1;
+    Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
+    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    if (ap && ap->cwd[0]) {
+        snprintf(g_download_form.remote_dir,
+                 sizeof(g_download_form.remote_dir), "%s", ap->cwd);
+    } else {
+        snprintf(g_download_form.remote_dir,
+                 sizeof(g_download_form.remote_dir), "~/");
+    }
+    g_download_form.filter_focus = false;
+    g_download_form.dir_focus = false;
+    g_ui_mode = UI_SFTP_DOWNLOAD;
+    download_form_refresh();
+}
+
+/* Build the dir-up path: "/a/b/c" → "/a/b", "/a" → "/", "~/foo" →
+   "~/", "~" stays "~/". Result written into `out`. */
+static void download_form_parent_dir(const char *in, char *out, size_t cap) {
+    snprintf(out, cap, "%s", in);
+    /* Strip any trailing slashes (except root). */
+    size_t l = strlen(out);
+    while (l > 1 && out[l - 1] == '/') { out[l - 1] = 0; l--; }
+    /* Find last separator. */
+    char *slash = strrchr(out, '/');
+    if (!slash) {
+        /* Bare alias like "~"; reset to "~/". */
+        snprintf(out, cap, "~/");
+        return;
+    }
+    if (slash == out) {
+        /* "/foo" → "/". */
+        out[1] = 0;
+    } else {
+        *slash = 0;
+    }
+}
+
+/* Submit: fire NSSavePanel for local dest, kick off the download.
+   Closes the modal on success; leaves it open with status set on
+   error. */
+static void download_form_submit_selected(void) {
+    g_download_form.status[0] = 0;
+    int idxs[1024];
+    int fcount = download_filtered_indices(idxs, (int)(sizeof(idxs) / sizeof(idxs[0])));
+    if (g_download_form.selected < 0 || g_download_form.selected >= fcount) {
+        snprintf(g_download_form.status, sizeof(g_download_form.status),
+                 "select a file first");
+        return;
+    }
+    PtyDirEntry *e = &g_download_form.entries[idxs[g_download_form.selected]];
+    if (e->is_dir) {
+        /* Activating a directory navigates into it instead of
+           downloading. ".." pops up; everything else descends. */
+        char next[sizeof(g_download_form.remote_dir)];
+        if (strcmp(e->name, "..") == 0) {
+            download_form_parent_dir(g_download_form.remote_dir,
+                                     next, sizeof(next));
+        } else {
+            size_t cl = strlen(g_download_form.remote_dir);
+            const char *sep = (cl > 0 && g_download_form.remote_dir[cl - 1] == '/') ? "" : "/";
+            snprintf(next, sizeof(next), "%s%s%s",
+                     g_download_form.remote_dir, sep, e->name);
+        }
+        snprintf(g_download_form.remote_dir,
+                 sizeof(g_download_form.remote_dir), "%s", next);
+        download_form_refresh();
+        return;
+    }
+    /* Pick local destination. */
+    char local[4096] = {0};
+#ifdef __APPLE__
+    if (!mac_pick_save_file(e->name, local, sizeof(local))) {
+        return;   /* user cancelled */
+    }
+#else
+    /* Headless fallback: drop into ~/Downloads/<name>. */
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = ".";
+    snprintf(local, sizeof(local), "%s/Downloads/%s", home, e->name);
+#endif
+    /* Compose absolute remote path. */
+    char remote[4096];
+    size_t cl = strlen(g_download_form.remote_dir);
+    const char *sep = (cl > 0 && g_download_form.remote_dir[cl - 1] == '/') ? "" : "/";
+    snprintf(remote, sizeof(remote), "%s%s%s",
+             g_download_form.remote_dir, sep, e->name);
+
+    Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
+    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    if (!ap) {
+        snprintf(g_download_form.status, sizeof(g_download_form.status),
+                 "no active pane");
+        return;
+    }
+    if (ap->download) {
+        pty_download_release(ap->download);
+        ap->download = NULL;
+    }
+    char err[256] = {0};
+    ap->download = pty_download_start(ap->pty, remote, local, err, sizeof(err));
+    if (!ap->download) {
+        snprintf(g_download_form.status, sizeof(g_download_form.status),
+                 "%s", err[0] ? err : "download failed to start");
+        return;
+    }
+    ap->download_done_at = 0.0;
+    g_ui_mode = UI_NORMAL;
+}
+
+static void download_form_close(void) {
+    if (g_download_form.entries) {
+        pty_listdir_free(g_download_form.entries);
+        g_download_form.entries = NULL;
+        g_download_form.entry_count = 0;
+    }
+    g_ui_mode = UI_NORMAL;
+}
+
+#define DL_ROW_H 22
+
+static void download_form_handle_mouse(DownloadFormLayout L) {
+    Vector2 mp_h = GetMousePosition();
+    int hx = (int)mp_h.x, hy = (int)mp_h.y;
+    if (rect_hit(L.list, hx, hy)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_download_form.scroll -= (int)(wheel * 3.0f);
+            if (g_download_form.scroll < 0) g_download_form.scroll = 0;
+        }
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+    Vector2 mp = GetMousePosition();
+    int mx = (int)mp.x, my = (int)mp.y;
+
+    if (rect_hit(L.dir_field, mx, my)) {
+        g_download_form.dir_focus = true;
+        g_download_form.filter_focus = false;
+        return;
+    }
+    if (rect_hit(L.refresh_btn, mx, my)) {
+        download_form_refresh();
+        return;
+    }
+    if (rect_hit(L.filter_field, mx, my)) {
+        g_download_form.filter_focus = true;
+        g_download_form.dir_focus = false;
+        return;
+    }
+    if (rect_hit(L.list, mx, my)) {
+        g_download_form.dir_focus = false;
+        g_download_form.filter_focus = false;
+        int rel = (my - L.list.y) / DL_ROW_H + g_download_form.scroll;
+        int idxs[1024];
+        int fcount = download_filtered_indices(idxs, (int)(sizeof(idxs) / sizeof(idxs[0])));
+        if (rel < 0 || rel >= fcount) return;
+        /* Single-click selects; double-click activates (descends
+           into a directory or fires the save dialog for a file). */
+        static double last_click_t = -1;
+        static int    last_click_i = -1;
+        if (g_download_form.selected == rel &&
+            GetTime() - last_click_t < 0.45 &&
+            last_click_i == rel) {
+            download_form_submit_selected();
+            last_click_i = -1;
+            return;
+        }
+        g_download_form.selected = rel;
+        last_click_t = GetTime();
+        last_click_i = rel;
+        return;
+    }
+    if (rect_hit(L.download_btn, mx, my)) {
+        download_form_submit_selected();
+        return;
+    }
+    if (rect_hit(L.cancel_btn, mx, my)) {
+        download_form_close();
+        return;
+    }
+    if (!rect_hit(L.modal, mx, my)) {
+        download_form_close();
+        return;
+    }
+    g_download_form.dir_focus = false;
+    g_download_form.filter_focus = false;
+}
+
+static void download_form_handle_keys(void) {
+    if (IsKeyPressed(KEY_ESCAPE)) { download_form_close(); return; }
+    int idxs[1024];
+    int fcount = download_filtered_indices(idxs, (int)(sizeof(idxs) / sizeof(idxs[0])));
+    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
+        if (fcount > 0) {
+            g_download_form.selected =
+                (g_download_form.selected < 0) ? 0
+                : (g_download_form.selected + 1) % fcount;
+        }
+        return;
+    }
+    if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) {
+        if (fcount > 0) {
+            g_download_form.selected =
+                (g_download_form.selected <= 0) ? fcount - 1
+                : g_download_form.selected - 1;
+        }
+        return;
+    }
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        if (g_download_form.dir_focus) {
+            download_form_refresh();
+            g_download_form.dir_focus = false;
+        } else {
+            download_form_submit_selected();
+        }
+        return;
+    }
+
+    /* Text editing for whichever field has focus. */
+    char *buf = NULL;
+    size_t cap = 0;
+    if (g_download_form.dir_focus) {
+        buf = g_download_form.remote_dir;
+        cap = sizeof(g_download_form.remote_dir);
+    } else if (g_download_form.filter_focus) {
+        buf = g_download_form.filter;
+        cap = sizeof(g_download_form.filter);
+    }
+    if (!buf) return;
+    size_t len = strlen(buf);
+    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+        if (len > 0) buf[len - 1] = 0;
+        return;
+    }
+    int cp;
+    while ((cp = GetCharPressed()) != 0) {
+        if (cp < 32 || cp >= 127) continue;
+        if (len + 1 >= cap) continue;
+        buf[len++] = (char)cp;
+        buf[len] = 0;
+    }
+}
+
+static void format_size(uint64_t bytes, char *out, size_t cap) {
+    if (bytes < 1024)            snprintf(out, cap, "%llu B",  (unsigned long long)bytes);
+    else if (bytes < 1024 * 1024) snprintf(out, cap, "%.1f KB", (double)bytes / 1024.0);
+    else if (bytes < (uint64_t)1024 * 1024 * 1024)
+                                  snprintf(out, cap, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    else                          snprintf(out, cap, "%.1f GB",
+                                          (double)bytes / (1024.0 * 1024.0 * 1024.0));
+}
+
+static void draw_download_form(Renderer *r, int win_w, int win_h, DownloadFormLayout L) {
+    (void)win_w; (void)win_h;
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(),
+                  (Color){0, 0, 0, 150});
+    DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                  (Color){30, 34, 46, 255});
+    DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                       (Color){125, 207, 255, 220});
+    Font *f = (Font *)r->font_data;
+    DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
+                  (Color){38, 42, 58, 255});
+    DrawTextEx(*f, "SFTP — Download",
+               (Vector2){L.modal.x + 20, L.modal.y + 11},
+               16, 0, (Color){230, 232, 240, 255});
+
+    /* Directory field. */
+    DrawRectangle(L.dir_field.x, L.dir_field.y, L.dir_field.w, L.dir_field.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.dir_field.x, L.dir_field.y, L.dir_field.w, L.dir_field.h,
+                       g_download_form.dir_focus ? (Color){125, 207, 255, 255}
+                                                  : (Color){70, 74, 90, 255});
+    BeginScissorMode(L.dir_field.x + 6, L.dir_field.y,
+                     L.dir_field.w - 12, L.dir_field.h);
+    DrawTextEx(*f, g_download_form.remote_dir,
+               (Vector2){L.dir_field.x + 8, L.dir_field.y + 7},
+               14, 0, (Color){230, 232, 240, 255});
+    if (g_download_form.dir_focus &&
+        ((long long)(GetTime() * 2.0) & 1) == 0) {
+        Vector2 vsz = MeasureTextEx(*f, g_download_form.remote_dir, 14, 0);
+        DrawRectangle(L.dir_field.x + 8 + (int)vsz.x + 1,
+                      L.dir_field.y + 6, 8, 16,
+                      (Color){125, 207, 255, 255});
+    }
+    EndScissorMode();
+    /* Refresh button. */
+    DrawRectangle(L.refresh_btn.x, L.refresh_btn.y,
+                  L.refresh_btn.w, L.refresh_btn.h,
+                  (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.refresh_btn.x, L.refresh_btn.y,
+                       L.refresh_btn.w, L.refresh_btn.h,
+                       (Color){125, 207, 255, 200});
+    Vector2 rsz = MeasureTextEx(*f, "Refresh", 13, 0);
+    DrawTextEx(*f, "Refresh",
+               (Vector2){L.refresh_btn.x + (L.refresh_btn.w - rsz.x) / 2,
+                         L.refresh_btn.y + (L.refresh_btn.h - rsz.y) / 2},
+               13, 0, (Color){230, 232, 240, 255});
+
+    /* Filter field. */
+    DrawRectangle(L.filter_field.x, L.filter_field.y,
+                  L.filter_field.w, L.filter_field.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.filter_field.x, L.filter_field.y,
+                       L.filter_field.w, L.filter_field.h,
+                       g_download_form.filter_focus ? (Color){125, 207, 255, 255}
+                                                     : (Color){70, 74, 90, 255});
+    BeginScissorMode(L.filter_field.x + 6, L.filter_field.y,
+                     L.filter_field.w - 12, L.filter_field.h);
+    if (g_download_form.filter[0]) {
+        DrawTextEx(*f, g_download_form.filter,
+                   (Vector2){L.filter_field.x + 8, L.filter_field.y + 7},
+                   14, 0, (Color){230, 232, 240, 255});
+    } else {
+        DrawTextEx(*f, "(filter — type to narrow the list)",
+                   (Vector2){L.filter_field.x + 8, L.filter_field.y + 7},
+                   14, 0, (Color){110, 115, 130, 255});
+    }
+    EndScissorMode();
+
+    /* Listing. */
+    DrawRectangle(L.list.x, L.list.y, L.list.w, L.list.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.list.x, L.list.y, L.list.w, L.list.h,
+                       (Color){70, 74, 90, 255});
+    int idxs[1024];
+    int fcount = download_filtered_indices(idxs, (int)(sizeof(idxs) / sizeof(idxs[0])));
+    int visible = L.list.h / DL_ROW_H;
+    int max_scroll = fcount - visible;
+    if (max_scroll < 0) max_scroll = 0;
+    if (g_download_form.scroll > max_scroll) g_download_form.scroll = max_scroll;
+    /* Auto-scroll so the selected row stays in view. */
+    if (g_download_form.selected >= 0) {
+        if (g_download_form.selected < g_download_form.scroll)
+            g_download_form.scroll = g_download_form.selected;
+        if (g_download_form.selected >= g_download_form.scroll + visible)
+            g_download_form.scroll = g_download_form.selected - visible + 1;
+    }
+
+    BeginScissorMode(L.list.x + 2, L.list.y + 2,
+                     L.list.w - 4, L.list.h - 4);
+    int size_col_x = L.list.x + L.list.w - 110;
+    for (int i = 0; i < fcount; i++) {
+        int row_y = L.list.y + (i - g_download_form.scroll) * DL_ROW_H;
+        if (row_y + DL_ROW_H < L.list.y || row_y > L.list.y + L.list.h) continue;
+        const PtyDirEntry *e = &g_download_form.entries[idxs[i]];
+        bool sel = (i == g_download_form.selected);
+        if (sel) {
+            DrawRectangle(L.list.x + 2, row_y, L.list.w - 4, DL_ROW_H,
+                          (Color){46, 62, 90, 220});
+        }
+        char display[300];
+        if (e->is_dir) snprintf(display, sizeof(display), "%s/", e->name);
+        else           snprintf(display, sizeof(display), "%s",  e->name);
+        Color name_col = e->is_dir ? (Color){180, 220, 255, 255}
+                                   : (Color){230, 232, 240, 255};
+        DrawTextEx(*f, display,
+                   (Vector2){L.list.x + 10, row_y + 3},
+                   13, 0, name_col);
+        if (!e->is_dir) {
+            char sz[24];
+            format_size(e->size, sz, sizeof(sz));
+            DrawTextEx(*f, sz,
+                       (Vector2){size_col_x, row_y + 3},
+                       12, 0, (Color){170, 175, 195, 255});
+        }
+    }
+    EndScissorMode();
+
+    /* Status / error line. */
+    if (g_download_form.status[0]) {
+        DrawTextEx(*f, g_download_form.status,
+                   (Vector2){L.modal.x + 22, L.cancel_btn.y - 22},
+                   13, 0, (Color){240, 120, 120, 255});
+    } else if (fcount == 0 && g_download_form.entry_count == 0) {
+        DrawTextEx(*f, "(empty or still loading)",
+                   (Vector2){L.modal.x + 22, L.cancel_btn.y - 22},
+                   13, 0, (Color){140, 145, 160, 255});
+    }
+
+    /* Buttons. */
+    DrawRectangle(L.cancel_btn.x, L.cancel_btn.y, L.cancel_btn.w, L.cancel_btn.h,
+                  (Color){48, 52, 66, 255});
+    DrawRectangleLines(L.cancel_btn.x, L.cancel_btn.y, L.cancel_btn.w, L.cancel_btn.h,
+                       (Color){150, 155, 170, 200});
+    Vector2 xsz = MeasureTextEx(*f, "Close", 14, 0);
+    DrawTextEx(*f, "Close",
+               (Vector2){L.cancel_btn.x + (L.cancel_btn.w - xsz.x) / 2,
+                         L.cancel_btn.y + (L.cancel_btn.h - xsz.y) / 2},
+               14, 0, (Color){210, 215, 230, 255});
+    DrawRectangle(L.download_btn.x, L.download_btn.y,
+                  L.download_btn.w, L.download_btn.h,
+                  (Color){46, 92, 150, 255});
+    DrawRectangleLines(L.download_btn.x, L.download_btn.y,
+                       L.download_btn.w, L.download_btn.h,
+                       (Color){125, 207, 255, 220});
+    Vector2 dsz = MeasureTextEx(*f, "Download", 14, 0);
+    DrawTextEx(*f, "Download",
+               (Vector2){L.download_btn.x + (L.download_btn.w - dsz.x) / 2,
+                         L.download_btn.y + (L.download_btn.h - dsz.y) / 2},
                14, 0, (Color){230, 240, 255, 255});
 }
 
@@ -9131,22 +9730,34 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* SFTP upload sweep: when an upload finishes (status != 0),
-           note the time so the toast can fade after a delay. After
-           4 seconds release the handle (joins the worker, frees). */
+        /* SFTP transfer sweep: covers both uploads and downloads.
+           When the worker finishes (status != 0), record the time
+           so the toast can fade; after 4 s release the handle. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
             for (int pi = 0; pi < t->num_panes; pi++) {
                 Pane *p = &t->panes[pi];
-                if (!p->upload) continue;
-                int st = pty_upload_status(p->upload, NULL, NULL, NULL, 0);
-                if (st != 0 && p->upload_done_at == 0.0) {
-                    p->upload_done_at = now;
+                if (p->upload) {
+                    int st = pty_upload_status(p->upload, NULL, NULL, NULL, 0);
+                    if (st != 0 && p->upload_done_at == 0.0) {
+                        p->upload_done_at = now;
+                    }
+                    if (p->upload_done_at != 0.0 && now - p->upload_done_at > 4.0) {
+                        pty_upload_release(p->upload);
+                        p->upload = NULL;
+                        p->upload_done_at = 0.0;
+                    }
                 }
-                if (p->upload_done_at != 0.0 && now - p->upload_done_at > 4.0) {
-                    pty_upload_release(p->upload);
-                    p->upload = NULL;
-                    p->upload_done_at = 0.0;
+                if (p->download) {
+                    int st = pty_download_status(p->download, NULL, NULL, NULL, 0);
+                    if (st != 0 && p->download_done_at == 0.0) {
+                        p->download_done_at = now;
+                    }
+                    if (p->download_done_at != 0.0 && now - p->download_done_at > 4.0) {
+                        pty_download_release(p->download);
+                        p->download = NULL;
+                        p->download_done_at = 0.0;
+                    }
                 }
             }
         }
@@ -9187,6 +9798,9 @@ int main(int argc, char **argv) {
                 }
                 else if (h.on_upload) {
                     upload_form_open();
+                }
+                else if (h.on_download) {
+                    download_form_open();
                 }
                 else if (h.on_split_v || h.on_split_h) {
                     if (cur) {
@@ -9521,6 +10135,24 @@ int main(int argc, char **argv) {
             L = settings_layout(win_w_now, win_h_now);
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_settings(&r, win_w_now, win_h_now, L);
+            EndDrawing();
+            continue;
+        }
+
+        /* SFTP download modal. */
+        if (g_ui_mode == UI_SFTP_DOWNLOAD) {
+            DownloadFormLayout DL = download_form_layout(win_w_now, win_h_now);
+            download_form_handle_mouse(DL);
+            download_form_handle_keys();
+            cur = active_tab();
+            if (!cur) break;
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
+            if (g_ui_mode == UI_SFTP_DOWNLOAD) {
+                draw_download_form(&r, win_w_now, win_h_now, DL);
+            }
             EndDrawing();
             continue;
         }

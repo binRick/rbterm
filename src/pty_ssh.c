@@ -1114,3 +1114,340 @@ void ssh_upload_release_impl(struct PtyUpload *u) {
     if (u->thread_started) pthread_join(u->thread, NULL);
     free(u);
 }
+
+/* ---------------- SFTP listdir + download ---------------- */
+
+/* strcasecmp isn't portable to MSVC; tiny shim. */
+static int strcasecmp_compat(const char *a, const char *b) {
+#ifdef _WIN32
+    return _stricmp(a, b);
+#else
+    while (*a && *b) {
+        int ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return ca - cb;
+        a++; b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+#endif
+}
+
+/* Comparator: directories first, then alphabetical (case-insensitive). */
+static int dir_cmp(const void *a, const void *b) {
+    const PtyDirEntry *ea = a, *eb = b;
+    if (ea->is_dir != eb->is_dir) return ea->is_dir ? -1 : 1;
+    return strcasecmp_compat(ea->name, eb->name);
+}
+
+/* Same `~/foo` → `foo` rewrite the upload path uses. SFTP doesn't
+   know about tildes; the SFTP cwd is the user's home. */
+static void sftp_strip_tilde(const char *src, char *dst, size_t cap) {
+    if (src[0] == '~' && (src[1] == '/' || src[1] == 0)) {
+        src += 1;
+        while (*src == '/') src++;
+    }
+    if (!*src) snprintf(dst, cap, ".");
+    else       snprintf(dst, cap, "%s", src);
+}
+
+struct PtyDirEntry *ssh_listdir_impl(void *impl, const char *remote_dir,
+                                     int *count_out,
+                                     char *err, size_t errsz) {
+    if (count_out) *count_out = 0;
+    SshPty *p = impl;
+    if (!p || !p->session || !p->alive) {
+        if (err && errsz) snprintf(err, errsz, "session not alive");
+        return NULL;
+    }
+    if (!remote_dir || !*remote_dir) remote_dir = ".";
+
+    char dir[PATH_MAX_FALLBACK];
+    sftp_strip_tilde(remote_dir, dir, sizeof(dir));
+
+    pthread_mutex_lock(&p->session_lock);
+    bool was_blocking = ssh_is_blocking(p->session);
+    ssh_set_blocking(p->session, 1);
+
+    sftp_session sftp = sftp_new(p->session);
+    if (!sftp) {
+        if (err && errsz) snprintf(err, errsz, "sftp_new: %s", ssh_get_error(p->session));
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        return NULL;
+    }
+    if (sftp_init(sftp) != SSH_OK) {
+        if (err && errsz) snprintf(err, errsz, "sftp_init: %s", ssh_get_error(p->session));
+        sftp_free(sftp);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        return NULL;
+    }
+
+    sftp_dir d = sftp_opendir(sftp, dir);
+    if (!d) {
+        if (err && errsz) snprintf(err, errsz, "opendir %s: %s",
+                                   dir, ssh_get_error(p->session));
+        sftp_free(sftp);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        return NULL;
+    }
+
+    int cap = 64, n = 0;
+    PtyDirEntry *entries = calloc((size_t)cap, sizeof(*entries));
+    if (!entries) {
+        sftp_closedir(d);
+        sftp_free(sftp);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        if (err && errsz) snprintf(err, errsz, "out of memory");
+        return NULL;
+    }
+    sftp_attributes a;
+    while ((a = sftp_readdir(sftp, d)) != NULL) {
+        const char *nm = a->name ? a->name : "";
+        /* Skip "." but keep ".." so the picker can navigate up. */
+        if (strcmp(nm, ".") == 0) { sftp_attributes_free(a); continue; }
+        if (n == cap) {
+            int ncap = cap * 2;
+            PtyDirEntry *grow = realloc(entries, (size_t)ncap * sizeof(*entries));
+            if (!grow) { sftp_attributes_free(a); break; }
+            entries = grow;
+            memset(&entries[cap], 0, (size_t)(ncap - cap) * sizeof(*entries));
+            cap = ncap;
+        }
+        snprintf(entries[n].name, sizeof(entries[n].name), "%s", nm);
+        entries[n].size       = (uint64_t)a->size;
+        entries[n].mtime      = (long)a->mtime;
+        entries[n].is_dir     = (a->type == SSH_FILEXFER_TYPE_DIRECTORY);
+        entries[n].is_symlink = (a->type == SSH_FILEXFER_TYPE_SYMLINK);
+        n++;
+        sftp_attributes_free(a);
+    }
+    sftp_closedir(d);
+    sftp_free(sftp);
+    if (!was_blocking) ssh_set_blocking(p->session, 0);
+    pthread_mutex_unlock(&p->session_lock);
+
+    qsort(entries, (size_t)n, sizeof(*entries), dir_cmp);
+    if (count_out) *count_out = n;
+    return (struct PtyDirEntry *)entries;
+}
+
+/* ---------- Download (mirror of upload, opposite direction) ---------- */
+
+struct PtyDownload {
+    SshPty   *ssh;
+    pthread_t thread;
+    bool      thread_started;
+
+    char      remote_path[PATH_MAX_FALLBACK];
+    char      local_path[PATH_MAX_FALLBACK];
+    char      display_name[256];
+
+    volatile int      status;
+    volatile uint64_t bytes_done;
+    volatile uint64_t bytes_total;
+    char              err[256];
+
+    volatile int      cancel;
+};
+
+static void download_set_err(struct PtyDownload *d, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(d->err, sizeof(d->err), fmt, ap);
+    va_end(ap);
+}
+
+static void download_log(const char *fmt, ...) {
+    if (!upload_log_enabled()) return;
+    char path[PATH_MAX_FALLBACK];
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    snprintf(path, sizeof(path), "%s/rbterm-upload.log", home);
+    FILE *fp = fopen(path, "a");
+    if (!fp) return;
+    time_t now = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(fp, "[%s] DL ", ts);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
+
+static void *sftp_download_worker(void *arg) {
+    struct PtyDownload *d = arg;
+    SshPty *p = d->ssh;
+    download_log("---- start: remote=%s local=%s", d->remote_path, d->local_path);
+
+    char remote[PATH_MAX_FALLBACK];
+    sftp_strip_tilde(d->remote_path, remote, sizeof(remote));
+
+    FILE *out = fopen(d->local_path, "wb");
+    if (!out) {
+        download_set_err(d, "open local: %s", strerror(errno));
+        download_log("FAIL %s", d->err);
+        d->status = -1;
+        return NULL;
+    }
+
+    pthread_mutex_lock(&p->session_lock);
+    bool was_blocking = ssh_is_blocking(p->session);
+    ssh_set_blocking(p->session, 1);
+
+    sftp_session sftp = sftp_new(p->session);
+    if (!sftp) {
+        download_set_err(d, "sftp_new: %s", ssh_get_error(p->session));
+        download_log("FAIL %s", d->err);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        fclose(out);
+        d->status = -1;
+        return NULL;
+    }
+    if (sftp_init(sftp) != SSH_OK) {
+        download_set_err(d, "sftp_init: %s", ssh_get_error(p->session));
+        download_log("FAIL %s", d->err);
+        sftp_free(sftp);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        fclose(out);
+        d->status = -1;
+        return NULL;
+    }
+
+    sftp_attributes a = sftp_stat(sftp, remote);
+    if (a) {
+        d->bytes_total = (uint64_t)a->size;
+        sftp_attributes_free(a);
+    }
+
+    sftp_file rf = sftp_open(sftp, remote, O_RDONLY, 0);
+    if (!rf) {
+        download_set_err(d, "sftp_open %s: %s", remote, ssh_get_error(p->session));
+        download_log("FAIL sftp_open: sftp_err=%d ssh_err=%s",
+                     sftp_get_error(sftp), ssh_get_error(p->session));
+        sftp_free(sftp);
+        if (!was_blocking) ssh_set_blocking(p->session, 0);
+        pthread_mutex_unlock(&p->session_lock);
+        fclose(out);
+        d->status = -1;
+        return NULL;
+    }
+
+    uint8_t buf[SFTP_CHUNK_SZ];
+    bool ok = true;
+    int chunk_count = 0;
+    for (;;) {
+        if (d->cancel) { ok = false;
+                         download_set_err(d, "cancelled");
+                         download_log("cancelled mid-transfer");
+                         break; }
+        ssize_t n = sftp_read(rf, buf, sizeof(buf));
+        if (n == 0) break;
+        if (n < 0) {
+            ok = false;
+            download_set_err(d, "sftp_read: %s", ssh_get_error(p->session));
+            download_log("FAIL sftp_read: sftp_err=%d ssh_err=%s",
+                         sftp_get_error(sftp), ssh_get_error(p->session));
+            break;
+        }
+        size_t w = fwrite(buf, 1, (size_t)n, out);
+        if ((ssize_t)w != n) {
+            ok = false;
+            download_set_err(d, "write local: %s", strerror(errno));
+            download_log("FAIL write local: %s", strerror(errno));
+            break;
+        }
+        d->bytes_done += (uint64_t)n;
+        if ((++chunk_count % 32) == 0) {
+            download_log("progress: %llu / %llu",
+                         (unsigned long long)d->bytes_done,
+                         (unsigned long long)d->bytes_total);
+        }
+    }
+
+    sftp_close(rf);
+    sftp_free(sftp);
+    if (!was_blocking) ssh_set_blocking(p->session, 0);
+    pthread_mutex_unlock(&p->session_lock);
+    fclose(out);
+
+    if (ok && !d->bytes_total) d->bytes_total = d->bytes_done;
+    d->status = ok ? 1 : -1;
+    download_log("---- done: status=%d done=%llu total=%llu err=%s",
+                 d->status,
+                 (unsigned long long)d->bytes_done,
+                 (unsigned long long)d->bytes_total,
+                 d->err[0] ? d->err : "(none)");
+    return NULL;
+}
+
+struct PtyDownload *ssh_download_start_impl(void *impl,
+                                            const char *remote_path,
+                                            const char *local_path,
+                                            char *err, size_t errsz) {
+    if (err && errsz) err[0] = 0;
+    SshPty *p = impl;
+    if (!p || !p->session || !p->alive) {
+        if (err && errsz) snprintf(err, errsz, "session not alive");
+        return NULL;
+    }
+    if (!remote_path || !*remote_path || !local_path || !*local_path) {
+        if (err && errsz) snprintf(err, errsz, "missing path");
+        return NULL;
+    }
+
+    struct PtyDownload *d = calloc(1, sizeof(*d));
+    if (!d) {
+        if (err && errsz) snprintf(err, errsz, "out of memory");
+        return NULL;
+    }
+    d->ssh = p;
+    snprintf(d->remote_path, sizeof(d->remote_path), "%s", remote_path);
+    snprintf(d->local_path,  sizeof(d->local_path),  "%s", local_path);
+    snprintf(d->display_name, sizeof(d->display_name), "%s",
+             path_basename(remote_path));
+
+    if (pthread_create(&d->thread, NULL, sftp_download_worker, d) != 0) {
+        if (err && errsz) snprintf(err, errsz, "pthread_create failed");
+        free(d);
+        return NULL;
+    }
+    d->thread_started = true;
+    return d;
+}
+
+int ssh_download_status_impl(struct PtyDownload *d,
+                             uint64_t *bytes_done, uint64_t *bytes_total,
+                             char *err, size_t errsz) {
+    if (!d) {
+        if (err && errsz) snprintf(err, errsz, "no download");
+        return -1;
+    }
+    if (bytes_done)  *bytes_done  = d->bytes_done;
+    if (bytes_total) *bytes_total = d->bytes_total;
+    if (d->status < 0 && err && errsz) snprintf(err, errsz, "%s", d->err);
+    return d->status;
+}
+
+const char *ssh_download_name_impl(struct PtyDownload *d) {
+    return d ? d->display_name : "";
+}
+
+void ssh_download_release_impl(struct PtyDownload *d) {
+    if (!d) return;
+    d->cancel = 1;
+    if (d->thread_started) pthread_join(d->thread, NULL);
+    free(d);
+}

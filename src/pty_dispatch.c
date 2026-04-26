@@ -135,3 +135,46 @@ const char *pty_upload_name(PtyUpload *u) {
 void pty_upload_release(PtyUpload *u) {
     ssh_upload_release_impl((struct PtyUpload *)u);
 }
+
+PtyDirEntry *pty_listdir(Pty *p, const char *remote_dir, int *count_out,
+                         char *err, size_t errsz) {
+    if (count_out) *count_out = 0;
+    if (err && errsz) err[0] = 0;
+    if (!p || p->kind != PTY_SSH) {
+        if (err && errsz) snprintf(err, errsz, "listdir requires an SSH session");
+        return NULL;
+    }
+    return (PtyDirEntry *)ssh_listdir_impl(p->impl, remote_dir, count_out,
+                                           err, errsz);
+}
+
+void pty_listdir_free(PtyDirEntry *entries) {
+    free(entries);
+}
+
+PtyDownload *pty_download_start(Pty *p, const char *remote_path,
+                                const char *local_path,
+                                char *err, size_t errsz) {
+    if (err && errsz) err[0] = 0;
+    if (!p || p->kind != PTY_SSH) {
+        if (err && errsz) snprintf(err, errsz, "download requires an SSH session");
+        return NULL;
+    }
+    return (PtyDownload *)ssh_download_start_impl(p->impl,
+                                                  remote_path, local_path,
+                                                  err, errsz);
+}
+
+int pty_download_status(PtyDownload *d, uint64_t *bytes_done,
+                        uint64_t *bytes_total, char *err, size_t errsz) {
+    return ssh_download_status_impl((struct PtyDownload *)d,
+                                    bytes_done, bytes_total, err, errsz);
+}
+
+const char *pty_download_name(PtyDownload *d) {
+    return ssh_download_name_impl((struct PtyDownload *)d);
+}
+
+void pty_download_release(PtyDownload *d) {
+    ssh_download_release_impl((struct PtyDownload *)d);
+}
