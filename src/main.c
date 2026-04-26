@@ -189,6 +189,7 @@ typedef struct {
     int  key_repeat_initial_ms;  /* delay before first repeat fires (held key) */
     int  key_repeat_rate_ms;     /* period between subsequent repeats */
     int  cursor_style;           /* CursorStyle enum — default for new panes */
+    char cursor_color[16];       /* "#rrggbb" or empty (= use natural cursor colour, the cell's fg) */
     int  startup_window;         /* StartupWindowMode */
     char rec_dir[PATH_MAX];      /* default folder for saved recordings */
     bool show_hud;               /* master enable for the system-info overlay */
@@ -340,6 +341,11 @@ static void config_load_into_defaults(void) {
             else if (!strcmp(v, "underline")) g_app_settings.cursor_style = CURSOR_STYLE_UNDERLINE;
             else if (!strcmp(v, "bar"))       g_app_settings.cursor_style = CURSOR_STYLE_BAR;
             else if (!strcmp(v, "blink"))     g_app_settings.cursor_style = CURSOR_STYLE_BLOCK_BLINK;
+        } else if (strcmp(k, "cursor_color") == 0) {
+            strncpy(g_app_settings.cursor_color, v,
+                    sizeof(g_app_settings.cursor_color) - 1);
+            g_app_settings.cursor_color[
+                sizeof(g_app_settings.cursor_color) - 1] = 0;
         } else if (strcmp(k, "startup_window") == 0) {
             if      (!strcmp(v, "maximized"))  g_app_settings.startup_window = STARTUP_WINDOW_MAXIMIZED;
             else if (!strcmp(v, "small"))      g_app_settings.startup_window = STARTUP_WINDOW_SMALL;
@@ -409,6 +415,8 @@ static bool config_save(Renderer *r) {
         }
         if (cs) fprintf(fp, "cursor_style=%s\n", cs);
     }
+    if (g_app_settings.cursor_color[0])
+        fprintf(fp, "cursor_color=%s\n", g_app_settings.cursor_color);
     {
         const char *sw = "default";
         switch (g_app_settings.startup_window) {
@@ -640,6 +648,10 @@ typedef struct {
        hand-edit. Applied at draw_tab_bar time only — the terminal
        contents themselves remain whatever theme is in force. */
     char  ssh_color[16];
+    /* Per-host cursor colour ("#rrggbb"); empty = inherit
+       Settings → Cursor's choice (which itself may be empty,
+       meaning "use the natural cursor colour"). */
+    char  ssh_cursor_color[16];
     /* Per-host HUD configuration. ssh_hud.override == false means
        fall back to g_app_settings; render code goes through
        hud_effective(t) so it doesn't have to branch. */
@@ -716,6 +728,7 @@ typedef struct {
     char log_dir[PATH_MAX];
     int  log_mode;           /* 0 = inherit, 1 = on, 2 = off */
     char color[16];          /* "#rrggbb" tab accent colour; empty = none */
+    char cursor_color[16];   /* "#rrggbb" cursor colour; empty = inherit */
     HudConfig hud;           /* per-host HUD override (override flag gates use) */
     char key[512];
     /* Per-host startup commands. After the SSH session opens we
@@ -785,6 +798,7 @@ typedef struct {
     /* 0 = inherit app setting, 1 = force on, 2 = force off. */
     int  log_mode;
     char color[16];          /* "#rrggbb" tab accent; empty = none */
+    char cursor_color[16];   /* "#rrggbb" cursor colour; empty = inherit */
     HudConfig hud;           /* per-host HUD override */
     /* Run-on-connect commands. Sent verbatim to the remote shell
        right after the channel opens. */
@@ -849,6 +863,8 @@ typedef struct {
     /* Tab accent colour row: 8 preset swatches plus a "none" sentinel
        at index SSH_COLOR_PRESET_COUNT. */
     Rect color_swatch[9];
+    /* Cursor colour row — same shape, slot 8 = "default". */
+    Rect cur_color_swatch[9];
     /* HUD tab — per-host override of the HUD config. */
     Rect hud_override_btn;      /* "Use host overrides" toggle */
     Rect hud_toggle;            /* show / hide HUD on this host */
@@ -1184,6 +1200,13 @@ static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
     if (g_app_settings.cursor_style != CURSOR_STYLE_DEFAULT) {
         screen_set_cursor_style(p->scr, (CursorStyle)g_app_settings.cursor_style);
     }
+    if (g_app_settings.cursor_color[0]) {
+        Color cc;
+        if (parse_hex_color(g_app_settings.cursor_color, &cc)) {
+            uint32_t rgb = ((uint32_t)cc.r << 16) | ((uint32_t)cc.g << 8) | cc.b;
+            screen_set_cursor_color(p->scr, rgb);
+        }
+    }
     if (cwd && *cwd) {
         strncpy(p->cwd, cwd, sizeof(p->cwd) - 1);
         p->cwd[sizeof(p->cwd) - 1] = 0;
@@ -1508,7 +1531,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const char *theme, int cursor_style,
                          const char *font, int font_size,
                          const char *log_dir, int log_mode,
-                         const char *color,
+                         const char *color, const char *cursor_color,
                          const HudConfig *hud,
                          const char *init_cwd, const char *init_cmd,
                          int cols, int rows,
@@ -1543,6 +1566,10 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     if (log_dir)  { strncpy(t->ssh_log_dir, log_dir, sizeof(t->ssh_log_dir) - 1); t->ssh_log_dir[sizeof(t->ssh_log_dir) - 1] = 0; }
     t->ssh_log_mode = log_mode;
     if (color)    { strncpy(t->ssh_color, color, sizeof(t->ssh_color) - 1); t->ssh_color[sizeof(t->ssh_color) - 1] = 0; }
+    if (cursor_color) {
+        strncpy(t->ssh_cursor_color, cursor_color, sizeof(t->ssh_cursor_color) - 1);
+        t->ssh_cursor_color[sizeof(t->ssh_cursor_color) - 1] = 0;
+    }
     if (hud) t->ssh_hud = *hud;
     if (init_cwd) {
         strncpy(t->ssh_init_cwd, init_cwd, sizeof(t->ssh_init_cwd) - 1);
@@ -1653,6 +1680,13 @@ static void pane_apply_tab_appearance(const Tab *t, Pane *p) {
     }
     if (t->ssh_cursor_style != CURSOR_STYLE_DEFAULT)
         screen_set_cursor_style(p->scr, (CursorStyle)t->ssh_cursor_style);
+    if (t->ssh_cursor_color[0]) {
+        Color cc;
+        if (parse_hex_color(t->ssh_cursor_color, &cc)) {
+            uint32_t rgb = ((uint32_t)cc.r << 16) | ((uint32_t)cc.g << 8) | cc.b;
+            screen_set_cursor_color(p->scr, rgb);
+        }
+    }
 }
 
 /* Split the active tab. If the tab was opened via SSH, re-dial the same
@@ -3683,6 +3717,7 @@ static void ssh_profiles_load(void) {
                 const char *color_pfx    = "rbterm-color:";
                 const char *icwd_pfx     = "rbterm-init-cwd:";
                 const char *icmd_pfx     = "rbterm-init-cmd:";
+                const char *ccol_pfx     = "rbterm-cursor-color:";
                 const char *hud_pfx      = "rbterm-hud:";
                 const char *hud_pos_pfx  = "rbterm-hud-pos:";
                 const char *hud_cpu_pfx  = "rbterm-hud-cpu:";
@@ -3725,6 +3760,12 @@ static void ssh_profiles_load(void) {
                     trim_end(q);
                     strncpy(cur->init_cmd, q, sizeof(cur->init_cmd) - 1);
                     cur->init_cmd[sizeof(cur->init_cmd) - 1] = 0;
+                } else if (strncmp(q, ccol_pfx, strlen(ccol_pfx)) == 0) {
+                    q += strlen(ccol_pfx);
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    strncpy(cur->cursor_color, q, sizeof(cur->cursor_color) - 1);
+                    cur->cursor_color[sizeof(cur->cursor_color) - 1] = 0;
                 /* Any rbterm-hud-* presence implies an override is in
                    effect. We seed the rest of cur->hud once on first
                    sight so unspecified fields take sensible defaults
@@ -3890,6 +3931,8 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     g_form.log_mode = prof->log_mode;
     strncpy(g_form.color, prof->color, sizeof(g_form.color) - 1);
     g_form.color[sizeof(g_form.color) - 1] = 0;
+    strncpy(g_form.cursor_color, prof->cursor_color, sizeof(g_form.cursor_color) - 1);
+    g_form.cursor_color[sizeof(g_form.cursor_color) - 1] = 0;
     strncpy(g_form.init_cwd, prof->init_cwd, sizeof(g_form.init_cwd) - 1);
     g_form.init_cwd[sizeof(g_form.init_cwd) - 1] = 0;
     strncpy(g_form.init_cmd, prof->init_cmd, sizeof(g_form.init_cmd) - 1);
@@ -5054,6 +5097,11 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
             L.color_swatch[i] = (Rect){
                 field_x + i * (sw + gap), swatch_row_y, sw, sh };
         }
+        int cur_swatch_y = swatch_row_y + sh + 14;
+        for (int i = 0; i < n; i++) {
+            L.cur_color_swatch[i] = (Rect){
+                field_x + i * (sw + gap), cur_swatch_y, sw, sh };
+        }
     }
 
     /* LOGGING tab — tri-state mode pill + per-host log directory. */
@@ -5171,6 +5219,7 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.log_dir[0] ? g_form.log_dir : NULL,
         g_form.log_mode,
         g_form.color[0]   ? g_form.color   : NULL,
+        g_form.cursor_color[0] ? g_form.cursor_color : NULL,
         g_form.hud.override ? &g_form.hud  : NULL,
         g_form.init_cwd[0] ? g_form.init_cwd : NULL,
         g_form.init_cmd[0] ? g_form.init_cmd : NULL,
@@ -5240,6 +5289,8 @@ static void emit_form_managed_lines(FILE *fp) {
         fprintf(fp, "    # rbterm-log: off\n");
     if (g_form.color[0])
         fprintf(fp, "    # rbterm-color: %s\n", g_form.color);
+    if (g_form.cursor_color[0])
+        fprintf(fp, "    # rbterm-cursor-color: %s\n", g_form.cursor_color);
     if (g_form.init_cwd[0])
         fprintf(fp, "    # rbterm-init-cwd: %s\n", g_form.init_cwd);
     if (g_form.init_cmd[0])
@@ -5633,6 +5684,21 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     }
     if (rect_hit(L.color_swatch[SSH_COLOR_PRESET_COUNT], mx, my)) {
         g_form.color[0] = 0;
+        return;
+    }
+    /* Cursor-colour swatches — same shape, last entry resets
+       to "inherit Settings → Cursor" by clearing the override. */
+    for (int i = 0; i < SSH_COLOR_PRESET_COUNT; i++) {
+        if (L.cur_color_swatch[i].w > 0 &&
+            rect_hit(L.cur_color_swatch[i], mx, my)) {
+            snprintf(g_form.cursor_color, sizeof(g_form.cursor_color),
+                     "%s", SSH_COLOR_PRESETS[i]);
+            return;
+        }
+    }
+    if (L.cur_color_swatch[SSH_COLOR_PRESET_COUNT].w > 0 &&
+        rect_hit(L.cur_color_swatch[SSH_COLOR_PRESET_COUNT], mx, my)) {
+        g_form.cursor_color[0] = 0;
         return;
     }
 
@@ -6534,6 +6600,39 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                              nr.y + (nr.h - nsz2.y) / 2},
                    12, 0, (Color){200, 205, 220, 255});
     }
+    /* Per-host cursor colour row. Same shape as tab-accent;
+       last tile = "default" (inherit Settings → Cursor). */
+    {
+        DrawTextEx(*f, "Cursor color",
+                   (Vector2){L.cur_color_swatch[0].x - 104,
+                             L.cur_color_swatch[0].y + 7},
+                   13, 0, (Color){180, 185, 200, 255});
+        for (int i = 0; i < SSH_COLOR_PRESET_COUNT; i++) {
+            Rect rr = L.cur_color_swatch[i];
+            Color c = (Color){90, 95, 110, 255};
+            parse_hex_color(SSH_COLOR_PRESETS[i], &c);
+            bool on = (strcmp(g_form.cursor_color,
+                              SSH_COLOR_PRESETS[i]) == 0);
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, c);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               on ? (Color){240, 245, 255, 255}
+                                  : (Color){0, 0, 0, 120});
+            if (on) DrawRectangleLines(rr.x + 1, rr.y + 1,
+                                        rr.w - 2, rr.h - 2,
+                                        (Color){240, 245, 255, 180});
+        }
+        Rect dr = L.cur_color_swatch[SSH_COLOR_PRESET_COUNT];
+        bool def_on = (g_form.cursor_color[0] == 0);
+        DrawRectangle(dr.x, dr.y, dr.w, dr.h, (Color){34, 38, 52, 255});
+        DrawRectangleLines(dr.x, dr.y, dr.w, dr.h,
+                           def_on ? (Color){240, 245, 255, 255}
+                                  : (Color){125, 207, 255, 150});
+        Vector2 dsz2 = MeasureTextEx(*f, "default", 12, 0);
+        DrawTextEx(*f, "default",
+                   (Vector2){dr.x + (dr.w - dsz2.x) / 2,
+                             dr.y + (dr.h - dsz2.y) / 2},
+                   12, 0, (Color){200, 205, 220, 255});
+    }
     }   /* end SSH_FORM_TAB_APPEARANCE second half (tab color) */
 
     if (g_ssh_form_tab == SSH_FORM_TAB_HUD) {
@@ -6794,6 +6893,10 @@ typedef struct {
     Rect cur_under;
     Rect cur_bar;
     Rect cur_blink;
+    /* Cursor-colour swatches: 8 presets + a "default" sentinel
+       at index SSH_COLOR_PRESET_COUNT meaning "use natural fg
+       colour". Also lives on the Cursor tab. */
+    Rect cur_color_swatch[9];
     Rect pad_val;
     Rect pad_dec, pad_inc;
     Rect spc_val;
@@ -7239,6 +7342,17 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         int kr2_y = kr1_y + row_pitch;
         L.repeat_rate    = (Rect){ L.modal.x + 140, kr2_y, w - 140 - 22 - 60,
                                    slider_track_h };
+        /* Cursor-colour swatch row, sitting under the key-repeat
+           sliders. 8 presets + a "default" sentinel at index 8. */
+        int sw_y = kr2_y + 30;
+        int n = SSH_COLOR_PRESET_COUNT + 1;
+        int sw_gap = 4;
+        int sw = ((w - 140 - 22) - (n - 1) * sw_gap) / n;
+        int sh = 28;
+        for (int i = 0; i < n; i++) {
+            L.cur_color_swatch[i] = (Rect){ L.modal.x + 140 + i * (sw + sw_gap),
+                                            sw_y, sw, sh };
+        }
     } else if (g_settings_tab == SETTINGS_TAB_SESSION) {
         int log_row1_y = content_y;
         L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
@@ -7492,6 +7606,47 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         else if (rect_hit(L.cur_under, mx, my)) { st = CURSOR_STYLE_UNDERLINE;   hit = true; }
         else if (rect_hit(L.cur_bar,   mx, my)) { st = CURSOR_STYLE_BAR;         hit = true; }
         else if (rect_hit(L.cur_blink, mx, my)) { st = CURSOR_STYLE_BLOCK_BLINK; hit = true; }
+        if (!hit && g_settings_tab == SETTINGS_TAB_CURSOR) {
+            for (int i = 0; i < SSH_COLOR_PRESET_COUNT; i++) {
+                if (rect_hit(L.cur_color_swatch[i], mx, my)) {
+                    snprintf(g_app_settings.cursor_color,
+                             sizeof(g_app_settings.cursor_color),
+                             "%s", SSH_COLOR_PRESETS[i]);
+                    /* Apply live to every open pane. */
+                    Color cc;
+                    if (parse_hex_color(g_app_settings.cursor_color, &cc)) {
+                        uint32_t rgb = ((uint32_t)cc.r << 16) |
+                                       ((uint32_t)cc.g << 8) | cc.b;
+                        for (int ti = 0; ti < g_num_tabs; ti++) {
+                            for (int pi = 0; pi < g_tabs[ti]->num_panes; pi++) {
+                                if (g_tabs[ti]->panes[pi].scr) {
+                                    screen_set_cursor_color(
+                                        g_tabs[ti]->panes[pi].scr, rgb);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            if (rect_hit(L.cur_color_swatch[SSH_COLOR_PRESET_COUNT], mx, my)) {
+                g_app_settings.cursor_color[0] = 0;
+                /* "Default" — re-apply each Screen's seed colour. */
+                for (int ti = 0; ti < g_num_tabs; ti++) {
+                    for (int pi = 0; pi < g_tabs[ti]->num_panes; pi++) {
+                        if (g_tabs[ti]->panes[pi].scr) {
+                            /* SEED_CURSOR_COLOR is screen.c-private; use
+                               whatever screen_default_fg returns as a
+                               sensible "natural" fallback. */
+                            screen_set_cursor_color(
+                                g_tabs[ti]->panes[pi].scr,
+                                screen_default_fg(g_tabs[ti]->panes[pi].scr));
+                        }
+                    }
+                }
+                return;
+            }
+        }
         if (hit) {
             /* Pick this style as the new default for fresh panes AND
                apply it immediately to the currently-focused pane.
@@ -9379,6 +9534,40 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         }
     }
 
+    /* Cursor-colour swatch row. 8 presets + a "Default" tile.
+       Selected swatch wears a brighter outline. */
+    {
+        DrawTextEx(*f, "Color",
+                   (Vector2){L.modal.x + 22,
+                             L.cur_color_swatch[0].y + 8},
+                   14, 0, (Color){200, 205, 220, 255});
+        for (int i = 0; i < SSH_COLOR_PRESET_COUNT; i++) {
+            Rect rr = L.cur_color_swatch[i];
+            Color c = (Color){90, 95, 110, 255};
+            parse_hex_color(SSH_COLOR_PRESETS[i], &c);
+            bool on = (strcmp(g_app_settings.cursor_color,
+                              SSH_COLOR_PRESETS[i]) == 0);
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, c);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               on ? (Color){240, 245, 255, 255}
+                                  : (Color){0, 0, 0, 120});
+            if (on) DrawRectangleLines(rr.x + 1, rr.y + 1,
+                                        rr.w - 2, rr.h - 2,
+                                        (Color){240, 245, 255, 180});
+        }
+        Rect dr = L.cur_color_swatch[SSH_COLOR_PRESET_COUNT];
+        bool def_on = (g_app_settings.cursor_color[0] == 0);
+        DrawRectangle(dr.x, dr.y, dr.w, dr.h, (Color){34, 38, 52, 255});
+        DrawRectangleLines(dr.x, dr.y, dr.w, dr.h,
+                           def_on ? (Color){240, 245, 255, 255}
+                                  : (Color){125, 207, 255, 150});
+        Vector2 dsz = MeasureTextEx(*f, "default", 12, 0);
+        DrawTextEx(*f, "default",
+                   (Vector2){dr.x + (dr.w - dsz.x) / 2,
+                             dr.y + (dr.h - dsz.y) / 2},
+                   12, 0, (Color){200, 205, 220, 255});
+    }
+
     }  /* end Cursor tab */
     if (g_settings_tab == SETTINGS_TAB_FONT) {
     /* Padding row. */
@@ -10422,10 +10611,11 @@ int main(int argc, char **argv) {
                     prof ? prof->font_size : 0,
                     prof && prof->log_dir[0]  ? prof->log_dir  : NULL,
                     prof ? prof->log_mode : 0,
-                    prof && prof->color[0]    ? prof->color    : NULL,
-                    prof && prof->hud.override ? &prof->hud    : NULL,
-                    prof && prof->init_cwd[0] ? prof->init_cwd : NULL,
-                    prof && prof->init_cmd[0] ? prof->init_cmd : NULL,
+                    prof && prof->color[0]        ? prof->color        : NULL,
+                    prof && prof->cursor_color[0] ? prof->cursor_color : NULL,
+                    prof && prof->hud.override    ? &prof->hud         : NULL,
+                    prof && prof->init_cwd[0]     ? prof->init_cwd     : NULL,
+                    prof && prof->init_cmd[0]     ? prof->init_cmd     : NULL,
                     derive_cols, derive_rows, err, sizeof(err));
                 if (!t) {
                     fprintf(stderr,
