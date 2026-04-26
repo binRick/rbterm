@@ -273,6 +273,7 @@ static id           g_quake_local_monitor  = nil;
 #include <IOKit/hidsystem/IOHIDLib.h>
 #include <IOKit/hidsystem/IOHIDParameter.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #import <Carbon/Carbon.h>
 
 /* Force the caps-lock LED + modifier state off. Used right after
@@ -359,8 +360,15 @@ static void quake_install_prev_app_tracker(void) {
 
 static void quake_toggle_inline(void) {
     @autoreleasepool {
-        quake_log(g_quake_was_hidden ? "toggle:show-start" : "toggle:hide-start");
-        if (g_quake_was_hidden) {
+        /* Source of truth is "is rbterm the foreground app right
+           now?", not our own hidden flag. The user might have
+           Cmd+Tab'd away (rbterm goes background but our flag
+           stays "shown") and then expect Cmd+CapsLock to summon
+           rbterm — without this, the chord ran the hide branch
+           on already-hidden windows and did nothing visible. */
+        bool foreground = [NSApp isActive];
+        quake_log(foreground ? "toggle:hide-start" : "toggle:show-start");
+        if (!foreground) {
             [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
             for (NSWindow *w in [NSApp windows]) {
                 [w orderFrontRegardless];
@@ -466,18 +474,30 @@ void mac_install_quake_hotkey(void) {
             return e;
         }];
 
-    /* Disable App Nap. Without this, macOS throttles hidden apps
-       so aggressively that our main thread only wakes every
-       1-2 s — the user pressed Cmd+CapsLock to unhide and saw a
-       multi-second lag before the chord registered. We're an
-       interactive utility users expect to summon instantly, so
-       opt out of the energy-saver entirely. NSActivityLatencyCritical
-       is the strongest level; perfectly fine on a desktop /
-       wall-power Mac. */
+    /* Disable App Nap two ways — NSProcessInfo's activity token
+       (high-level "this is user work, don't throttle me") plus
+       an IOPMAssertion (low-level "don't let the system idle"
+       — bypasses the App Nap heuristics that otherwise keep
+       throttling our background process anyway). The user
+       reported chord events queueing for seconds at a time on
+       just the activity-token version; the IOPM assertion is
+       what macOS Quake-style replacements like iTerm2's hotkey
+       window use to stay responsive. */
     g_quake_no_nap_token = [[NSProcessInfo processInfo]
         beginActivityWithOptions:(NSActivityUserInitiated |
                                   NSActivityLatencyCritical)
                           reason:@"rbterm global hotkey"];
+    {
+        IOPMAssertionID assertion_id;
+        IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep,
+            kIOPMAssertionLevelOn,
+            CFSTR("rbterm Quake hotkey responsiveness"),
+            &assertion_id);
+        /* Held forever by the running process — IOPM releases
+           on process death automatically. */
+        (void)assertion_id;
+    }
 
     /* Note who's frontmost so we can flip back to them on hide. */
     quake_install_prev_app_tracker();
