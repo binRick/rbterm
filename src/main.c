@@ -4208,6 +4208,13 @@ static int download_filtered_indices(int *out, int cap) {
     return n;
 }
 
+/* True for the first frame after the download modal opens — used
+   to swallow the same click that triggered the open so the
+   "click-outside-closes" branch in download_form_handle_mouse
+   doesn't immediately dismiss it. Cleared on the next frame's
+   first call into the handler. */
+static bool g_download_form_just_opened = false;
+
 /* Open the download modal anchored on the active pane's tracked
    cwd (falls back to "~/"). */
 static void download_form_open(void) {
@@ -4229,6 +4236,7 @@ static void download_form_open(void) {
     g_download_form.filter_focus = false;
     g_download_form.dir_focus = false;
     g_ui_mode = UI_SFTP_DOWNLOAD;
+    g_download_form_just_opened = true;
     download_form_refresh();
 }
 
@@ -4346,6 +4354,15 @@ static void download_form_handle_mouse(DownloadFormLayout L) {
             g_download_form.scroll -= (int)(wheel * 3.0f);
             if (g_download_form.scroll < 0) g_download_form.scroll = 0;
         }
+    }
+    /* Eat the opening click — the same MOUSE_BUTTON_LEFT press
+       that fired download_form_open in the tab-bar handler is
+       still seen by IsMouseButtonPressed in this frame, and the
+       click coords (somewhere up in the tab bar) lie outside the
+       modal rect, which would immediately close it. */
+    if (g_download_form_just_opened) {
+        g_download_form_just_opened = false;
+        return;
     }
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
     Vector2 mp = GetMousePosition();
