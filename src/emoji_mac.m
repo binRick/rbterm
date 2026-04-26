@@ -228,3 +228,31 @@ bool glyph_render(const char *font_name, uint32_t codepoint, int pixel_size,
     if (out_colored) *out_colored = coloured;
     return true;
 }
+
+/* Open a modal NSOpenPanel and return the chosen file's POSIX path
+   in `out` (NUL-terminated). Returns true if the user picked a file,
+   false on cancel or buffer overflow. Single-file selection only. */
+bool mac_pick_open_file(char *out, size_t cap) {
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+    __block bool ok = false;
+    @autoreleasepool {
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        [panel setCanChooseFiles:YES];
+        [panel setCanChooseDirectories:NO];
+        [panel setAllowsMultipleSelection:NO];
+        [panel setResolvesAliases:YES];
+        [panel setTitle:@"Choose a file to upload"];
+        [panel setPrompt:@"Choose"];
+        if ([panel runModal] == NSModalResponseOK) {
+            NSURL *url = [[panel URLs] firstObject];
+            const char *p = [[url path] UTF8String];
+            if (p && strlen(p) + 1 <= cap) {
+                strncpy(out, p, cap - 1);
+                out[cap - 1] = 0;
+                ok = true;
+            }
+        }
+    }
+    return ok;
+}

@@ -97,3 +97,32 @@ bool pty_hud_snapshot(Pty *p, PtyHudSnapshot *out);
    SSH; the SSH I/O thread already hands data straight to the
    parser via libssh callbacks). */
 void pty_snap_cursor(Pty *p, int cy, int cx);
+
+/* SFTP upload (SSH only). Spawns a worker thread that streams the
+   local file to `remote_path` over the same libssh session, taking
+   the session lock cooperatively with read / write / probe. Caller
+   polls via pty_upload_status and frees the handle with
+   pty_upload_release once it's done with status display. Returns
+   NULL for non-SSH PTYs or if the upload couldn't be started. */
+typedef struct PtyUpload PtyUpload;
+
+PtyUpload *pty_upload_start(Pty *p, const char *local_path,
+                            const char *remote_path,
+                            char *err, size_t errsz);
+
+/* Atomic snapshot. Returns:
+     0  → still in flight; bytes_done / bytes_total reflect progress
+     1  → completed successfully
+    -1  → failed; err filled with libssh / errno reason. */
+int  pty_upload_status(PtyUpload *u,
+                       uint64_t *bytes_done, uint64_t *bytes_total,
+                       char *err, size_t errsz);
+
+/* Display name (basename of local_path). Stable for the upload's
+   lifetime; valid until pty_upload_release. */
+const char *pty_upload_name(PtyUpload *u);
+
+/* Joins the worker thread (if any) and frees the handle. Safe to
+   call before completion (cancels by best-effort: the worker will
+   notice on its next chunk boundary and bail). */
+void pty_upload_release(PtyUpload *u);

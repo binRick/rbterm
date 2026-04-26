@@ -54,6 +54,7 @@
   void mac_install_ctrl_tab_monitor(void);
   int  mac_consume_ctrl_tab(void);
   void mac_enter_native_fullscreen(void);
+  bool mac_pick_open_file(char *out, size_t cap);
 #endif
 
 #ifndef _WIN32
@@ -497,6 +498,16 @@ typedef struct {
        counters are meaningless. */
     unsigned long long hud_cpu_prev_busy;
     unsigned long long hud_cpu_prev_total;
+
+    /* Active SFTP upload (one at a time per pane). NULL when no
+       upload is in flight or the toast has expired. The display
+       name + status are pulled from the PtyUpload via
+       pty_upload_status / pty_upload_name. */
+    PtyUpload *upload;
+    /* Wall-clock time the upload finished (success or fail). 0
+       while in flight. Used to keep the toast on screen for a few
+       seconds after completion before releasing the handle. */
+    double     upload_done_at;
 } Pane;
 
 typedef enum {
@@ -564,6 +575,7 @@ static HudConfig hud_effective(const Tab *t) {
 #define TAB_SPLIT_W 28          /* one split button (two of them — vertical + horizontal) */
 #define TAB_REC_W   26          /* one record button (start + stop, both always visible) */
 #define TAB_SSH_W   48
+#define TAB_UPLOAD_W 28         /* SFTP upload button (only visible on SSH tabs) */
 
 static Tab *g_tabs[MAX_TABS];
 
@@ -581,7 +593,7 @@ static int g_active = 0;
    keystrokes edit form fields and mouse clicks focus them instead of
    going to the active tab. Layout is computed on the fly in
    ssh_form_layout() so draw and hit-test share one source of truth. */
-typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP, UI_REC_SAVE } UiMode;
+typedef enum { UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP, UI_REC_SAVE, UI_SFTP_UPLOAD } UiMode;
 typedef enum {
     F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
     F_NEW, F_CONNECT, F_DELETE, F_SAVE, F_CANCEL,
@@ -609,6 +621,18 @@ typedef struct {
 } SshForm;
 static UiMode  g_ui_mode = UI_NORMAL;
 static SshForm g_form;
+
+/* SFTP upload form state. Lives behind UI_SFTP_UPLOAD; reset by
+   upload_form_open. The local file is set by the system file
+   picker (or "Choose…" inside the modal); remote_path is editable
+   text and defaults to "~/" the first time the modal opens. */
+typedef struct {
+    char  local_path[4096];
+    char  remote_path[4096];
+    bool  remote_focus;
+    char  status[256];   /* error from pty_upload_start, if any */
+} SftpUploadForm;
+static SftpUploadForm g_upload_form;
 
 typedef struct {
     int x, y, w, h;
@@ -1099,6 +1123,9 @@ static void pane_free(Pane *p) {
     /* Stop a recording if its target pane is going away — the file
        pointer would dangle otherwise. */
     if (g_rec.active && g_rec.pane == p) rec_stop();
+    /* Cancel + join any in-flight SFTP upload before tearing down
+       the PTY (the worker thread holds the session lock). */
+    if (p->upload) { pty_upload_release(p->upload); p->upload = NULL; }
     pane_log_close(p);
     if (p->pty) { pty_close(p->pty); p->pty = NULL; }
     if (p->scr) { screen_free(p->scr); p->scr = NULL; }
@@ -2895,6 +2922,52 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         }
     }
 
+    /* SFTP upload toast — bottom-left of each pane with an active
+       transfer or one that finished within the last few seconds.
+       Reads atomic state from the worker thread so this is safe to
+       call every frame without locking. */
+    for (int pi = 0; pi < t->num_panes; pi++) {
+        Pane *p = &t->panes[pi];
+        if (!p->upload) continue;
+        uint64_t done = 0, total = 0;
+        char err[256] = {0};
+        int st = pty_upload_status(p->upload, &done, &total, err, sizeof(err));
+        const char *name = pty_upload_name(p->upload);
+        char label[320];
+        Color outline = (Color){80, 90, 110, 255};
+        if (st == 0) {
+            int pct = (total > 0) ? (int)((done * 100ULL) / total) : 0;
+            if (pct > 99) pct = 99;
+            snprintf(label, sizeof(label), "↑ %s  %d%%", name, pct);
+            outline = (Color){125, 207, 255, 220};
+        } else if (st == 1) {
+            double mb = (double)total / (1024.0 * 1024.0);
+            if (mb >= 1.0) snprintf(label, sizeof(label), "✓ %s  %.1f MB", name, mb);
+            else           snprintf(label, sizeof(label), "✓ %s  %llu KB",
+                                    name, (unsigned long long)(total / 1024));
+            outline = (Color){140, 230, 160, 220};
+        } else {
+            snprintf(label, sizeof(label), "✗ %s  %s",
+                     name, err[0] ? err : "failed");
+            outline = (Color){240, 120, 120, 220};
+        }
+        PaneRect pr;
+        pane_rect(t, pi, win_w, win_h, &pr);
+        int fs = 12;
+        int tw = MeasureText(label, fs);
+        int x_pad = 8, y_pad = 4;
+        int slab_w = tw + x_pad * 2;
+        int slab_h = fs + y_pad * 2;
+        int margin = 8;
+        int slab_x = pr.x + margin;
+        int slab_y = pr.y + pr.h - slab_h - margin;
+        DrawRectangle(slab_x, slab_y, slab_w, slab_h,
+                      (Color){10, 12, 18, 200});
+        DrawRectangleLines(slab_x, slab_y, slab_w, slab_h, outline);
+        DrawText(label, slab_x + x_pad, slab_y + y_pad, fs,
+                 (Color){230, 235, 245, 255});
+    }
+
     SetMouseCursor(hud_hover ? MOUSE_CURSOR_POINTING_HAND
                   : want_url_cursor ? MOUSE_CURSOR_POINTING_HAND
                                     : MOUSE_CURSOR_DEFAULT);
@@ -2935,6 +3008,7 @@ typedef struct {
     bool on_split_h;       /* top/bottom split button */
     bool on_rec_start;     /* start asciinema recording */
     bool on_rec_stop;      /* stop asciinema recording */
+    bool on_upload;        /* SFTP upload — only present on SSH tabs */
 } TabBarHit;
 
 /* Split buttons are hidden when the active tab is already split — there's
@@ -2945,14 +3019,23 @@ static bool split_buttons_visible(void) {
     return t && t->split == SPLIT_NONE;
 }
 
+/* True iff the active tab is an SSH session — controls visibility of
+   the SFTP upload tab-bar button. */
+static bool upload_button_visible(void) {
+    if (g_active < 0 || g_active >= g_num_tabs) return false;
+    Tab *t = g_tabs[g_active];
+    return t && t->is_ssh;
+}
+
 /* Compute the per-tab pixel width in the tab bar from the
    available room (window width minus the SSH/help/+/-/split
    buttons). Splits the leftover width evenly across the open
    tabs, clamped to TAB_MIN_W..TAB_MAX_W. */
 static int tab_width_for(int win_w) {
-    int split_w = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
+    int split_w  = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
+    int upload_w = upload_button_visible()  ? TAB_UPLOAD_W   : 0;
     int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - 2 * TAB_REC_W
-                - TAB_HELP_W - split_w - TAB_SSH_W;
+                - TAB_HELP_W - split_w - upload_w - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -2965,15 +3048,17 @@ static int tab_width_for(int win_w) {
    The "+" was on the far right; moved next to [ssh] so the two
    "open something" buttons live together. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false };
+    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     bool show_splits = split_buttons_visible();
+    bool show_up     = upload_button_visible();
     int help_x      = win_w - TAB_HELP_W;
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W     : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
     int rec_stop_x  = split_v_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
-    int gear_x      = rec_start_x - TAB_GEAR_W;
+    int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
+    int gear_x      = upload_x - TAB_GEAR_W;
     int plus_x      = TAB_SSH_W;
     int tab_start   = TAB_SSH_W + TAB_PLUS_W;
     if (mx < TAB_SSH_W)                       { h.on_ssh  = true; return h; }
@@ -2984,6 +3069,7 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     if (show_splits && mx >= split_v_x) { h.on_split_v = true; return h; }
     if (mx >= rec_stop_x)   { h.on_rec_stop  = true; return h; }
     if (mx >= rec_start_x)  { h.on_rec_start = true; return h; }
+    if (show_up && mx >= upload_x) { h.on_upload = true; return h; }
     if (mx >= gear_x)       { h.on_gear      = true; return h; }
     int tw = tab_width_for(win_w);
     int idx = (mx - tab_start) / tw;
@@ -3088,11 +3174,13 @@ static void draw_tab_bar(Renderer *r, int win_w) {
        Compute every x from right to left so it stays in sync. The
        REC pill renders only while a recording is active. */
     bool show_splits = split_buttons_visible();
+    bool show_up     = upload_button_visible();
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W    : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W : help_x;
     int rec_stop_x  = split_v_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
-    int gear_x      = rec_start_x - TAB_GEAR_W;
+    int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
+    int gear_x      = upload_x - TAB_GEAR_W;
 
     /* REC pill: shows while a recording is active. Sits just left
        of the gear and counts up from the recording's start time.
@@ -3159,6 +3247,28 @@ static void draw_tab_bar(Renderer *r, int win_w) {
         int sq = 10;
         DrawRectangle(rec_stop_x + (TAB_REC_W - sq) / 2,
                       (TAB_BAR_H - sq) / 2, sq, sq, stop_col);
+    }
+
+    /* SFTP upload button — only on SSH tabs. A small "↑" arrow
+       glyph drawn from line primitives so we don't depend on the
+       active font having an arrow codepoint. Click opens
+       UI_SFTP_UPLOAD with the system file picker pre-fired. */
+    if (show_up) {
+        Color up_bg = (Color){38, 48, 66, 255};
+        Color up_outline = (Color){125, 207, 255, 200};
+        Color up_glyph = (Color){220, 235, 255, 255};
+        DrawRectangle(upload_x, 0, TAB_UPLOAD_W, TAB_BAR_H, up_bg);
+        DrawRectangleLines(upload_x, 2, TAB_UPLOAD_W - 1, TAB_BAR_H - 4, up_outline);
+        float cx = upload_x + TAB_UPLOAD_W / 2.0f;
+        float cy = TAB_BAR_H / 2.0f;
+        float size = TAB_BAR_H * 0.42f;
+        /* Vertical shaft, then a chevron at the top. */
+        DrawLineEx((Vector2){cx, cy + size * 0.55f},
+                   (Vector2){cx, cy - size * 0.55f}, 2.0f, up_glyph);
+        DrawLineEx((Vector2){cx - size * 0.45f, cy - size * 0.10f},
+                   (Vector2){cx, cy - size * 0.55f}, 2.0f, up_glyph);
+        DrawLineEx((Vector2){cx + size * 0.45f, cy - size * 0.10f},
+                   (Vector2){cx, cy - size * 0.55f}, 2.0f, up_glyph);
     }
 
     /* Split buttons — vertical (side-by-side) then horizontal
@@ -3632,6 +3742,280 @@ static void ssh_form_open(void) {
        entries even if Settings hasn't been opened yet. */
     if (g_font_count == 0)
         fonts_load(g_renderer ? g_renderer->font_path : NULL);
+}
+
+/* Open the SFTP upload modal pre-populated with the active pane's
+   tracked cwd as the remote path (falls back to "~/"). The system
+   file picker is fired immediately so the common case — "open
+   modal, pick file, hit upload" — collapses to one extra
+   dialog. The modal stays open afterwards so the user can edit
+   the remote path before committing. */
+static void upload_form_open(void) {
+    memset(&g_upload_form, 0, sizeof(g_upload_form));
+    /* Default remote path: active pane's last-known cwd (set by
+       OSC 7) if present, else home. */
+    Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
+    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    if (ap && ap->cwd[0]) {
+        size_t cl = strlen(ap->cwd);
+        snprintf(g_upload_form.remote_path,
+                 sizeof(g_upload_form.remote_path),
+                 "%s%s", ap->cwd, (cl > 0 && ap->cwd[cl - 1] == '/') ? "" : "/");
+    } else {
+        snprintf(g_upload_form.remote_path,
+                 sizeof(g_upload_form.remote_path), "~/");
+    }
+    /* Auto-fire the system file picker so the user lands on the
+       modal with a file already chosen. They can still hit
+       "Choose…" again to swap. */
+#ifdef __APPLE__
+    char picked[sizeof(g_upload_form.local_path)];
+    if (mac_pick_open_file(picked, sizeof(picked))) {
+        snprintf(g_upload_form.local_path,
+                 sizeof(g_upload_form.local_path), "%s", picked);
+    } else {
+        /* User cancelled the picker — don't open the modal at all. */
+        return;
+    }
+#endif
+    g_upload_form.remote_focus = true;
+    g_ui_mode = UI_SFTP_UPLOAD;
+}
+
+/* Forward decl — `rect_hit` is defined after the SSH-form layout
+   helpers but the upload modal handlers need it earlier. */
+static bool rect_hit(Rect r, int x, int y);
+
+typedef struct {
+    Rect modal;
+    Rect choose_btn;
+    Rect remote_field;
+    Rect upload_btn;
+    Rect cancel_btn;
+} UploadFormLayout;
+
+static UploadFormLayout upload_form_layout(int win_w, int win_h) {
+    UploadFormLayout L = {0};
+    int w = 640, h = 240;
+    if (w > win_w - 40) w = win_w - 40;
+    if (h > win_h - 40) h = win_h - 40;
+    L.modal.x = (win_w - w) / 2;
+    L.modal.y = (win_h - h) / 2;
+    L.modal.w = w;
+    L.modal.h = h;
+    int pad = 22;
+    int title_h = 38;
+    int label_w = 100;
+    int field_x = L.modal.x + pad + label_w;
+    int field_w = w - 2 * pad - label_w;
+
+    int row_y = L.modal.y + title_h + 14;
+    /* Local-file row: caption is drawn left of a "Choose…" button
+       that re-fires the picker. The picked path is rendered above
+       in a non-interactive line. */
+    L.choose_btn = (Rect){ field_x, row_y, 100, 28 };
+    row_y += 28 + 14;
+    L.remote_field = (Rect){ field_x, row_y, field_w, 28 };
+
+    int btn_h = 32;
+    int btn_y = L.modal.y + h - 22 - btn_h;
+    L.upload_btn = (Rect){ L.modal.x + w - 22 - 110, btn_y, 110, btn_h };
+    L.cancel_btn = (Rect){ L.upload_btn.x - 8 - 90,  btn_y,  90, btn_h };
+    return L;
+}
+
+static void upload_form_submit(void) {
+    g_upload_form.status[0] = 0;
+    if (!g_upload_form.local_path[0]) {
+        snprintf(g_upload_form.status, sizeof(g_upload_form.status),
+                 "Choose a local file first");
+        return;
+    }
+    Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
+    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    if (!ap) {
+        snprintf(g_upload_form.status, sizeof(g_upload_form.status),
+                 "no active pane");
+        return;
+    }
+    /* Replace any existing upload — joining the previous worker is
+       cheap because pty_upload_release sets cancel + waits. */
+    if (ap->upload) {
+        pty_upload_release(ap->upload);
+        ap->upload = NULL;
+    }
+    char err[256] = {0};
+    ap->upload = pty_upload_start(ap->pty,
+                                  g_upload_form.local_path,
+                                  g_upload_form.remote_path[0]
+                                      ? g_upload_form.remote_path : "~/",
+                                  err, sizeof(err));
+    if (!ap->upload) {
+        snprintf(g_upload_form.status, sizeof(g_upload_form.status),
+                 "%s", err[0] ? err : "upload failed to start");
+        return;
+    }
+    ap->upload_done_at = 0.0;
+    g_ui_mode = UI_NORMAL;
+}
+
+static void upload_form_handle_mouse(UploadFormLayout L) {
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+    Vector2 mp = GetMousePosition();
+    int mx = (int)mp.x, my = (int)mp.y;
+    if (rect_hit(L.choose_btn, mx, my)) {
+#ifdef __APPLE__
+        char picked[sizeof(g_upload_form.local_path)];
+        if (mac_pick_open_file(picked, sizeof(picked))) {
+            snprintf(g_upload_form.local_path,
+                     sizeof(g_upload_form.local_path), "%s", picked);
+            g_upload_form.status[0] = 0;
+        }
+#endif
+        g_upload_form.remote_focus = false;
+        return;
+    }
+    if (rect_hit(L.remote_field, mx, my)) {
+        g_upload_form.remote_focus = true;
+        return;
+    }
+    if (rect_hit(L.upload_btn, mx, my)) {
+        upload_form_submit();
+        return;
+    }
+    if (rect_hit(L.cancel_btn, mx, my)) {
+        g_ui_mode = UI_NORMAL;
+        return;
+    }
+    /* Click anywhere outside controls drops keyboard focus from the
+       remote-path field. */
+    if (!rect_hit(L.modal, mx, my)) {
+        g_ui_mode = UI_NORMAL;
+        return;
+    }
+    g_upload_form.remote_focus = false;
+}
+
+static void upload_form_handle_keys(void) {
+    if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        upload_form_submit();
+        return;
+    }
+    if (g_upload_form.remote_focus) {
+        size_t len = strlen(g_upload_form.remote_path);
+        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+            if (len > 0) g_upload_form.remote_path[len - 1] = 0;
+        }
+        int cp;
+        while ((cp = GetCharPressed()) != 0) {
+            if (cp < 32 || cp >= 127) continue;
+            if (len + 1 >= sizeof(g_upload_form.remote_path)) continue;
+            g_upload_form.remote_path[len++] = (char)cp;
+            g_upload_form.remote_path[len] = 0;
+        }
+    }
+}
+
+static void draw_upload_form(Renderer *r, int win_w, int win_h, UploadFormLayout L) {
+    (void)win_w; (void)win_h;
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(),
+                  (Color){0, 0, 0, 150});
+    DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                  (Color){30, 34, 46, 255});
+    DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                       (Color){125, 207, 255, 220});
+    Font *f = (Font *)r->font_data;
+    DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
+                  (Color){38, 42, 58, 255});
+    DrawTextEx(*f, "SFTP — Upload",
+               (Vector2){L.modal.x + 20, L.modal.y + 11},
+               16, 0, (Color){230, 232, 240, 255});
+
+    /* Local-file caption + path display + Choose button. */
+    DrawTextEx(*f, "Local file",
+               (Vector2){L.modal.x + 22, L.choose_btn.y + 7},
+               13, 0, (Color){180, 185, 200, 255});
+    /* Pick button. */
+    DrawRectangle(L.choose_btn.x, L.choose_btn.y,
+                  L.choose_btn.w, L.choose_btn.h,
+                  (Color){46, 52, 70, 255});
+    DrawRectangleLines(L.choose_btn.x, L.choose_btn.y,
+                       L.choose_btn.w, L.choose_btn.h,
+                       (Color){125, 207, 255, 200});
+    Vector2 csz = MeasureTextEx(*f, "Choose…", 13, 0);
+    DrawTextEx(*f, "Choose…",
+               (Vector2){L.choose_btn.x + (L.choose_btn.w - csz.x) / 2,
+                         L.choose_btn.y + (L.choose_btn.h - csz.y) / 2},
+               13, 0, (Color){230, 232, 240, 255});
+    /* Path display next to the button. */
+    const char *shown = g_upload_form.local_path[0]
+                        ? g_upload_form.local_path : "(no file selected)";
+    BeginScissorMode(L.choose_btn.x + L.choose_btn.w + 10,
+                     L.choose_btn.y,
+                     L.modal.x + L.modal.w - 22 - (L.choose_btn.x + L.choose_btn.w + 10),
+                     L.choose_btn.h);
+    DrawTextEx(*f, shown,
+               (Vector2){L.choose_btn.x + L.choose_btn.w + 10,
+                         L.choose_btn.y + 7},
+               13, 0,
+               g_upload_form.local_path[0] ? (Color){230, 232, 240, 255}
+                                           : (Color){110, 115, 130, 255});
+    EndScissorMode();
+
+    /* Remote path field. */
+    DrawTextEx(*f, "Remote path",
+               (Vector2){L.modal.x + 22, L.remote_field.y + 7},
+               13, 0, (Color){180, 185, 200, 255});
+    DrawRectangle(L.remote_field.x, L.remote_field.y,
+                  L.remote_field.w, L.remote_field.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.remote_field.x, L.remote_field.y,
+                       L.remote_field.w, L.remote_field.h,
+                       g_upload_form.remote_focus
+                           ? (Color){125, 207, 255, 255}
+                           : (Color){70, 74, 90, 255});
+    BeginScissorMode(L.remote_field.x + 6, L.remote_field.y,
+                     L.remote_field.w - 12, L.remote_field.h);
+    DrawTextEx(*f, g_upload_form.remote_path,
+               (Vector2){L.remote_field.x + 8, L.remote_field.y + 7},
+               14, 0, (Color){230, 232, 240, 255});
+    if (g_upload_form.remote_focus &&
+        ((long long)(GetTime() * 2.0) & 1) == 0) {
+        Vector2 vsz = MeasureTextEx(*f, g_upload_form.remote_path, 14, 0);
+        DrawRectangle(L.remote_field.x + 8 + (int)vsz.x + 1,
+                      L.remote_field.y + 6, 8, 16,
+                      (Color){125, 207, 255, 255});
+    }
+    EndScissorMode();
+
+    /* Status line (errors only). */
+    if (g_upload_form.status[0]) {
+        DrawTextEx(*f, g_upload_form.status,
+                   (Vector2){L.modal.x + 22, L.upload_btn.y - 22},
+                   13, 0, (Color){240, 120, 120, 255});
+    }
+
+    /* Buttons. */
+    DrawRectangle(L.cancel_btn.x, L.cancel_btn.y, L.cancel_btn.w, L.cancel_btn.h,
+                  (Color){48, 52, 66, 255});
+    DrawRectangleLines(L.cancel_btn.x, L.cancel_btn.y, L.cancel_btn.w, L.cancel_btn.h,
+                       (Color){150, 155, 170, 200});
+    Vector2 xsz = MeasureTextEx(*f, "Cancel", 14, 0);
+    DrawTextEx(*f, "Cancel",
+               (Vector2){L.cancel_btn.x + (L.cancel_btn.w - xsz.x) / 2,
+                         L.cancel_btn.y + (L.cancel_btn.h - xsz.y) / 2},
+               14, 0, (Color){210, 215, 230, 255});
+
+    DrawRectangle(L.upload_btn.x, L.upload_btn.y, L.upload_btn.w, L.upload_btn.h,
+                  (Color){46, 92, 150, 255});
+    DrawRectangleLines(L.upload_btn.x, L.upload_btn.y, L.upload_btn.w, L.upload_btn.h,
+                       (Color){125, 207, 255, 220});
+    Vector2 usz = MeasureTextEx(*f, "Upload", 14, 0);
+    DrawTextEx(*f, "Upload",
+               (Vector2){L.upload_btn.x + (L.upload_btn.w - usz.x) / 2,
+                         L.upload_btn.y + (L.upload_btn.h - usz.y) / 2},
+               14, 0, (Color){230, 240, 255, 255});
 }
 
 static char *form_buf(int field, size_t *cap) {
@@ -8745,6 +9129,26 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* SFTP upload sweep: when an upload finishes (status != 0),
+           note the time so the toast can fade after a delay. After
+           4 seconds release the handle (joins the worker, frees). */
+        for (int i = 0; i < g_num_tabs; i++) {
+            Tab *t = g_tabs[i];
+            for (int pi = 0; pi < t->num_panes; pi++) {
+                Pane *p = &t->panes[pi];
+                if (!p->upload) continue;
+                int st = pty_upload_status(p->upload, NULL, NULL, NULL, 0);
+                if (st != 0 && p->upload_done_at == 0.0) {
+                    p->upload_done_at = now;
+                }
+                if (p->upload_done_at != 0.0 && now - p->upload_done_at > 4.0) {
+                    pty_upload_release(p->upload);
+                    p->upload = NULL;
+                    p->upload_done_at = 0.0;
+                }
+            }
+        }
+
         Tab *cur = active_tab();
         Vector2 mp = GetMousePosition();
         bool in_tab_bar = (mp.y < TAB_BAR_H);
@@ -8778,6 +9182,9 @@ int main(int argc, char **argv) {
                 }
                 else if (h.on_rec_stop) {
                     rec_stop();
+                }
+                else if (h.on_upload) {
+                    upload_form_open();
                 }
                 else if (h.on_split_v || h.on_split_h) {
                     if (cur) {
@@ -9112,6 +9519,24 @@ int main(int argc, char **argv) {
             L = settings_layout(win_w_now, win_h_now);
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_settings(&r, win_w_now, win_h_now, L);
+            EndDrawing();
+            continue;
+        }
+
+        /* SFTP upload modal. */
+        if (g_ui_mode == UI_SFTP_UPLOAD) {
+            UploadFormLayout UL = upload_form_layout(win_w_now, win_h_now);
+            upload_form_handle_mouse(UL);
+            upload_form_handle_keys();
+            cur = active_tab();
+            if (!cur) break;
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
+            if (g_ui_mode == UI_SFTP_UPLOAD) {
+                draw_upload_form(&r, win_w_now, win_h_now, UL);
+            }
             EndDrawing();
             continue;
         }

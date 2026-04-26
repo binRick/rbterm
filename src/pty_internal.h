@@ -42,3 +42,15 @@ void  ssh_write_impl(void *impl, const uint8_t *buf, size_t n);
 void  ssh_resize_impl(void *impl, int cols, int rows);
 struct PtyHudSnapshot;   /* declared in pty.h */
 bool  ssh_hud_snapshot_impl(void *impl, struct PtyHudSnapshot *out);
+
+/* SFTP upload — only the SSH backend implements this. */
+struct PtyUpload;        /* opaque; defined in pty_ssh.c */
+struct PtyUpload *ssh_upload_start_impl(void *impl,
+                                        const char *local_path,
+                                        const char *remote_path,
+                                        char *err, size_t errsz);
+int  ssh_upload_status_impl(struct PtyUpload *u,
+                            uint64_t *bytes_done, uint64_t *bytes_total,
+                            char *err, size_t errsz);
+const char *ssh_upload_name_impl(struct PtyUpload *u);
+void ssh_upload_release_impl(struct PtyUpload *u);

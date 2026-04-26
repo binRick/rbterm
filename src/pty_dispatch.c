@@ -5,6 +5,7 @@
 #include "pty.h"
 #include "pty_internal.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -104,4 +105,33 @@ void pty_snap_cursor(Pty *p, int cy, int cx) {
     if (!p) return;
     if (p->kind == PTY_SSH) return;
     local_snap_cursor_impl(p->impl, cy, cx);
+}
+
+/* SFTP upload — only meaningful for SSH PTYs. Local PTYs return NULL
+   and the caller surfaces "upload only works on SSH tabs" in the UI. */
+PtyUpload *pty_upload_start(Pty *p, const char *local_path,
+                            const char *remote_path,
+                            char *err, size_t errsz) {
+    if (err && errsz) err[0] = 0;
+    if (!p || p->kind != PTY_SSH) {
+        if (err && errsz) snprintf(err, errsz, "upload requires an SSH session");
+        return NULL;
+    }
+    return (PtyUpload *)ssh_upload_start_impl(p->impl, local_path,
+                                              remote_path, err, errsz);
+}
+
+int pty_upload_status(PtyUpload *u,
+                      uint64_t *bytes_done, uint64_t *bytes_total,
+                      char *err, size_t errsz) {
+    return ssh_upload_status_impl((struct PtyUpload *)u,
+                                  bytes_done, bytes_total, err, errsz);
+}
+
+const char *pty_upload_name(PtyUpload *u) {
+    return ssh_upload_name_impl((struct PtyUpload *)u);
+}
+
+void pty_upload_release(PtyUpload *u) {
+    ssh_upload_release_impl((struct PtyUpload *)u);
 }
