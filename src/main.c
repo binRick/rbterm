@@ -2935,19 +2935,21 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
         const char *name = pty_upload_name(p->upload);
         char label[320];
         Color outline = (Color){80, 90, 110, 255};
+        /* ASCII-only — raylib's bundled font (used for this toast)
+           doesn't carry ↑/✓/✗ codepoints; "?" was rendering instead. */
         if (st == 0) {
             int pct = (total > 0) ? (int)((done * 100ULL) / total) : 0;
             if (pct > 99) pct = 99;
-            snprintf(label, sizeof(label), "↑ %s  %d%%", name, pct);
+            snprintf(label, sizeof(label), "[up] %s  %d%%", name, pct);
             outline = (Color){125, 207, 255, 220};
         } else if (st == 1) {
             double mb = (double)total / (1024.0 * 1024.0);
-            if (mb >= 1.0) snprintf(label, sizeof(label), "✓ %s  %.1f MB", name, mb);
-            else           snprintf(label, sizeof(label), "✓ %s  %llu KB",
+            if (mb >= 1.0) snprintf(label, sizeof(label), "[ok] %s  %.1f MB", name, mb);
+            else           snprintf(label, sizeof(label), "[ok] %s  %llu KB",
                                     name, (unsigned long long)(total / 1024));
             outline = (Color){140, 230, 160, 220};
         } else {
-            snprintf(label, sizeof(label), "✗ %s  %s",
+            snprintf(label, sizeof(label), "[err] %s: %s",
                      name, err[0] ? err : "failed");
             outline = (Color){240, 120, 120, 220};
         }

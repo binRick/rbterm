@@ -791,6 +791,7 @@ void ssh_resize_impl(void *impl, int cols, int rows) {
 #include <errno.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <time.h>
 
 #define SFTP_CHUNK_SZ (32u * 1024u)
 #define PATH_MAX_FALLBACK 4096
@@ -822,6 +823,35 @@ static void upload_set_err(struct PtyUpload *u, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Append a line to ~/rbterm-upload.log so we can post-mortem upload
+   failures without a debugger. Always-on (logs are tiny). The file
+   is created on first write and grows from there; nothing rotates
+   it — clear it manually if it gets large. */
+static void upload_log(const char *fmt, ...) {
+    char path[PATH_MAX_FALLBACK];
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    snprintf(path, sizeof(path), "%s/rbterm-upload.log", home);
+    FILE *fp = fopen(path, "a");
+    if (!fp) return;
+    /* Timestamp prefix so consecutive runs are distinguishable. */
+    time_t now = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(fp, "[%s] ", ts);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
+
 static const char *path_basename(const char *p) {
     if (!p) return "";
     const char *b = p;
@@ -835,11 +865,14 @@ static void *sftp_worker(void *arg) {
     struct PtyUpload *u = arg;
     SshPty *p = u->ssh;
 
+    upload_log("---- start: local=%s remote=%s", u->local_path, u->remote_path);
+
     /* Open the local file before grabbing the session lock so we
        don't block the reader on file I/O. */
     FILE *fp = fopen(u->local_path, "rb");
     if (!fp) {
         upload_set_err(u, "open local: %s", strerror(errno));
+        upload_log("FAIL: %s", u->err);
         u->status = -1;
         return NULL;
     }
@@ -848,6 +881,8 @@ static void *sftp_worker(void *arg) {
         if (sz > 0) u->bytes_total = (uint64_t)sz;
         fseek(fp, 0, SEEK_SET);
     }
+    upload_log("local opened: %llu bytes",
+               (unsigned long long)u->bytes_total);
 
     /* Decide the final remote path. If the user gave a directory
        (trailing slash or libssh stat says it's one), append the
@@ -857,6 +892,7 @@ static void *sftp_worker(void *arg) {
 
     /* libssh calls — all under session_lock. */
     pthread_mutex_lock(&p->session_lock);
+    upload_log("got session_lock");
 
     bool was_blocking = ssh_is_blocking(p->session);
     ssh_set_blocking(p->session, 1);
@@ -864,14 +900,19 @@ static void *sftp_worker(void *arg) {
     sftp_session sftp = sftp_new(p->session);
     if (!sftp) {
         upload_set_err(u, "sftp_new: %s", ssh_get_error(p->session));
+        upload_log("FAIL sftp_new: %s", u->err);
         if (!was_blocking) ssh_set_blocking(p->session, 0);
         pthread_mutex_unlock(&p->session_lock);
         fclose(fp);
         u->status = -1;
         return NULL;
     }
-    if (sftp_init(sftp) != SSH_OK) {
+    upload_log("sftp_new ok");
+    int init_rc = sftp_init(sftp);
+    if (init_rc != SSH_OK) {
         upload_set_err(u, "sftp_init: %s", ssh_get_error(p->session));
+        upload_log("FAIL sftp_init rc=%d sftp_err=%d ssh_err=%s",
+                   init_rc, sftp_get_error(sftp), ssh_get_error(p->session));
         sftp_free(sftp);
         if (!was_blocking) ssh_set_blocking(p->session, 0);
         pthread_mutex_unlock(&p->session_lock);
@@ -879,6 +920,7 @@ static void *sftp_worker(void *arg) {
         u->status = -1;
         return NULL;
     }
+    upload_log("sftp_init ok");
 
     /* If remote path looks like a directory (trailing /), or the
        stat says it is, append the basename of the local file. */
@@ -890,29 +932,34 @@ static void *sftp_worker(void *arg) {
             if (a) {
                 if (a->type == SSH_FILEXFER_TYPE_DIRECTORY) ends_slash = true;
                 sftp_attributes_free(a);
+                upload_log("stat(%s): is_dir=%d",
+                           final_remote, ends_slash ? 1 : 0);
+            } else {
+                upload_log("stat(%s): not found (%s) — treating as file path",
+                           final_remote, ssh_get_error(p->session));
             }
         }
         if (ends_slash) {
             const char *bn = path_basename(u->local_path);
-            size_t need = rl + (final_remote[rl - 1] == '/' ? 0 : 1) + strlen(bn) + 1;
-            if (need <= sizeof(final_remote)) {
-                if (final_remote[rl - 1] != '/') {
-                    if (rl + 1 < sizeof(final_remote)) {
-                        final_remote[rl] = '/';
-                        final_remote[rl + 1] = 0;
-                    }
+            if (final_remote[rl - 1] != '/') {
+                if (rl + 1 < sizeof(final_remote)) {
+                    final_remote[rl] = '/';
+                    final_remote[rl + 1] = 0;
                 }
-                strncat(final_remote, bn,
-                        sizeof(final_remote) - strlen(final_remote) - 1);
             }
+            strncat(final_remote, bn,
+                    sizeof(final_remote) - strlen(final_remote) - 1);
         }
     }
+    upload_log("final remote path: %s", final_remote);
 
     sftp_file rf = sftp_open(sftp, final_remote,
                              O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (!rf) {
         upload_set_err(u, "sftp_open %s: %s",
                        final_remote, ssh_get_error(p->session));
+        upload_log("FAIL sftp_open: sftp_err=%d ssh_err=%s",
+                   sftp_get_error(sftp), ssh_get_error(p->session));
         sftp_free(sftp);
         if (!was_blocking) ssh_set_blocking(p->session, 0);
         pthread_mutex_unlock(&p->session_lock);
@@ -920,18 +967,23 @@ static void *sftp_worker(void *arg) {
         u->status = -1;
         return NULL;
     }
+    upload_log("sftp_open ok, streaming");
 
     uint8_t buf[SFTP_CHUNK_SZ];
     bool ok = true;
+    int chunk_count = 0;
     for (;;) {
         if (u->cancel) { ok = false;
                          upload_set_err(u, "cancelled");
+                         upload_log("cancelled mid-transfer");
                          break; }
         size_t n = fread(buf, 1, sizeof(buf), fp);
         if (n == 0) {
             if (ferror(fp)) { ok = false;
                               upload_set_err(u, "read local: %s",
-                                             strerror(errno)); }
+                                             strerror(errno));
+                              upload_log("FAIL read local: %s",
+                                         strerror(errno)); }
             break;
         }
         ssize_t w = sftp_write(rf, buf, n);
@@ -939,9 +991,16 @@ static void *sftp_worker(void *arg) {
             ok = false;
             upload_set_err(u, "sftp_write: %s",
                            ssh_get_error(p->session));
+            upload_log("FAIL sftp_write n=%zu w=%zd sftp_err=%d ssh_err=%s",
+                       n, w, sftp_get_error(sftp), ssh_get_error(p->session));
             break;
         }
         u->bytes_done += n;
+        if ((++chunk_count % 32) == 0) {
+            upload_log("progress: %llu / %llu bytes",
+                       (unsigned long long)u->bytes_done,
+                       (unsigned long long)u->bytes_total);
+        }
     }
 
     sftp_close(rf);
@@ -952,6 +1011,11 @@ static void *sftp_worker(void *arg) {
 
     if (ok && !u->bytes_total) u->bytes_total = u->bytes_done;
     u->status = ok ? 1 : -1;
+    upload_log("---- done: status=%d done=%llu total=%llu err=%s",
+               u->status,
+               (unsigned long long)u->bytes_done,
+               (unsigned long long)u->bytes_total,
+               u->err[0] ? u->err : "(none)");
     return NULL;
 }
 
@@ -982,7 +1046,10 @@ struct PtyUpload *ssh_upload_start_impl(void *impl,
     snprintf(u->display_name, sizeof(u->display_name), "%s",
              path_basename(local_path));
 
+    upload_log("==== upload requested: local=%s remote=%s",
+               u->local_path, u->remote_path);
     if (pthread_create(&u->thread, NULL, sftp_worker, u) != 0) {
+        upload_log("FAIL pthread_create");
         free(u);
         if (err && errsz) snprintf(err, errsz, "pthread_create failed");
         return NULL;
