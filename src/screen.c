@@ -1136,7 +1136,13 @@ static void finish_osc(Screen *s) {
     }
     if (ps == 4) {
         /* OSC 4;N;spec[;N;spec...] — set one or more palette entries
-           on this screen only. */
+           on this screen only. We also retroactively re-tag cells
+           whose stored bg/fg is the OLD palette[N] RGB but currently
+           pinned as raw truecolor (no ATTR_*_INDEX flag): convert
+           them to ATTR_*_INDEX with this index so subsequent palette
+           changes propagate. Helps tmux/starship-style apps that
+           emit truecolor matching a palette slot — after a `pal`
+           swap, every cell that "would have been" palette N now is. */
         while (*p) {
             int idx = 0; bool any = false;
             while (*p >= '0' && *p <= '9') { idx = idx * 10 + (*p - '0'); any = true; p++; }
@@ -1147,7 +1153,50 @@ static void finish_osc(Screen *s) {
             spec[si] = 0;
             uint32_t col;
             if (idx >= 0 && idx < 256 && parse_color_spec(spec, &col)) {
-                s->palette[idx] = col;
+                uint32_t old_rgb = s->palette[idx];
+                if (old_rgb != col) {
+                    s->palette[idx] = col;
+                    /* Walk every cell. Convert raw-RGB matches to
+                       ATTR_*_INDEX so they'll dynamically resolve
+                       to the new palette[idx] each frame and follow
+                       future swaps. */
+                    Cell *bufs[2] = { s->main, s->alt };
+                    int  cnts[2] = { s->rows * s->cols, s->rows * s->cols };
+                    for (int b = 0; b < 2; b++) {
+                        Cell *cs = bufs[b];
+                        if (!cs) continue;
+                        int n = cnts[b];
+                        for (int i = 0; i < n; i++) {
+                            Cell *c = &cs[i];
+                            if (!(c->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) &&
+                                c->bg == old_rgb) {
+                                c->bg = (uint32_t)idx;
+                                c->attrs = (uint16_t)(c->attrs | ATTR_BG_INDEX);
+                            }
+                            if (!(c->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) &&
+                                c->fg == old_rgb) {
+                                c->fg = (uint32_t)idx;
+                                c->attrs = (uint16_t)(c->attrs | ATTR_FG_INDEX);
+                            }
+                        }
+                    }
+                    if (s->sb && s->sb_cap > 0) {
+                        int n = s->sb_cap * s->cols;
+                        for (int i = 0; i < n; i++) {
+                            Cell *c = &s->sb[i];
+                            if (!(c->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) &&
+                                c->bg == old_rgb) {
+                                c->bg = (uint32_t)idx;
+                                c->attrs = (uint16_t)(c->attrs | ATTR_BG_INDEX);
+                            }
+                            if (!(c->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) &&
+                                c->fg == old_rgb) {
+                                c->fg = (uint32_t)idx;
+                                c->attrs = (uint16_t)(c->attrs | ATTR_FG_INDEX);
+                            }
+                        }
+                    }
+                }
             }
             if (*p == ';') p++; else break;
         }
