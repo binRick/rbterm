@@ -823,11 +823,22 @@ static void upload_set_err(struct PtyUpload *u, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* Append a line to ~/rbterm-upload.log so we can post-mortem upload
-   failures without a debugger. Always-on (logs are tiny). The file
-   is created on first write and grows from there; nothing rotates
-   it — clear it manually if it gets large. */
+/* Append a line to ~/rbterm-upload.log when RBTERM_DEBUG is set in
+   the environment (run.sh enables it, normal launches don't). The
+   env var is read once and cached — it doesn't change mid-session,
+   and we don't want a getenv on every chunk. The file is created
+   on first write and grows from there; nothing rotates it — clear
+   it manually if it gets large. */
+static bool upload_log_enabled(void) {
+    static int cached = -1;   /* -1 = unset, 0 = off, 1 = on */
+    if (cached < 0) {
+        const char *v = getenv("RBTERM_DEBUG");
+        cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
 static void upload_log(const char *fmt, ...) {
+    if (!upload_log_enabled()) return;
     char path[PATH_MAX_FALLBACK];
     const char *home = getenv("HOME");
     if (!home || !*home) home = "/tmp";

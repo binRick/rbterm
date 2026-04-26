@@ -43,6 +43,13 @@ if pgrep -x rbterm >/dev/null 2>&1; then
   pkill -9 -x rbterm 2>/dev/null || true
 fi
 
+# run.sh is the dev launcher — turn on the debug switches that
+# shouldn't burden a normal `open -a rbterm` user. Today that's
+# just RBTERM_DEBUG, which routes SFTP-upload tracing to
+# ~/rbterm-upload.log; keep adding flags here as more debug-only
+# instrumentation lands.
+export RBTERM_DEBUG=1
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
   make app
   # Launching the binary directly (rather than via `open`) keeps
