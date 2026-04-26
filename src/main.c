@@ -188,6 +188,19 @@ typedef struct {
     int  hud_size[HUD_FIELD_COUNT];   /* font size in points, clamped 10..18 */
     bool hud_show_cpu;           /* CPU sparkline (last 60 sec) under the text slab */
     bool hud_collapsed;          /* user rolled the slab up to a chevron tab */
+
+    /* Launch entries — what tabs to open when rbterm starts. Empty
+       count = fall back to the default behaviour (one local shell).
+       Otherwise we open one tab per entry, in order. SSH entries
+       resolve `host` against ~/.ssh/config via libssh's normal
+       parsing; the user's saved-host appearance overrides apply.
+       Persisted as `launch.<i>=local` or `launch.<i>=ssh:<alias>`. */
+#define LAUNCH_ENTRY_MAX 16
+    struct {
+        int  kind;          /* 0 = local, 1 = ssh */
+        char host[128];     /* ssh alias from ~/.ssh/config; "" for local */
+    } launch[LAUNCH_ENTRY_MAX];
+    int  launch_count;
 } AppSettings;
 
 /* Per-instance HUD configuration. Used both as the per-SSH-host
@@ -307,6 +320,23 @@ static void config_load_into_defaults(void) {
                ToggleFullscreen call was broken. */
             if      (!strcmp(v, "maximized"))  g_app_settings.startup_window = STARTUP_WINDOW_MAXIMIZED;
             else                               g_app_settings.startup_window = STARTUP_WINDOW_DEFAULT;
+        } else if (strncmp(k, "launch.", 7) == 0) {
+            /* launch.<i>=local | ssh:<alias>. Index is informational
+               for humans editing the file; we always append in the
+               order seen so re-saving rewrites the slots cleanly. */
+            if (g_app_settings.launch_count < LAUNCH_ENTRY_MAX) {
+                int i = g_app_settings.launch_count++;
+                if (strncmp(v, "ssh:", 4) == 0) {
+                    g_app_settings.launch[i].kind = 1;
+                    strncpy(g_app_settings.launch[i].host, v + 4,
+                            sizeof(g_app_settings.launch[i].host) - 1);
+                    g_app_settings.launch[i].host[
+                        sizeof(g_app_settings.launch[i].host) - 1] = 0;
+                } else {
+                    g_app_settings.launch[i].kind = 0;
+                    g_app_settings.launch[i].host[0] = 0;
+                }
+            }
         }
     }
     fclose(fp);
@@ -346,6 +376,15 @@ static bool config_save(Renderer *r) {
         const char *sw = (g_app_settings.startup_window == STARTUP_WINDOW_MAXIMIZED)
                              ? "maximized" : "default";
         fprintf(fp, "startup_window=%s\n", sw);
+    }
+    /* Launch entries — one line per slot, in order. We rewrite all
+       of them on save so deletes propagate cleanly. */
+    for (int i = 0; i < g_app_settings.launch_count; i++) {
+        if (g_app_settings.launch[i].kind == 1) {
+            fprintf(fp, "launch.%d=ssh:%s\n", i, g_app_settings.launch[i].host);
+        } else {
+            fprintf(fp, "launch.%d=local\n", i);
+        }
     }
     fclose(fp);
 #ifndef _WIN32
@@ -6593,7 +6632,8 @@ typedef enum {
     SETTINGS_TAB_WINDOW     = 4,
     SETTINGS_TAB_RECORDING  = 5,
     SETTINGS_TAB_HUD        = 6,
-    SETTINGS_TAB_COUNT      = 7,
+    SETTINGS_TAB_LAUNCH     = 7,
+    SETTINGS_TAB_COUNT      = 8,
 } SettingsTab;
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
