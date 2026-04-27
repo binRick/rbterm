@@ -5543,7 +5543,12 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
        Delete has zero size when no saved host is selected so it can't
        receive clicks; everything else keeps its position. */
     int btn_h = 32;
-    int btn_y = L.modal.y + L.modal.h - btn_h - pad - (g_form.error[0] ? 24 : 0);
+    /* Auth errors with the "Tried: agent / id_ed25519 / …" detail can
+       wrap to several lines. Reserve up to 4 lines (≈64 px) when an
+       error is set so the button bar moves out of the way. Status
+       (success) line is always single. */
+    int err_reserve = g_form.error[0] ? 64 : (g_form_status[0] ? 24 : 0);
+    int btn_y = L.modal.y + L.modal.h - btn_h - pad - err_reserve;
     int new_w = 70, connect_w = 110, del_w = 80, save_w = 90, cancel_w = 96;
     int test_w = 80;
     int gap = 8;
@@ -7415,14 +7420,64 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                          L.cancel.y + (L.cancel.h - xsz.y) / 2},
                14, 0, (Color){210, 215, 230, 255});
 
-    /* Status (success) / error line under the buttons. */
+    /* Status (success) / error line under the buttons. Word-wrap
+       the error inside the modal width — the auth-failed message
+       includes the full "tried: agent / id_ed25519 / …" detail
+       which used to overflow off the right edge. Up to 4 lines;
+       beyond that the tail is truncated with an ellipsis. */
+    int msg_x = L.modal.x + 22;
+    int msg_y = L.connect.y + L.connect.h + 10;
+    int msg_w_max = L.modal.w - 44;
+    int line_h   = 14;
     if (g_form.error[0]) {
-        DrawTextEx(*f, g_form.error,
-                   (Vector2){L.modal.x + 22, L.connect.y + L.connect.h + 10},
-                   12, 0, (Color){240, 100, 100, 255});
+        const char *src = g_form.error;
+        size_t srclen = strlen(src);
+        size_t pos = 0;
+        Color ec = (Color){240, 100, 100, 255};
+        for (int line_i = 0; line_i < 4 && pos < srclen; line_i++) {
+            char buf[256];
+            size_t take = srclen - pos;
+            if (take >= sizeof(buf)) take = sizeof(buf) - 1;
+            memcpy(buf, src + pos, take);
+            buf[take] = 0;
+            /* Shrink to fit. Walk back to the last whitespace so we
+               don't break a word. If no whitespace, hard break. */
+            while (take > 0) {
+                Vector2 sz = MeasureTextEx(*f, buf, 12, 0);
+                if (sz.x <= msg_w_max) break;
+                take--;
+                buf[take] = 0;
+            }
+            if (pos + take < srclen) {
+                size_t back = take;
+                while (back > 0 && buf[back - 1] != ' ' &&
+                       buf[back - 1] != ',' && buf[back - 1] != '/')
+                    back--;
+                if (back > take / 2) { take = back; buf[take] = 0; }
+            }
+            /* Last line + still text remaining → ellipsis. */
+            if (line_i == 3 && pos + take < srclen) {
+                while (take > 1) {
+                    char tmp[260];
+                    snprintf(tmp, sizeof(tmp), "%s…", buf);
+                    Vector2 sz = MeasureTextEx(*f, tmp, 12, 0);
+                    if (sz.x <= msg_w_max) {
+                        memcpy(buf, tmp, strlen(tmp) + 1);
+                        break;
+                    }
+                    take--;
+                    buf[take] = 0;
+                }
+            }
+            DrawTextEx(*f, buf,
+                       (Vector2){msg_x, msg_y + line_i * line_h},
+                       12, 0, ec);
+            pos += take;
+            while (pos < srclen && src[pos] == ' ') pos++;
+        }
     } else if (g_form_status[0]) {
         DrawTextEx(*f, g_form_status,
-                   (Vector2){L.modal.x + 22, L.connect.y + L.connect.h + 10},
+                   (Vector2){msg_x, msg_y},
                    12, 0, (Color){120, 220, 140, 255});
     }
 
