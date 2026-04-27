@@ -919,6 +919,7 @@ typedef struct {
        Appearance / Logging / HUD. Mirrors the Settings modal pattern. */
     Rect form_tab[4];
     Rect newbtn;
+    Rect testbtn;               /* dry-run auth without opening a tab */
     Rect connect;
     Rect delbtn;                /* zero-sized when not deletable */
     Rect save;
@@ -5544,23 +5545,26 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     int btn_h = 32;
     int btn_y = L.modal.y + L.modal.h - btn_h - pad - (g_form.error[0] ? 24 : 0);
     int new_w = 70, connect_w = 110, del_w = 80, save_w = 90, cancel_w = 96;
+    int test_w = 80;
     int gap = 8;
     bool has_del = (g_ssh_list_selected >= 0 && g_form.name[0]);
     int right_edge = L.modal.x + L.modal.w - pad;
     L.cancel.w  = cancel_w;  L.cancel.h  = btn_h;
     L.save.w    = save_w;    L.save.h    = btn_h;
     L.connect.w = connect_w; L.connect.h = btn_h;
+    L.testbtn.w = test_w;    L.testbtn.h = btn_h;
     L.newbtn.w  = new_w;     L.newbtn.h  = btn_h;
     L.delbtn.w  = has_del ? del_w : 0;  L.delbtn.h = btn_h;
     L.cancel.x  = right_edge - cancel_w;
     L.save.x    = L.cancel.x - gap - save_w;
     L.delbtn.x  = has_del ? (L.save.x - gap - del_w) : 0;
     L.connect.x = (has_del ? L.delbtn.x : L.save.x) - gap - connect_w;
+    L.testbtn.x = L.connect.x - gap - test_w;
     L.newbtn.x  = L.modal.x + pad + list_w + (list_w > 0 ? 14 : 0);
     /* "New" floats one row above the main button bar so it reads as a
        form-level reset, not a commit-style action. */
     L.newbtn.y  = btn_y - btn_h - 10;
-    L.cancel.y = L.save.y = L.connect.y = L.delbtn.y = btn_y;
+    L.cancel.y = L.save.y = L.connect.y = L.delbtn.y = L.testbtn.y = btn_y;
     return L;
 }
 
@@ -5618,6 +5622,51 @@ static void ssh_form_submit(int cols, int rows) {
         g_ui_mode = UI_NORMAL;
     } else {
         strncpy(g_form.error, err[0] ? err : "connection failed",
+                sizeof(g_form.error) - 1);
+        g_form.error[sizeof(g_form.error) - 1] = 0;
+    }
+#endif
+}
+
+/* Dry-run authentication with the form's current values. Opens
+   a session, runs the same connect + auth + channel sequence
+   Connect would, then tears it down without spawning a tab.
+   Result lands in g_form.error (red) or g_form_status (green).
+   Same UI freeze profile as Connect since libssh is blocking. */
+static void ssh_form_test_auth(int cols, int rows) {
+#ifdef __EMSCRIPTEN__
+    (void)cols; (void)rows;
+    strncpy(g_form.error,
+            "SSH disabled in the web demo.",
+            sizeof(g_form.error) - 1);
+    g_form.error[sizeof(g_form.error) - 1] = 0;
+    return;
+#else
+    if (!g_form.host[0]) {
+        strncpy(g_form.error, "Host is required", sizeof(g_form.error) - 1);
+        g_form.focus = F_HOST;
+        return;
+    }
+    int port = atoi(g_form.port);
+    if (port <= 0) port = 22;
+    char err[256] = {0};
+    Pty *p = pty_open_ssh(
+        g_form.user[0] ? g_form.user : NULL,
+        g_form.host,
+        port,
+        g_form.pass[0] ? g_form.pass : NULL,
+        g_form.key[0]  ? g_form.key  : NULL,
+        cols, rows, err, sizeof(err));
+    if (p) {
+        pty_close(p);
+        g_form.error[0] = 0;
+        snprintf(g_form_status, sizeof(g_form_status),
+                 "Auth ok — %s@%s:%d",
+                 g_form.user[0] ? g_form.user : "(default)",
+                 g_form.host, port);
+    } else {
+        g_form_status[0] = 0;
+        strncpy(g_form.error, err[0] ? err : "auth failed",
                 sizeof(g_form.error) - 1);
         g_form.error[sizeof(g_form.error) - 1] = 0;
     }
@@ -6266,6 +6315,10 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     if (rect_hit(L.newbtn, mx, my)) {
         g_form.focus = F_NEW;
         ssh_form_clear();
+        return;
+    }
+    if (rect_hit(L.testbtn, mx, my)) {
+        ssh_form_test_auth(cols, rows);
         return;
     }
     if (rect_hit(L.connect, mx, my)) {
@@ -7221,6 +7274,18 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                (Vector2){L.newbtn.x + (L.newbtn.w - nsz.x) / 2,
                          L.newbtn.y + (L.newbtn.h - nsz.y) / 2},
                14, 0, (Color){210, 215, 230, 255});
+
+    /* Test — dry-run auth. Same row as Connect, muted accent so the
+       eye lands on Connect. */
+    DrawRectangle(L.testbtn.x, L.testbtn.y, L.testbtn.w, L.testbtn.h,
+                  (Color){48, 52, 66, 255});
+    DrawRectangleLines(L.testbtn.x, L.testbtn.y, L.testbtn.w, L.testbtn.h,
+                       (Color){150, 200, 230, 180});
+    Vector2 tsz = MeasureTextEx(*f, "Test", 14, 0);
+    DrawTextEx(*f, "Test",
+               (Vector2){L.testbtn.x + (L.testbtn.w - tsz.x) / 2,
+                         L.testbtn.y + (L.testbtn.h - tsz.y) / 2},
+               14, 0, (Color){210, 220, 235, 255});
 
     bool cf = g_form.focus == F_CONNECT;
     DrawRectangle(L.connect.x, L.connect.y, L.connect.w, L.connect.h,
