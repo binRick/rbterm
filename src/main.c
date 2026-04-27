@@ -229,6 +229,7 @@ typedef struct {
     char pubpath[PATH_MAX]; /* absolute path to .pub */
     char privpath[PATH_MAX];/* absolute path to private (may not exist) */
     bool has_private;
+    time_t mtime;         /* .pub file mtime — used for newest-first sort */
 } SshKeyEntry;
 static SshKeyEntry g_ssh_keys[SSH_KEYS_MAX];
 static int         g_ssh_keys_count = 0;
@@ -3731,6 +3732,8 @@ static void ssh_keys_rescan(void) {
         snprintf(e->privpath, sizeof(e->privpath), "%s/%s",     dir, e->name);
         struct stat st;
         e->has_private = (stat(e->privpath, &st) == 0);
+        struct stat pst;
+        e->mtime = (stat(e->pubpath, &pst) == 0) ? pst.st_mtime : 0;
 
         /* Read first line of the .pub file to extract the algo
            token ("ssh-ed25519", "ssh-rsa", …). */
@@ -3773,12 +3776,21 @@ static void ssh_keys_rescan(void) {
     }
     closedir(d);
 
-    /* Stable sort by name so the order doesn't reshuffle between
-       rescans. Tiny n (≤ 32). */
+    /* Sort newest first by .pub mtime — keys generated in this
+       session land at the top. Ties (or stat failures, both = 0) fall
+       back to case-insensitive name order so the result is stable.
+       Tiny n (≤ 32) — insertion sort. */
     for (int i = 1; i < g_ssh_keys_count; i++) {
         SshKeyEntry tmp = g_ssh_keys[i];
         int j = i - 1;
-        while (j >= 0 && strcasecmp(g_ssh_keys[j].name, tmp.name) > 0) {
+        while (j >= 0) {
+            int cmp;
+            if (g_ssh_keys[j].mtime != tmp.mtime) {
+                cmp = (g_ssh_keys[j].mtime < tmp.mtime) ? 1 : -1;
+            } else {
+                cmp = strcasecmp(g_ssh_keys[j].name, tmp.name);
+            }
+            if (cmp <= 0) break;
             g_ssh_keys[j + 1] = g_ssh_keys[j];
             j--;
         }
