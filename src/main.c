@@ -250,6 +250,9 @@ static SshKeyGenForm g_keygen_form;
    list is visible. */
 static int g_keys_install_dropdown = -1;
 static int g_keys_install_scroll   = 0;
+/* Index of the key whose delete-confirmation modal is visible.
+   -1 = no modal. */
+static int g_keys_delete_idx       = -1;
 /* Status line shown below the keys list (e.g. "Generated id_rbterm",
    "ssh-copy-id failed: …"). */
 static char g_keys_status[256];
@@ -7345,6 +7348,10 @@ static void settings_open(Renderer *r) {
        first open. Cheap — disk scan of ~/.ssh and a popen per
        .pub for the fingerprint. */
     ssh_keys_rescan();
+    /* Reset Keys-tab modal state so a previously-open delete
+       confirm doesn't reappear on the next open. */
+    g_keys_delete_idx = -1;
+    g_keys_install_dropdown = -1;
 }
 
 /* Set the renderer font size + cascade through every tab so each
@@ -7424,6 +7431,7 @@ typedef struct {
        [Delete?] — for now we only show Install. Plus a "+
        Generate" button at the bottom. */
     Rect keys_install[SSH_KEYS_MAX];
+    Rect keys_delete[SSH_KEYS_MAX];
     Rect keys_generate_btn;
     /* Generate modal — appears when keys_generate_btn is clicked.
        Internally a sub-modal centred on the Settings modal. */
@@ -7434,6 +7442,11 @@ typedef struct {
     Rect keygen_pass_field;
     Rect keygen_cancel;
     Rect keygen_ok;
+    /* Delete-confirmation sub-modal — shown when g_keys_delete_idx >= 0.
+       Mirrors the keygen modal's layout. */
+    Rect keysdel_modal;
+    Rect keysdel_cancel;
+    Rect keysdel_ok;
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -7921,18 +7934,34 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         int field_x = L.modal.x + 22;
         int field_w_total = w - 22 - 22;
         int install_w = 150;
+        int del_w = 32;          /* small × button after Install */
+        int gap = 6;
         for (int i = 0; i < SSH_KEYS_MAX; i++) {
             if (i < g_ssh_keys_count) {
-                L.keys_install[i] = (Rect){
-                    field_x + field_w_total - install_w,
-                    row_y, install_w, row_h };
+                int del_x = field_x + field_w_total - del_w;
+                int inst_x = del_x - gap - install_w;
+                L.keys_install[i] = (Rect){ inst_x, row_y, install_w, row_h };
+                L.keys_delete[i]  = (Rect){ del_x,  row_y, del_w,     row_h };
                 row_y += row_h + 6;
             } else {
                 L.keys_install[i] = (Rect){0,0,0,0};
+                L.keys_delete[i]  = (Rect){0,0,0,0};
             }
         }
         row_y += 8;
         L.keys_generate_btn = (Rect){ field_x, row_y, 200, row_h };
+        /* Delete-confirmation modal — same size + position as keygen. */
+        {
+            int dm_w = 520, dm_h = 200;
+            L.keysdel_modal = (Rect){ L.modal.x + (w - dm_w) / 2,
+                                       L.modal.y + 100, dm_w, dm_h };
+            int dm_pad = 18;
+            int dm_btn_y = L.keysdel_modal.y + dm_h - btn - dm_pad;
+            L.keysdel_ok     = (Rect){ L.keysdel_modal.x + dm_w - dm_pad - 110,
+                                        dm_btn_y, 110, btn };
+            L.keysdel_cancel = (Rect){ L.keysdel_ok.x - 8 - 90,
+                                        dm_btn_y, 90, btn };
+        }
         /* Generate sub-modal — sized for two text inputs + a
            type-pill row + buttons. Drawn only when
            g_keygen_form.open. */
@@ -8305,6 +8334,38 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     /* Keys tab — generate / install dropdowns. The keygen sub-modal
        intercepts clicks while open. */
     if (g_settings_tab == SETTINGS_TAB_KEYS) {
+        /* Delete-confirmation sub-modal — eats every click while up. */
+        if (g_keys_delete_idx >= 0 && g_keys_delete_idx < g_ssh_keys_count) {
+            if (rect_hit(L.keysdel_cancel, mx, my)) {
+                g_keys_delete_idx = -1;
+                return;
+            }
+            if (rect_hit(L.keysdel_ok, mx, my)) {
+                int ki = g_keys_delete_idx;
+                const char *priv = g_ssh_keys[ki].privpath;
+                const char *pub  = g_ssh_keys[ki].pubpath;
+                int rc1 = (priv[0] && g_ssh_keys[ki].has_private)
+                          ? unlink(priv) : 0;
+                int rc2 = (pub[0])  ? unlink(pub)  : 0;
+                if (rc1 == 0 && rc2 == 0) {
+                    snprintf(g_keys_status, sizeof(g_keys_status),
+                             "Deleted %s.", g_ssh_keys[ki].name);
+                } else {
+                    snprintf(g_keys_status, sizeof(g_keys_status),
+                             "Delete %s: %s",
+                             g_ssh_keys[ki].name, strerror(errno));
+                }
+                g_keys_delete_idx = -1;
+                ssh_keys_rescan();
+                return;
+            }
+            /* Click outside the sub-modal cancels. */
+            if (!rect_hit(L.keysdel_modal, mx, my)) {
+                g_keys_delete_idx = -1;
+                return;
+            }
+            return;
+        }
         /* Sub-modal first (eats every click while up). */
         if (g_keygen_form.open) {
             if (rect_hit(L.keygen_type_ed, mx, my))
@@ -8389,13 +8450,19 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             /* Click outside closes the dropdown. */
             g_keys_install_dropdown = -1;
         }
-        /* Per-row Install button. */
+        /* Per-row Install / Delete buttons. */
         for (int i = 0; i < g_ssh_keys_count; i++) {
             if (L.keys_install[i].w > 0 &&
                 rect_hit(L.keys_install[i], mx, my)) {
                 ssh_profiles_load();
                 g_keys_install_dropdown = i;
                 g_keys_install_scroll = 0;
+                return;
+            }
+            if (L.keys_delete[i].w > 0 &&
+                rect_hit(L.keys_delete[i], mx, my)) {
+                g_keys_delete_idx = i;
+                g_keys_install_dropdown = -1;
                 return;
             }
         }
@@ -8658,6 +8725,9 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (g_settings_dir_focus) { g_settings_dir_focus = false; return; }
         if (g_settings_recdir_focus) { g_settings_recdir_focus = false; return; }
+        if (g_keys_delete_idx >= 0) {
+            g_keys_delete_idx = -1; return;
+        }
         if (g_keys_install_dropdown >= 0) {
             g_keys_install_dropdown = -1; return;
         }
@@ -10830,6 +10900,17 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                        (Vector2){ib.x + (ib.w - isz.x) / 2,
                                  ib.y + (ib.h - isz.y) / 2},
                        13, 0, (Color){230, 240, 255, 255});
+
+            /* Delete (×) button — sits to the right of Install. */
+            Rect db = L.keys_delete[i];
+            DrawRectangle(db.x, db.y, db.w, db.h, (Color){58, 30, 34, 255});
+            DrawRectangleLines(db.x, db.y, db.w, db.h, (Color){220, 110, 110, 200});
+            const char *xlbl = "x";
+            Vector2 xsz = MeasureTextEx(*f, xlbl, 14, 0);
+            DrawTextEx(*f, xlbl,
+                       (Vector2){db.x + (db.w - xsz.x) / 2,
+                                 db.y + (db.h - xsz.y) / 2},
+                       14, 0, (Color){240, 200, 200, 255});
         }
         if (g_ssh_keys_count == 0) {
             DrawTextEx(*f, "(no keys yet — generate one below)",
@@ -11003,6 +11084,63 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                        (Vector2){L.keygen_ok.x + (L.keygen_ok.w - osz2.x) / 2,
                                  L.keygen_ok.y + (L.keygen_ok.h - osz2.y) / 2},
                        14, 0, (Color){220, 240, 225, 255});
+        }
+
+        /* Delete-confirmation sub-modal. Shows the full private +
+           public paths so the user knows exactly what's about to be
+           unlinked, and a Cancel/Delete pair. */
+        if (g_keys_delete_idx >= 0 && g_keys_delete_idx < g_ssh_keys_count) {
+            const SshKeyEntry *e = &g_ssh_keys[g_keys_delete_idx];
+            DrawRectangle(L.keysdel_modal.x, L.keysdel_modal.y,
+                          L.keysdel_modal.w, L.keysdel_modal.h,
+                          (Color){30, 34, 46, 245});
+            DrawRectangleLines(L.keysdel_modal.x, L.keysdel_modal.y,
+                               L.keysdel_modal.w, L.keysdel_modal.h,
+                               (Color){220, 110, 110, 230});
+            DrawTextEx(*f, "Delete SSH key?",
+                       (Vector2){L.keysdel_modal.x + 18,
+                                 L.keysdel_modal.y + 14},
+                       16, 0, (Color){240, 200, 200, 255});
+            DrawTextEx(*f, "These files will be removed from disk:",
+                       (Vector2){L.keysdel_modal.x + 18,
+                                 L.keysdel_modal.y + 48},
+                       12, 0, (Color){200, 205, 220, 255});
+            char l1[PATH_MAX + 16];
+            char l2[PATH_MAX + 16];
+            snprintf(l1, sizeof(l1), "  %s", e->privpath);
+            snprintf(l2, sizeof(l2), "  %s", e->pubpath);
+            DrawTextEx(*f, l1,
+                       (Vector2){L.keysdel_modal.x + 18,
+                                 L.keysdel_modal.y + 70},
+                       12, 0, (Color){230, 232, 240, 255});
+            DrawTextEx(*f, l2,
+                       (Vector2){L.keysdel_modal.x + 18,
+                                 L.keysdel_modal.y + 90},
+                       12, 0, (Color){230, 232, 240, 255});
+
+            DrawRectangle(L.keysdel_cancel.x, L.keysdel_cancel.y,
+                          L.keysdel_cancel.w, L.keysdel_cancel.h,
+                          (Color){48, 52, 66, 255});
+            DrawRectangleLines(L.keysdel_cancel.x, L.keysdel_cancel.y,
+                               L.keysdel_cancel.w, L.keysdel_cancel.h,
+                               (Color){150, 155, 170, 200});
+            Vector2 dcsz = MeasureTextEx(*f, "Cancel", 14, 0);
+            DrawTextEx(*f, "Cancel",
+                       (Vector2){L.keysdel_cancel.x + (L.keysdel_cancel.w - dcsz.x) / 2,
+                                 L.keysdel_cancel.y + (L.keysdel_cancel.h - dcsz.y) / 2},
+                       14, 0, (Color){210, 215, 230, 255});
+
+            DrawRectangle(L.keysdel_ok.x, L.keysdel_ok.y,
+                          L.keysdel_ok.w, L.keysdel_ok.h,
+                          (Color){90, 38, 42, 255});
+            DrawRectangleLines(L.keysdel_ok.x, L.keysdel_ok.y,
+                               L.keysdel_ok.w, L.keysdel_ok.h,
+                               (Color){220, 110, 110, 230});
+            Vector2 dosz = MeasureTextEx(*f, "Delete", 14, 0);
+            DrawTextEx(*f, "Delete",
+                       (Vector2){L.keysdel_ok.x + (L.keysdel_ok.w - dosz.x) / 2,
+                                 L.keysdel_ok.y + (L.keysdel_ok.h - dosz.y) / 2},
+                       14, 0, (Color){250, 220, 220, 255});
         }
     }
 
