@@ -918,12 +918,19 @@ typedef struct {
     Rect delbtn;                /* zero-sized when not deletable */
     Rect save;
     Rect cancel;
+    /* Key-file dropdown trigger (right edge of F_KEY field) and the
+       expanded list rect when open. List is sized for up to 6 visible
+       rows; scroll if more. */
+    Rect key_pick_btn;
+    Rect key_pick_list;
 } SshFormLayout;
 
 /* Per-list scroll state for the SSH form (independent of the Settings
    modal's scrolls so each picker remembers its own position). */
 static int g_form_theme_scroll = 0;
 static int g_form_font_scroll  = 0;
+static bool g_form_key_dropdown = false;
+static int  g_form_key_scroll   = 0;
 
 /* SSH form is split into tabs the same way the Settings modal is.
    Connection holds the text fields users always edit; the rest are
@@ -5398,13 +5405,28 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
     /* CONNECTION tab — six text fields stacked. */
     if (g_ssh_form_tab == SSH_FORM_TAB_CONNECTION) {
         int y = content_top;
+        int pick_w = 28;
         for (int i = 0; i < F_TEXT_FIELDS; i++) {
+            int fw = field_w;
+            if (i == F_KEY) fw -= pick_w + 4;  /* leave room for ▼ */
             L.field[i].x = field_x;
             L.field[i].y = y;
-            L.field[i].w = field_w;
+            L.field[i].w = fw;
             L.field[i].h = field_h;
+            if (i == F_KEY) {
+                L.key_pick_btn = (Rect){ field_x + fw + 4, y, pick_w, field_h };
+            }
             y += field_h + 8;
         }
+        /* Dropdown opens below the F_KEY field, full width. Height
+           caps at 6 rows; click handler scrolls when more. */
+        int kr_w = field_w;
+        int kr_h = 6 * 22 + 4;
+        L.key_pick_list = (Rect){
+            field_x,
+            L.field[F_KEY].y + field_h + 2,
+            kr_w, kr_h
+        };
     }
 
     /* APPEARANCE tab — theme/font pickers, font-size row, cursor
@@ -6002,6 +6024,37 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
         return;
     }
 
+    /* Key-file dropdown: handle the open list FIRST so a click inside
+       it doesn't fall through to the field below. */
+    if (g_form_key_dropdown) {
+        if (rect_hit(L.key_pick_list, mx, my)) {
+            ssh_keys_rescan();
+            int row_h = 22;
+            int idx = (my - L.key_pick_list.y) / row_h + g_form_key_scroll;
+            if (idx >= 0 && idx < g_ssh_keys_count) {
+                snprintf(g_form.key, sizeof(g_form.key),
+                         "%s", g_ssh_keys[idx].privpath);
+                g_form_key_dropdown = false;
+                g_form.focus = F_KEY;
+                g_form.sel_all = false;
+            }
+            return;
+        }
+        /* Click outside the open list — collapse and let the rest of
+           the handler process the click as normal. */
+        if (!rect_hit(L.key_pick_btn, mx, my)) {
+            g_form_key_dropdown = false;
+            /* fall through */
+        }
+    }
+    if (rect_hit(L.key_pick_btn, mx, my)) {
+        g_form_key_dropdown = !g_form_key_dropdown;
+        if (g_form_key_dropdown) {
+            ssh_keys_rescan();
+            g_form_key_scroll = 0;
+        }
+        return;
+    }
     for (int i = 0; i < F_TEXT_FIELDS; i++) {
         if (rect_hit(L.field[i], mx, my)) { g_form.focus = i; g_form.sel_all = false; return; }
     }
@@ -6230,7 +6283,10 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     bool mod   = ctrl || cmd;
     bool is_text_field = (g_form.focus >= F_NAME && g_form.focus <= F_INIT_CMD);
 
-    if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        if (g_form_key_dropdown) { g_form_key_dropdown = false; return; }
+        g_ui_mode = UI_NORMAL; return;
+    }
 
     /* Up/Down arrow navigation when a picker list has keyboard focus.
        Index of -1 represents the synthetic "(inherit default)" row at
@@ -6620,6 +6676,25 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                           (Color){125, 207, 255, 255});
         }
         EndScissorMode();
+    }
+
+    /* Key-file dropdown trigger (▼) sits flush to the right of the
+       Key file field. The list itself draws after the rest of the
+       form so it overlaps any field below. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_CONNECTION && L.key_pick_btn.w > 0) {
+        Rect kb = L.key_pick_btn;
+        bool open = g_form_key_dropdown;
+        DrawRectangle(kb.x, kb.y, kb.w, kb.h,
+                      open ? (Color){46, 92, 150, 255}
+                           : (Color){34, 38, 52, 255});
+        DrawRectangleLines(kb.x, kb.y, kb.w, kb.h,
+                           (Color){125, 207, 255, open ? 255 : 150});
+        const char *arrow = "v";
+        Vector2 asz = MeasureTextEx(*f, arrow, 14, 0);
+        DrawTextEx(*f, arrow,
+                   (Vector2){kb.x + (kb.w - asz.x) / 2,
+                             kb.y + (kb.h - asz.y) / 2},
+                   14, 0, (Color){200, 215, 240, 255});
     }
 
     if (g_ssh_form_tab == SSH_FORM_TAB_APPEARANCE) {
@@ -7187,6 +7262,39 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     DrawTextEx(*f, "Tab navigates · Enter connects · Save appends to ~/.ssh/config · Esc cancels",
                (Vector2){L.modal.x + 22, L.modal.y + L.modal.h - 22},
                11, 0, (Color){110, 115, 130, 255});
+
+    /* Key-file dropdown — drawn last so it stacks over neighbouring
+       fields. The same list that powers Settings → Keys; clicking a
+       row sets g_form.key to that key's absolute path. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_CONNECTION && g_form_key_dropdown) {
+        Rect kr = L.key_pick_list;
+        DrawRectangle(kr.x + 2, kr.y + 2, kr.w, kr.h, (Color){0, 0, 0, 120});
+        DrawRectangle(kr.x, kr.y, kr.w, kr.h, (Color){22, 25, 34, 255});
+        DrawRectangleLines(kr.x, kr.y, kr.w, kr.h, (Color){125, 207, 255, 220});
+        int row_h = 22;
+        int visible = kr.h / row_h;
+        if (g_form_key_scroll < 0) g_form_key_scroll = 0;
+        int max_scroll = g_ssh_keys_count - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (g_form_key_scroll > max_scroll) g_form_key_scroll = max_scroll;
+        BeginScissorMode(kr.x + 2, kr.y + 2, kr.w - 4, kr.h - 4);
+        if (g_ssh_keys_count == 0) {
+            DrawTextEx(*f, "(no keys in ~/.ssh — generate one in Settings → Keys)",
+                       (Vector2){kr.x + 10, kr.y + 6},
+                       12, 0, (Color){140, 145, 160, 255});
+        }
+        for (int i = 0; i < g_ssh_keys_count; i++) {
+            int ry = kr.y + (i - g_form_key_scroll) * row_h;
+            if (ry + row_h < kr.y || ry > kr.y + kr.h) continue;
+            char line[320];
+            const SshKeyEntry *e = &g_ssh_keys[i];
+            snprintf(line, sizeof(line), "%s   %s",
+                     e->name, e->algo[0] ? e->algo : "?");
+            DrawTextEx(*f, line, (Vector2){kr.x + 10, ry + 4},
+                       13, 0, (Color){200, 205, 220, 255});
+        }
+        EndScissorMode();
+    }
 }
 
 /* ---------- Settings modal ----------
