@@ -3912,7 +3912,12 @@ static bool ssh_keys_install_native(const SshProfile *prof,
         ssh_free(s);
         return false;
     }
-    if (ssh_userauth_publickey_auto(s, NULL, NULL) != SSH_AUTH_SUCCESS) {
+    /* Empty-string passphrase prevents libssh / OpenSSL from falling
+       back to a tty prompt when an encrypted ~/.ssh/id_* is loaded —
+       on an unencrypted key it's a no-op, on an encrypted one we just
+       skip it instead of leaving the user staring at an unresponsive
+       modal while a hidden tty prompt waits in the launching shell. */
+    if (ssh_userauth_publickey_auto(s, NULL, "") != SSH_AUTH_SUCCESS) {
         if (err && errsz) snprintf(err, errsz,
                                    "auth: %s", ssh_get_error(s));
         ssh_disconnect(s);

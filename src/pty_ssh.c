@@ -72,6 +72,25 @@ typedef struct {
    helpers) but ssh_open_impl needs it as a pthread entry point. */
 static void *ssh_hud_probe(void *arg);
 
+/* libssh / OpenSSL fall back to prompting on the controlling tty
+   when a private key is encrypted and we hand them a NULL
+   passphrase. That breaks the GUI flow (the user sees nothing in
+   rbterm — the prompt lands on whatever shell launched the binary).
+   Pass this callback whenever we load a private key: if userdata
+   carries a non-empty passphrase string, hand it back; otherwise
+   cancel so libssh fails the load instead of escalating to tty. */
+static int rbterm_passphrase_cb(const char *prompt, char *buf, size_t len,
+                                int echo, int verify, void *userdata) {
+    (void)prompt; (void)echo; (void)verify;
+    const char *pass = (const char *)userdata;
+    if (!pass || !*pass || !buf || len == 0) return -1;
+    size_t n = strlen(pass);
+    if (n >= len) n = len - 1;
+    memcpy(buf, pass, n);
+    buf[n] = 0;
+    return 0;
+}
+
 static void *ssh_reader(void *arg) {
     SshPty *p = (SshPty *)arg;
     uint8_t buf[16384];
@@ -280,11 +299,18 @@ void *ssh_open_impl(const char *user, const char *host, int port,
                             "using private key %s\n", expanded);
         }
         ssh_key priv = NULL;
-        int r = ssh_pki_import_privkey_file(expanded, NULL, NULL, NULL, &priv);
+        /* If the user typed something into F_PASS, try it as the key
+           passphrase first; otherwise the callback returns -1 so
+           libssh fails the load cleanly instead of prompting on tty. */
+        int r = ssh_pki_import_privkey_file(expanded,
+                                            (password && *password) ? password : NULL,
+                                            rbterm_passphrase_cb,
+                                            (void *)password,
+                                            &priv);
         if (r != SSH_OK || !priv) {
             set_err(err, errsz, "can't load key %s%s%s",
                     expanded,
-                    r == SSH_EOF ? " (passphrase-protected?)" : "",
+                    r == SSH_EOF ? " (encrypted? enter passphrase in Password field)" : "",
                     ssh_get_error(p->session));
             goto fail;
         }
@@ -329,9 +355,15 @@ void *ssh_open_impl(const char *user, const char *host, int port,
             if (!fp) continue;
             fclose(fp);
             ssh_key priv = NULL;
-            int r = ssh_pki_import_privkey_file(path, NULL, NULL, NULL, &priv);
+            /* Path 4 only runs when password is empty, so the callback
+               will return -1 on encrypted keys — which is what we want
+               (skip them quietly, never prompt on tty). */
+            int r = ssh_pki_import_privkey_file(path, NULL,
+                                                rbterm_passphrase_cb,
+                                                (void *)password,
+                                                &priv);
             if (r != SSH_OK || !priv) {
-                fprintf(stderr, "rbterm: %s: can't load (passphrase?)\n", path);
+                fprintf(stderr, "rbterm: %s: can't load (encrypted?)\n", path);
                 TRIED("%s [load failed]", defaults[i]);
                 continue;
             }
