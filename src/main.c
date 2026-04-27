@@ -7630,7 +7630,7 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
     SettingsLayout L = {0};
     /* Modal is sized to the tallest tab's content so swapping tabs
        doesn't reshuffle the window. Clamp to fit the OS window. */
-    int w = 600, h = 560;
+    int w = 760, h = 660;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -7789,8 +7789,9 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         /* List of detected keys + a "+ Generate" button. Each
            row: [Install on host…] button on the right; the
            filename + algo + fingerprint render to the left of
-           it in the draw routine. */
-        int row_y = content_y;
+           it in the draw routine. Reserve 26px at the top so the
+           "SSH keys (~/.ssh)" header doesn't overlap the rows. */
+        int row_y = content_y + 26;
         int row_h = btn;
         int field_x = L.modal.x + 22;
         int field_w_total = w - 22 - 22;
@@ -10652,11 +10653,14 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     }
 
     if (g_settings_tab == SETTINGS_TAB_KEYS) {
+        /* Header sits in the 26px gap reserved above the first row
+           (see settings_layout). Anchor to the row top minus the
+           header height + a small gap so it never collides. */
+        int header_y = (g_ssh_keys_count > 0
+                        ? L.keys_install[0].y - 22
+                        : L.keys_generate_btn.y - 22);
         DrawTextEx(*f, "SSH keys (~/.ssh)",
-                   (Vector2){L.modal.x + 22,
-                             (g_ssh_keys_count > 0
-                              ? L.keys_install[0].y - 22
-                              : L.modal.y + 76)},
+                   (Vector2){L.modal.x + 22, header_y},
                    14, 0, (Color){200, 205, 220, 255});
 
         for (int i = 0; i < g_ssh_keys_count; i++) {
