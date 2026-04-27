@@ -158,6 +158,10 @@ endif()
 # up normally.
 if(RBTERM_SSH)
     list(APPEND RBTERM_SOURCES src/pty_ssh.c)
+    # main.c also gates the Settings → Keys generation/install paths on
+    # this define — without it, libssh's ssh_pki_* symbols won't link
+    # on the wasm build (where RBTERM_SSH is forced off).
+    add_compile_definitions(RBTERM_SSH=1)
 
     find_package(libssh QUIET)
     if(NOT libssh_FOUND)

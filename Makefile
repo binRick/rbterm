@@ -29,6 +29,9 @@ endif
 
 # libssh: brew install libssh (macOS) / apt install libssh-dev (Linux).
 LDLIBS += -lssh
+# main.c gates Settings → Keys (libssh ssh_pki_* calls) on this define.
+# Always on for the Makefile build since the Makefile is desktop-only.
+CFLAGS += -DRBTERM_SSH=1
 
 # libwebp + libwebpmux: brew install webp (macOS) / apt install
 # libwebp-dev (Linux). Used for native animated WebP encoding so

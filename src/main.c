@@ -218,6 +218,41 @@ typedef struct {
     int  launch_active;     /* row index that becomes the active tab on startup */
 } AppSettings;
 
+/* SSH key inventory — populated by ssh_keys_rescan from ~/.ssh.
+   Each entry is one private/public pair (we list them by the
+   public-key file's stem so id_ed25519.pub → name "id_ed25519"). */
+#define SSH_KEYS_MAX 32
+typedef struct {
+    char name[64];        /* file stem, e.g. "id_ed25519" */
+    char algo[16];        /* "ed25519" / "rsa" / "ecdsa" / "dsa" */
+    char fingerprint[80]; /* short ssh-keygen -lf output, may be empty */
+    char pubpath[PATH_MAX]; /* absolute path to .pub */
+    char privpath[PATH_MAX];/* absolute path to private (may not exist) */
+    bool has_private;
+} SshKeyEntry;
+static SshKeyEntry g_ssh_keys[SSH_KEYS_MAX];
+static int         g_ssh_keys_count = 0;
+
+/* Generate-key form (Settings → Keys "+ Generate" button). */
+typedef struct {
+    int   type_idx;       /* 0 = ed25519, 1 = rsa */
+    char  name[64];       /* file stem; written to ~/.ssh/<name> */
+    char  pass[256];      /* optional passphrase */
+    int   focus_field;    /* 0 = name, 1 = pass */
+    char  status[256];    /* error / success line */
+    bool  open;
+} SshKeyGenForm;
+static SshKeyGenForm g_keygen_form;
+
+/* Per-row install dropdown — same shape as the Settings → Launch
+   host picker. -1 = closed, otherwise the key index whose host
+   list is visible. */
+static int g_keys_install_dropdown = -1;
+static int g_keys_install_scroll   = 0;
+/* Status line shown below the keys list (e.g. "Generated id_rbterm",
+   "ssh-copy-id failed: …"). */
+static char g_keys_status[256];
+
 /* Deferred-SSH-launch queue. main() opens local entries before
    the first frame so the window appears immediately; SSH entries
    land here and the main loop drains one per frame so the user
@@ -3656,6 +3691,316 @@ static void trim_end(char *s) {
         s[--n] = 0;
 }
 
+/* Scan ~/.ssh for SSH key pairs. Each `*.pub` file with a
+   matching private file (same stem, no extension) is one entry.
+   We sniff the algorithm from the first whitespace-delimited
+   token of the .pub line ("ssh-ed25519 …", "ssh-rsa …", etc.)
+   and call out to `ssh-keygen -lf <path>` for a fingerprint
+   string. Best-effort throughout — bad entries are skipped, not
+   fatal. */
+static void ssh_keys_rescan(void) {
+    g_ssh_keys_count = 0;
+#ifndef _WIN32
+    char dir[PATH_MAX];
+    expand_home_path("~/.ssh", dir, sizeof(dir));
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (g_ssh_keys_count >= SSH_KEYS_MAX) break;
+        const char *nm = de->d_name;
+        size_t l = strlen(nm);
+        if (l < 5 || strcmp(nm + l - 4, ".pub") != 0) continue;
+        /* Skip anything starting with `.` — leftover backups. */
+        if (nm[0] == '.') continue;
+
+        SshKeyEntry *e = &g_ssh_keys[g_ssh_keys_count];
+        memset(e, 0, sizeof(*e));
+        size_t stem = l - 4;
+        if (stem + 1 > sizeof(e->name)) continue;
+        memcpy(e->name, nm, stem);
+        e->name[stem] = 0;
+        snprintf(e->pubpath,  sizeof(e->pubpath),  "%s/%s",     dir, nm);
+        snprintf(e->privpath, sizeof(e->privpath), "%s/%s",     dir, e->name);
+        struct stat st;
+        e->has_private = (stat(e->privpath, &st) == 0);
+
+        /* Read first line of the .pub file to extract the algo
+           token ("ssh-ed25519", "ssh-rsa", …). */
+        FILE *fp = fopen(e->pubpath, "r");
+        if (fp) {
+            char line[1024];
+            if (fgets(line, sizeof(line), fp)) {
+                char *sp = strchr(line, ' ');
+                if (sp) *sp = 0;
+                if (strncmp(line, "ssh-", 4) == 0) {
+                    snprintf(e->algo, sizeof(e->algo), "%s", line + 4);
+                } else {
+                    snprintf(e->algo, sizeof(e->algo), "%s", line);
+                }
+            }
+            fclose(fp);
+        }
+
+        /* Optional fingerprint via ssh-keygen -lf. We pipe through
+           popen so a missing ssh-keygen doesn't crash. Output
+           format: "256 SHA256:abc… user@host (ED25519)". */
+        char cmd[PATH_MAX + 32];
+        snprintf(cmd, sizeof(cmd),
+                 "ssh-keygen -lf '%s' 2>/dev/null", e->pubpath);
+        FILE *pp = popen(cmd, "r");
+        if (pp) {
+            char out[256];
+            if (fgets(out, sizeof(out), pp)) {
+                /* Trim trailing newline + the parenthetical algo
+                   suffix that ssh-keygen always appends — saves
+                   horizontal space in the row. */
+                size_t ol = strlen(out);
+                while (ol > 0 && (out[ol - 1] == '\n' || out[ol - 1] == '\r'))
+                    out[--ol] = 0;
+                snprintf(e->fingerprint, sizeof(e->fingerprint), "%s", out);
+            }
+            pclose(pp);
+        }
+        g_ssh_keys_count++;
+    }
+    closedir(d);
+
+    /* Stable sort by name so the order doesn't reshuffle between
+       rescans. Tiny n (≤ 32). */
+    for (int i = 1; i < g_ssh_keys_count; i++) {
+        SshKeyEntry tmp = g_ssh_keys[i];
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(g_ssh_keys[j].name, tmp.name) > 0) {
+            g_ssh_keys[j + 1] = g_ssh_keys[j];
+            j--;
+        }
+        g_ssh_keys[j + 1] = tmp;
+    }
+#endif
+}
+
+/* Generate a fresh SSH key pair via libssh's PKI API and write
+   the private + public files into ~/.ssh. No subprocess, no
+   ssh-keygen dependency. Sets 0600 perms on the private file,
+   0644 on the public file. Returns true on success; on failure
+   writes a human-readable reason into `err`. */
+#ifdef RBTERM_SSH
+#include <libssh/libssh.h>
+static bool ssh_keys_generate_native(const char *type_name,
+                                     const char *file_stem,
+                                     const char *passphrase,
+                                     char *err, size_t errsz) {
+    if (err && errsz) err[0] = 0;
+    if (!file_stem || !*file_stem) {
+        if (err && errsz) snprintf(err, errsz, "filename required");
+        return false;
+    }
+    enum ssh_keytypes_e ktype = SSH_KEYTYPE_ED25519;
+    int kparam = 0;
+    if (type_name && strcmp(type_name, "rsa") == 0) {
+        ktype = SSH_KEYTYPE_RSA;
+        kparam = 4096;
+    }
+    /* libssh's pki_generate is the right entry point — for ED25519
+       the parameter is ignored. */
+    ssh_key key = NULL;
+    if (ssh_pki_generate(ktype, kparam, &key) != SSH_OK || !key) {
+        if (err && errsz) snprintf(err, errsz, "ssh_pki_generate failed");
+        return false;
+    }
+    /* Resolve target paths under ~/.ssh, ensure the dir exists
+       with the right perms (0700) since libssh just opens the
+       file directly. */
+    char ssh_dir[PATH_MAX], priv_path[PATH_MAX], pub_path[PATH_MAX];
+    expand_home_path("~/.ssh", ssh_dir, sizeof(ssh_dir));
+    mkdir_p(ssh_dir);
+#ifndef _WIN32
+    chmod(ssh_dir, 0700);
+#endif
+    snprintf(priv_path, sizeof(priv_path), "%s/%s",     ssh_dir, file_stem);
+    snprintf(pub_path,  sizeof(pub_path),  "%s/%s.pub", ssh_dir, file_stem);
+
+    /* Don't clobber an existing key. */
+    {
+        struct stat st;
+        if (stat(priv_path, &st) == 0) {
+            if (err && errsz)
+                snprintf(err, errsz, "%s already exists", priv_path);
+            ssh_key_free(key);
+            return false;
+        }
+    }
+
+    const char *pp = (passphrase && *passphrase) ? passphrase : NULL;
+    if (ssh_pki_export_privkey_file(key, pp, NULL, NULL, priv_path) != SSH_OK) {
+        if (err && errsz) snprintf(err, errsz, "writing private key failed");
+        ssh_key_free(key);
+        return false;
+    }
+    if (ssh_pki_export_pubkey_file(key, pub_path) != SSH_OK) {
+        if (err && errsz) snprintf(err, errsz, "writing public key failed");
+        unlink(priv_path);
+        ssh_key_free(key);
+        return false;
+    }
+#ifndef _WIN32
+    chmod(priv_path, 0600);
+    chmod(pub_path,  0644);
+#endif
+    ssh_key_free(key);
+    return true;
+}
+
+/* Append a public key to ~/.ssh/authorized_keys on the remote
+   host the saved profile points at. Uses libssh's normal
+   connect / publickey_auto path (i.e. the user must already be
+   able to log in via agent or another saved key). Once the exec
+   channel is up we feed the pubkey in and invoke a small shell
+   snippet that writes it with the right perms. */
+static bool ssh_keys_install_native(const SshProfile *prof,
+                                    const char *pubkey_text,
+                                    char *err, size_t errsz) {
+    if (err && errsz) err[0] = 0;
+    if (!prof || !pubkey_text || !*pubkey_text) {
+        if (err && errsz) snprintf(err, errsz, "missing host or key");
+        return false;
+    }
+    ssh_session s = ssh_new();
+    if (!s) {
+        if (err && errsz) snprintf(err, errsz, "ssh_new failed");
+        return false;
+    }
+    /* Same options stack the existing connect path uses so we
+       pick up alias / HostName / User / Port from the user's
+       ~/.ssh/config. Form-level overrides win. */
+    ssh_options_set(s, SSH_OPTIONS_HOST, prof->name[0] ? prof->name : prof->hostname);
+    ssh_options_parse_config(s, NULL);
+    if (prof->hostname[0])
+        ssh_options_set(s, SSH_OPTIONS_HOST, prof->hostname);
+    if (prof->user[0])
+        ssh_options_set(s, SSH_OPTIONS_USER, prof->user);
+    if (prof->port > 0)
+        ssh_options_set(s, SSH_OPTIONS_PORT, &prof->port);
+    long timeout_s = 10;
+    ssh_options_set(s, SSH_OPTIONS_TIMEOUT, &timeout_s);
+
+    if (ssh_connect(s) != SSH_OK) {
+        if (err && errsz) snprintf(err, errsz,
+                                   "connect: %s", ssh_get_error(s));
+        ssh_free(s);
+        return false;
+    }
+    /* Trust-on-first-use: same policy as pty_ssh's connect path. */
+    enum ssh_known_hosts_e hk = ssh_session_is_known_server(s);
+    if (hk == SSH_KNOWN_HOSTS_OK) {
+        /* fine */
+    } else if (hk == SSH_KNOWN_HOSTS_UNKNOWN ||
+               hk == SSH_KNOWN_HOSTS_NOT_FOUND) {
+        ssh_session_update_known_hosts(s);
+    } else {
+        if (err && errsz) snprintf(err, errsz,
+                                   "host key check failed (changed?)");
+        ssh_disconnect(s);
+        ssh_free(s);
+        return false;
+    }
+    if (ssh_userauth_publickey_auto(s, NULL, NULL) != SSH_AUTH_SUCCESS) {
+        if (err && errsz) snprintf(err, errsz,
+                                   "auth: %s", ssh_get_error(s));
+        ssh_disconnect(s);
+        ssh_free(s);
+        return false;
+    }
+
+    ssh_channel ch = ssh_channel_new(s);
+    if (!ch || ssh_channel_open_session(ch) != SSH_OK) {
+        if (err && errsz) snprintf(err, errsz,
+                                   "open channel: %s", ssh_get_error(s));
+        if (ch) ssh_channel_free(ch);
+        ssh_disconnect(s);
+        ssh_free(s);
+        return false;
+    }
+    /* Append-only writer with proper permissions. The pubkey is
+       fed via stdin so we don't have to worry about shell-quoting
+       the key bytes (which can contain special chars in the
+       comment field). The grep guards against duplicate inserts
+       on repeat installs. */
+    const char *cmd =
+        "umask 077 && mkdir -p ~/.ssh && "
+        "kf=~/.ssh/authorized_keys && touch \"$kf\" && "
+        "k=\"$(cat)\" && grep -qxF -- \"$k\" \"$kf\" || echo \"$k\" >> \"$kf\" ; "
+        "chmod 600 \"$kf\"";
+    if (ssh_channel_request_exec(ch, cmd) != SSH_OK) {
+        if (err && errsz) snprintf(err, errsz,
+                                   "exec: %s", ssh_get_error(s));
+        ssh_channel_close(ch); ssh_channel_free(ch);
+        ssh_disconnect(s); ssh_free(s);
+        return false;
+    }
+    /* Feed the public key bytes as the command's stdin. */
+    ssh_channel_write(ch, pubkey_text, (uint32_t)strlen(pubkey_text));
+    if (pubkey_text[strlen(pubkey_text) - 1] != '\n') {
+        ssh_channel_write(ch, "\n", 1);
+    }
+    ssh_channel_send_eof(ch);
+    /* Drain stderr if anything came back. */
+    char drain[256];
+    while (ssh_channel_read_timeout(ch, drain, sizeof(drain), 1, 2000) > 0) { }
+    int rc = ssh_channel_get_exit_status(ch);
+    ssh_channel_close(ch);
+    ssh_channel_free(ch);
+    ssh_disconnect(s);
+    ssh_free(s);
+    if (rc != 0) {
+        if (err && errsz) snprintf(err, errsz,
+                                   "remote command exited %d", rc);
+        return false;
+    }
+    return true;
+}
+
+/* Read a public-key file's text into out (NUL-terminated).
+   Returns false on read error. */
+static bool ssh_keys_read_pubfile(const char *path, char *out, size_t cap) {
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return false;
+    size_t n = fread(out, 1, cap - 1, fp);
+    fclose(fp);
+    out[n] = 0;
+    return n > 0;
+}
+#else  /* RBTERM_SSH not defined — no-op stubs so callers don't need ifdefs. */
+static bool ssh_keys_generate_native(const char *type_name,
+                                     const char *file_stem,
+                                     const char *passphrase,
+                                     char *err, size_t errsz) {
+    (void)type_name; (void)file_stem; (void)passphrase;
+    if (err && errsz) snprintf(err, errsz, "SSH disabled in this build");
+    return false;
+}
+static bool ssh_keys_install_native(const SshProfile *prof,
+                                    const char *pubkey_text,
+                                    char *err, size_t errsz) {
+    (void)prof; (void)pubkey_text;
+    if (err && errsz) snprintf(err, errsz, "SSH disabled in this build");
+    return false;
+}
+static bool ssh_keys_read_pubfile(const char *path, char *out, size_t cap) {
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return false;
+    size_t n = fread(out, 1, cap - 1, fp);
+    fclose(fp);
+    out[n] = 0;
+    return n > 0;
+}
+#endif
+
 /* Parse ~/.ssh/config into g_ssh_profiles. Reads HostName / User /
    Port / IdentityFile + the rbterm-specific # comment fields used
    by the SSH form. Wildcard stanzas (`Host *`, `Host !foo`) are
@@ -6859,7 +7204,8 @@ typedef enum {
     SETTINGS_TAB_RECORDING  = 5,
     SETTINGS_TAB_HUD        = 6,
     SETTINGS_TAB_LAUNCH     = 7,
-    SETTINGS_TAB_COUNT      = 8,
+    SETTINGS_TAB_KEYS       = 8,
+    SETTINGS_TAB_COUNT      = 9,
 } SettingsTab;
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
@@ -6870,6 +7216,10 @@ static void settings_open(Renderer *r) {
     g_ui_mode = UI_SETTINGS;
     g_settings_status[0] = 0;
     fonts_load(r ? r->font_path : NULL);
+    /* Pre-warm the keys list so the Keys tab is responsive on
+       first open. Cheap — disk scan of ~/.ssh and a popen per
+       .pub for the fingerprint. */
+    ssh_keys_rescan();
 }
 
 /* Set the renderer font size + cascade through every tab so each
@@ -6945,6 +7295,20 @@ typedef struct {
     Rect launch_del   [LAUNCH_ENTRY_MAX];
     Rect launch_add_local;
     Rect launch_add_ssh;
+    /* Keys tab. Per-row [name+algo+fingerprint label] [Install]
+       [Delete?] — for now we only show Install. Plus a "+
+       Generate" button at the bottom. */
+    Rect keys_install[SSH_KEYS_MAX];
+    Rect keys_generate_btn;
+    /* Generate modal — appears when keys_generate_btn is clicked.
+       Internally a sub-modal centred on the Settings modal. */
+    Rect keygen_modal;
+    Rect keygen_type_ed;
+    Rect keygen_type_rsa;
+    Rect keygen_name_field;
+    Rect keygen_pass_field;
+    Rect keygen_cancel;
+    Rect keygen_ok;
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -7421,6 +7785,51 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         }
         row_y += 8;
         L.hud_cpu_toggle = (Rect){ L.modal.x + 140, row_y, 200, btn };
+    } else if (g_settings_tab == SETTINGS_TAB_KEYS) {
+        /* List of detected keys + a "+ Generate" button. Each
+           row: [Install on host…] button on the right; the
+           filename + algo + fingerprint render to the left of
+           it in the draw routine. */
+        int row_y = content_y;
+        int row_h = btn;
+        int field_x = L.modal.x + 22;
+        int field_w_total = w - 22 - 22;
+        int install_w = 150;
+        for (int i = 0; i < SSH_KEYS_MAX; i++) {
+            if (i < g_ssh_keys_count) {
+                L.keys_install[i] = (Rect){
+                    field_x + field_w_total - install_w,
+                    row_y, install_w, row_h };
+                row_y += row_h + 6;
+            } else {
+                L.keys_install[i] = (Rect){0,0,0,0};
+            }
+        }
+        row_y += 8;
+        L.keys_generate_btn = (Rect){ field_x, row_y, 200, row_h };
+        /* Generate sub-modal — sized for two text inputs + a
+           type-pill row + buttons. Drawn only when
+           g_keygen_form.open. */
+        int km_w = 480, km_h = 240;
+        L.keygen_modal = (Rect){ L.modal.x + (w - km_w) / 2,
+                                 L.modal.y + 80,
+                                 km_w, km_h };
+        int km_pad = 18;
+        int km_y = L.keygen_modal.y + 50;
+        int half = (km_w - 2 * km_pad - 6) / 2;
+        L.keygen_type_ed  = (Rect){ L.keygen_modal.x + km_pad,                 km_y, half, btn };
+        L.keygen_type_rsa = (Rect){ L.keygen_modal.x + km_pad + half + 6,      km_y, half, btn };
+        km_y += btn + 12;
+        L.keygen_name_field = (Rect){ L.keygen_modal.x + km_pad, km_y,
+                                       km_w - 2 * km_pad, btn };
+        km_y += btn + 8;
+        L.keygen_pass_field = (Rect){ L.keygen_modal.x + km_pad, km_y,
+                                       km_w - 2 * km_pad, btn };
+        int km_btn_y = L.keygen_modal.y + km_h - btn - km_pad;
+        L.keygen_ok      = (Rect){ L.keygen_modal.x + km_w - km_pad - 110,
+                                    km_btn_y, 110, btn };
+        L.keygen_cancel  = (Rect){ L.keygen_ok.x - 8 - 90,
+                                    km_btn_y, 90, btn };
     } else if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
         /* One row per launch entry:
              [kind pill] [host picker] [▲] [▼] [×]
@@ -7538,6 +7947,11 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 g_settings_focused_list = SETTINGS_FOCUS_NONE;
                 g_slider_drag_track.w = 0;
                 g_slider_drag_target = NULL;
+                /* Refresh the keys list every time the user
+                   re-enters the tab — `ssh-keygen` from another
+                   terminal or rbterm's own generate path may
+                   have added entries since last open. */
+                if (i == SETTINGS_TAB_KEYS) ssh_keys_rescan();
             }
             return;
         }
@@ -7762,6 +8176,113 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             return;
         }
     }
+    /* Keys tab — generate / install dropdowns. The keygen sub-modal
+       intercepts clicks while open. */
+    if (g_settings_tab == SETTINGS_TAB_KEYS) {
+        /* Sub-modal first (eats every click while up). */
+        if (g_keygen_form.open) {
+            if (rect_hit(L.keygen_type_ed, mx, my))
+                { g_keygen_form.type_idx = 0; return; }
+            if (rect_hit(L.keygen_type_rsa, mx, my))
+                { g_keygen_form.type_idx = 1; return; }
+            if (rect_hit(L.keygen_name_field, mx, my))
+                { g_keygen_form.focus_field = 0; return; }
+            if (rect_hit(L.keygen_pass_field, mx, my))
+                { g_keygen_form.focus_field = 1; return; }
+            if (rect_hit(L.keygen_cancel, mx, my)) {
+                memset(&g_keygen_form, 0, sizeof(g_keygen_form));
+                return;
+            }
+            if (rect_hit(L.keygen_ok, mx, my)) {
+                char err[256] = {0};
+                const char *type_name =
+                    (g_keygen_form.type_idx == 1) ? "rsa" : "ed25519";
+                bool ok = ssh_keys_generate_native(
+                    type_name, g_keygen_form.name,
+                    g_keygen_form.pass, err, sizeof(err));
+                if (ok) {
+                    snprintf(g_keys_status, sizeof(g_keys_status),
+                             "Generated %s.", g_keygen_form.name);
+                    ssh_keys_rescan();
+                    memset(&g_keygen_form, 0, sizeof(g_keygen_form));
+                } else {
+                    snprintf(g_keygen_form.status,
+                             sizeof(g_keygen_form.status),
+                             "%s", err[0] ? err : "generate failed");
+                }
+                return;
+            }
+            /* Click outside the sub-modal closes it. */
+            if (!rect_hit(L.keygen_modal, mx, my)) {
+                memset(&g_keygen_form, 0, sizeof(g_keygen_form));
+                return;
+            }
+            return;
+        }
+        /* Open install dropdown? Route click to it. */
+        if (g_keys_install_dropdown >= 0 &&
+            g_keys_install_dropdown < g_ssh_keys_count) {
+            int ki = g_keys_install_dropdown;
+            Rect ib = L.keys_install[ki];
+            int row_h = 22;
+            int n = g_ssh_profile_count;
+            int dh = n * row_h;
+            int max_dh = 220;
+            if (dh > max_dh) dh = max_dh;
+            Rect dd = (Rect){ ib.x, ib.y + ib.h, ib.w, dh };
+            if (rect_hit(dd, mx, my)) {
+                int rel = (my - dd.y) / row_h + g_keys_install_scroll;
+                if (rel >= 0 && rel < n) {
+                    char pubtext[8192];
+                    if (ssh_keys_read_pubfile(g_ssh_keys[ki].pubpath,
+                                               pubtext, sizeof(pubtext))) {
+                        char err[256] = {0};
+                        bool ok = ssh_keys_install_native(
+                            &g_ssh_profiles[rel], pubtext,
+                            err, sizeof(err));
+                        if (ok) {
+                            snprintf(g_keys_status, sizeof(g_keys_status),
+                                     "Installed %s on %s.",
+                                     g_ssh_keys[ki].name,
+                                     g_ssh_profiles[rel].name);
+                        } else {
+                            snprintf(g_keys_status, sizeof(g_keys_status),
+                                     "%s → %s: %s",
+                                     g_ssh_keys[ki].name,
+                                     g_ssh_profiles[rel].name,
+                                     err[0] ? err : "install failed");
+                        }
+                    } else {
+                        snprintf(g_keys_status, sizeof(g_keys_status),
+                                 "Couldn't read %s", g_ssh_keys[ki].pubpath);
+                    }
+                    g_keys_install_dropdown = -1;
+                }
+                return;
+            }
+            /* Click outside closes the dropdown. */
+            g_keys_install_dropdown = -1;
+        }
+        /* Per-row Install button. */
+        for (int i = 0; i < g_ssh_keys_count; i++) {
+            if (L.keys_install[i].w > 0 &&
+                rect_hit(L.keys_install[i], mx, my)) {
+                ssh_profiles_load();
+                g_keys_install_dropdown = i;
+                g_keys_install_scroll = 0;
+                return;
+            }
+        }
+        if (rect_hit(L.keys_generate_btn, mx, my)) {
+            memset(&g_keygen_form, 0, sizeof(g_keygen_form));
+            g_keygen_form.open = true;
+            g_keygen_form.type_idx = 0;
+            snprintf(g_keygen_form.name, sizeof(g_keygen_form.name),
+                     "%s", "id_rbterm");
+            g_keygen_form.focus_field = 0;
+            return;
+        }
+    }
     /* Launch tab — add / delete entries, toggle kind, open the
        saved-host dropdown for SSH rows, pick from it. */
     if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
@@ -7963,9 +8484,57 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
 #endif
     bool mod  = ctrl || cmd;
 
+    /* Keygen sub-modal text input. Whichever field has focus
+       receives keystrokes; Backspace deletes; Enter / Tab swaps
+       focus or fires Generate. */
+    if (g_keygen_form.open && !IsKeyPressed(KEY_ESCAPE)) {
+        char *buf = (g_keygen_form.focus_field == 1)
+                    ? g_keygen_form.pass : g_keygen_form.name;
+        size_t cap = (g_keygen_form.focus_field == 1)
+                    ? sizeof(g_keygen_form.pass)
+                    : sizeof(g_keygen_form.name);
+        size_t len = strlen(buf);
+        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+            if (len > 0) buf[len - 1] = 0;
+        }
+        if (IsKeyPressed(KEY_TAB)) {
+            g_keygen_form.focus_field ^= 1;
+        }
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+            char err[256] = {0};
+            const char *type_name =
+                (g_keygen_form.type_idx == 1) ? "rsa" : "ed25519";
+            bool ok = ssh_keys_generate_native(
+                type_name, g_keygen_form.name,
+                g_keygen_form.pass, err, sizeof(err));
+            if (ok) {
+                snprintf(g_keys_status, sizeof(g_keys_status),
+                         "Generated %s.", g_keygen_form.name);
+                ssh_keys_rescan();
+                memset(&g_keygen_form, 0, sizeof(g_keygen_form));
+            } else {
+                snprintf(g_keygen_form.status,
+                         sizeof(g_keygen_form.status),
+                         "%s", err[0] ? err : "generate failed");
+            }
+            return;
+        }
+        int cp;
+        while ((cp = GetCharPressed()) != 0) {
+            if (cp < 32 || cp >= 127) continue;
+            if (len + 1 >= cap) continue;
+            buf[len++] = (char)cp;
+            buf[len] = 0;
+        }
+        return;
+    }
+
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (g_settings_dir_focus) { g_settings_dir_focus = false; return; }
         if (g_settings_recdir_focus) { g_settings_recdir_focus = false; return; }
+        if (g_keys_install_dropdown >= 0) {
+            g_keys_install_dropdown = -1; return;
+        }
         if (g_settings_launch_dropdown >= 0) {
             g_settings_launch_dropdown = -1; return;
         }
@@ -9246,7 +9815,8 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     /* Tab bar. Active tab gets an accent fill; others sit dim. */
     {
         const char *labels[SETTINGS_TAB_COUNT] = {
-            "Font", "Theme", "Cursor", "Session", "Window", "Recording", "HUD", "Launch"
+            "Font", "Theme", "Cursor", "Session", "Window",
+            "Recording", "HUD", "Launch", "Keys"
         };
         for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
             Rect tr = L.tab[i];
@@ -10078,6 +10648,232 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                            12, 0, (Color){140, 145, 160, 255});
             }
             EndScissorMode();
+        }
+    }
+
+    if (g_settings_tab == SETTINGS_TAB_KEYS) {
+        DrawTextEx(*f, "SSH keys (~/.ssh)",
+                   (Vector2){L.modal.x + 22,
+                             (g_ssh_keys_count > 0
+                              ? L.keys_install[0].y - 22
+                              : L.modal.y + 76)},
+                   14, 0, (Color){200, 205, 220, 255});
+
+        for (int i = 0; i < g_ssh_keys_count; i++) {
+            Rect ib = L.keys_install[i];
+            /* Row backdrop. */
+            DrawRectangle(L.modal.x + 22, ib.y,
+                          ib.x - (L.modal.x + 22) - 10, ib.h,
+                          (Color){22, 25, 34, 255});
+            DrawRectangleLines(L.modal.x + 22, ib.y,
+                               ib.x - (L.modal.x + 22) - 10, ib.h,
+                               (Color){70, 74, 90, 255});
+
+            /* Name + algo + truncated fingerprint, left-aligned. */
+            char line[256];
+            const SshKeyEntry *e = &g_ssh_keys[i];
+            if (e->fingerprint[0]) {
+                snprintf(line, sizeof(line), "%s   %s   %s",
+                         e->name,
+                         e->algo[0] ? e->algo : "?",
+                         e->fingerprint);
+            } else {
+                snprintf(line, sizeof(line), "%s   %s",
+                         e->name, e->algo[0] ? e->algo : "?");
+            }
+            BeginScissorMode(L.modal.x + 28, ib.y,
+                             (ib.x - (L.modal.x + 22) - 18), ib.h);
+            DrawTextEx(*f, line,
+                       (Vector2){L.modal.x + 30, ib.y + 7},
+                       13, 0, (Color){230, 232, 240, 255});
+            EndScissorMode();
+
+            /* Install button. */
+            bool open = (g_keys_install_dropdown == i);
+            DrawRectangle(ib.x, ib.y, ib.w, ib.h,
+                          open ? (Color){46, 92, 150, 255}
+                               : (Color){46, 52, 70, 255});
+            DrawRectangleLines(ib.x, ib.y, ib.w, ib.h,
+                               (Color){125, 207, 255, open ? 255 : 200});
+            const char *ilbl = "Install on host…";
+            Vector2 isz = MeasureTextEx(*f, ilbl, 13, 0);
+            DrawTextEx(*f, ilbl,
+                       (Vector2){ib.x + (ib.w - isz.x) / 2,
+                                 ib.y + (ib.h - isz.y) / 2},
+                       13, 0, (Color){230, 240, 255, 255});
+        }
+        if (g_ssh_keys_count == 0) {
+            DrawTextEx(*f, "(no keys yet — generate one below)",
+                       (Vector2){L.modal.x + 22,
+                                 L.keys_generate_btn.y - 22},
+                       12, 0, (Color){140, 150, 170, 255});
+        }
+
+        /* Generate button. */
+        Rect gb = L.keys_generate_btn;
+        DrawRectangle(gb.x, gb.y, gb.w, gb.h, (Color){48, 78, 58, 255});
+        DrawRectangleLines(gb.x, gb.y, gb.w, gb.h, (Color){150, 220, 170, 200});
+        Vector2 gsz = MeasureTextEx(*f, "+ Generate new key", 13, 0);
+        DrawTextEx(*f, "+ Generate new key",
+                   (Vector2){gb.x + (gb.w - gsz.x) / 2,
+                             gb.y + (gb.h - gsz.y) / 2},
+                   13, 0, (Color){220, 240, 225, 255});
+
+        /* Status / last operation outcome. */
+        if (g_keys_status[0]) {
+            DrawTextEx(*f, g_keys_status,
+                       (Vector2){L.modal.x + 22, gb.y + gb.h + 10},
+                       12, 0, (Color){170, 220, 180, 255});
+        }
+
+        /* Install dropdown — overlays everything else when open. */
+        if (g_keys_install_dropdown >= 0 &&
+            g_keys_install_dropdown < g_ssh_keys_count) {
+            int ki = g_keys_install_dropdown;
+            Rect ib = L.keys_install[ki];
+            int row_h = 22;
+            int n = g_ssh_profile_count;
+            int dh = n * row_h;
+            int max_dh = 220;
+            if (dh > max_dh) dh = max_dh;
+            Rect dd = (Rect){ ib.x, ib.y + ib.h, ib.w, dh };
+            DrawRectangle(dd.x, dd.y, dd.w, dd.h, (Color){22, 25, 34, 255});
+            DrawRectangleLines(dd.x, dd.y, dd.w, dd.h, (Color){125, 207, 255, 220});
+            BeginScissorMode(dd.x + 1, dd.y + 1, dd.w - 2, dd.h - 2);
+            int visible = dd.h / row_h;
+            int max_scroll = n - visible;
+            if (max_scroll < 0) max_scroll = 0;
+            if (g_keys_install_scroll > max_scroll)
+                g_keys_install_scroll = max_scroll;
+            for (int kk = 0; kk < n; kk++) {
+                int ry = dd.y + (kk - g_keys_install_scroll) * row_h;
+                if (ry + row_h < dd.y || ry > dd.y + dd.h) continue;
+                DrawTextEx(*f, g_ssh_profiles[kk].name,
+                           (Vector2){dd.x + 10, ry + 4},
+                           13, 0, (Color){230, 232, 240, 255});
+            }
+            if (n == 0) {
+                DrawTextEx(*f, "(no saved hosts in ~/.ssh/config)",
+                           (Vector2){dd.x + 10, dd.y + 6},
+                           12, 0, (Color){140, 145, 160, 255});
+            }
+            EndScissorMode();
+        }
+
+        /* Generate sub-modal. */
+        if (g_keygen_form.open) {
+            DrawRectangle(L.keygen_modal.x, L.keygen_modal.y,
+                          L.keygen_modal.w, L.keygen_modal.h,
+                          (Color){30, 34, 46, 245});
+            DrawRectangleLines(L.keygen_modal.x, L.keygen_modal.y,
+                               L.keygen_modal.w, L.keygen_modal.h,
+                               (Color){125, 207, 255, 230});
+            DrawTextEx(*f, "Generate SSH key",
+                       (Vector2){L.keygen_modal.x + 18,
+                                 L.keygen_modal.y + 14},
+                       16, 0, (Color){230, 232, 240, 255});
+
+            /* Type pills. */
+            struct { Rect r; const char *lbl; int idx; } types[] = {
+                { L.keygen_type_ed,  "ed25519", 0 },
+                { L.keygen_type_rsa, "rsa 4096", 1 },
+            };
+            for (int ti = 0; ti < 2; ti++) {
+                bool on = (g_keygen_form.type_idx == types[ti].idx);
+                DrawRectangle(types[ti].r.x, types[ti].r.y,
+                              types[ti].r.w, types[ti].r.h,
+                              on ? (Color){46, 92, 150, 255}
+                                 : (Color){34, 38, 52, 255});
+                DrawRectangleLines(types[ti].r.x, types[ti].r.y,
+                                   types[ti].r.w, types[ti].r.h,
+                                   (Color){125, 207, 255, on ? 255 : 150});
+                Vector2 tsz = MeasureTextEx(*f, types[ti].lbl, 13, 0);
+                DrawTextEx(*f, types[ti].lbl,
+                           (Vector2){types[ti].r.x + (types[ti].r.w - tsz.x) / 2,
+                                     types[ti].r.y + (types[ti].r.h - tsz.y) / 2},
+                           13, 0, (Color){230, 232, 240, 255});
+            }
+
+            /* Name + Pass text fields. */
+            struct { Rect r; const char *label; const char *value;
+                     bool focus; bool mask; const char *hint; } flds[] = {
+                { L.keygen_name_field, "Name",
+                  g_keygen_form.name, g_keygen_form.focus_field == 0,
+                  false, "id_rbterm" },
+                { L.keygen_pass_field, "Passphrase",
+                  g_keygen_form.pass, g_keygen_form.focus_field == 1,
+                  true,  "(optional)" },
+            };
+            for (int fi = 0; fi < 2; fi++) {
+                Rect rr = flds[fi].r;
+                DrawRectangle(rr.x, rr.y, rr.w, rr.h, (Color){22, 25, 34, 255});
+                DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                                   flds[fi].focus
+                                       ? (Color){125, 207, 255, 255}
+                                       : (Color){70, 74, 90, 255});
+                DrawTextEx(*f, flds[fi].label,
+                           (Vector2){rr.x - 100, rr.y + 7},
+                           13, 0, (Color){180, 185, 200, 255});
+                BeginScissorMode(rr.x + 6, rr.y, rr.w - 12, rr.h);
+                char masked[256];
+                const char *shown = flds[fi].value;
+                if (flds[fi].mask && *shown) {
+                    int n = (int)strlen(flds[fi].value);
+                    if (n > (int)sizeof(masked) - 1) n = (int)sizeof(masked) - 1;
+                    for (int k = 0; k < n; k++) masked[k] = '*';
+                    masked[n] = 0;
+                    shown = masked;
+                }
+                Color tc = (Color){230, 232, 240, 255};
+                if (!*shown) {
+                    shown = flds[fi].hint;
+                    tc = (Color){110, 115, 130, 255};
+                }
+                DrawTextEx(*f, shown,
+                           (Vector2){rr.x + 8, rr.y + 7},
+                           14, 0, tc);
+                if (flds[fi].focus && flds[fi].value[0] && !flds[fi].mask &&
+                    ((long long)(GetTime() * 2.0) & 1) == 0) {
+                    Vector2 vsz = MeasureTextEx(*f, flds[fi].value, 14, 0);
+                    DrawRectangle(rr.x + 8 + (int)vsz.x + 1,
+                                  rr.y + 6, 8, 16,
+                                  (Color){125, 207, 255, 255});
+                }
+                EndScissorMode();
+            }
+
+            /* Status line / error from a failed generate. */
+            if (g_keygen_form.status[0]) {
+                DrawTextEx(*f, g_keygen_form.status,
+                           (Vector2){L.keygen_modal.x + 18,
+                                     L.keygen_ok.y - 22},
+                           12, 0, (Color){240, 130, 130, 255});
+            }
+
+            /* Cancel + Generate buttons. */
+            DrawRectangle(L.keygen_cancel.x, L.keygen_cancel.y,
+                          L.keygen_cancel.w, L.keygen_cancel.h,
+                          (Color){48, 52, 66, 255});
+            DrawRectangleLines(L.keygen_cancel.x, L.keygen_cancel.y,
+                               L.keygen_cancel.w, L.keygen_cancel.h,
+                               (Color){150, 155, 170, 200});
+            Vector2 csz2 = MeasureTextEx(*f, "Cancel", 14, 0);
+            DrawTextEx(*f, "Cancel",
+                       (Vector2){L.keygen_cancel.x + (L.keygen_cancel.w - csz2.x) / 2,
+                                 L.keygen_cancel.y + (L.keygen_cancel.h - csz2.y) / 2},
+                       14, 0, (Color){210, 215, 230, 255});
+
+            DrawRectangle(L.keygen_ok.x, L.keygen_ok.y,
+                          L.keygen_ok.w, L.keygen_ok.h,
+                          (Color){48, 78, 58, 255});
+            DrawRectangleLines(L.keygen_ok.x, L.keygen_ok.y,
+                               L.keygen_ok.w, L.keygen_ok.h,
+                               (Color){150, 220, 170, 200});
+            Vector2 osz2 = MeasureTextEx(*f, "Generate", 14, 0);
+            DrawTextEx(*f, "Generate",
+                       (Vector2){L.keygen_ok.x + (L.keygen_ok.w - osz2.x) / 2,
+                                 L.keygen_ok.y + (L.keygen_ok.h - osz2.y) / 2},
+                       14, 0, (Color){220, 240, 225, 255});
         }
     }
 
