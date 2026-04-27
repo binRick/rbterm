@@ -242,6 +242,7 @@ typedef struct {
     int   focus_field;    /* 0 = name, 1 = pass */
     char  status[256];    /* error / success line */
     bool  open;
+    bool  sel_all;        /* Cmd+A — next text input replaces field */
 } SshKeyGenForm;
 static SshKeyGenForm g_keygen_form;
 
@@ -8681,17 +8682,70 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
        receives keystrokes; Backspace deletes; Enter / Tab swaps
        focus or fires Generate. */
     if (g_keygen_form.open && !IsKeyPressed(KEY_ESCAPE)) {
+        bool kg_shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        bool kg_ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+        bool kg_cmd   = IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#else
+        bool kg_cmd   = false;
+#endif
+        bool kg_mod   = kg_ctrl || kg_cmd;
+        (void)kg_shift;
         char *buf = (g_keygen_form.focus_field == 1)
                     ? g_keygen_form.pass : g_keygen_form.name;
         size_t cap = (g_keygen_form.focus_field == 1)
                     ? sizeof(g_keygen_form.pass)
                     : sizeof(g_keygen_form.name);
+
+        /* Cmd+A — mark the field as fully selected. Next typed
+           char or paste replaces it; Backspace clears it. */
+        if (kg_mod && IsKeyPressed(KEY_A)) {
+            g_keygen_form.sel_all = true;
+            return;
+        }
+        /* Cmd+C — copy field. Passphrase is masked in the UI; not
+           round-tripping it through the system clipboard matches
+           the SSH form's F_PASS policy. */
+        if (kg_mod && IsKeyPressed(KEY_C)) {
+            if (g_keygen_form.focus_field == 0 && *buf) {
+                SetClipboardText(buf);
+            }
+            return;
+        }
+        /* Cmd+V — paste clipboard. Replace if sel_all, else append.
+           Filters newlines / tabs / non-ASCII so a clipboard that
+           ends in `\n` doesn't terminate the form. */
+        if (kg_mod && IsKeyPressed(KEY_V)) {
+            const char *clip = GetClipboardText();
+            if (clip && *clip) {
+                if (g_keygen_form.sel_all) {
+                    buf[0] = 0;
+                    g_keygen_form.sel_all = false;
+                }
+                size_t bl = strlen(buf);
+                for (const char *q = clip; *q; q++) {
+                    unsigned char c = (unsigned char)*q;
+                    if (c < 32 || c >= 127) continue;
+                    if (bl + 1 >= cap) break;
+                    buf[bl++] = (char)c;
+                }
+                buf[bl] = 0;
+            }
+            return;
+        }
+
         size_t len = strlen(buf);
         if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
-            if (len > 0) buf[len - 1] = 0;
+            if (g_keygen_form.sel_all) {
+                buf[0] = 0;
+                g_keygen_form.sel_all = false;
+            } else if (len > 0) {
+                buf[len - 1] = 0;
+            }
         }
         if (IsKeyPressed(KEY_TAB)) {
             g_keygen_form.focus_field ^= 1;
+            g_keygen_form.sel_all = false;
         }
         if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
             char err[256] = {0};
@@ -8715,6 +8769,12 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
         int cp;
         while ((cp = GetCharPressed()) != 0) {
             if (cp < 32 || cp >= 127) continue;
+            /* First keystroke after Cmd+A replaces the field. */
+            if (g_keygen_form.sel_all) {
+                buf[0] = 0;
+                len = 0;
+                g_keygen_form.sel_all = false;
+            }
             if (len + 1 >= cap) continue;
             buf[len++] = (char)cp;
             buf[len] = 0;
@@ -11038,6 +11098,15 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                 if (!*shown) {
                     shown = flds[fi].hint;
                     tc = (Color){110, 115, 130, 255};
+                }
+                /* Cmd+A select-all highlight on the focused field. */
+                if (flds[fi].focus && g_keygen_form.sel_all && flds[fi].value[0]) {
+                    Vector2 ssz = MeasureTextEx(*f, shown, 14, 0);
+                    int sw = (int)ssz.x + 4;
+                    if (sw > rr.w - 12) sw = rr.w - 12;
+                    DrawRectangle(rr.x + 6, rr.y + 4,
+                                  sw, rr.h - 8,
+                                  (Color){64, 100, 150, 200});
                 }
                 DrawTextEx(*f, shown,
                            (Vector2){rr.x + 8, rr.y + 7},
