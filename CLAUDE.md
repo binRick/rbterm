@@ -973,6 +973,99 @@ The picker uses `SSH_COLOR_PRESETS` (the same 8-tile palette as
 the SSH tab-accent picker) plus a 9th "default" tile that clears
 the override.
 
+## SSH key manager (Settings → Keys)
+
+A Settings tab that owns `~/.ssh` for the user — list, generate,
+install, delete. Pure libssh + POSIX, no `ssh-keygen` /
+`ssh-copy-id` subprocess dependency anywhere.
+
+### Discovery — `ssh_keys_rescan` in `main.c`
+- `opendir(~/.ssh)` + scan for `*.pub`. Each match is a
+  `SshKeyEntry { name, algo, fingerprint, pubpath, privpath,
+  has_private, mtime }`. Capped at `SSH_KEYS_MAX = 32`.
+- `algo` is the first whitespace-delimited token of the pub
+  file's first line (`ssh-ed25519` → `ed25519`).
+- `fingerprint` is the SHA256 line from `ssh-keygen -lf` (popen,
+  trimmed). Optional — silently empty when ssh-keygen isn't on
+  PATH; everything else still works.
+- `mtime` from `stat()` on the .pub file; sort key is descending
+  mtime with case-insensitive name as tie-break, so a
+  freshly-generated key lands at the top of both this list and
+  the SSH form's Key file dropdown.
+
+### Generation — `ssh_keys_generate_native`
+- `ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &k)` for ed25519,
+  `SSH_KEYTYPE_RSA` + `4096` for rsa-4096. Both are deprecated in
+  recent libssh but still functional and the only single-call
+  generators that don't require pulling in OpenSSL directly.
+- `ssh_pki_export_privkey_file(k, passphrase, NULL, NULL, path)` +
+  `ssh_pki_export_pubkey_file(k, path)`. Then `chmod 0600` on the
+  private file and `0644` on the pub file.
+- Sub-modal UI lives in `SettingsLayout.keygen_*` rects with
+  `g_keygen_form` as state (type pill, name field, passphrase
+  field, status). Cancel / Esc / click-outside dismiss without
+  side effects.
+
+### Install — `ssh_keys_install_native`
+- Opens a fresh `ssh_session` to the chosen `SshProfile`, applies
+  the same options the SSH form does (HostName / User / Port /
+  IdentityFile), `ssh_connect`, `ssh_session_is_known_server`
+  for trust-on-first-use, then `ssh_userauth_publickey_auto(s,
+  NULL, "")` (the empty-string passphrase is load-bearing — see
+  "tty-prompt fix" below).
+- Auth done, opens an exec channel and runs:
+  ```sh
+  umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys
+  if ! grep -qF "$KEY" ~/.ssh/authorized_keys 2>/dev/null; then
+      printf '%s\n' "$KEY" >> ~/.ssh/authorized_keys
+  fi
+  ```
+  Pubkey is fed via `ssh_channel_write` as stdin, exit status
+  collected via `ssh_channel_get_exit_status` (also deprecated
+  but still works). Duplicate insertions are no-ops.
+- Failures land in `g_keys_status` ("auth: …", "exec: …", "host
+  key changed"). Successes too ("Installed id_rbterm on mia.").
+
+### Delete — confirmation + unlink
+- Per-row × button. Click sets `g_keys_delete_idx`; the modal at
+  `L.keysdel_*` shows both **absolute** paths (private + .pub)
+  plus Cancel / Delete pair. Delete runs `unlink()` on each then
+  rescans. `errno` flows into the status line on failure.
+- Both `g_keys_delete_idx` and `g_keys_install_dropdown` are
+  reset in `settings_open` so a half-finished interaction
+  doesn't reappear next time the modal opens.
+
+### tty-prompt fix (`pty_ssh.c` + `main.c`)
+
+The bug to remember: `ssh_pki_import_privkey_file(path, NULL,
+NULL, NULL, &k)` lets libssh / OpenSSL fall back to OpenSSL's
+default `Enter PEM pass phrase:` prompter on the controlling
+tty — which is whatever shell launched rbterm. The user sees
+the modal hang while the prompt sits invisibly on the launching
+terminal.
+
+Fix is `rbterm_passphrase_cb` in `pty_ssh.c` — wired into every
+`ssh_pki_import_privkey_file` call. If `userdata` carries a
+non-empty passphrase, hand it back; otherwise return -1 so
+libssh fails the load cleanly. Either way the OpenSSL tty
+fallback is short-circuited. Side effect: encrypted private
+keys now work in-app — typing the passphrase into the SSH
+form's Password field gets passed straight through.
+
+For `ssh_userauth_publickey_auto` (used by the install path in
+`main.c`) the equivalent fix is passing `""` as the passphrase
+arg instead of `NULL`. Same root cause, same outcome:
+encrypted ~/.ssh/id_* keys are skipped silently.
+
+### SSH form integration
+
+The SSH form's Key file field has a small `▼` button to its
+right that opens a dropdown sourced from the same
+`ssh_keys_rescan` data. Picking a row sets `g_form.key` to the
+key's absolute private path. Esc collapses the dropdown
+without dismissing the SSH modal — only an Esc with no
+dropdown open cancels the form.
+
 ## Things left for later
 
 - SSH interactive password / keyboard-interactive auth (draw a prompt

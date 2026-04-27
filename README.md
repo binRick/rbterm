@@ -17,7 +17,7 @@ how the OS, the shell, and a graphics library all meet.
 
 ## Pure C99 — fast, lean, no runtime
 
-The whole thing is ~21,000 lines of straight C99 — no C++, no
+The whole thing is ~25,000 lines of straight C99 — no C++, no
 garbage collector, no Electron, no JavaScript engine, no embedded
 scripting language. Every keystroke goes from raylib's input → a
 fixed-state-machine parser → a flat cell-grid → a single glyph atlas
@@ -380,7 +380,7 @@ drains every pane's PTY each frame so background tabs stay live.
 
 ## Performance — fastest of the field on 9 of 10 benchmarks
 
-~21k lines of straight C99, hand-tuned, no GPU shaders, no
+~25k lines of straight C99, hand-tuned, no GPU shaders, no
 runtime, no scripting language — and on real
 [alacritty/vtebench](https://github.com/alacritty/vtebench) numbers
 **rbterm beats every other terminal on 9 of 10 PTY-drain
@@ -552,9 +552,29 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   trust-on-first-use into `~/.ssh/known_hosts`. The form is fronted
   by a **saved-host picker** that reads `~/.ssh/config`: every
   `Host` stanza shows up as a clickable row, sorted, scrollable,
-  keyboard-navigable. Per-host knobs (theme, font, cursor style,
-  font size, log dir, logging on/off) survive as `# rbterm-*`
-  comments inside `~/.ssh/config` that plain ssh ignores.
+  keyboard-navigable. The Key file field has a ▼ dropdown that
+  lists every key in `~/.ssh` so a freshly-generated key is one
+  click away. Encrypted private keys work in-app — type the
+  passphrase into the Password field instead of being hijacked by
+  a hidden tty prompt on the launching shell. Per-host knobs
+  (theme, font, cursor style, font size, log dir, logging on/off)
+  survive as `# rbterm-*` comments inside `~/.ssh/config` that
+  plain ssh ignores.
+- **SSH key manager (Settings → Keys)** — list of every key pair
+  found in `~/.ssh` (sorted newest-first by `.pub` mtime), with
+  algorithm + ssh-keygen-style fingerprint. Two flows, both pure
+  libssh, no subprocesses:
+  - **+ Generate new key** — sub-modal picks `ed25519` or
+    `rsa-4096`, filename stem, optional passphrase. Calls
+    `ssh_pki_generate` + `ssh_pki_export_*_file` with `0600/0644`
+    perms. No `ssh-keygen` dependency.
+  - **Install on host…** — dropdown of saved hosts; picking one
+    opens a fresh libssh session, auths via agent / existing
+    keys, then appends the new pubkey to `~/.ssh/authorized_keys`
+    over an exec channel (with a grep guard against duplicates).
+    No `ssh-copy-id` dependency.
+  - **× Delete** — confirmation modal shows both absolute paths
+    (private + `.pub`) before unlinking.
 - **Tab label tracks `cd`** via `proc_pidinfo` (macOS) /
   `/proc/<pid>/cwd` (Linux). `$HOME` shortens to `~`. Cmd+T opens
   the new tab in the active pane's cwd; splits inherit too.
