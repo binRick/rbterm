@@ -5633,13 +5633,15 @@ static void ssh_form_submit(int cols, int rows) {
 #endif
 }
 
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(_WIN32)
 /* Fast TCP preflight: open a non-blocking socket, connect with a
    tight timeout, return true on reachable. Used by the SSH form's
    Test button so a bogus port reports "connection refused" /
    "timed out" in ~3 s instead of stalling the main thread for the
    full libssh handshake timeout (long enough that macOS shows the
-   beachball). errbuf gets a libc-style explanation on failure. */
+   beachball). errbuf gets a libc-style explanation on failure.
+   Posix-only — Windows skips it; libssh's own timeout is enough
+   there (no beachball-equivalent). */
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -5728,6 +5730,7 @@ static void ssh_form_test_auth(int cols, int rows) {
     int port = atoi(g_form.port);
     if (port <= 0) port = 22;
     char err[256] = {0};
+#if !defined(_WIN32)
     /* TCP preflight first — bogus port / unreachable host fails in
        ~3s instead of waiting through the full libssh timeout. */
     if (!ssh_form_tcp_check(g_form.host, port, 3000, err, sizeof(err))) {
@@ -5737,6 +5740,7 @@ static void ssh_form_test_auth(int cols, int rows) {
         g_form.error[sizeof(g_form.error) - 1] = 0;
         return;
     }
+#endif
     Pty *p = pty_open_ssh(
         g_form.user[0] ? g_form.user : NULL,
         g_form.host,
