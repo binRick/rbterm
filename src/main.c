@@ -5628,6 +5628,79 @@ static void ssh_form_submit(int cols, int rows) {
 #endif
 }
 
+#ifndef __EMSCRIPTEN__
+/* Fast TCP preflight: open a non-blocking socket, connect with a
+   tight timeout, return true on reachable. Used by the SSH form's
+   Test button so a bogus port reports "connection refused" /
+   "timed out" in ~3 s instead of stalling the main thread for the
+   full libssh handshake timeout (long enough that macOS shows the
+   beachball). errbuf gets a libc-style explanation on failure. */
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <fcntl.h>
+static bool ssh_form_tcp_check(const char *host, int port,
+                               int timeout_ms,
+                               char *errbuf, size_t errsz) {
+    if (errbuf && errsz) errbuf[0] = 0;
+    char ports[16];
+    snprintf(ports, sizeof(ports), "%d", port);
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host, ports, &hints, &res);
+    if (gai != 0 || !res) {
+        if (errbuf && errsz) snprintf(errbuf, errsz,
+                                       "resolve %s: %s", host,
+                                       gai_strerror(gai));
+        return false;
+    }
+    bool ok = false;
+    for (struct addrinfo *ai = res; ai && !ok; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0) { ok = true; close(fd); break; }
+        if (errno != EINPROGRESS) {
+            if (errbuf && errsz) snprintf(errbuf, errsz,
+                                           "%s:%d: %s",
+                                           host, port, strerror(errno));
+            close(fd);
+            continue;
+        }
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+        if (sel == 0) {
+            if (errbuf && errsz) snprintf(errbuf, errsz,
+                                           "%s:%d: connection timed out",
+                                           host, port);
+        } else if (sel > 0) {
+            int soerr = 0; socklen_t slen = sizeof(soerr);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+            if (soerr == 0) ok = true;
+            else if (errbuf && errsz) snprintf(errbuf, errsz,
+                                                "%s:%d: %s",
+                                                host, port, strerror(soerr));
+        } else {
+            if (errbuf && errsz) snprintf(errbuf, errsz,
+                                           "%s:%d: %s",
+                                           host, port, strerror(errno));
+        }
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+#endif
+
 /* Dry-run authentication with the form's current values. Opens
    a session, runs the same connect + auth + channel sequence
    Connect would, then tears it down without spawning a tab.
@@ -5650,6 +5723,15 @@ static void ssh_form_test_auth(int cols, int rows) {
     int port = atoi(g_form.port);
     if (port <= 0) port = 22;
     char err[256] = {0};
+    /* TCP preflight first — bogus port / unreachable host fails in
+       ~3s instead of waiting through the full libssh timeout. */
+    if (!ssh_form_tcp_check(g_form.host, port, 3000, err, sizeof(err))) {
+        g_form_status[0] = 0;
+        strncpy(g_form.error, err[0] ? err : "host unreachable",
+                sizeof(g_form.error) - 1);
+        g_form.error[sizeof(g_form.error) - 1] = 0;
+        return;
+    }
     Pty *p = pty_open_ssh(
         g_form.user[0] ? g_form.user : NULL,
         g_form.host,
