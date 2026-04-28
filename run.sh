@@ -45,10 +45,30 @@ fi
 
 # run.sh is the dev launcher — turn on the debug switches that
 # shouldn't burden a normal `open -a rbterm` user. Today that's
-# just RBTERM_DEBUG, which routes SFTP-upload tracing to
-# ~/rbterm-upload.log; keep adding flags here as more debug-only
-# instrumentation lands.
+# RBTERM_DEBUG (routes SFTP-upload tracing to ~/rbterm-upload.log,
+# enables verbose ligature-shape diagnostics) plus a startup dump
+# of the user's persisted config so a Claude assist session can see
+# what's loaded without asking.
 export RBTERM_DEBUG=1
+
+# Dump the persisted config to stderr at launch. Users grep this
+# block when reporting "rbterm did X" — it's the fastest way to
+# see exactly what state the binary will boot into.
+echo "=== rbterm dev launcher ==="
+echo "uname: $(uname -a)"
+CFG="${HOME}/.config/rbterm/config.ini"
+if [[ -f "$CFG" ]]; then
+  echo "--- $CFG ---"
+  cat "$CFG"
+else
+  echo "(no $CFG yet — run rbterm and press Save as Default in Settings)"
+fi
+SSH_CFG="${HOME}/.ssh/config"
+if [[ -f "$SSH_CFG" ]] && grep -q '^# rbterm-' "$SSH_CFG" 2>/dev/null; then
+  echo "--- per-host rbterm overrides in $SSH_CFG ---"
+  grep -nE '^(Host |[[:space:]]+# rbterm-)' "$SSH_CFG" || true
+fi
+echo "==========================="
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   make app

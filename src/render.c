@@ -500,37 +500,67 @@ static bool backup_font_has(uint32_t cp) {
     return (gi->image.width > 0 && gi->image.height > 0);
 }
 
-/* Drop the cached pointer to the embedded font blob. Called after
-   switching back to a disk-loaded font so the next size-change
-   path falls through to the disk loader instead of a stale memory
-   blob. */
-static void forget_embedded_blob(Renderer *r) {
-    r->cur_data = NULL;
-    r->cur_data_size = 0;
+/* Free the cached font bytes if we own them, then null the slot. The
+   embedded blobs we get from .incbin / RCDATA are read-only static
+   data we mustn't free; the disk-loaded path mallocs its own copy
+   and owns it. The owned flag distinguishes. */
+static void forget_font_data(Renderer *r) {
+    if (r->cur_data_owned && r->cur_data) {
+        free((void *)r->cur_data);
+    }
+    r->cur_data       = NULL;
+    r->cur_data_size  = 0;
+    r->cur_data_owned = false;
     r->cur_ext[0] = 0;
 }
 
-/* Load a font from disk + install it. Atlas is rasterised at 2x
-   the display size so bilinear-filtered glyphs stay crisp. Returns
-   false if raylib couldn't open / parse the file. */
+/* Read a whole file into a heap buffer. Returns NULL on error; on
+   success writes the byte count via *out_size. Caller frees. */
+static unsigned char *slurp_file(const char *path, size_t *out_size) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long sz = ftell(fp);
+    if (sz <= 0)                     { fclose(fp); return NULL; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return NULL; }
+    unsigned char *buf = malloc((size_t)sz);
+    if (!buf) { fclose(fp); return NULL; }
+    if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(buf); fclose(fp); return NULL;
+    }
+    fclose(fp);
+    *out_size = (size_t)sz;
+    return buf;
+}
+
+/* Forward decl: load_font_into reads the file then hands off to the
+   shared in-memory loader so HarfBuzz has bytes to shape against. */
+static bool load_font_data_into(Renderer *r, const unsigned char *data,
+                                int data_size, const char *ext, int size,
+                                const char *display_path);
+
+/* Load a font from disk + install it. The bytes are slurped into a
+   heap buffer first so they remain available for HarfBuzz shaping
+   (which can't take a path) and so the size-change path doesn't
+   re-read from disk. Returns false if the file's missing or fails
+   to parse. */
 static bool load_font_into(Renderer *r, const char *path, int size) {
-    int cp_count;
-    int *cps = build_codepoints(&cp_count);
-    /* Rasterise the atlas at 3× the display size and downsample at draw
-       time. The extra glyph resolution survives the bilinear filter so
-       strokes look brighter / less washed out — without this the default
-       white text reads as gray-ish because sRGB blending eats the edges.
-       (2× looked fine on Linux + Windows but text felt thin on macOS
-       retina; 3× is sharper without the GPU memory hit being noticeable.) */
-    int atlas_size = size * 3;
-    if (atlas_size > 144) atlas_size = 144;
-    Font f = LoadFontEx(path, atlas_size, cps, cp_count);
-    free(cps);
-    if (f.texture.id == 0) return false;
-    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
-    install_font(r, f, size, path);
-    forget_embedded_blob(r);
-    return true;
+    size_t sz = 0;
+    unsigned char *buf = slurp_file(path, &sz);
+    if (!buf) return false;
+    /* Pull the extension off the path so LoadFontFromMemory routes to
+       the right parser. */
+    const char *dot = strrchr(path, '.');
+    const char *ext = dot ? dot + 1 : "ttf";
+    bool ok = load_font_data_into(r, buf, (int)sz, ext, size, path);
+    if (ok) {
+        /* load_font_data_into now points cur_data at our heap buffer.
+           Mark it as owned so the next forget_font_data frees it. */
+        r->cur_data_owned = true;
+    } else {
+        free(buf);
+    }
+    return ok;
 }
 
 /* Load a font from an in-memory blob (embedded fonts) and install
@@ -555,9 +585,13 @@ static bool load_font_data_into(Renderer *r, const unsigned char *data,
     if (f.texture.id == 0) return false;
     SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
     install_font(r, f, size, display_path);
-    /* Cache the blob so size changes don't need the embedded table. */
+    /* Free any previously-owned bytes before pointing cur_data at the
+       new blob. The disk loader's caller flips cur_data_owned back on
+       after we return; embedded callers leave it false. */
+    forget_font_data(r);
     r->cur_data = data;
     r->cur_data_size = data_size;
+    r->cur_data_owned = false;
     if (ext && *ext) {
         strncpy(r->cur_ext, ext, sizeof(r->cur_ext) - 1);
         r->cur_ext[sizeof(r->cur_ext) - 1] = 0;
@@ -622,6 +656,7 @@ void renderer_shutdown(Renderer *r) {
         shape_font_free((ShapeFont *)r->shape_font);
         r->shape_font = NULL;
     }
+    forget_font_data(r);
     UnloadFont(*as_font(r));
     free(r->font_data);
     r->font_data = NULL;
@@ -869,13 +904,33 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             int n = shape_row((ShapeFont *)r->shape_font, lig_cps, lig_cols,
                               lig_out, 4096);
             for (int g = 0; g < n; g++) {
-                if (!lig_out[g].is_ligature) continue;     /* only headlining ligatures matter */
-                if (lig_out[g].glyph_id == 0) continue;    /* .notdef → fall back to codepoint draw */
+                if (lig_out[g].glyph_id == 0) continue;    /* .notdef → fall back */
                 int head = lig_out[g].cell_col;
                 int sp   = lig_out[g].cell_span;
                 if (head < 0 || head >= lig_cols) continue;
-                if (sp < 2) continue;
+                if (sp < 1) continue;
                 if (head + sp > lig_cols) sp = lig_cols - head;
+
+                /* Two flavours of OpenType ligature substitution:
+                     - multi-cell cluster (sp > 1): classic =>⇒. Always
+                       rendered via the shape path.
+                     - single-cell cluster (sp == 1) where the shaped
+                       glyph_id differs from the cmap-natural glyph_id:
+                       split / contextual substitution. Cascadia +
+                       CaskaydiaCove use this — `=>` becomes two
+                       glyphs `equal_start.seq` + `greater_equal_end.seq`,
+                       each occupying its own cell, so the spans are
+                       all 1 but every cell's glyph_id has changed.
+                   Skip when sp == 1 AND the glyph_id matches the
+                   natural one (no substitution → use the existing
+                   atlas path). */
+                if (sp == 1) {
+                    uint32_t natural = shape_natural_glyph_id(
+                        (ShapeFont *)r->shape_font, lig_cps[head]);
+                    if (natural != 0 && natural == lig_out[g].glyph_id)
+                        continue;
+                }
+
                 /* Pre-rasterise the glyph so we can confirm it loads
                    before marking the cluster as ours. If it fails, we
                    leave lig_head untouched and the cells render via
@@ -883,9 +938,6 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                 ShapeGlyph *sg = shape_render_glyph(
                     (ShapeFont *)r->shape_font, lig_out[g].glyph_id);
                 if (!sg || !sg->ok) continue;
-                /* Mark every cell in the cluster as consumed; the head
-                   carries the glyph_id + span so the per-cell loop
-                   below can render it. */
                 for (int k = 0; k < sp; k++) lig_head[head + k] = head;
                 lig_glyph[head] = lig_out[g].glyph_id;
                 lig_span[head]  = sp;

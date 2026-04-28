@@ -85,3 +85,12 @@ int shape_row(ShapeFont *sf,
    on failure. The returned pointer is owned by the ShapeFont and
    freed when shape_font_free is called. */
 ShapeGlyph *shape_render_glyph(ShapeFont *sf, uint32_t glyph_id);
+
+/* Return the OpenType glyph_id this codepoint maps to with no
+   shaping applied (cmap lookup only). The renderer compares this
+   against shape_row's output to detect single-cell substitutions:
+   when shape_row returns glyph_id != natural, the font has done a
+   contextual / stylistic / split-ligature substitution that should
+   be rendered instead of the per-codepoint atlas glyph. Returns 0
+   if no glyph maps to this codepoint or shape isn't available. */
+uint32_t shape_natural_glyph_id(ShapeFont *sf, uint32_t codepoint);

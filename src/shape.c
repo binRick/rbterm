@@ -130,7 +130,20 @@ int shape_row(ShapeFont *sf,
         hb_buffer_add(sf->buffer, codepoints[i] ? codepoints[i] : ' ', i);
     }
 
-    hb_shape(sf->font, sf->buffer, NULL, 0);
+    /* Force-enable the ligature features programmer fonts rely on.
+       `calt` is the big one — Cascadia / CaskaydiaCove / Fira Code put
+       most of their substitution lookups behind it, and HarfBuzz's
+       default Latin shaping enables it but only for some font types.
+       Enabling them explicitly avoids the "ligatures are silent"
+       footgun where the font ships them but they don't fire. */
+    static const hb_feature_t k_features[] = {
+        { HB_TAG('l','i','g','a'), 1, 0, (unsigned int)-1 },
+        { HB_TAG('c','l','i','g'), 1, 0, (unsigned int)-1 },
+        { HB_TAG('c','a','l','t'), 1, 0, (unsigned int)-1 },
+        { HB_TAG('d','l','i','g'), 1, 0, (unsigned int)-1 },
+    };
+    hb_shape(sf->font, sf->buffer, k_features,
+             sizeof(k_features) / sizeof(k_features[0]));
 
     unsigned int glyph_count = 0;
     hb_glyph_info_t     *gi = hb_buffer_get_glyph_infos(sf->buffer, &glyph_count);
@@ -185,6 +198,12 @@ static ShapeGlyph *glyph_cache_alloc(ShapeFont *sf, uint32_t glyph_id) {
     memset(e, 0, sizeof(*e));
     e->glyph_id = glyph_id;
     return e;
+}
+
+uint32_t shape_natural_glyph_id(ShapeFont *sf, uint32_t codepoint) {
+    if (!sf) return 0;
+    int gid = stbtt_FindGlyphIndex(&sf->info, (int)codepoint);
+    return gid > 0 ? (uint32_t)gid : 0;
 }
 
 ShapeGlyph *shape_render_glyph(ShapeFont *sf, uint32_t glyph_id) {
@@ -261,6 +280,10 @@ int  shape_row(ShapeFont *sf, const uint32_t *codepoints, int n_codepoints,
 ShapeGlyph *shape_render_glyph(ShapeFont *sf, uint32_t glyph_id) {
     (void)sf; (void)glyph_id;
     return NULL;
+}
+uint32_t shape_natural_glyph_id(ShapeFont *sf, uint32_t codepoint) {
+    (void)sf; (void)codepoint;
+    return 0;
 }
 
 #endif  /* RBTERM_HAVE_HARFBUZZ */

@@ -13,11 +13,15 @@ typedef struct {
     float bg_alpha;       /* default-background opacity, 0..1 */
     char font_path[1024];
     void *font_data;      // Font* (opaque)
-    /* Cache of the embedded blob the current font came from (NULL when
-       it was loaded from a disk path). renderer_set_font_size can
-       re-load from this without revisiting the filesystem. */
+    /* Cached bytes for the currently loaded font. For embedded fonts
+       this points at the read-only `.incbin`'d blob (cur_data_owned =
+       false, never freed). For disk-loaded fonts the bytes are slurped
+       into a heap buffer so HarfBuzz can shape against them and the
+       size-change path doesn't have to revisit the filesystem
+       (cur_data_owned = true, freed on next swap / shutdown). */
     const unsigned char *cur_data;
-    int cur_data_size;
+    int  cur_data_size;
+    bool cur_data_owned;
     char cur_ext[8];
 
     /* OpenType ligature shaping. Off by default. When enabled and the
