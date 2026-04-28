@@ -38,11 +38,24 @@ CFLAGS += -DRBTERM_SSH=1
 # we don't depend on a libwebp-enabled ffmpeg build.
 LDLIBS += -lwebp -lwebpmux
 
+# HarfBuzz: brew install harfbuzz (macOS) / apt install libharfbuzz-dev
+# (Linux). Used for OpenType ligature shaping in the renderer when the
+# Settings → Font "Ligatures" toggle is on. Auto-detected via
+# pkg-config — when absent the code in src/shape.c compiles to a stub
+# and the toggle is hidden in the UI. Lets users without the dev
+# headers build rbterm and get the unshaped (existing) renderer.
+HB_CFLAGS := $(shell pkg-config --cflags harfbuzz 2>/dev/null)
+HB_LDLIBS := $(shell pkg-config --libs   harfbuzz 2>/dev/null)
+ifneq ($(HB_LDLIBS),)
+  CFLAGS += $(HB_CFLAGS) -DRBTERM_HAVE_HARFBUZZ=1
+  LDLIBS += $(HB_LDLIBS)
+endif
+
 
 SRCS := src/main.c src/screen.c src/render.c src/input.c src/theme.c \
         src/sixel.c src/kitty.c src/pty_unix.c src/pty_ssh.c src/pty_dispatch.c \
         src/gif_encoder.c src/webp_encoder.c src/cast.c src/hud.c \
-        src/rec_effects.c
+        src/rec_effects.c src/shape.c
 OBJS := $(SRCS:.c=.o) $(EMOJI_OBJ) src/fonts_embedded.o
 
 all: rbterm

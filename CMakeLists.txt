@@ -53,6 +53,7 @@ set(RBTERM_SOURCES
     src/gif_encoder.c
     src/hud.c
     src/rec_effects.c
+    src/shape.c
 )
 # Native webp + libwebpmux on desktop when the libs are available;
 # stub otherwise (Emscripten always; desktop CI runners that don't
@@ -75,6 +76,21 @@ else()
     list(APPEND RBTERM_SOURCES src/webp_encoder_stub.c)
     if(NOT EMSCRIPTEN)
         message(WARNING "libwebp / libwebpmux not found — building with WebP-encoder stub. Recording's WebP output will be inert. brew install webp / apt install libwebp-dev to enable.")
+    endif()
+endif()
+
+# HarfBuzz — used by src/shape.c for OpenType ligature shaping. Optional;
+# the shape module compiles to a stub when the library isn't present so
+# packagers without harfbuzz-dev can still build, with the Ligatures
+# toggle simply hidden in the UI.
+set(RBTERM_HAVE_HARFBUZZ FALSE)
+if(NOT EMSCRIPTEN)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(HARFBUZZ harfbuzz)
+        if(HARFBUZZ_FOUND)
+            set(RBTERM_HAVE_HARFBUZZ TRUE)
+        endif()
     endif()
 endif()
 
@@ -220,6 +236,15 @@ endif()
 if(RBTERM_HAVE_WEBP)
     target_link_libraries(rbterm PRIVATE ${WEBP_LIB} ${WEBPMUX_LIB})
     target_include_directories(rbterm PRIVATE ${WEBP_INCLUDE_DIR})
+endif()
+
+# Link HarfBuzz when available; otherwise shape.c's stub path runs and
+# the Ligatures toggle stays hidden.
+if(RBTERM_HAVE_HARFBUZZ)
+    target_link_libraries(rbterm PRIVATE ${HARFBUZZ_LIBRARIES})
+    target_include_directories(rbterm PRIVATE ${HARFBUZZ_INCLUDE_DIRS})
+    target_link_directories(rbterm PRIVATE ${HARFBUZZ_LIBRARY_DIRS})
+    target_compile_definitions(rbterm PRIVATE RBTERM_HAVE_HARFBUZZ=1)
 endif()
 
 if(APPLE)

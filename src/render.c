@@ -1,6 +1,7 @@
 #include "render.h"
 #include "emoji.h"
 #include "raylib.h"
+#include "shape.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -563,6 +564,16 @@ static bool load_font_data_into(Renderer *r, const unsigned char *data,
     } else {
         r->cur_ext[0] = 0;
     }
+    /* Rebuild the shape handle if ligatures are on — the new font may
+       have a different OpenType GSUB table, and the shape font's
+       cached glyph bitmaps are tied to the old font/size. */
+    if (r->shape_font) {
+        shape_font_free((ShapeFont *)r->shape_font);
+        r->shape_font = NULL;
+    }
+    if (r->ligatures) {
+        r->shape_font = shape_font_open(data, data_size, size);
+    }
     return true;
 }
 
@@ -607,9 +618,30 @@ void renderer_shutdown(Renderer *r) {
     present_set_clear();
     backup_font_unload();
     if (!r || !r->font_data) return;
+    if (r->shape_font) {
+        shape_font_free((ShapeFont *)r->shape_font);
+        r->shape_font = NULL;
+    }
     UnloadFont(*as_font(r));
     free(r->font_data);
     r->font_data = NULL;
+}
+
+/* Toggle ligature shaping. Building/freeing the shape handle is done
+   here so callers don't have to know about ShapeFont. No-op when
+   HarfBuzz wasn't linked at build time. */
+void renderer_set_ligatures(Renderer *r, bool on) {
+    if (!r) return;
+    if (on == r->ligatures) return;
+    r->ligatures = on;
+    if (r->shape_font) {
+        shape_font_free((ShapeFont *)r->shape_font);
+        r->shape_font = NULL;
+    }
+    if (on && r->cur_data && r->cur_data_size > 0) {
+        r->shape_font = shape_font_open(r->cur_data, r->cur_data_size,
+                                        r->font_size);
+    }
 }
 
 /* Re-rasterise the current font at a new pixel size. Clamps to
@@ -804,7 +836,62 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     int glyph_y_offset = (ch - r->font_size) / 2;
     /* Rasterize emoji at 2x the displayed pixel height for crisper retina output. */
     int emoji_px = ch * 2;
+
+    /* Per-row ligature map. lig_head[x] = -1 → cell x isn't part of a
+       ligature cluster; >= 0 → cell x is consumed by a cluster whose
+       head sits at column lig_head[x]. lig_glyph[head] holds the
+       OpenType glyph_id to rasterise for the cluster's span.
+
+       Static buffers because renderer_draw runs on the main thread
+       only. 4096 cells is far above realistic terminal widths
+       (vtebench / wide displays max out around 500-800 cols). */
+    static int      lig_head[4096];
+    static uint32_t lig_glyph[4096];
+    static int      lig_span[4096];
+    static uint32_t lig_cps[4096];
+    static ShapedGlyph lig_out[4096];
+    int lig_cols = (cols < 4096) ? cols : 4096;
+
     for (int y = 0; y < rows; y++) {
+        /* Reset the per-row ligature map. */
+        for (int i = 0; i < lig_cols; i++) lig_head[i] = -1;
+
+        /* Shape the row when ligatures are on AND the font is
+           shape-able (we only support shaping on embedded fonts that
+           expose their raw bytes). hb_shape() is fast at this width;
+           the cost when no ligatures fire is one shape call returning
+           N-codepoint output that we walk and discard. */
+        if (r->shape_font && lig_cols > 0) {
+            for (int x = 0; x < lig_cols; x++) {
+                Cell c0 = screen_view_cell(s, x, y);
+                lig_cps[x] = (c0.attrs & ATTR_WIDE_CONT) ? 0 : (uint32_t)c0.cp;
+            }
+            int n = shape_row((ShapeFont *)r->shape_font, lig_cps, lig_cols,
+                              lig_out, 4096);
+            for (int g = 0; g < n; g++) {
+                if (!lig_out[g].is_ligature) continue;     /* only headlining ligatures matter */
+                if (lig_out[g].glyph_id == 0) continue;    /* .notdef → fall back to codepoint draw */
+                int head = lig_out[g].cell_col;
+                int sp   = lig_out[g].cell_span;
+                if (head < 0 || head >= lig_cols) continue;
+                if (sp < 2) continue;
+                if (head + sp > lig_cols) sp = lig_cols - head;
+                /* Pre-rasterise the glyph so we can confirm it loads
+                   before marking the cluster as ours. If it fails, we
+                   leave lig_head untouched and the cells render via
+                   their normal codepoint paths — better than a blank. */
+                ShapeGlyph *sg = shape_render_glyph(
+                    (ShapeFont *)r->shape_font, lig_out[g].glyph_id);
+                if (!sg || !sg->ok) continue;
+                /* Mark every cell in the cluster as consumed; the head
+                   carries the glyph_id + span so the per-cell loop
+                   below can render it. */
+                for (int k = 0; k < sp; k++) lig_head[head + k] = head;
+                lig_glyph[head] = lig_out[g].glyph_id;
+                lig_span[head]  = sp;
+            }
+        }
+
         for (int x = 0; x < cols; x++) {
             Cell c = screen_view_cell(s, x, y);
             if (c.attrs & ATTR_WIDE_CONT) continue;  /* drawn as part of the head cell */
@@ -830,6 +917,38 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
 
             float alpha = (c.attrs & ATTR_DIM) ? 0.6f : 1.0f;
             int span = (c.attrs & ATTR_WIDE) ? 2 : 1;
+
+            /* Ligature-cluster handling. lig_head[x] tells us this
+               cell is part of a multi-cell shaped cluster.
+                 - x is the head: rasterise & draw the ligature glyph
+                   spanning the full cluster width, then fall through
+                   to glyph_drawn so underlines etc. still apply.
+                 - x is a tail member: the head already drew, skip
+                   the per-cell glyph but keep decorations. */
+            if (lig_head[x] >= 0) {
+                if (lig_head[x] == x) {
+                    ShapeGlyph *sg = shape_render_glyph(
+                        (ShapeFont *)r->shape_font, lig_glyph[x]);
+                    if (sg && sg->ok && sg->texture) {
+                        Texture2D *tex = (Texture2D *)sg->texture;
+                        int sp = lig_span[x];
+                        int total_w = sp * cw;
+                        /* Centre the ligature glyph horizontally
+                           inside the cluster's cell footprint. */
+                        float dst_x = (float)(x * cw + (total_w - sg->width) / 2);
+                        float dst_y = (float)(y * ch + glyph_y_offset
+                                              + (r->font_size + sg->bearing_y));
+                        Rectangle src = { 0, 0, (float)sg->width, (float)sg->height };
+                        Rectangle dst = { dst_x, dst_y,
+                                          (float)sg->width, (float)sg->height };
+                        DrawTexturePro(*tex, src, dst, (Vector2){0, 0}, 0.0f,
+                                       col_from_rgb(fg, alpha));
+                    }
+                }
+                /* Whether head or tail, jump past the per-codepoint
+                   draw — decorations follow. */
+                goto glyph_drawn;
+            }
 
             /* Skip glyph rendering for blank cells; jump straight to the
                decoration pass below so underlines / strike / hyperlink

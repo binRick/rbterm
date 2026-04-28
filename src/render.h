@@ -1,5 +1,6 @@
 #pragma once
 #include "screen.h"
+#include <stdbool.h>
 
 typedef struct {
     int font_size;
@@ -18,6 +19,18 @@ typedef struct {
     const unsigned char *cur_data;
     int cur_data_size;
     char cur_ext[8];
+
+    /* OpenType ligature shaping. Off by default. When enabled and the
+       current font was loaded from an in-memory blob (cur_data != NULL,
+       i.e. one of the bundled fonts), the renderer shapes each row
+       through HarfBuzz before drawing — cells that participate in a
+       ligature cluster get the rasterised ligature glyph instead of
+       the per-codepoint atlas glyphs. Disk-path fonts don't shape
+       (we don't keep their bytes around). The shape_font handle is
+       a `ShapeFont *` (opaque to keep this header thin); rebuilt
+       whenever the font / size changes. */
+    bool  ligatures;
+    void *shape_font;     /* ShapeFont *, owned by the renderer */
 } Renderer;
 
 typedef struct {
@@ -71,3 +84,10 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
 
 // Find a default system monospace font. Returns static buffer.
 const char *renderer_find_default_font(void);
+
+// Toggle OpenType ligature shaping. When `on` is true and HarfBuzz
+// was linked at build time, the next renderer_draw will shape each
+// row through HarfBuzz and substitute ligature glyphs (Fira Code's
+// `=>`, JetBrains Mono's `!=`, etc.) for the matching cell pairs.
+// No-op when shaping isn't compiled in.
+void renderer_set_ligatures(Renderer *r, bool on);

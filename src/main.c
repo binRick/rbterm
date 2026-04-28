@@ -4,6 +4,7 @@
 #include "webp_encoder.h"
 #include "hud.h"
 #include "rec_effects.h"
+#include "shape.h"
 #include <stdarg.h>
 #include "screen.h"
 #include "render.h"
@@ -225,6 +226,14 @@ typedef struct {
        playback — but we keep it in the struct so the same RecEffects
        type works in both contexts. */
     RecEffects effects;
+
+    /* OpenType ligature shaping (Settings → Font → Ligatures). When
+       on the renderer routes each row through HarfBuzz before drawing
+       and substitutes ligature glyphs (=>, !=, >=, …). Only applies
+       to fonts loaded from embedded blobs (the bundled set);
+       disk-path fonts don't shape because we don't keep their bytes
+       around. */
+    bool ligatures;
 } AppSettings;
 
 /* SSH key inventory — populated by ssh_keys_rescan from ~/.ssh.
@@ -417,6 +426,9 @@ static void config_load_into_defaults(void) {
                via the shared helper so config-file and SSH-stanza
                readers handle the same set of keys identically. */
             rec_effects_set(&g_app_settings.effects, k + 8, v);
+        } else if (strcmp(k, "ligatures") == 0) {
+            g_app_settings.ligatures = (strcmp(v, "true") == 0 ||
+                                        strcmp(v, "1") == 0);
         } else if (strncmp(k, "launch.", 7) == 0) {
             /* launch.<i>=local | ssh:<alias>. Index is informational
                for humans editing the file; we always append in the
@@ -506,6 +518,9 @@ static bool config_save(Renderer *r) {
                 fprintf(fp, "effects.%s=%s\n", rec_effects_keys[i], buf);
             }
         }
+    }
+    if (g_app_settings.ligatures) {
+        fprintf(fp, "ligatures=true\n");
     }
     fclose(fp);
 #ifndef _WIN32
@@ -8250,6 +8265,7 @@ typedef struct {
     Rect spc_dec, spc_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
+    Rect ligatures_toggle; /* Settings → Font: enable HarfBuzz shaping */
     Rect rec_dir;    /* editable text box with recording-save directory */
     Rect repeat_initial; /* slider track — initial repeat delay */
     Rect repeat_rate;    /* slider track — per-repeat period */
@@ -8807,6 +8823,17 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         L.spc_val  = (Rect){ L.modal.x + w - 214, spc_row_y, 66, btn };
         L.spc_dec  = (Rect){ L.modal.x + w - 138, spc_row_y, btn, btn };
         L.spc_inc  = (Rect){ L.modal.x + w - 60,  spc_row_y, btn, btn };
+
+        /* Ligatures toggle — sits one row below the cell-spacing
+           controls. Only relevant when shape_available() (HarfBuzz
+           linked at build time); the click handler hides the row when
+           it isn't. */
+        if (shape_available()) {
+            int lig_row_y = spc_row_y + btn + 14;
+            L.ligatures_toggle = (Rect){ L.modal.x + 140, lig_row_y, 200, btn };
+        } else {
+            L.ligatures_toggle = (Rect){ 0, 0, 0, 0 };
+        }
     } else if (g_settings_tab == SETTINGS_TAB_THEME) {
         int theme_list_y = content_y;
         /* Theme tab now uses the full content height — cursor moved
@@ -9200,6 +9227,15 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     if (rect_hit(L.pad_inc, mx, my)) { settings_apply_padding(r, r->pad_x + 2); return; }
     if (rect_hit(L.spc_dec, mx, my)) { settings_apply_spacing(r, r->cell_extra_w - 1); return; }
     if (rect_hit(L.spc_inc, mx, my)) { settings_apply_spacing(r, r->cell_extra_w + 1); return; }
+    if (L.ligatures_toggle.w > 0 && rect_hit(L.ligatures_toggle, mx, my)) {
+        g_app_settings.ligatures = !g_app_settings.ligatures;
+        renderer_set_ligatures(r, g_app_settings.ligatures);
+        snprintf(g_settings_status, sizeof(g_settings_status),
+                 "Ligatures %s. Use a font like Fira Code / JetBrains Mono "
+                 "and type \"=> != >=\" to see them.",
+                 g_app_settings.ligatures ? "on" : "off");
+        return;
+    }
     if (rect_hit(L.font_list, mx, my)) {
         int row_h = 22;
         int row = (my - L.font_list.y) / row_h + g_font_list_scroll;
@@ -11854,6 +11890,28 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                          L.spc_inc.y + (L.spc_inc.h - ps.y) / 2},
                18, 0, (Color){230, 232, 240, 255});
 
+    /* Ligatures toggle. Hidden when shape_available() is false (no
+       HarfBuzz at build time) — the layout sets a zero-width rect in
+       that case so the click handler can't hit it either. */
+    if (L.ligatures_toggle.w > 0) {
+        DrawTextEx(*f, "Ligatures",
+                   (Vector2){L.modal.x + 22, L.ligatures_toggle.y + 8},
+                   14, 0, (Color){200, 205, 220, 255});
+        bool on = g_app_settings.ligatures;
+        Color bg = on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255};
+        DrawRectangle(L.ligatures_toggle.x, L.ligatures_toggle.y,
+                      L.ligatures_toggle.w, L.ligatures_toggle.h, bg);
+        DrawRectangleLines(L.ligatures_toggle.x, L.ligatures_toggle.y,
+                           L.ligatures_toggle.w, L.ligatures_toggle.h,
+                           (Color){125, 207, 255, on ? 255 : 120});
+        const char *lbl = on ? "On (HarfBuzz)" : "Off";
+        Vector2 ts = MeasureTextEx(*f, lbl, 13, 0);
+        DrawTextEx(*f, lbl,
+                   (Vector2){L.ligatures_toggle.x + (L.ligatures_toggle.w - ts.x) / 2,
+                             L.ligatures_toggle.y + (L.ligatures_toggle.h - ts.y) / 2},
+                   13, 0, (Color){230, 232, 240, 255});
+    }
+
     }  /* end Font tab (padding + spacing) */
     if (g_settings_tab == SETTINGS_TAB_EFFECTS) {
         /* Six slider rows + Phosphor pills + Reset button. The
@@ -13053,6 +13111,12 @@ int main(int argc, char **argv) {
     r.pad_y = init_padding;
     r.bg_alpha = init_opacity;
     if (g_persisted.has_spacing) renderer_set_cell_spacing(&r, g_persisted.spacing);
+    /* Apply persisted ligature toggle. shape_available() is the
+       compile-time HarfBuzz check — when shaping isn't built in,
+       leaving the flag off keeps the existing 1:1 codepoint path. */
+    if (g_app_settings.ligatures && shape_available()) {
+        renderer_set_ligatures(&r, true);
+    }
 
     int win_w = init_cols * r.cell_w + 2 * r.pad_x;
     int win_h = init_rows * r.cell_h + TAB_BAR_H + 2 * r.pad_y;
