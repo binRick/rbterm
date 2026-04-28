@@ -234,6 +234,11 @@ typedef struct {
        disk-path fonts don't shape because we don't keep their bytes
        around. */
     bool ligatures;
+
+    /* Default folder for `Cmd+Shift+S` / camera-button screenshots.
+       Populated to ~/Desktop on first run; configurable via the
+       Recording settings tab. Created on first save with mkdir_p. */
+    char screenshot_dir[PATH_MAX];
 } AppSettings;
 
 /* SSH key inventory — populated by ssh_keys_rescan from ~/.ssh.
@@ -388,6 +393,11 @@ static void config_load_into_defaults(void) {
         } else if (strcmp(k, "rec_dir") == 0) {
             strncpy(g_app_settings.rec_dir, v, sizeof(g_app_settings.rec_dir) - 1);
             g_app_settings.rec_dir[sizeof(g_app_settings.rec_dir) - 1] = 0;
+        } else if (strcmp(k, "screenshot_dir") == 0) {
+            strncpy(g_app_settings.screenshot_dir, v,
+                    sizeof(g_app_settings.screenshot_dir) - 1);
+            g_app_settings.screenshot_dir[
+                sizeof(g_app_settings.screenshot_dir) - 1] = 0;
         } else if (strcmp(k, "key_repeat_initial_ms") == 0) {
             int vi = atoi(v);
             if (vi >= 0 && vi <= 2000) g_app_settings.key_repeat_initial_ms = vi;
@@ -468,6 +478,7 @@ static bool config_save(Renderer *r) {
     fprintf(fp, "log_enabled=%s\n",  g_app_settings.log_enabled ? "true" : "false");
     if (g_app_settings.log_dir[0]) fprintf(fp, "log_dir=%s\n", g_app_settings.log_dir);
     if (g_app_settings.rec_dir[0]) fprintf(fp, "rec_dir=%s\n", g_app_settings.rec_dir);
+    if (g_app_settings.screenshot_dir[0]) fprintf(fp, "screenshot_dir=%s\n", g_app_settings.screenshot_dir);
     fprintf(fp, "key_repeat_initial_ms=%d\n", g_app_settings.key_repeat_initial_ms);
     fprintf(fp, "key_repeat_rate_ms=%d\n",    g_app_settings.key_repeat_rate_ms);
     {
@@ -558,11 +569,15 @@ static void app_settings_init(void) {
                  "%s/.rbterm/logs", home);
         snprintf(g_app_settings.rec_dir, sizeof(g_app_settings.rec_dir),
                  "%s/Downloads", home);
+        snprintf(g_app_settings.screenshot_dir, sizeof(g_app_settings.screenshot_dir),
+                 "%s/Desktop", home);
     } else {
         strncpy(g_app_settings.log_dir, "./rbterm-logs",
                 sizeof(g_app_settings.log_dir) - 1);
         strncpy(g_app_settings.rec_dir, "./",
                 sizeof(g_app_settings.rec_dir) - 1);
+        strncpy(g_app_settings.screenshot_dir, "./",
+                sizeof(g_app_settings.screenshot_dir) - 1);
     }
 }
 
@@ -794,6 +809,7 @@ static HudConfig hud_effective(const Tab *t) {
 #define TAB_HELP_W  28
 #define TAB_SPLIT_W 28          /* one split button (two of them — vertical + horizontal) */
 #define TAB_REC_W   26          /* one record button (start + stop, both always visible) */
+#define TAB_SNAP_W  28          /* screenshot of the active pane → PNG to disk */
 #define TAB_SSH_W   48
 #define TAB_UPLOAD_W 28         /* SFTP upload button (only visible on SSH tabs) */
 #define TAB_DOWNLOAD_W 28       /* SFTP download button (only visible on SSH tabs) */
@@ -1620,6 +1636,22 @@ static void rec_emit_initial_snapshot(FILE *fp, Pane *p) {
     fflush(fp);
     free(buf);
 }
+
+/* Status line for the most recent screenshot. The tab bar surfaces
+   this as a small pill next to the camera button for ~3 seconds so
+   the user gets immediate confirmation + the saved path without
+   needing to look at stderr. Defined here (early in the file) so
+   the tab-bar draw can show the most recent message. The actual
+   screenshot_active_pane function lives further down — after the
+   PaneRect / pane_rect declarations it depends on. */
+static char   g_snap_status[PATH_MAX];
+static double g_snap_status_at;
+
+/* Forward declaration so the tab-bar click handler at the bottom
+   of main() can dispatch into the screenshot path. The body lives
+   below pane_rect's definition because it needs to compute the
+   active pane's on-screen rect. */
+static bool screenshot_active_pane(Renderer *r);
 
 /* Begin recording the bytes coming out of pane `p`. Writes the
    asciinema v2 header (cols, rows, unix timestamp), seeds the
@@ -2936,6 +2968,82 @@ static void pane_dims(const Renderer *r, const PaneRect *pr,
     *rows_out = rs;
 }
 
+/* Capture the active pane to a PNG and pop it open in the system
+   image viewer. Returns true on success; false (and a stderr log
+   line) on failure — typically a write-permission issue with the
+   target directory. The pane is re-rendered to an off-screen
+   RenderTexture so the screenshot is a clean grid (no tab bar, no
+   modals, no HUD) regardless of what's currently overlaying it. */
+static bool screenshot_active_pane(Renderer *r) {
+    Tab *t = active_tab();
+    if (!t || !r) return false;
+    Pane *p = active_pane_of(t);
+    if (!p || !p->scr) return false;
+    int win_w = GetScreenWidth();
+    int win_h = GetScreenHeight();
+    PaneRect pr;
+    pane_rect(t, t->active_pane, win_w, win_h, &pr);
+    if (pr.w <= 0 || pr.h <= 0) return false;
+    /* RenderTexture sizes must be even on some drivers; round up. */
+    int rw = pr.w, rh = pr.h;
+    if (rw & 1) rw++;
+    if (rh & 1) rh++;
+    RenderTexture2D rt = LoadRenderTexture(rw, rh);
+    if (rt.id == 0) {
+        fprintf(stderr, "rbterm: screenshot: couldn't allocate %dx%d RT\n", rw, rh);
+        return false;
+    }
+    uint32_t bg = screen_default_bg(p->scr);
+    Color bgc = { (unsigned char)((bg >> 16) & 0xff),
+                  (unsigned char)((bg >> 8)  & 0xff),
+                  (unsigned char)( bg        & 0xff), 255 };
+    BeginTextureMode(rt);
+        ClearBackground(bgc);
+        renderer_draw(r, p->scr, GetTime(), true, &p->sel,
+                      0, 0, -1, -1);
+    EndTextureMode();
+
+    Image img = LoadImageFromTexture(rt.texture);
+    ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    /* RT textures store bottom-up; flip vertically so the PNG isn't
+       upside-down when opened in Preview. */
+    ImageFlipVertical(&img);
+
+    /* Resolve the destination directory and timestamp the filename. */
+    char dir[PATH_MAX];
+    expand_home_path(g_app_settings.screenshot_dir[0]
+                       ? g_app_settings.screenshot_dir : "~/Desktop",
+                     dir, sizeof(dir));
+    mkdir_p(dir);
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm *lt = localtime(&now);
+    if (lt) strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", lt);
+    else    snprintf(ts, sizeof(ts), "%lld", (long long)now);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/rbterm-%s.png", dir, ts);
+
+    bool ok = ExportImage(img, path);
+    UnloadImage(img);
+    UnloadRenderTexture(rt);
+
+    if (ok) {
+        snprintf(g_snap_status, sizeof(g_snap_status),
+                 "Screenshot → %s", path);
+        g_snap_status_at = GetTime();
+        fprintf(stderr, "rbterm: %s\n", g_snap_status);
+        /* Open the PNG in the user's default image viewer for
+           immediate "view" without leaving rbterm. */
+        open_url(path);
+    } else {
+        snprintf(g_snap_status, sizeof(g_snap_status),
+                 "Screenshot failed: couldn't write %s", path);
+        g_snap_status_at = GetTime();
+        fprintf(stderr, "rbterm: %s\n", g_snap_status);
+    }
+    return ok;
+}
+
 /* Find which pane of the active tab a window-pixel coordinate falls
    into (or -1 if neither). Used for click-to-focus. */
 static int pane_at(const Tab *t, int win_w, int win_h, int mx, int my) {
@@ -3558,6 +3666,7 @@ typedef struct {
     bool on_split_h;       /* top/bottom split button */
     bool on_rec_start;     /* start asciinema recording */
     bool on_rec_stop;      /* stop asciinema recording */
+    bool on_snap;          /* take screenshot of active pane */
     bool on_upload;        /* SFTP upload — only present on SSH tabs */
     bool on_download;      /* SFTP download — only present on SSH tabs */
 } TabBarHit;
@@ -3589,7 +3698,7 @@ static int tab_width_for(int win_w) {
     int split_w  = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
     int upload_w = upload_button_visible()  ? TAB_UPLOAD_W   : 0;
     int dl_w     = download_button_visible() ? TAB_DOWNLOAD_W : 0;
-    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - 2 * TAB_REC_W
+    int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - 2 * TAB_REC_W - TAB_SNAP_W
                 - TAB_HELP_W - split_w - upload_w - dl_w - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
@@ -3603,7 +3712,7 @@ static int tab_width_for(int win_w) {
    The "+" was on the far right; moved next to [ssh] so the two
    "open something" buttons live together. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false, false, false };
+    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     bool show_splits = split_buttons_visible();
     bool show_up     = upload_button_visible();
@@ -3611,7 +3720,8 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     int help_x      = win_w - TAB_HELP_W;
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W     : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
-    int rec_stop_x  = split_v_x - TAB_REC_W;
+    int snap_x      = split_v_x - TAB_SNAP_W;
+    int rec_stop_x  = snap_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
     int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
     int dl_x        = show_dl ? upload_x - TAB_DOWNLOAD_W  : upload_x;
@@ -3624,6 +3734,7 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     if (mx >= help_x)       { h.on_help    = true; return h; }
     if (show_splits && mx >= split_h_x) { h.on_split_h = true; return h; }
     if (show_splits && mx >= split_v_x) { h.on_split_v = true; return h; }
+    if (mx >= snap_x)       { h.on_snap      = true; return h; }
     if (mx >= rec_stop_x)   { h.on_rec_stop  = true; return h; }
     if (mx >= rec_start_x)  { h.on_rec_start = true; return h; }
     if (show_up && mx >= upload_x) { h.on_upload = true; return h; }
@@ -3736,7 +3847,8 @@ static void draw_tab_bar(Renderer *r, int win_w) {
     bool show_dl     = download_button_visible();
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W    : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W : help_x;
-    int rec_stop_x  = split_v_x - TAB_REC_W;
+    int snap_x      = split_v_x - TAB_SNAP_W;
+    int rec_stop_x  = snap_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
     int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
     int dl_x        = show_dl ? upload_x - TAB_DOWNLOAD_W  : upload_x;
@@ -3807,6 +3919,31 @@ static void draw_tab_bar(Renderer *r, int win_w) {
         int sq = 10;
         DrawRectangle(rec_stop_x + (TAB_REC_W - sq) / 2,
                       (TAB_BAR_H - sq) / 2, sq, sq, stop_col);
+    }
+
+    /* Screenshot button — small camera icon drawn from primitives
+       (rounded body + viewfinder bump + lens circle). One click
+       captures the active pane to a PNG and pops it open in the
+       system image viewer. Same x slot whether or not a recording
+       is in progress. */
+    {
+        Color cam_bg      = (Color){38, 48, 66, 255};
+        Color cam_outline = (Color){125, 207, 255, 200};
+        Color cam_glyph   = (Color){220, 235, 255, 255};
+        DrawRectangle(snap_x, 0, TAB_SNAP_W, TAB_BAR_H, cam_bg);
+        DrawRectangleLines(snap_x, 2, TAB_SNAP_W - 1, TAB_BAR_H - 4, cam_outline);
+        float cx = snap_x + TAB_SNAP_W / 2.0f;
+        float cy = TAB_BAR_H / 2.0f;
+        float bw = 14.0f, bh = 9.0f;
+        /* Camera body. */
+        DrawRectangle((int)(cx - bw / 2.0f), (int)(cy - bh / 2.0f + 1),
+                      (int)bw, (int)bh, cam_glyph);
+        /* Viewfinder bump on top-left of the body. */
+        DrawRectangle((int)(cx - bw / 2.0f + 2), (int)(cy - bh / 2.0f - 2),
+                      4, 3, cam_glyph);
+        /* Lens (dark circle + tiny white highlight). */
+        DrawCircle((int)cx, (int)(cy + 1), 3.2f, cam_bg);
+        DrawCircle((int)cx, (int)cy, 1.0f, cam_glyph);
     }
 
     /* SFTP upload button — only on SSH tabs. A small "↑" arrow
@@ -13564,6 +13701,9 @@ int main(int argc, char **argv) {
                 else if (h.on_rec_stop) {
                     rec_stop();
                 }
+                else if (h.on_snap) {
+                    screenshot_active_pane(&r);
+                }
                 else if (h.on_upload) {
                     upload_form_open();
                 }
@@ -14126,6 +14266,12 @@ int main(int argc, char **argv) {
             }
             else if (shift_held && IsKeyPressed(KEY_T)) {
                 ssh_form_open();
+            }
+            else if (shift_held && IsKeyPressed(KEY_S)) {
+                /* Cmd+Shift+S — capture the active pane to PNG and
+                   open it in the system image viewer. Same code path
+                   the camera button in the tab bar uses. */
+                screenshot_active_pane(&r);
             }
             else if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
             /* Cmd+W closes the active tab. macOS's AppKit ordinarily
