@@ -1151,6 +1151,14 @@ static const EmbeddedFont *embedded_font_lookup(const char *path_or_name);
 typedef struct FontEntry FontEntry;
 static Font font_preview_load(const FontEntry *fe, int size);
 
+/* Forward decls for font-picker grouping helpers (defined down with
+   the loader). Both pickers (Settings and SSH form) call into these
+   to decide which display-rows are headers and which are font rows. */
+static int         font_display_row_count(void);
+static int         font_display_to_idx(int row);
+static int         font_idx_to_display(int idx);
+static const char *font_header_at_row(int row);
+
 /* Enumerated monospace fonts. Populated by scan_bundled_fonts() before
    any UI opens; read by both the SSH form's per-host font picker and
    the Settings modal's font picker. `data` is non-null for fonts
@@ -1164,6 +1172,12 @@ typedef struct FontEntry {
     const unsigned char *data;
     unsigned int          data_size;
     char ext[8];           /* "ttf" / "otf" / "ttc" — needed for LoadFontFromMemory. */
+    bool  ligatures;       /* true = font ships with programming ligatures (Fira
+                              Code-class). The picker groups these at the top of
+                              the list so users can find them at a glance. The
+                              flag is informational only until HarfBuzz shaping
+                              lands — rbterm doesn't substitute glyph clusters
+                              today, but the font *would* light up when it does. */
 } FontEntry;
 
 #define MAX_FONTS 256
@@ -6859,14 +6873,17 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     }
     if (rect_hit(L.font_list, mx, my)) {
         int row_h = 22;
-        int idx = (my - L.font_list.y) / row_h + g_form_font_scroll;
-        if (idx == 0) {
+        int row = (my - L.font_list.y) / row_h + g_form_font_scroll;
+        if (row == 0) {
             g_form.font[0] = 0;
             g_form_font_idx = -1;
-        } else if (idx > 0 && idx - 1 < g_font_count) {
-            strncpy(g_form.font, g_fonts[idx - 1].path, sizeof(g_form.font) - 1);
-            g_form.font[sizeof(g_form.font) - 1] = 0;
-            g_form_font_idx = idx - 1;
+        } else {
+            int idx = font_display_to_idx(row - 1);    /* -1 = header → no-op */
+            if (idx >= 0 && idx < g_font_count) {
+                strncpy(g_form.font, g_fonts[idx].path, sizeof(g_form.font) - 1);
+                g_form.font[sizeof(g_form.font) - 1] = 0;
+                g_form_font_idx = idx;
+            }
         }
         g_form_focused_list = FORM_FOCUS_FONT;
         return;
@@ -7458,7 +7475,10 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                        (Color){70, 74, 90, 255});
     {
         int row_h = 22;
-        int total = 1 + g_font_count;
+        /* Row 0 is the synthetic "(inherit default)" row; rows 1..N
+           are the grouped picker (headers + fonts), so the total is
+           one more than font_display_row_count(). */
+        int total = 1 + font_display_row_count();
         int visible = L.font_list.h / row_h;
         int max_scroll = total - visible;
         if (max_scroll < 0) max_scroll = 0;
@@ -7466,44 +7486,58 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
         if (g_form_font_scroll < 0) g_form_font_scroll = 0;
         BeginScissorMode(L.font_list.x + 2, L.font_list.y + 2,
                          L.font_list.w - 4, L.font_list.h - 4);
-        for (int i = 0; i < total; i++) {
-            int ry = L.font_list.y + (i - g_form_font_scroll) * row_h;
+        for (int row = 0; row < total; row++) {
+            int ry = L.font_list.y + (row - g_form_font_scroll) * row_h;
             if (ry + row_h < L.font_list.y ||
                 ry > L.font_list.y + L.font_list.h) continue;
-            bool sel = (i == 0 && !g_form.font[0]) ||
-                       (i > 0 && strcmp(g_fonts[i-1].path, g_form.font) == 0);
+            if (row == 0) {
+                bool sel_inherit = !g_form.font[0];
+                if (sel_inherit) {
+                    DrawRectangle(L.font_list.x + 2, ry,
+                                  L.font_list.w - 4, row_h,
+                                  (Color){46, 62, 90, 220});
+                }
+                DrawTextEx(*f, "(inherit default)",
+                           (Vector2){L.font_list.x + 10, ry + 4},
+                           13, 0, (Color){150, 155, 170, 255});
+                continue;
+            }
+            const char *header = font_header_at_row(row - 1);
+            if (header) {
+                DrawTextEx(*f, header,
+                           (Vector2){L.font_list.x + 8, ry + 5},
+                           12, 0, (Color){145, 165, 195, 255});
+                DrawRectangle(L.font_list.x + 8, ry + row_h - 2,
+                              L.font_list.w - 16, 1,
+                              (Color){70, 80, 100, 200});
+                continue;
+            }
+            int i = font_display_to_idx(row - 1);
+            if (i < 0) continue;
+            FontEntry *fe = &g_fonts[i];
+            bool sel = (strcmp(fe->path, g_form.font) == 0);
             if (sel) {
                 DrawRectangle(L.font_list.x + 2, ry,
                               L.font_list.w - 4, row_h,
                               (Color){46, 62, 90, 220});
             }
-            if (i == 0) {
-                DrawTextEx(*f, "(inherit default)",
-                           (Vector2){L.font_list.x + 10, ry + 4},
-                           13, 0, (Color){150, 155, 170, 255});
-            } else {
-                /* Lazy-load a small preview the first time the row
-                   scrolls into view so the name renders in its own
-                   typeface. Failures are sticky so we don't retry
-                   each frame. */
-                FontEntry *fe = &g_fonts[i - 1];
-                if (!fe->preview && !fe->load_failed) {
-                    Font fprev = font_preview_load(fe, 14);
-                    if (fprev.texture.id == 0) {
-                        fe->load_failed = true;
-                    } else {
-                        SetTextureFilter(fprev.texture, TEXTURE_FILTER_BILINEAR);
-                        fe->preview = malloc(sizeof(Font));
-                        *(Font *)fe->preview = fprev;
-                    }
+            /* Lazy-load preview as before; failures are sticky. */
+            if (!fe->preview && !fe->load_failed) {
+                Font fprev = font_preview_load(fe, 14);
+                if (fprev.texture.id == 0) {
+                    fe->load_failed = true;
+                } else {
+                    SetTextureFilter(fprev.texture, TEXTURE_FILTER_BILINEAR);
+                    fe->preview = malloc(sizeof(Font));
+                    *(Font *)fe->preview = fprev;
                 }
-                Font *row_font = fe->preview ? (Font *)fe->preview : f;
-                DrawTextEx(*row_font, fe->name,
-                           (Vector2){L.font_list.x + 10, ry + 4},
-                           14, 0,
-                           sel ? (Color){230, 232, 240, 255}
-                               : (Color){200, 205, 220, 255});
             }
+            Font *row_font = fe->preview ? (Font *)fe->preview : f;
+            DrawTextEx(*row_font, fe->name,
+                       (Vector2){L.font_list.x + 10, ry + 4},
+                       14, 0,
+                       sel ? (Color){230, 232, 240, 255}
+                           : (Color){200, 205, 220, 255});
         }
         EndScissorMode();
         if (total > visible) {
@@ -8331,10 +8365,116 @@ static bool looks_monospace(const char *name) {
     return false;
 }
 
-/* qsort comparator — alphabetise font entries case-insensitively. */
-static int cmp_font_name(const void *a, const void *b) {
-    return strcasecmp(((const FontEntry *)a)->name,
-                      ((const FontEntry *)b)->name);
+/* Classify a font filename / display name as ligature-capable. The list
+   is curated — every entry is a font whose primary distinguishing
+   feature is a programming-ligature set (=> != >= -> etc.) shipped in
+   the .ttf. Matched as a substring against the display name OR the
+   filename so e.g. JetBrains-Mono-Vazir-Regular and JetBrainsMono
+   both classify the same. False positives here are visual only — the
+   picker just groups the row at the top. */
+static bool font_has_ligatures(const char *display_name, const char *path) {
+    static const char *pat[] = {
+        "FiraCode",   "Fira Code",   "FiraMono",   "Fira Mono",
+        "JetBrains",  "JetBrainsMono",
+        "Cascadia",   "Caskaydia",   "CaskaydiaCove",
+        "Iosevka",
+        "Monaspace",
+        "Hasklig",
+        "Victor Mono", "VictorMono",
+        "Maple",      "MapleMono",
+        "Monoid",
+        "0xProto",    "Pragmata",
+        "Recursive",
+        "Comic Mono", "ComicMono",
+        NULL
+    };
+    if (!display_name) display_name = "";
+    if (!path)         path         = "";
+    for (int i = 0; pat[i]; i++) {
+        if (strstr(display_name, pat[i]) ||
+            (path[0] && strstr(path, pat[i])))
+            return true;
+    }
+    return false;
+}
+
+/* qsort comparator — group ligature-capable fonts at the top of the
+   list, then sort each group alphabetically (case-insensitive). The
+   draw routine inserts a section header at the boundary so the user
+   sees "Programming / ligatures" vs "Classic monospace" labels. */
+static int cmp_font_grouped(const void *a, const void *b) {
+    const FontEntry *fa = (const FontEntry *)a;
+    const FontEntry *fb = (const FontEntry *)b;
+    if (fa->ligatures != fb->ligatures)
+        return fb->ligatures ? +1 : -1;        /* ligatures group first */
+    return strcasecmp(fa->name, fb->name);
+}
+
+/* ---------- Picker row ↔ font-index mapping ---------------------------
+   Both font pickers (Settings → Font and the SSH form's font tab) draw
+   one row per font *plus* a section header before each group. The row
+   ↔ font-index mapping has to skip those header rows for click
+   hit-tests and scroll math. These helpers centralise that bookkeeping
+   so each picker reads identical. */
+
+static int font_classic_first_idx(void) {
+    for (int i = 0; i < g_font_count; i++)
+        if (!g_fonts[i].ligatures) return i;
+    return g_font_count;
+}
+
+/* Total number of *displayed* rows (fonts + section headers). */
+static int font_display_row_count(void) {
+    int classic = font_classic_first_idx();
+    int headers = (classic > 0)             /* "Programming / ligatures" */
+                + (classic < g_font_count); /* "Classic monospace"        */
+    return g_font_count + headers;
+}
+
+/* Convert a displayed row index to a font index, or -1 if the row is a
+   section header. Inverse of font_idx_to_display. */
+static int font_display_to_idx(int row) {
+    if (row < 0) return -1;
+    int classic = font_classic_first_idx();
+    bool has_lig = (classic > 0);
+    bool has_cla = (classic < g_font_count);
+    int r = row;
+    if (has_lig) {
+        if (r == 0) return -1;          /* ligature group header */
+        r -= 1;
+    }
+    if (has_lig && has_cla && r == classic) return -1;   /* classic header */
+    if (has_lig && has_cla && r > classic) r -= 1;
+    if (!has_lig && has_cla && r == 0) return -1;        /* classic header (no lig group) */
+    if (!has_lig && has_cla && r > 0)  r -= 1;
+    if (r < 0 || r >= g_font_count) return -1;
+    return r;
+}
+
+/* Convert a font index to its displayed row. Used for "scroll-to-selected". */
+static int font_idx_to_display(int idx) {
+    if (idx < 0 || idx >= g_font_count) return -1;
+    int classic = font_classic_first_idx();
+    bool has_lig = (classic > 0);
+    bool has_cla = (classic < g_font_count);
+    int row = idx;
+    if (has_lig) row += 1;                          /* skip ligature header */
+    if (has_lig && has_cla && idx >= classic) row += 1;  /* skip classic header */
+    if (!has_lig && has_cla) row += 1;              /* skip classic header (no lig group) */
+    return row;
+}
+
+/* If `row` is a header row, return its caption string; else NULL. */
+static const char *font_header_at_row(int row) {
+    int classic = font_classic_first_idx();
+    bool has_lig = (classic > 0);
+    bool has_cla = (classic < g_font_count);
+    if (has_lig && row == 0)
+        return "Programming / ligatures";
+    int r = row - (has_lig ? 1 : 0);
+    if (has_lig && has_cla && r == classic) return "Classic monospace";
+    if (!has_lig && has_cla && row == 0)    return "Classic monospace";
+    return NULL;
 }
 
 /* Case-insensitive ends-with check — used to filter for .ttf /
@@ -8382,9 +8522,11 @@ static void scan_font_dir(const char *dir) {
             if (strcmp(g_fonts[j].name, trimmed_w) == 0) { dup_w = true; break; }
         if (dup_w) continue;
         FontEntry *f = &g_fonts[g_font_count++];
+        memset(f, 0, sizeof(*f));
         snprintf(f->path, sizeof(f->path), "%s/%s", dir, name);
         strncpy(f->name, trimmed_w, sizeof(f->name) - 1);
         f->name[sizeof(f->name) - 1] = 0;
+        f->ligatures = font_has_ligatures(f->name, f->path);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
@@ -8409,9 +8551,11 @@ static void scan_font_dir(const char *dir) {
             if (strcmp(g_fonts[j].name, trimmed) == 0) { dup = true; break; }
         if (dup) continue;
         FontEntry *f = &g_fonts[g_font_count++];
+        memset(f, 0, sizeof(*f));
         snprintf(f->path, sizeof(f->path), "%s/%s", dir, name);
         strncpy(f->name, trimmed, sizeof(f->name) - 1);
         f->name[sizeof(f->name) - 1] = 0;
+        f->ligatures = font_has_ligatures(f->name, f->path);
     }
     closedir(dp);
 #endif
@@ -8460,6 +8604,7 @@ static void scan_embedded_fonts(void) {
         f->data      = k_embedded_fonts[i].data;
         f->data_size = k_embedded_fonts[i].data_size;
         strncpy(f->ext, k_embedded_fonts[i].ext, sizeof(f->ext) - 1);
+        f->ligatures = font_has_ligatures(f->name, NULL);
         f->ext[sizeof(f->ext) - 1] = 0;
     }
 }
@@ -8544,7 +8689,7 @@ static void fonts_load(const char *current_path) {
     expand_home_path("~/.fonts", user_fonts, sizeof(user_fonts));
     scan_font_dir(user_fonts);
 #endif
-    qsort(g_fonts, g_font_count, sizeof(FontEntry), cmp_font_name);
+    qsort(g_fonts, g_font_count, sizeof(FontEntry), cmp_font_grouped);
     /* Mark the currently-loaded font if it's in the list. */
     if (current_path) {
         for (int i = 0; i < g_font_count; i++) {
@@ -9057,7 +9202,8 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     if (rect_hit(L.spc_inc, mx, my)) { settings_apply_spacing(r, r->cell_extra_w + 1); return; }
     if (rect_hit(L.font_list, mx, my)) {
         int row_h = 22;
-        int idx = (my - L.font_list.y) / row_h + g_font_list_scroll;
+        int row = (my - L.font_list.y) / row_h + g_font_list_scroll;
+        int idx = font_display_to_idx(row);
         if (idx >= 0 && idx < g_font_count) {
             g_font_list_selected = idx;
             settings_apply_font(r, &g_fonts[idx]);
@@ -11379,17 +11525,32 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                    12, 0, (Color){140, 145, 160, 255});
     } else {
         int row_h = 22;
+        int total_rows = font_display_row_count();
         int visible = L.font_list.h / row_h;
-        int max_scroll = g_font_count - visible;
+        int max_scroll = total_rows - visible;
         if (max_scroll < 0) max_scroll = 0;
         if (g_font_list_scroll > max_scroll) g_font_list_scroll = max_scroll;
         if (g_font_list_scroll < 0) g_font_list_scroll = 0;
         BeginScissorMode(L.font_list.x + 2, L.font_list.y + 2,
                          L.font_list.w - 4, L.font_list.h - 4);
-        for (int i = 0; i < g_font_count; i++) {
-            int ry = L.font_list.y + (i - g_font_list_scroll) * row_h;
+        for (int row = 0; row < total_rows; row++) {
+            int ry = L.font_list.y + (row - g_font_list_scroll) * row_h;
             if (ry + row_h < L.font_list.y || ry > L.font_list.y + L.font_list.h)
                 continue;
+            const char *header = font_header_at_row(row);
+            if (header) {
+                /* Section header — non-clickable, dim accent + tiny
+                   underline so it stands apart from font rows. */
+                DrawTextEx(*f, header,
+                           (Vector2){L.font_list.x + 8, ry + 5},
+                           12, 0, (Color){145, 165, 195, 255});
+                DrawRectangle(L.font_list.x + 8, ry + row_h - 2,
+                              L.font_list.w - 16, 1,
+                              (Color){70, 80, 100, 200});
+                continue;
+            }
+            int i = font_display_to_idx(row);
+            if (i < 0) continue;
             bool sel = (i == g_font_list_selected);
             if (sel) {
                 DrawRectangle(L.font_list.x + 2, ry,
@@ -11419,9 +11580,9 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                            : (Color){200, 205, 220, 255});
         }
         EndScissorMode();
-        if (g_font_count > visible) {
+        if (total_rows > visible) {
             int track_x = L.font_list.x + L.font_list.w - 5;
-            int bar_h = L.font_list.h * visible / g_font_count;
+            int bar_h = L.font_list.h * visible / total_rows;
             if (bar_h < 24) bar_h = 24;
             int bar_y = L.font_list.y +
                         (L.font_list.h - bar_h) * g_font_list_scroll /
