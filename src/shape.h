@@ -41,14 +41,23 @@ typedef struct {
 typedef struct ShapeFont ShapeFont;
 
 /* Per-glyph rasterised bitmap cache entry. Glyph_id keyed; reused for
-   the lifetime of the font. */
+   the lifetime of the font.
+
+   The bitmap is rasterised at a higher pixel density (oversample) so
+   raylib's bilinear filter can downsample crisply at draw time —
+   matching how raylib's own atlas works. Display dimensions and
+   bearings are at 1× (cell coordinates); width/height are stored at
+   the rasterised pixel density and the renderer scales the dst rect
+   to display_w / display_h. */
 typedef struct {
     uint32_t glyph_id;
     void *texture;           /* raylib Texture2D* (opaque to keep this header raylib-free) */
-    int   width;             /* pixel dims of the rasterised bitmap */
-    int   height;
-    int   bearing_x;         /* x advance from cluster origin to bitmap left */
-    int   bearing_y;         /* y advance from cluster origin to bitmap top  */
+    int   width;             /* texture pixel width  (oversample) */
+    int   height;            /* texture pixel height (oversample) */
+    int   display_w;         /* on-screen width  in cell-coordinate pixels */
+    int   display_h;         /* on-screen height in cell-coordinate pixels */
+    int   bearing_x;         /* offset from cluster origin to bitmap left (1×) */
+    int   bearing_y;         /* offset from baseline    to bitmap top  (1×, negative for ascenders) */
     bool  ok;
     bool  failed;            /* sticky — don't keep retrying on miss */
 } ShapeGlyph;
@@ -94,3 +103,9 @@ ShapeGlyph *shape_render_glyph(ShapeFont *sf, uint32_t glyph_id);
    be rendered instead of the per-codepoint atlas glyph. Returns 0
    if no glyph maps to this codepoint or shape isn't available. */
 uint32_t shape_natural_glyph_id(ShapeFont *sf, uint32_t codepoint);
+
+/* The font's ascent in pixels at the configured pixel size. The
+   renderer needs this to compute the on-screen baseline for a
+   ligature glyph: cell_top + ascent + glyph.bearing_y is the y of
+   the bitmap's top edge. */
+int shape_font_ascent_px(ShapeFont *sf);

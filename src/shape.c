@@ -17,6 +17,11 @@
 
 #define GLYPH_CACHE_INIT 64
 
+/* Glyph rasterisation oversample factor. Match raylib's atlas (which
+   builds at font_size * 3 then downsamples) so ligature glyphs blend
+   into surrounding text at the same crispness. */
+#define SHAPE_OVERSAMPLE 3
+
 struct ShapeFont {
     /* HarfBuzz: shape_row asks hb_shape() for the OpenType-driven
        cluster output. */
@@ -29,9 +34,10 @@ struct ShapeFont {
        raylib's atlas is keyed by codepoint and can't reach
        codepointless ligature glyphs. */
     stbtt_fontinfo info;
-    float scale;             /* px-per-em derived from pixel_size */
+    float scale;             /* 1× px-per-em — used for bearings  */
+    float scale_hi;          /* SHAPE_OVERSAMPLE× — used for bitmaps */
     int   pixel_size;
-    int   ascent_px;         /* baseline offset within a cell */
+    int   ascent_px;         /* baseline offset within a cell (1×) */
 
     /* Per-glyph_id cache — small open-hash, linear probe. Glyph IDs
        are 16-bit OpenType so collisions are exceedingly rare even at
@@ -77,7 +83,9 @@ ShapeFont *shape_font_open(const unsigned char *font_data,
         goto fail;
     }
     sf->pixel_size = pixel_size;
-    sf->scale = stbtt_ScaleForPixelHeight(&sf->info, (float)pixel_size);
+    sf->scale    = stbtt_ScaleForPixelHeight(&sf->info, (float)pixel_size);
+    sf->scale_hi = stbtt_ScaleForPixelHeight(&sf->info,
+                                             (float)pixel_size * SHAPE_OVERSAMPLE);
     int ascent, descent, line_gap;
     stbtt_GetFontVMetrics(&sf->info, &ascent, &descent, &line_gap);
     sf->ascent_px = (int)((float)ascent * sf->scale);
@@ -213,27 +221,29 @@ ShapeGlyph *shape_render_glyph(ShapeFont *sf, uint32_t glyph_id) {
     if (!e) return NULL;
     if (e->ok || e->failed) return e;
 
-    /* Rasterise via stb_truetype's glyph-id API. Returns 1-channel
-       (alpha) bitmap data. */
-    int x0, y0, x1, y1;
-    stbtt_GetGlyphBitmapBox(&sf->info, (int)glyph_id, sf->scale, sf->scale,
-                            &x0, &y0, &x1, &y1);
-    int w = x1 - x0, h = y1 - y0;
-    if (w <= 0 || h <= 0) {
+    /* Rasterise via stb_truetype at SHAPE_OVERSAMPLE× the display
+       size; the renderer draws at 1× and bilinear-filters down for
+       the same crispness raylib gets from its 3× atlas. */
+    int hx0, hy0, hx1, hy1;
+    stbtt_GetGlyphBitmapBox(&sf->info, (int)glyph_id,
+                            sf->scale_hi, sf->scale_hi,
+                            &hx0, &hy0, &hx1, &hy1);
+    int hw = hx1 - hx0, hh = hy1 - hy0;
+    if (hw <= 0 || hh <= 0) {
         /* Empty glyph (e.g. .notdef). Mark failed so we skip on retry. */
         e->failed = true;
         return e;
     }
-    unsigned char *alpha = malloc((size_t)w * h);
+    unsigned char *alpha = malloc((size_t)hw * hh);
     if (!alpha) { e->failed = true; return e; }
-    stbtt_MakeGlyphBitmap(&sf->info, alpha, w, h, w,
-                          sf->scale, sf->scale, (int)glyph_id);
+    stbtt_MakeGlyphBitmap(&sf->info, alpha, hw, hh, hw,
+                          sf->scale_hi, sf->scale_hi, (int)glyph_id);
 
     /* Convert single-channel alpha to RGBA so raylib's textured-quad
        path can blend it. R = G = B = 255 (white), A = the bitmap. */
-    unsigned char *rgba = malloc((size_t)w * h * 4);
+    unsigned char *rgba = malloc((size_t)hw * hh * 4);
     if (!rgba) { free(alpha); e->failed = true; return e; }
-    for (int p = 0; p < w * h; p++) {
+    for (int p = 0; p < hw * hh; p++) {
         rgba[p * 4 + 0] = 255;
         rgba[p * 4 + 1] = 255;
         rgba[p * 4 + 2] = 255;
@@ -241,7 +251,7 @@ ShapeGlyph *shape_render_glyph(ShapeFont *sf, uint32_t glyph_id) {
     }
     free(alpha);
 
-    Image img = { rgba, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+    Image img = { rgba, hw, hh, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
     Texture2D tex = LoadTextureFromImage(img);
     UnloadImage(img);   /* frees rgba */
     if (tex.id == 0) { e->failed = true; return e; }
@@ -254,12 +264,22 @@ ShapeGlyph *shape_render_glyph(ShapeFont *sf, uint32_t glyph_id) {
         return e;
     }
     *(Texture2D *)e->texture = tex;
-    e->width    = w;
-    e->height   = h;
-    e->bearing_x = x0;
-    e->bearing_y = y0;
-    e->ok        = true;
+    /* width/height = oversampled bitmap dims. display_w/h = the same
+       in cell coordinates (i.e. divided by oversample) so the
+       renderer's dst rect lands at 1× while sampling from the
+       oversampled atlas. */
+    e->width      = hw;
+    e->height     = hh;
+    e->display_w  = (hw + SHAPE_OVERSAMPLE - 1) / SHAPE_OVERSAMPLE;
+    e->display_h  = (hh + SHAPE_OVERSAMPLE - 1) / SHAPE_OVERSAMPLE;
+    e->bearing_x  = hx0 / SHAPE_OVERSAMPLE;
+    e->bearing_y  = hy0 / SHAPE_OVERSAMPLE;
+    e->ok         = true;
     return e;
+}
+
+int shape_font_ascent_px(ShapeFont *sf) {
+    return sf ? sf->ascent_px : 0;
 }
 
 #else  /* !RBTERM_HAVE_HARFBUZZ — stub path */
@@ -285,5 +305,6 @@ uint32_t shape_natural_glyph_id(ShapeFont *sf, uint32_t codepoint) {
     (void)sf; (void)codepoint;
     return 0;
 }
+int shape_font_ascent_px(ShapeFont *sf) { (void)sf; return 0; }
 
 #endif  /* RBTERM_HAVE_HARFBUZZ */

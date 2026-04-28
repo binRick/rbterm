@@ -985,14 +985,25 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                         Texture2D *tex = (Texture2D *)sg->texture;
                         int sp = lig_span[x];
                         int total_w = sp * cw;
-                        /* Centre the ligature glyph horizontally
-                           inside the cluster's cell footprint. */
-                        float dst_x = (float)(x * cw + (total_w - sg->width) / 2);
+                        int ascent = shape_font_ascent_px(
+                            (ShapeFont *)r->shape_font);
+                        /* The font's baseline within a cell is at
+                           cell_top + glyph_y_offset + ascent. The
+                           glyph bitmap's top sits bearing_y above
+                           that (bearing_y is negative for ascenders).
+                           Horizontally we centre the bitmap inside
+                           the cluster's footprint. Drawing at
+                           display_w / display_h scales the
+                           oversampled atlas back to 1×; raylib's
+                           bilinear filter on the texture yields
+                           the same crispness as the codepoint atlas. */
+                        float dst_x = (float)(x * cw + (total_w - sg->display_w) / 2);
                         float dst_y = (float)(y * ch + glyph_y_offset
-                                              + (r->font_size + sg->bearing_y));
+                                              + ascent + sg->bearing_y);
                         Rectangle src = { 0, 0, (float)sg->width, (float)sg->height };
                         Rectangle dst = { dst_x, dst_y,
-                                          (float)sg->width, (float)sg->height };
+                                          (float)sg->display_w,
+                                          (float)sg->display_h };
                         DrawTexturePro(*tex, src, dst, (Vector2){0, 0}, 0.0f,
                                        col_from_rgb(fg, alpha));
                     }
