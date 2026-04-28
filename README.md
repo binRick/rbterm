@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="assets/icon.png" width="96" alt="rbterm icon"><br>
-  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary with split panes, inline sixel + kitty graphics, session recording (native gif + webp), <strong>20 cinema/hardware effect presets</strong> (Nostromo, HAL 9000, Tron, Matrix, Game Boy, …) with live phosphor decay, live system-info HUD (local + remote-over-SSH), OSC 8 hyperlinks, OSC 133 success/failure gutter, 252 themes and 31 monospace fonts baked in.</em>
+  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary with split panes, inline sixel + kitty graphics, session recording (native gif + webp), <strong>20 cinema/hardware effect presets</strong> (Nostromo, HAL 9000, Tron, Matrix, Game Boy, …) with live phosphor decay, live system-info HUD (local + remote-over-SSH), OSC 8 hyperlinks, OSC 133 success/failure gutter, 252 themes and 37 monospace fonts baked in.</em>
 </p>
 
 <p align="center"><img src="docs/screenshot.png" alt="rbterm screenshot — two panes, system-info HUD in the corner, prompt-status gutter badges, baked-in theme and font"></p>
@@ -33,14 +33,18 @@ at link time**:
 - **252 colour palette themes** baked in as `static const` C arrays
   via a tiny generator that walks the [`pal`](https://github.com/binRick/pal)
   submodule.
-- **31 monospace fonts** (JetBrains Mono, Fira Code, Hack, Monaspace
+- **37 monospace fonts** (JetBrains Mono, Fira Code, Hack, Monaspace
   Argon/Krypton/Neon/Radon/Xenon ± Nerd Font icons, terroo mono
-  family, Arabic/Persian hybrid variants, etc.) pulled in with
-  `.incbin` on Unix and RCDATA resources on Windows, so the
-  executable carries them as raw bytes — no `fonts/` folder beside
-  the binary, no runtime download. `make app` on macOS produces a
-  single self-contained `.app` you can drag and drop; the
-  Linux/Windows release zips are likewise standalone.
+  family, Arabic/Persian hybrid variants, plus the new ligature
+  set: Hasklig, Victor Mono, Maple Mono, 0xProto, Recursive Mono,
+  Intel One Mono) pulled in with `.incbin` on Unix and RCDATA
+  resources on Windows, so the executable carries them as raw
+  bytes — no `fonts/` folder beside the binary, no runtime
+  download. The settings font picker groups ligature-capable fonts
+  at the top under a "Programming / ligatures" header so you can
+  spot them at a glance. `make app` on macOS produces a single
+  self-contained `.app` you can drag and drop; the Linux/Windows
+  release zips are likewise standalone.
 
 The result is a 13 MB single-file terminal that opens instantly,
 runs with one process per window, has zero non-system dependencies

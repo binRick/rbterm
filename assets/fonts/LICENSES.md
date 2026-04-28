@@ -26,6 +26,12 @@ see the linked repos for the full licence text.
 | SF Mono            | Apple system font                                     | Apple system font licence |
 | Noto Mono          | https://fonts.google.com/noto/specimen/Noto+Sans+Mono | OFL-1.1               |
 | Hybrid Mono Fonts (FiraCode + JetBrains Mono × Kawkab/Vazir Arabic + Persian) | https://github.com/ghazyami/hybrid-mono-fonts | OFL-1.1 |
+| Hasklig            | https://github.com/i-tu/Hasklig                       | OFL-1.1               |
+| Victor Mono        | https://github.com/rubjo/victor-mono                  | OFL-1.1               |
+| Maple Mono         | https://github.com/subframe7536/maple-font            | OFL-1.1               |
+| 0xProto            | https://github.com/0xType/0xProto                     | OFL-1.1               |
+| Recursive Mono     | https://github.com/arrowtype/recursive                | MIT (font is OFL-1.1) |
+| Intel One Mono     | https://github.com/intel/intel-one-mono               | OFL-1.1               |
 
 None of the bundled files have been modified from upstream. If you
 redistribute rbterm you need to preserve the licence notices.
