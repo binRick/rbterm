@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="assets/icon.png" width="96" alt="rbterm icon"><br>
-  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary with split panes, inline sixel + kitty graphics, session recording (native gif + webp), live system-info HUD (local + remote-over-SSH), OSC 8 hyperlinks, OSC 133 success/failure gutter, 252 themes and 31 monospace fonts baked in.</em>
+  <em>A cross-platform terminal emulator written in <strong>pure C99</strong>, rendered with <strong>raylib</strong>. Single self-contained binary with split panes, inline sixel + kitty graphics, session recording (native gif + webp), <strong>20 cinema/hardware effect presets</strong> (Nostromo, HAL 9000, Tron, Matrix, Game Boy, …) with live phosphor decay, live system-info HUD (local + remote-over-SSH), OSC 8 hyperlinks, OSC 133 success/failure gutter, 252 themes and 31 monospace fonts baked in.</em>
 </p>
 
 <p align="center"><img src="docs/screenshot.png" alt="rbterm screenshot — two panes, system-info HUD in the corner, prompt-status gutter badges, baked-in theme and font"></p>
@@ -123,6 +123,51 @@ raylib emits no draw calls when nothing has changed. The CPU's only
 job each frame is walking the cell grid, parsing PTY input through a
 hand-written DFA, and handing rlgl the vertex data; the rest is
 pixels on the GPU.
+
+## Cinema-grade effects — 20 presets, live phosphor trails
+
+rbterm ships with a fragment shader that turns any pane into a
+piece of computing history: classic green CRT, amber industrial
+readout, dot-matrix LCD, lo-fi VHS, neon-glow cyberpunk. Eight knobs
+(CRT scanlines + curvature + RGB aperture mask + vignette /
+phosphor mono-tint / bloom / VHS jitter + tape lines / glitch
+slice-scramble / film grain / halftone dot mask / phosphor decay)
+combine into a single fullscreen-quad pass. Bright pixels persist
+across frames as fading trails via a ping-pong RT and a `u_prev`
+sampler, so HAL 9000-style ghosting actually ghosts.
+
+The interesting bit is how few hooks it has into anything else. The
+existing per-pane render writes into a `RenderTexture2D` instead of
+straight to the window; the shader pass blits it back through one
+GLSL 330 program, ping-ponging two RTs so this frame samples last
+frame as `texture1`. UI overlays (search, URL highlights, HUD,
+recording badge) draw on top of the effected output in screen-space
+so they stay sharp and readable. Disable every effect and the
+RTs are released — there's no overhead until you opt in.
+
+Twenty curated presets ship in the box, organised by category:
+
+| | | |
+|---|---|---|
+| **Movie / TV** | Nostromo (Alien, 1979) | HAL 9000 (2001, 1968) |
+| | Tron (1982) | Matrix operator |
+| | WarGames WOPR | RoboCop OCP |
+| | Black Mirror title | Dune (Villeneuve) |
+| **Hardware** | VT100 | Amber CRT |
+| | Game Boy DMG | Commodore 64 |
+| | Apollo DSKY | Newsroom CRT |
+| **Vibes** | VHS tape | Cyberpunk |
+| | Surveillance feed | Newsprint / risograph |
+| | Static / dead signal | Off (clear) |
+
+Each preset is one click — Settings → **Effects** tab, or
+Cmd+Shift+T → **Effects** tab to scope them per-SSH-host. Per-host
+overrides survive as `# rbterm-effects-*` comments in
+`~/.ssh/config` that plain ssh ignores, so opening `mia` can light
+up the screen as a 1979 Nostromo console while `prod-bastion`
+stays plain green VT100 and `playground` looks like a Game Boy. The
+session recording's save modal has the same effects panel, so you
+can bake any look into the rendered .gif / .mp4 / .webp.
 
 ## Session recording — seven formats, two of them ffmpeg-free
 
@@ -380,8 +425,10 @@ drains every pane's PTY each frame so background tabs stay live.
 
 ## Performance — fastest of the field on 9 of 10 benchmarks
 
-~25k lines of straight C99, hand-tuned, no GPU shaders, no
-runtime, no scripting language — and on real
+~25k lines of straight C99, hand-tuned, no runtime, no scripting
+language, no shaders in the text-render hot path (the cinema-look
+effects shader is opt-in and only runs when a pane has it
+enabled) — and on real
 [alacritty/vtebench](https://github.com/alacritty/vtebench) numbers
 **rbterm beats every other terminal on 9 of 10 PTY-drain
 benchmarks**, against alacritty, kitty, iTerm2, and macOS
@@ -634,10 +681,22 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   automatically show the *remote* host's stats via a dedicated
   probe thread. See **[System-info HUD](#system-info-hud--local-and-remote-in-the-corner-of-every-pane)**
   above for how it's wired.
+- **Cinema-grade visual effects.** Eight-knob fragment shader
+  (CRT scanlines + curvature + RGB aperture mask + vignette /
+  monochrome phosphor / bloom / VHS jitter / glitch slice-scramble
+  / film grain / halftone / phosphor decay) with **20 curated
+  presets**: Nostromo, HAL 9000, Tron, Matrix, WarGames, RoboCop,
+  Black Mirror, Dune, Game Boy DMG, Commodore 64, Apollo DSKY,
+  Cyberpunk, and more. Live phosphor decay via a ping-pong
+  RenderTexture so trails persist across frames. Settings → Effects
+  for the global default; Cmd+Shift+T → Effects for per-host
+  overrides; the recording save modal has the same panel.
 - **Session recording with native encoders.** Capture any pane to
   one of seven formats — `cast` / `txt` / `gif` / `webp` work
   without ffmpeg; `mp4` / `webm` / `apng` use ffmpeg if it's on
-  PATH. See **[Session recording](#session-recording--seven-formats-two-of-them-ffmpeg-free)**
+  PATH. The save modal includes the same effects panel as Settings,
+  so you can bake any look into the rendered file. See
+  **[Session recording](#session-recording--seven-formats-two-of-them-ffmpeg-free)**
   above for the pipeline.
 - **SFTP upload + download** — every SSH tab grows ↑/↓ buttons
   in the tab bar's right cluster. Upload streams a local file
@@ -648,10 +707,14 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
   above.
 - **SSH host overrides** — every saved host in `~/.ssh/config`
   can specify its own theme, font + size, cursor shape, tab
-  accent colour, log dir, HUD overrides, and `init dir` /
-  `init command` (run on connect: `cd ~/projects; tmux attach`,
-  etc.). All persisted as `# rbterm-…:` comments inside the
-  host's stanza so plain `ssh` keeps working.
+  accent colour, log dir, HUD overrides, **visual-effect preset**
+  (e.g. `# rbterm-effects-phosphor: green` + `# rbterm-effects-decay: 0.65`
+  for HAL 9000 on a single host), and `init dir` / `init command`
+  (run on connect: `cd ~/projects; tmux attach`, etc.). All
+  persisted as `# rbterm-…:` comments inside the host's stanza so
+  plain `ssh` keeps working. The SSH form's saved-host picker has
+  a **Clone** button that duplicates a host (with all its
+  overrides) under a new name in one click.
 - **Configurable launch tabs** — Settings → Launch lets you pick
   which tabs open on startup: any mix of local shells and SSH
   hosts, in any order (▲/▼ to reorder, × to delete, radio per row
@@ -687,7 +750,7 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 | Cmd+Shift+T | New tab over SSH (PuTTY-style form) |
 | Cmd+N | New rbterm window (new process) |
 | Cmd+W | Close active tab (or pane, if split) |
-| Cmd+, | Settings — six tabs: Font / Theme / Cursor / Session / Window / Recording |
+| Cmd+, | Settings — ten tabs: Font / Theme / Cursor / Effects / Session / Window / Recording / HUD / Launch / Keys |
 | Cmd+1..9 | Jump to tab N |
 | Cmd+[ / Cmd+] | Prev / next tab |
 | Cmd+Left / Cmd+Right | Prev / next tab |

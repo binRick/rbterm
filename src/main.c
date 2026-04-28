@@ -3,6 +3,7 @@
 #include "gif_encoder.h"
 #include "webp_encoder.h"
 #include "hud.h"
+#include "rec_effects.h"
 #include <stdarg.h>
 #include "screen.h"
 #include "render.h"
@@ -216,6 +217,14 @@ typedef struct {
     } launch[LAUNCH_ENTRY_MAX];
     int  launch_count;
     int  launch_active;     /* row index that becomes the active tab on startup */
+
+    /* Default visual effects applied to every new pane's live render.
+       SSH panes inherit this then have any matching `# rbterm-effects-*`
+       directive from ~/.ssh/config layered on top. The `speed` field
+       is unused for live rendering — it only matters during recording
+       playback — but we keep it in the struct so the same RecEffects
+       type works in both contexts. */
+    RecEffects effects;
 } AppSettings;
 
 /* SSH key inventory — populated by ssh_keys_rescan from ~/.ssh.
@@ -403,6 +412,11 @@ static void config_load_into_defaults(void) {
             int vi = atoi(v);
             if (vi < 0) vi = 0;
             g_app_settings.launch_active = vi;
+        } else if (strncmp(k, "effects.", 8) == 0) {
+            /* effects.<name>=<value> — pixel-effect default, parsed
+               via the shared helper so config-file and SSH-stanza
+               readers handle the same set of keys identically. */
+            rec_effects_set(&g_app_settings.effects, k + 8, v);
         } else if (strncmp(k, "launch.", 7) == 0) {
             /* launch.<i>=local | ssh:<alias>. Index is informational
                for humans editing the file; we always append in the
@@ -482,6 +496,17 @@ static bool config_save(Renderer *r) {
     if (g_app_settings.launch_count > 0) {
         fprintf(fp, "launch_active=%d\n", g_app_settings.launch_active);
     }
+    /* Visual effects — only emitted when something has been customised
+       so a vanilla install's config stays compact. */
+    if (!rec_effects_is_default(&g_app_settings.effects)) {
+        for (int i = 0; rec_effects_keys[i]; i++) {
+            char buf[32];
+            if (rec_effects_format(&g_app_settings.effects,
+                                   rec_effects_keys[i], buf, sizeof(buf))) {
+                fprintf(fp, "effects.%s=%s\n", rec_effects_keys[i], buf);
+            }
+        }
+    }
     fclose(fp);
 #ifndef _WIN32
     chmod(path, 0600);
@@ -508,6 +533,7 @@ static void app_settings_init(void) {
     }
     g_app_settings.hud_show_cpu = true;
     g_app_settings.hud_collapsed = false;
+    rec_effects_defaults(&g_app_settings.effects);
     const char *home = getenv("HOME");
 #ifdef _WIN32
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -650,6 +676,28 @@ typedef struct {
        concurrently; the toast block renders both stacked. */
     PtyDownload *download;
     double       download_done_at;
+
+    /* Per-pane visual effects (CRT / phosphor / VHS / etc.) applied
+       to the live render. New panes seed from g_app_settings.effects;
+       SSH panes also overlay any `# rbterm-effects-*` directives from
+       the matching ~/.ssh/config stanza. The shader pass is owned by
+       rec_effects.c and short-circuits when every effect is at its
+       neutral value, so the cost when disabled is one struct check
+       per frame. */
+    RecEffects effects;
+
+    /* Lazy-allocated render target the shader writes to. .id == 0
+       means "not allocated yet" (zero-init from memset is safe). The
+       size tracks the last-drawn pane rect so resize triggers a
+       reallocation. Freed in pane_free; reused across frames. */
+    RenderTexture2D fx_rt;
+    /* Previous-frame output for the phosphor-decay shader stage.
+       Live-render path ping-pongs between fx_rt and fx_prev each
+       frame: this frame writes to whichever is "current", reads
+       from the other as `texture1` so trails stay readable. Both
+       are freed together. */
+    RenderTexture2D fx_prev;
+    int             fx_rt_w, fx_rt_h;
 } Pane;
 
 typedef enum {
@@ -696,6 +744,13 @@ typedef struct {
        fall back to g_app_settings; render code goes through
        hud_effective(t) so it doesn't have to branch. */
     HudConfig ssh_hud;
+    /* Per-host visual-effect overrides. ssh_effects_override mirrors
+       the parsed `# rbterm-effects-*` directives — when set, every
+       pane on this tab gets ssh_effects copied in instead of the
+       global default; splits inherit cleanly because pane_apply_*
+       reads from the Tab. */
+    bool       ssh_effects_override;
+    RecEffects ssh_effects;
     /* Per-host startup commands, sent to the shell right after the
        channel opens. Empty = no-op. See ssh_form's matching fields. */
     char  ssh_init_cwd[256];
@@ -751,7 +806,7 @@ typedef enum {
 typedef enum {
     F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
     F_INIT_CWD, F_INIT_CMD,
-    F_NEW, F_CONNECT, F_DELETE, F_SAVE, F_CANCEL,
+    F_NEW, F_CONNECT, F_DELETE, F_CLONE, F_SAVE, F_CANCEL,
     F_COUNT
 } SshField;
 #define F_TEXT_FIELDS 8    /* name, host, port, user, pass, key, init_cwd, init_cmd */
@@ -770,6 +825,13 @@ typedef struct {
     char color[16];          /* "#rrggbb" tab accent colour; empty = none */
     char cursor_color[16];   /* "#rrggbb" cursor colour; empty = inherit */
     HudConfig hud;           /* per-host HUD override (override flag gates use) */
+    /* Per-host visual-effect override. effects_override flips on the
+       first time the user touches anything in the form's effects
+       panel; without it the SSH stanza is written without
+       `# rbterm-effects-*` lines and the host inherits the global
+       default. */
+    bool       effects_override;
+    RecEffects effects;
     char key[512];
     /* Per-host startup commands. After the SSH session opens we
        send `cd <init_cwd>; <init_cmd>\\r` to the remote shell so
@@ -820,6 +882,56 @@ typedef struct {
     int x, y, w, h;
 } Rect;
 
+/* ---------- Visual-effect picker shared widgets ----------------------------
+   Both the rec-save modal, the Settings → Effects tab, and the SSH
+   form's per-host effects panel show the same six sliders + Phosphor
+   picker. The enum + label helpers are declared here so every layout
+   below (SshFormLayout, SettingsLayout, RecSaveLayout) can size its
+   slider arrays from EFX_SLIDER_COUNT. */
+
+typedef enum {
+    EFX_SLIDER_CRT = 0,
+    EFX_SLIDER_BLOOM,
+    EFX_SLIDER_GRAIN,
+    EFX_SLIDER_VHS,
+    EFX_SLIDER_GLITCH,
+    EFX_SLIDER_HALFTONE,
+    EFX_SLIDER_COUNT
+} EfxSlider;
+
+#define EFX_SPEED_COUNT 5     /* 0.5× / 1× / 2× / 4× / 8× — rec-save only */
+
+/* Slider order on screen: left column top-down, then right column. */
+static const EfxSlider k_efx_left_col[3]  = { EFX_SLIDER_CRT,   EFX_SLIDER_BLOOM,  EFX_SLIDER_GRAIN };
+static const EfxSlider k_efx_right_col[3] = { EFX_SLIDER_VHS,   EFX_SLIDER_GLITCH, EFX_SLIDER_HALFTONE };
+
+static const float k_speed_values[EFX_SPEED_COUNT] = { 0.5f, 1.0f, 2.0f, 4.0f, 8.0f };
+static const char *k_speed_labels[EFX_SPEED_COUNT] = { "0.5x", "1x", "2x", "4x", "8x" };
+
+static const char *efx_slider_label(EfxSlider s) {
+    switch (s) {
+    case EFX_SLIDER_CRT:      return "CRT";
+    case EFX_SLIDER_BLOOM:    return "Bloom";
+    case EFX_SLIDER_GRAIN:    return "Grain";
+    case EFX_SLIDER_VHS:      return "VHS";
+    case EFX_SLIDER_GLITCH:   return "Glitch";
+    case EFX_SLIDER_HALFTONE: return "Halftone";
+    default:                  return "?";
+    }
+}
+
+static float *efx_slider_value(RecEffects *e, EfxSlider s) {
+    switch (s) {
+    case EFX_SLIDER_CRT:      return &e->crt;
+    case EFX_SLIDER_BLOOM:    return &e->bloom;
+    case EFX_SLIDER_GRAIN:    return &e->grain;
+    case EFX_SLIDER_VHS:      return &e->vhs;
+    case EFX_SLIDER_GLITCH:   return &e->glitch;
+    case EFX_SLIDER_HALFTONE: return &e->halftone;
+    default:                  return NULL;
+    }
+}
+
 typedef struct {
     char name[128];        /* alias from `Host X` */
     char hostname[256];    /* HostName */
@@ -840,6 +952,13 @@ typedef struct {
     char color[16];          /* "#rrggbb" tab accent; empty = none */
     char cursor_color[16];   /* "#rrggbb" cursor colour; empty = inherit */
     HudConfig hud;           /* per-host HUD override */
+    /* Per-host visual-effect overrides. `effects_override` flips to
+       true the first time any `# rbterm-effects-*` directive is seen
+       inside the stanza; once flipped, all RecEffects fields apply
+       to new SSH panes opened against this host instead of the
+       global default. */
+    bool       effects_override;
+    RecEffects effects;
     /* Run-on-connect commands. Sent verbatim to the remote shell
        right after the channel opens. */
     char init_cwd[256];
@@ -915,13 +1034,23 @@ typedef struct {
     Rect hud_size_val[HUD_FIELD_COUNT];
     Rect hud_size_inc[HUD_FIELD_COUNT];
     Rect hud_cpu_toggle;
+    /* Effects tab — per-host visual-effect override. Layout matches
+       the Settings → Effects tab: an Override toggle, six sliders in
+       two columns, a Decay slider, a Phosphor pill row, and a Preset
+       row. */
+    Rect efx_override_btn;
+    Rect efx_slider[EFX_SLIDER_COUNT];
+    Rect efx_decay;
+    Rect efx_phos[PHOSPHOR_COUNT];
+    Rect efx_preset[EFX_PRESET_COUNT];
     /* Form-tab buttons across the top of the modal — Connection /
-       Appearance / Logging / HUD. Mirrors the Settings modal pattern. */
-    Rect form_tab[4];
+       Appearance / Logging / HUD / Effects. */
+    Rect form_tab[5];
     Rect newbtn;
     Rect testbtn;               /* dry-run auth without opening a tab */
     Rect connect;
     Rect delbtn;                /* zero-sized when not deletable */
+    Rect clonebtn;              /* zero-sized when no saved host is selected */
     Rect save;
     Rect cancel;
     /* Key-file dropdown trigger (right edge of F_KEY field) and the
@@ -947,7 +1076,8 @@ typedef enum {
     SSH_FORM_TAB_APPEARANCE = 1,
     SSH_FORM_TAB_LOGGING    = 2,
     SSH_FORM_TAB_HUD        = 3,
-    SSH_FORM_TAB_COUNT      = 4,
+    SSH_FORM_TAB_EFFECTS    = 4,
+    SSH_FORM_TAB_COUNT      = 5,
 } SshFormTabId;
 static int g_ssh_form_tab = SSH_FORM_TAB_CONNECTION;
 
@@ -984,6 +1114,10 @@ static int g_form_font_idx  = -1;
 /* True when the per-host log-dir text input is focused (so character
    keys edit the path instead of cycling fields). */
 static bool g_form_logdir_focus = false;
+
+/* Slider drag state for the SSH form's Effects tab. */
+static bool g_form_efx_drag = false;
+static int  g_form_efx_drag_idx = 0;
 
 /* Renderer is owned by main() but the SSH form and per-host connect
    path need to apply font / font-size globally when a host is selected. */
@@ -1259,6 +1393,9 @@ static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
         strncpy(p->cwd, cwd, sizeof(p->cwd) - 1);
         p->cwd[sizeof(p->cwd) - 1] = 0;
     }
+    /* Seed visual effects from the global default. SSH panes get
+       per-host overrides layered on by tab_open_ssh. */
+    p->effects = g_app_settings.effects;
     return true;
 }
 
@@ -1273,6 +1410,10 @@ static bool pane_open_ssh(Pane *p, const char *user, const char *host, int port,
                           cols, rows, err, errsz);
     if (!p->pty) return false;
     p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    /* Same seed as a local pane; the SSH-specific override path
+       layers any `# rbterm-effects-*` directives on top after the
+       host stanza is parsed. */
+    p->effects = g_app_settings.effects;
     return true;
 }
 
@@ -1309,13 +1450,20 @@ typedef enum {
     REC_FMT_COUNT
 } RecFmt;
 typedef struct {
-    char   src_path[PATH_MAX];   /* the temp .cast file already on disk */
-    double duration_s;
-    char   dst_path[PATH_MAX];   /* user-editable destination */
-    RecFmt fmt;
-    bool   path_focus;
-    bool   path_sel_all;
-    char   status[256];
+    char       src_path[PATH_MAX];   /* the temp .cast file already on disk */
+    double     duration_s;
+    char       dst_path[PATH_MAX];   /* user-editable destination */
+    RecFmt     fmt;
+    bool       path_focus;
+    bool       path_sel_all;
+    char       status[256];
+    /* Per-recording effect choices. Reset to defaults each Stop. */
+    RecEffects effects;
+    /* True while the user is dragging one of the slider thumbs in the
+       effects panel. Index identifies which slider (see EFX_SLIDER_*
+       enum near the modal layout). */
+    bool       slider_drag;
+    int        slider_drag_idx;
 } RecSave;
 static RecSave g_rec_save;
 
@@ -1342,6 +1490,15 @@ static void pane_free(Pane *p) {
     p->search.caret = 0;
     p->search.sel_anchor = -1;
     p->search.mouse_down = false;
+    if (p->fx_rt.id) {
+        UnloadRenderTexture(p->fx_rt);
+        p->fx_rt.id = 0;
+    }
+    if (p->fx_prev.id) {
+        UnloadRenderTexture(p->fx_prev);
+        p->fx_prev.id = 0;
+    }
+    p->fx_rt_w = p->fx_rt_h = 0;
 }
 
 /* JSON-escape `n` bytes from `buf` into `fp`. Per asciinema v2 the
@@ -1526,6 +1683,7 @@ static void rec_stop(void) {
     strncpy(g_rec_save.src_path, g_rec.path, sizeof(g_rec_save.src_path) - 1);
     g_rec_save.duration_s = dur;
     g_rec_save.fmt = REC_FMT_CAST;
+    rec_effects_defaults(&g_rec_save.effects);
     /* Default destination = the temp path itself (user can edit). */
     strncpy(g_rec_save.dst_path, g_rec.path, sizeof(g_rec_save.dst_path) - 1);
     g_ui_mode = UI_REC_SAVE;
@@ -1581,6 +1739,7 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const char *log_dir, int log_mode,
                          const char *color, const char *cursor_color,
                          const HudConfig *hud,
+                         const RecEffects *effects, /* NULL = no override */
                          const char *init_cwd, const char *init_cmd,
                          int cols, int rows,
                          char *err, size_t errsz) {
@@ -1619,6 +1778,10 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
         t->ssh_cursor_color[sizeof(t->ssh_cursor_color) - 1] = 0;
     }
     if (hud) t->ssh_hud = *hud;
+    if (effects) {
+        t->ssh_effects_override = true;
+        t->ssh_effects          = *effects;
+    }
     if (init_cwd) {
         strncpy(t->ssh_init_cwd, init_cwd, sizeof(t->ssh_init_cwd) - 1);
         t->ssh_init_cwd[sizeof(t->ssh_init_cwd) - 1] = 0;
@@ -1734,6 +1897,13 @@ static void pane_apply_tab_appearance(const Tab *t, Pane *p) {
             uint32_t rgb = ((uint32_t)cc.r << 16) | ((uint32_t)cc.g << 8) | cc.b;
             screen_set_cursor_color(p->scr, rgb);
         }
+    }
+    /* Per-host effects override — applied once on pane creation;
+       splits inherit because tab_split also calls this helper.
+       Without an override the pane keeps whatever it picked up
+       from g_app_settings.effects in pane_open_*. */
+    if (t->ssh_effects_override) {
+        p->effects = t->ssh_effects;
     }
 }
 
@@ -2781,15 +2951,98 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
            and rows*ch + pad — when the window height isn't a clean
            multiple of cell_h, a thin sliver at the bottom would
            otherwise show the window's black ClearBackground. */
-        {
-            uint32_t bg = screen_default_bg(p->scr);
-            Color bgc = { (unsigned char)((bg >> 16) & 0xff),
-                          (unsigned char)((bg >> 8)  & 0xff),
-                          (unsigned char)( bg        & 0xff), 255 };
-            DrawRectangle(pr.x, pr.y, pr.w, pr.h, bgc);
+        uint32_t bg = screen_default_bg(p->scr);
+        Color bgc = { (unsigned char)((bg >> 16) & 0xff),
+                      (unsigned char)((bg >> 8)  & 0xff),
+                      (unsigned char)( bg        & 0xff), 255 };
+        bool use_pane_fx = rec_effects_any_visual(&p->effects)
+                           && rec_effects_shader_ready();
+        if (use_pane_fx) {
+            /* Lazy-allocate (or resize) the per-pane RTs.
+                 fx_rt   — terminal grid renders here, then the shader
+                           pass reads from it.
+                 fx_prev — last frame's *output*, sampled as `u_prev`
+                           when decay > 0 so trails are visible. We
+                           ping-pong by swapping these two each frame:
+                           this frame writes into fx_prev (it now
+                           becomes the new output), next frame uses
+                           the old output as its trail source. */
+            if (p->fx_rt.id == 0 || p->fx_rt_w != pr.w || p->fx_rt_h != pr.h) {
+                if (p->fx_rt.id)   UnloadRenderTexture(p->fx_rt);
+                if (p->fx_prev.id) UnloadRenderTexture(p->fx_prev);
+                p->fx_rt   = LoadRenderTexture(pr.w, pr.h);
+                p->fx_prev = LoadRenderTexture(pr.w, pr.h);
+                p->fx_rt_w = pr.w;
+                p->fx_rt_h = pr.h;
+                /* Clear both so the first decay sample doesn't pull
+                   garbage into the trail. */
+                if (p->fx_prev.id) {
+                    BeginTextureMode(p->fx_prev);
+                        ClearBackground(BLACK);
+                    EndTextureMode();
+                }
+            }
+            if (p->fx_rt.id == 0) {
+                /* Allocation failed — fall back to direct draw. */
+                use_pane_fx = false;
+            }
         }
-        renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
-                      pr.x, pr.y, hcol, hrow);
+        if (use_pane_fx) {
+            /* Render the terminal grid into fx_rt (the "raw" buffer). */
+            BeginTextureMode(p->fx_rt);
+                ClearBackground(bgc);
+                renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
+                              0, 0, hcol, hrow);
+            EndTextureMode();
+            /* Then run the effects shader, sampling fx_rt as texture0
+               and fx_prev (last frame's output) as texture1 / u_prev,
+               writing to fx_prev. After the swap below, what we just
+               wrote becomes the new "last frame" for the *next* tick. */
+            rec_effects_set_uniforms_for(&p->effects, pr.w, pr.h, time_sec,
+                                         &p->fx_prev.texture);
+            if (rec_effects_begin_shader_mode()) {
+                /* Render the shader output into a *fresh* RT so we
+                   can also blit it to the screen. We use fx_prev as
+                   the destination, then swap so it becomes
+                   "current". (Both RTs are the same size; ping-
+                   pong is safe.) */
+                BeginTextureMode(p->fx_prev);
+                    ClearBackground(BLACK);
+                    DrawTextureRec(p->fx_rt.texture,
+                                   (Rectangle){ 0.0f, 0.0f,
+                                                (float)p->fx_rt.texture.width,
+                                               -(float)p->fx_rt.texture.height },
+                                   (Vector2){ 0.0f, 0.0f }, WHITE);
+                EndTextureMode();
+                rec_effects_end_shader_mode();
+                /* Blit the just-produced output to the window at the
+                   pane's on-screen position. fx_prev now holds what
+                   the user sees this frame. */
+                DrawTextureRec(p->fx_prev.texture,
+                               (Rectangle){ 0.0f, 0.0f,
+                                            (float)p->fx_prev.texture.width,
+                                           -(float)p->fx_prev.texture.height },
+                               (Vector2){ (float)pr.x, (float)pr.y }, WHITE);
+                /* Swap so next frame's u_prev sample reads what we
+                   just produced (and we write into the other slot). */
+                RenderTexture2D tmp = p->fx_rt;
+                p->fx_rt   = p->fx_prev;
+                p->fx_prev = tmp;
+            }
+        } else {
+            DrawRectangle(pr.x, pr.y, pr.w, pr.h, bgc);
+            renderer_draw(r, p->scr, time_sec, pane_focused, &p->sel,
+                          pr.x, pr.y, hcol, hrow);
+            /* Free both cached RTs if effects were just turned off so
+               we don't sit on per-pane VRAM after the user disables
+               the look. */
+            if (p->fx_rt.id || p->fx_prev.id) {
+                if (p->fx_rt.id)   UnloadRenderTexture(p->fx_rt);
+                if (p->fx_prev.id) UnloadRenderTexture(p->fx_prev);
+                p->fx_rt.id = p->fx_prev.id = 0;
+                p->fx_rt_w = p->fx_rt_h = 0;
+            }
+        }
 
         /* Cmd/Ctrl-hover over a plain-text URL: tint the URL cells
            and paint a 2px underline, and switch the mouse cursor to
@@ -4174,6 +4427,33 @@ static void ssh_profiles_load(void) {
                     while (*q == ' ' || *q == '\t') q++;
                     trim_end(q);
                     cur->hud.show = (!strcmp(q, "on") || !strcmp(q, "true") || !strcmp(q, "1"));
+                } else if (strncmp(q, "rbterm-effects-", strlen("rbterm-effects-")) == 0) {
+                    /* `# rbterm-effects-<key>: <value>` — visual-effect
+                       override. First sighting flips effects_override
+                       and seeds with a fresh defaults struct so any
+                       fields the host doesn't override stay neutral
+                       (rather than inheriting the global default,
+                       which would be surprising for "phosphor: green"
+                       set on a single host). */
+                    if (!cur->effects_override) {
+                        rec_effects_defaults(&cur->effects);
+                        cur->effects_override = true;
+                    }
+                    const char *kk = q + strlen("rbterm-effects-");
+                    const char *colon = strchr(kk, ':');
+                    if (colon) {
+                        char keybuf[24];
+                        size_t klen = (size_t)(colon - kk);
+                        if (klen >= sizeof(keybuf)) klen = sizeof(keybuf) - 1;
+                        memcpy(keybuf, kk, klen);
+                        keybuf[klen] = 0;
+                        const char *vv = colon + 1;
+                        while (*vv == ' ' || *vv == '\t') vv++;
+                        char vbuf[64];
+                        snprintf(vbuf, sizeof(vbuf), "%s", vv);
+                        trim_end(vbuf);
+                        rec_effects_set(&cur->effects, keybuf, vbuf);
+                    }
                 } else {
                     for (size_t hi = 0; hi < sizeof(hud_field_pfx) / sizeof(hud_field_pfx[0]); hi++) {
                         size_t pl = strlen(hud_field_pfx[hi].pfx);
@@ -4321,6 +4601,18 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
         g_form.hud = hud_config_from_app_settings();
         g_form.hud.override = false;
     }
+    /* Visual effects: if the profile has any per-host override, lift
+       it into the form (so the panel shows what's currently saved);
+       otherwise seed with the global default + flag override=false
+       so saving-without-changes doesn't accidentally promote the
+       host to override mode. */
+    if (prof->effects_override) {
+        g_form.effects          = prof->effects;
+        g_form.effects_override = true;
+    } else {
+        g_form.effects          = g_app_settings.effects;
+        g_form.effects_override = false;
+    }
     g_form.sel_all = false;
     g_form.error[0] = 0;
     form_undo_clear_all();
@@ -4372,6 +4664,11 @@ static void ssh_form_clear(void) {
        look like what they're already running with. */
     g_form.hud = hud_config_from_app_settings();
     g_form.hud.override = false;
+    /* Visual effects: same idea — seed from the current global default
+       so the panel looks "what I'd get without overriding" until the
+       user actually moves a slider. */
+    g_form.effects          = g_app_settings.effects;
+    g_form.effects_override = false;
     form_undo_clear_all();
 }
 
@@ -5539,6 +5836,52 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
         L.hud_cpu_toggle = (Rect){ field_x, row_y, 200, btn };
     }
 
+    if (g_ssh_form_tab == SSH_FORM_TAB_EFFECTS) {
+        /* Override toggle, six sliders in two columns, Decay slider,
+           Phosphor pill row, Preset pill row. Same column geometry
+           as the Settings → Effects tab so the layouts feel familiar. */
+        int row_y = content_top;
+        int btn = 28;
+        L.efx_override_btn = (Rect){ field_x, row_y, 200, btn };
+        row_y += btn + 14;
+        int row_h = 28;
+        int row_gap = 10;
+        int col_gap = 28;
+        int half_w  = (field_w - col_gap) / 2;
+        int label_off = 96;          /* draw code uses rr.x - 96 for label */
+        int value_w   = 56;
+        int slider_w = half_w - label_off - value_w;
+        if (slider_w < 80) slider_w = 80;
+        int left_slider_x  = field_x + label_off;
+        int right_slider_x = field_x + half_w + col_gap + label_off;
+        for (int i = 0; i < 3; i++) {
+            int yy = row_y + i * (row_h + row_gap);
+            L.efx_slider[k_efx_left_col[i]]  = (Rect){ left_slider_x,  yy, slider_w, row_h };
+            L.efx_slider[k_efx_right_col[i]] = (Rect){ right_slider_x, yy, slider_w, row_h };
+        }
+        int decay_y = row_y + 3 * (row_h + row_gap);
+        L.efx_decay = (Rect){ left_slider_x, decay_y, slider_w, row_h };
+        int phos_y = decay_y + row_h + row_gap + 4;
+        int phos_track_w = field_w - label_off;
+        int phos_btn_w = (phos_track_w - 3 * 6) / PHOSPHOR_COUNT;
+        for (int i = 0; i < PHOSPHOR_COUNT; i++)
+            L.efx_phos[i] = (Rect){ left_slider_x + i * (phos_btn_w + 6),
+                                    phos_y, phos_btn_w, row_h };
+        /* Preset grid — same wrap as Settings → Effects so the layout
+           feels familiar. Cols pinned at 5; rows derive from the
+           preset count. */
+        const int PRESETS_COLS = 5;
+        int preset_y = phos_y + row_h + 12;
+        int preset_btn_w = (field_w - (PRESETS_COLS - 1) * 6) / PRESETS_COLS;
+        for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+            int rrow = i / PRESETS_COLS;
+            int rcol = i % PRESETS_COLS;
+            L.efx_preset[i] = (Rect){ field_x + rcol * (preset_btn_w + 6),
+                                       preset_y + rrow * (row_h + 4),
+                                       preset_btn_w, row_h };
+        }
+    }
+
     /* Buttons: [New] ... [Connect] [Delete] [Save] [Cancel].
        Delete has zero size when no saved host is selected so it can't
        receive clicks; everything else keeps its position. */
@@ -5549,27 +5892,37 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
        (success) line is always single. */
     int err_reserve = g_form.error[0] ? 64 : (g_form_status[0] ? 24 : 0);
     int btn_y = L.modal.y + L.modal.h - btn_h - pad - err_reserve;
-    int new_w = 70, connect_w = 110, del_w = 80, save_w = 90, cancel_w = 96;
+    int new_w = 70, connect_w = 110, del_w = 80, clone_w = 80, save_w = 90, cancel_w = 96;
     int test_w = 80;
     int gap = 8;
-    bool has_del = (g_ssh_list_selected >= 0 && g_form.name[0]);
+    /* Both Delete and Clone require a saved host to be selected (i.e.
+       the form is editing an existing stanza); they vanish to zero
+       width otherwise. */
+    bool has_saved = (g_ssh_list_selected >= 0 && g_form.name[0]);
     int right_edge = L.modal.x + L.modal.w - pad;
-    L.cancel.w  = cancel_w;  L.cancel.h  = btn_h;
-    L.save.w    = save_w;    L.save.h    = btn_h;
-    L.connect.w = connect_w; L.connect.h = btn_h;
-    L.testbtn.w = test_w;    L.testbtn.h = btn_h;
-    L.newbtn.w  = new_w;     L.newbtn.h  = btn_h;
-    L.delbtn.w  = has_del ? del_w : 0;  L.delbtn.h = btn_h;
-    L.cancel.x  = right_edge - cancel_w;
-    L.save.x    = L.cancel.x - gap - save_w;
-    L.delbtn.x  = has_del ? (L.save.x - gap - del_w) : 0;
-    L.connect.x = (has_del ? L.delbtn.x : L.save.x) - gap - connect_w;
+    L.cancel.w   = cancel_w;  L.cancel.h   = btn_h;
+    L.save.w     = save_w;    L.save.h     = btn_h;
+    L.connect.w  = connect_w; L.connect.h  = btn_h;
+    L.testbtn.w  = test_w;    L.testbtn.h  = btn_h;
+    L.newbtn.w   = new_w;     L.newbtn.h   = btn_h;
+    L.delbtn.w   = has_saved ? del_w   : 0;  L.delbtn.h   = btn_h;
+    L.clonebtn.w = has_saved ? clone_w : 0;  L.clonebtn.h = btn_h;
+    L.cancel.x   = right_edge - cancel_w;
+    L.save.x     = L.cancel.x - gap - save_w;
+    L.delbtn.x   = has_saved ? (L.save.x - gap - del_w) : 0;
+    L.clonebtn.x = has_saved
+                   ? (L.delbtn.x - gap - clone_w)
+                   : 0;
+    int connect_anchor = has_saved
+                          ? L.clonebtn.x
+                          : L.save.x;
+    L.connect.x = connect_anchor - gap - connect_w;
     L.testbtn.x = L.connect.x - gap - test_w;
     L.newbtn.x  = L.modal.x + pad + list_w + (list_w > 0 ? 14 : 0);
     /* "New" floats one row above the main button bar so it reads as a
        form-level reset, not a commit-style action. */
     L.newbtn.y  = btn_y - btn_h - 10;
-    L.cancel.y = L.save.y = L.connect.y = L.delbtn.y = L.testbtn.y = btn_y;
+    L.cancel.y = L.save.y = L.connect.y = L.delbtn.y = L.clonebtn.y = L.testbtn.y = btn_y;
     return L;
 }
 
@@ -5618,6 +5971,7 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.color[0]   ? g_form.color   : NULL,
         g_form.cursor_color[0] ? g_form.cursor_color : NULL,
         g_form.hud.override ? &g_form.hud  : NULL,
+        g_form.effects_override ? &g_form.effects : NULL,
         g_form.init_cwd[0] ? g_form.init_cwd : NULL,
         g_form.init_cmd[0] ? g_form.init_cmd : NULL,
         cols, rows, err, sizeof(err));
@@ -5768,11 +6122,14 @@ static void ssh_form_test_auth(int cols, int rows) {
    (+1 forward / -1 backward). Skips zero-sized rects so e.g. the
    Delete button is hidden until a saved host is selected. */
 static void ssh_form_advance_focus(int delta) {
-    /* Skip F_DELETE while the button is hidden (no host selected). */
-    bool can_del = (g_ssh_list_selected >= 0 && g_form.name[0]);
+    /* Skip F_DELETE / F_CLONE while their buttons are hidden (no
+       saved host selected). */
+    bool can_del   = (g_ssh_list_selected >= 0 && g_form.name[0]);
+    bool can_clone = can_del;
     for (int i = 0; i < F_COUNT; i++) {
         g_form.focus = (g_form.focus + delta + F_COUNT) % F_COUNT;
-        if (g_form.focus == F_DELETE && !can_del) continue;
+        if (g_form.focus == F_DELETE && !can_del)   continue;
+        if (g_form.focus == F_CLONE  && !can_clone) continue;
         break;
     }
     g_form.sel_all = false;
@@ -5846,6 +6203,20 @@ static void emit_form_managed_lines(FILE *fp) {
                     g_form.hud.field_size[fi]);
         }
         fprintf(fp, "    # rbterm-hud-cpu: %s\n", g_form.hud.show_cpu ? "on" : "off");
+    }
+    /* Per-host visual effects. Skipped entirely when the form has no
+       override, so a stanza that doesn't customise effects stays
+       free of `# rbterm-effects-*` lines and inherits the global
+       Settings → Effects defaults at connect time. */
+    if (g_form.effects_override) {
+        for (int i = 0; rec_effects_keys[i]; i++) {
+            char buf[32];
+            if (rec_effects_format(&g_form.effects, rec_effects_keys[i],
+                                   buf, sizeof(buf))) {
+                fprintf(fp, "    # rbterm-effects-%s: %s\n",
+                        rec_effects_keys[i], buf);
+            }
+        }
     }
 }
 
@@ -5966,6 +6337,49 @@ static bool ssh_form_update_in_config(const char *name) {
 /* Append the form's current values as a new `Host` stanza, or, if the
    alias already exists, delegate to ssh_form_update_in_config which
    rewrites that stanza in place. */
+/* Clone the currently-loaded host into a new alias. All the form's
+   fields (host / user / port / key / theme / cursor / font / colour /
+   HUD / effects / init_cwd / init_cmd / log) stay as-is; only the
+   `name` is rotated to a unique value. We pick `<name>-copy` first,
+   then `<name>-copy-2`, `<name>-copy-3`, … until we find one that
+   doesn't collide with any existing saved host. The user can rename
+   in the Name field before clicking Save; the new stanza is only
+   written to ~/.ssh/config when Save fires. */
+static void ssh_form_clone_active(void) {
+    if (!g_form.name[0]) {
+        strncpy(g_form.error, "Pick a saved host first to clone",
+                sizeof(g_form.error) - 1);
+        return;
+    }
+    const char *src = g_form.name;
+    char candidate[sizeof(g_form.name)];
+    bool taken = true;
+    for (int n = 1; n < 1000 && taken; n++) {
+        if (n == 1) snprintf(candidate, sizeof(candidate), "%s-copy", src);
+        else        snprintf(candidate, sizeof(candidate), "%s-copy-%d", src, n);
+        taken = false;
+        for (int i = 0; i < g_ssh_profile_count; i++) {
+            if (strcmp(g_ssh_profiles[i].name, candidate) == 0) {
+                taken = true;
+                break;
+            }
+        }
+    }
+    strncpy(g_form.name, candidate, sizeof(g_form.name) - 1);
+    g_form.name[sizeof(g_form.name) - 1] = 0;
+    /* The new alias doesn't exist on disk yet, so the saved-hosts
+       sidebar shouldn't highlight anything (its highlight is
+       index-based and would now point at the source row). The user
+       has to click Save to commit. */
+    g_ssh_list_selected = -1;
+    g_form.focus  = F_NAME;
+    g_form.sel_all = true;       /* whole new name pre-selected for easy rename */
+    snprintf(g_form_status, sizeof(g_form_status),
+             "Cloned '%s' → '%s'. Edit and Save to commit.",
+             src, g_form.name);
+    g_form.error[0] = 0;
+}
+
 static bool ssh_form_save_to_config(void) {
     if (!g_form.name[0]) {
         strncpy(g_form.error, "Name is required before saving",
@@ -6140,6 +6554,31 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
             g_form_font_scroll -= (int)(wheel * 3.0f);
             if (g_form_font_scroll < 0) g_form_font_scroll = 0;
         }
+    }
+
+    /* Effects-tab slider drag continuation. Mirrors the Settings tab,
+       and uses an EFX_SLIDER_COUNT sentinel for the dedicated Decay
+       slider since it lives outside the main slider array. */
+    if (g_form_efx_drag) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            Rect rr;
+            float *t = NULL;
+            if (g_form_efx_drag_idx == EFX_SLIDER_COUNT) {
+                rr = L.efx_decay;
+                t  = &g_form.effects.decay;
+            } else {
+                rr = L.efx_slider[g_form_efx_drag_idx];
+                t  = efx_slider_value(&g_form.effects,
+                                      (EfxSlider)g_form_efx_drag_idx);
+            }
+            float v = (float)(mhx - rr.x) / (float)(rr.w > 1 ? rr.w : 1);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            if (t) *t = v;
+            g_form.effects_override = true;
+            return;
+        }
+        g_form_efx_drag = false;
     }
 
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
@@ -6322,6 +6761,55 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
         g_form.hud.show_cpu = !g_form.hud.show_cpu;
         return;
     }
+    /* Per-host effects tab. Override toggle, sliders, Phosphor pills.
+       Inner controls auto-flip the override bit so the user doesn't
+       need two clicks to start customising — same UX as the HUD tab. */
+    if (L.efx_override_btn.w > 0 && rect_hit(L.efx_override_btn, mx, my)) {
+        g_form.effects_override = !g_form.effects_override;
+        return;
+    }
+    for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
+        if (L.efx_slider[i].w > 0 && rect_hit(L.efx_slider[i], mx, my)) {
+            g_form_efx_drag = true;
+            g_form_efx_drag_idx = i;
+            Rect rr = L.efx_slider[i];
+            float v = (float)(mx - rr.x) / (float)(rr.w > 1 ? rr.w : 1);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            float *t = efx_slider_value(&g_form.effects, (EfxSlider)i);
+            if (t) *t = v;
+            g_form.effects_override = true;
+            return;
+        }
+    }
+    if (L.efx_decay.w > 0 && rect_hit(L.efx_decay, mx, my)) {
+        g_form_efx_drag = true;
+        g_form_efx_drag_idx = EFX_SLIDER_COUNT;     /* "decay" sentinel */
+        Rect rr = L.efx_decay;
+        float v = (float)(mx - rr.x) / (float)(rr.w > 1 ? rr.w : 1);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        g_form.effects.decay = v;
+        g_form.effects_override = true;
+        return;
+    }
+    for (int i = 0; i < PHOSPHOR_COUNT; i++) {
+        if (L.efx_phos[i].w > 0 && rect_hit(L.efx_phos[i], mx, my)) {
+            g_form.effects.phosphor = (PhosphorMode)i;
+            g_form.effects_override = true;
+            return;
+        }
+    }
+    for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+        if (L.efx_preset[i].w > 0 && rect_hit(L.efx_preset[i], mx, my)) {
+            rec_effects_apply_preset(&g_form.effects, (EfxPreset)i);
+            g_form.effects_override = true;
+            snprintf(g_form_status, sizeof(g_form_status),
+                     "Applied '%s' preset to host effects.",
+                     rec_effects_preset_label((EfxPreset)i));
+            return;
+        }
+    }
     if (rect_hit(L.log_dir,     mx, my)) {
         g_form_logdir_focus = true;
         return;
@@ -6420,6 +6908,11 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     if (L.delbtn.w > 0 && rect_hit(L.delbtn, mx, my)) {
         g_form.focus = F_DELETE;
         ssh_form_delete_from_config(g_form.name);
+        return;
+    }
+    if (L.clonebtn.w > 0 && rect_hit(L.clonebtn, mx, my)) {
+        g_form.focus = F_CLONE;
+        ssh_form_clone_active();
         return;
     }
     if (rect_hit(L.save, mx, my)) {
@@ -6608,6 +7101,7 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
         if (g_form.focus == F_CANCEL) { g_ui_mode = UI_NORMAL; return; }
         if (g_form.focus == F_NEW)    { ssh_form_clear(); return; }
         if (g_form.focus == F_DELETE) { ssh_form_delete_from_config(g_form.name); return; }
+        if (g_form.focus == F_CLONE)  { ssh_form_clone_active();                  return; }
         if (g_form.focus == F_SAVE) {
             ssh_form_save_to_config();
             return;
@@ -6704,7 +7198,7 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     /* Form-tab bar — matches the Settings modal pattern. */
     {
         const char *labels[SSH_FORM_TAB_COUNT] = {
-            "Connection", "Appearance", "Logging", "HUD"
+            "Connection", "Appearance", "Logging", "HUD", "Effects"
         };
         for (int i = 0; i < SSH_FORM_TAB_COUNT; i++) {
             Rect tb = L.form_tab[i];
@@ -7354,6 +7848,123 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                    13, 0, text_main);
     }
 
+    if (g_ssh_form_tab == SSH_FORM_TAB_EFFECTS) {
+        /* Per-host visual-effect override. Mirrors the layout of the
+           Settings → Effects tab; the Override toggle gates whether
+           the form's slider/phosphor values get serialised to the
+           ~/.ssh/config stanza on save. */
+        Color hl_on  = (Color){46, 92, 150, 255};
+        Color hl_off = (Color){34, 38, 52, 255};
+        Color outline= (Color){125, 207, 255, 150};
+        Color outline_active = (Color){125, 207, 255, 255};
+        Color text_main = (Color){230, 232, 240, 255};
+        Color text_dim  = (Color){180, 185, 200, 255};
+        Color slider_bg     = (Color){22, 25, 34, 255};
+        Color slider_fill   = (Color){46, 92, 150, 220};
+        Color slider_border = (Color){70, 74, 90, 255};
+        Color slider_thumb  = (Color){125, 207, 255, 255};
+        Color val_col       = (Color){170, 200, 235, 255};
+
+        DrawTextEx(*f, "Override",
+                   (Vector2){L.efx_override_btn.x - 104,
+                             L.efx_override_btn.y + 7},
+                   13, 0, text_dim);
+        const char *ov_label = g_form.effects_override
+            ? "Use host overrides"
+            : "Inherit from app";
+        Rect ob = L.efx_override_btn;
+        DrawRectangle(ob.x, ob.y, ob.w, ob.h, g_form.effects_override ? hl_on : hl_off);
+        DrawRectangleLines(ob.x, ob.y, ob.w, ob.h,
+                           g_form.effects_override ? outline_active : outline);
+        Vector2 osz = MeasureTextEx(*f, ov_label, 13, 0);
+        DrawTextEx(*f, ov_label,
+                   (Vector2){ob.x + (ob.w - osz.x) / 2,
+                             ob.y + (ob.h - osz.y) / 2},
+                   13, 0, text_main);
+
+        /* Six sliders + value readouts. */
+        for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
+            Rect rr = L.efx_slider[i];
+            float v = *efx_slider_value(&g_form.effects, (EfxSlider)i);
+            int   fill_w = (int)(v * (float)rr.w);
+            DrawTextEx(*f, efx_slider_label((EfxSlider)i),
+                       (Vector2){rr.x - 96, rr.y + (rr.h - 13) / 2 + 1},
+                       13, 0, text_dim);
+            int track_h = 8;
+            int track_y = rr.y + (rr.h - track_h) / 2;
+            DrawRectangle(rr.x, track_y, rr.w, track_h, slider_bg);
+            DrawRectangle(rr.x, track_y, fill_w, track_h, slider_fill);
+            DrawRectangleLines(rr.x, track_y, rr.w, track_h, slider_border);
+            int thumb_x = rr.x + fill_w;
+            DrawCircle(thumb_x, track_y + track_h / 2, 7, slider_thumb);
+            DrawCircleLines(thumb_x, track_y + track_h / 2, 7, (Color){30, 34, 46, 255});
+            char vbuf[8];
+            snprintf(vbuf, sizeof(vbuf), "%.0f%%", v * 100.0f);
+            Vector2 vsz = MeasureTextEx(*f, vbuf, 12, 0);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){rr.x + rr.w + 6,
+                                 rr.y + (rr.h - vsz.y) / 2},
+                       12, 0, val_col);
+        }
+        /* Decay slider — phosphor trail / ghosting. */
+        {
+            Rect rr = L.efx_decay;
+            float v = g_form.effects.decay;
+            int   fill_w = (int)(v * (float)rr.w);
+            DrawTextEx(*f, "Decay",
+                       (Vector2){rr.x - 96, rr.y + (rr.h - 13) / 2 + 1},
+                       13, 0, text_dim);
+            int track_h = 8;
+            int track_y = rr.y + (rr.h - track_h) / 2;
+            DrawRectangle(rr.x, track_y, rr.w, track_h, slider_bg);
+            DrawRectangle(rr.x, track_y, fill_w, track_h, slider_fill);
+            DrawRectangleLines(rr.x, track_y, rr.w, track_h, slider_border);
+            int thumb_x = rr.x + fill_w;
+            DrawCircle(thumb_x, track_y + track_h / 2, 7, slider_thumb);
+            DrawCircleLines(thumb_x, track_y + track_h / 2, 7, (Color){30, 34, 46, 255});
+            char vbuf[8];
+            snprintf(vbuf, sizeof(vbuf), "%.0f%%", v * 100.0f);
+            Vector2 vsz = MeasureTextEx(*f, vbuf, 12, 0);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){rr.x + rr.w + 6,
+                                 rr.y + (rr.h - vsz.y) / 2},
+                       12, 0, val_col);
+        }
+        /* Phosphor pills. */
+        DrawTextEx(*f, "Phosphor",
+                   (Vector2){L.efx_phos[0].x - 96,
+                             L.efx_phos[0].y + (L.efx_phos[0].h - 13) / 2 + 1},
+                   13, 0, text_dim);
+        for (int i = 0; i < PHOSPHOR_COUNT; i++) {
+            Rect rr = L.efx_phos[i];
+            bool sel = (g_form.effects.phosphor == (PhosphorMode)i);
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, sel ? hl_on : hl_off);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h, sel ? outline_active : outline);
+            const char *plbl = phosphor_label((PhosphorMode)i);
+            Vector2 ts = MeasureTextEx(*f, plbl, 12, 0);
+            DrawTextEx(*f, plbl,
+                       (Vector2){rr.x + (rr.w - ts.x) / 2,
+                                 rr.y + (rr.h - ts.y) / 2},
+                       12, 0, text_main);
+        }
+        /* Preset pills. */
+        DrawTextEx(*f, "Preset",
+                   (Vector2){L.efx_preset[0].x - 60,
+                             L.efx_preset[0].y - 16},
+                   13, 0, text_dim);
+        for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+            Rect rr = L.efx_preset[i];
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, hl_off);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h, outline);
+            const char *lbl = rec_effects_preset_label((EfxPreset)i);
+            Vector2 ts = MeasureTextEx(*f, lbl, 12, 0);
+            DrawTextEx(*f, lbl,
+                       (Vector2){rr.x + (rr.w - ts.x) / 2,
+                                 rr.y + (rr.h - ts.y) / 2},
+                       12, 0, text_main);
+        }
+    }
+
     /* Buttons. */
     bool nf = g_form.focus == F_NEW;
     DrawRectangle(L.newbtn.x, L.newbtn.y, L.newbtn.w, L.newbtn.h,
@@ -7400,6 +8011,18 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                    (Vector2){L.delbtn.x + (L.delbtn.w - dsz.x) / 2,
                              L.delbtn.y + (L.delbtn.h - dsz.y) / 2},
                    14, 0, (Color){250, 225, 225, 255});
+    }
+    if (L.clonebtn.w > 0) {
+        bool clf = g_form.focus == F_CLONE;
+        DrawRectangle(L.clonebtn.x, L.clonebtn.y, L.clonebtn.w, L.clonebtn.h,
+                      clf ? (Color){72, 76, 96, 255} : (Color){48, 52, 66, 255});
+        DrawRectangleLines(L.clonebtn.x, L.clonebtn.y, L.clonebtn.w, L.clonebtn.h,
+                           (Color){180, 200, 230, clf ? 255 : 180});
+        Vector2 clsz = MeasureTextEx(*f, "Clone", 14, 0);
+        DrawTextEx(*f, "Clone",
+                   (Vector2){L.clonebtn.x + (L.clonebtn.w - clsz.x) / 2,
+                             L.clonebtn.y + (L.clonebtn.h - clsz.y) / 2},
+                   14, 0, (Color){220, 230, 245, 255});
     }
 
     bool sf = g_form.focus == F_SAVE;
@@ -7534,13 +8157,14 @@ typedef enum {
     SETTINGS_TAB_FONT       = 0,
     SETTINGS_TAB_THEME      = 1,
     SETTINGS_TAB_CURSOR     = 2,
-    SETTINGS_TAB_SESSION    = 3,
-    SETTINGS_TAB_WINDOW     = 4,
-    SETTINGS_TAB_RECORDING  = 5,
-    SETTINGS_TAB_HUD        = 6,
-    SETTINGS_TAB_LAUNCH     = 7,
-    SETTINGS_TAB_KEYS       = 8,
-    SETTINGS_TAB_COUNT      = 9,
+    SETTINGS_TAB_EFFECTS    = 3,
+    SETTINGS_TAB_SESSION    = 4,
+    SETTINGS_TAB_WINDOW     = 5,
+    SETTINGS_TAB_RECORDING  = 6,
+    SETTINGS_TAB_HUD        = 7,
+    SETTINGS_TAB_LAUNCH     = 8,
+    SETTINGS_TAB_KEYS       = 9,
+    SETTINGS_TAB_COUNT      = 10,
 } SettingsTab;
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
@@ -7654,9 +8278,24 @@ typedef struct {
     Rect keysdel_modal;
     Rect keysdel_cancel;
     Rect keysdel_ok;
+    /* Effects tab — six slider tracks (mirroring the rec save modal's
+       set: CRT / Bloom / Grain / VHS / Glitch / Halftone) plus a
+       four-button Phosphor picker. The slider's hit rect IS the
+       track; thumb position derives from the underlying float. */
+    Rect efx_set_slider[EFX_SLIDER_COUNT];
+    Rect efx_set_decay;                  /* extra slider for phosphor decay */
+    Rect efx_set_phos[PHOSPHOR_COUNT];
+    Rect efx_set_preset[EFX_PRESET_COUNT];
+    Rect efx_set_reset;
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
+
+/* Drag state for the Effects-tab sliders. Same shape as the rec save
+   modal's slider drag: the user presses inside a track to capture,
+   movement updates the value while held, release ends the drag. */
+static bool g_settings_efx_drag = false;
+static int  g_settings_efx_drag_idx = 0;
 
 /* Theme picker state — modal-local since the picker is transient UI. */
 static int g_theme_list_scroll = 0;
@@ -8062,6 +8701,65 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
             L.cur_color_swatch[i] = (Rect){ L.modal.x + 140 + i * (sw + sw_gap),
                                             sw_y, sw, sh };
         }
+    } else if (g_settings_tab == SETTINGS_TAB_EFFECTS) {
+        /* Effects tab.
+
+           Three slider rows in two columns:
+             row 0: CRT  | VHS
+             row 1: Bloom | Glitch
+             row 2: Grain | Halftone
+           Then a Decay slider on its own row (left column),
+           a Phosphor pill row, a Preset pill row, and a Reset
+           button. Per column we reserve:
+              [label_w][slider_w][value_w]
+           and put `col_gap` of breathing room between the two
+           columns so the right column's label doesn't land on top
+           of the left column's value readout. The draw code
+           positions labels at `slider.x - 96`, so label_w /
+           col_gap are tuned to keep that offset clear. */
+        int row_y = content_y;
+        int row_h = 28;
+        int row_gap = 10;
+        int inner_x = L.modal.x + 22;
+        int inner_w = w - 44;
+        int col_gap = 28;
+        int half_w  = (inner_w - col_gap) / 2;
+        int label_w = 96;
+        int value_w = 56;
+        int slider_w = half_w - label_w - value_w;
+        if (slider_w < 80) slider_w = 80;        /* tiny-window safety */
+        int left_slider_x  = inner_x + label_w;
+        int right_slider_x = inner_x + half_w + col_gap + label_w;
+        for (int i = 0; i < 3; i++) {
+            int yy = row_y + i * (row_h + row_gap);
+            L.efx_set_slider[k_efx_left_col[i]]  = (Rect){ left_slider_x,  yy, slider_w, row_h };
+            L.efx_set_slider[k_efx_right_col[i]] = (Rect){ right_slider_x, yy, slider_w, row_h };
+        }
+        int decay_y = row_y + 3 * (row_h + row_gap);
+        L.efx_set_decay = (Rect){ left_slider_x, decay_y, slider_w, row_h };
+        int phos_y = decay_y + row_h + row_gap + 4;
+        int phos_track_w = inner_w - label_w;
+        int phos_btn_w = (phos_track_w - 3 * 6) / PHOSPHOR_COUNT;
+        for (int i = 0; i < PHOSPHOR_COUNT; i++)
+            L.efx_set_phos[i] = (Rect){ left_slider_x + i * (phos_btn_w + 6),
+                                        phos_y, phos_btn_w, row_h };
+        /* Preset grid — too many presets for a single row, so wrap
+           into PRESETS_COLS columns. The button width is computed
+           against the inner content rect; rows stack with `row_h + 4`
+           pitch, matching the slider rhythm. */
+        const int PRESETS_COLS = 5;
+        int preset_y = phos_y + row_h + 12;
+        int preset_btn_w = (inner_w - (PRESETS_COLS - 1) * 6) / PRESETS_COLS;
+        int preset_rows  = (EFX_PRESET_COUNT + PRESETS_COLS - 1) / PRESETS_COLS;
+        for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+            int rr = i / PRESETS_COLS;
+            int cc = i % PRESETS_COLS;
+            L.efx_set_preset[i] = (Rect){ inner_x + cc * (preset_btn_w + 6),
+                                          preset_y + rr * (row_h + 4),
+                                          preset_btn_w, row_h };
+        }
+        int reset_y = preset_y + preset_rows * (row_h + 4) + 10;
+        L.efx_set_reset = (Rect){ left_slider_x, reset_y, 200, btn };
     } else if (g_settings_tab == SETTINGS_TAB_SESSION) {
         int log_row1_y = content_y;
         L.log_toggle = (Rect){ L.modal.x + w - 140, log_row1_y, 110, btn };
@@ -8281,6 +8979,39 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         g_slider_drag_track.w = 0;
         g_slider_drag_target = NULL;
     }
+    /* Effects-tab slider drag continuation. The drag idx is either a
+       valid EfxSlider (0..EFX_SLIDER_COUNT-1) → that slider's value,
+       or EFX_SLIDER_COUNT (sentinel) → the dedicated decay slider. */
+    if (g_settings_efx_drag) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            Rect rr;
+            float *t = NULL;
+            if (g_settings_efx_drag_idx == EFX_SLIDER_COUNT) {
+                rr = L.efx_set_decay;
+                t  = &g_app_settings.effects.decay;
+            } else {
+                rr = L.efx_set_slider[g_settings_efx_drag_idx];
+                t  = efx_slider_value(&g_app_settings.effects,
+                                      (EfxSlider)g_settings_efx_drag_idx);
+            }
+            float v = (float)(mx - rr.x) / (float)(rr.w > 1 ? rr.w : 1);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            if (t) *t = v;
+            /* Live preview: copy the global default into every open
+               pane so the user sees the change as they drag. Panes
+               that have a per-host override applied still inherit
+               the global; we don't try to be cleverer than that. */
+            for (int ti = 0; ti < g_num_tabs; ti++) {
+                Tab *tt = g_tabs[ti];
+                if (!tt) continue;
+                for (int pi = 0; pi < tt->num_panes; pi++)
+                    tt->panes[pi].effects = g_app_settings.effects;
+            }
+            return;
+        }
+        g_settings_efx_drag = false;
+    }
     /* Wheel-scroll the font list whenever the pointer is over it. */
     if (rect_hit(L.font_list, mx, my)) {
         float wheel = GetMouseWheelMove();
@@ -8475,6 +9206,72 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
         g_settings_recdir_focus = true;
         g_settings_recdir_sel_all = false;
         return;
+    }
+    /* Effects tab — sliders (capture for drag), Decay slider, Phosphor
+       pills, Preset pills, Reset. Use a small helper so each slot
+       hits the same "update + push live" pipeline. */
+    if (g_settings_tab == SETTINGS_TAB_EFFECTS) {
+        #define EFX_PUSH_LIVE() do {                                    \
+            for (int ti = 0; ti < g_num_tabs; ti++) {                   \
+                Tab *tt = g_tabs[ti];                                   \
+                if (!tt) continue;                                      \
+                for (int pi = 0; pi < tt->num_panes; pi++)              \
+                    tt->panes[pi].effects = g_app_settings.effects;     \
+            }                                                           \
+        } while (0)
+        for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
+            if (rect_hit(L.efx_set_slider[i], mx, my)) {
+                g_settings_efx_drag = true;
+                g_settings_efx_drag_idx = i;
+                Rect rr = L.efx_set_slider[i];
+                float v = (float)(mx - rr.x) / (float)(rr.w > 1 ? rr.w : 1);
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                float *t = efx_slider_value(&g_app_settings.effects, (EfxSlider)i);
+                if (t) *t = v;
+                EFX_PUSH_LIVE();
+                return;
+            }
+        }
+        if (rect_hit(L.efx_set_decay, mx, my)) {
+            /* Reuse the slider-drag machinery for Decay too — store it
+               in a sentinel "drag idx" of EFX_SLIDER_COUNT so the
+               continuation block below knows to target ->decay. */
+            g_settings_efx_drag = true;
+            g_settings_efx_drag_idx = EFX_SLIDER_COUNT;   /* "decay" sentinel */
+            Rect rr = L.efx_set_decay;
+            float v = (float)(mx - rr.x) / (float)(rr.w > 1 ? rr.w : 1);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            g_app_settings.effects.decay = v;
+            EFX_PUSH_LIVE();
+            return;
+        }
+        for (int i = 0; i < PHOSPHOR_COUNT; i++) {
+            if (rect_hit(L.efx_set_phos[i], mx, my)) {
+                g_app_settings.effects.phosphor = (PhosphorMode)i;
+                EFX_PUSH_LIVE();
+                return;
+            }
+        }
+        for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+            if (rect_hit(L.efx_set_preset[i], mx, my)) {
+                rec_effects_apply_preset(&g_app_settings.effects, (EfxPreset)i);
+                EFX_PUSH_LIVE();
+                snprintf(g_settings_status, sizeof(g_settings_status),
+                         "Applied '%s' preset. Save as Default to persist.",
+                         rec_effects_preset_label((EfxPreset)i));
+                return;
+            }
+        }
+        if (rect_hit(L.efx_set_reset, mx, my)) {
+            rec_effects_defaults(&g_app_settings.effects);
+            EFX_PUSH_LIVE();
+            snprintf(g_settings_status, sizeof(g_settings_status),
+                     "Effects reset. Save as Default to persist.");
+            return;
+        }
+        #undef EFX_PUSH_LIVE
     }
     /* Startup window mode pickers — applied on next launch. */
     {
@@ -9151,28 +9948,45 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
     }
 }
 
-/* ---------- Save-recording modal ---------- */
+/* ---------- Save-recording modal ----------------------------------------
+
+   Layout grows top-to-bottom in fixed-height sections:
+
+     ┌─ Save recording ───────────────────────────────┐
+     │ Path  [editable text                       ]   │  path row
+     │ Format [cast][txt][gif][mp4][webm][apng][webp] │  fmt row
+     │ ────── Effects ─────                          │  separator
+     │  CRT      [slider]    VHS      [slider]        │  effects rows
+     │  Bloom    [slider]    Glitch   [slider]        │  (2 columns)
+     │  Grain    [slider]    Halftone [slider]        │
+     │  Phosphor [N|G|A|B]   Pixelate [1|2|…|8]       │
+     │  Speed   [0.5×|1×|2×|4×|8×]                    │  speed row
+     │  status / hint line                            │
+     │                       [Preview][Close][Save]   │  footer
+     └────────────────────────────────────────────────┘
+
+   Each slider's hit rect IS the slider track; click-to-set + thumb-drag
+   both use (mx - rect.x) / rect.w. Phosphor / Pixelate / Speed pickers
+   are pill-button rows (matches the format row's visual style). */
 
 typedef struct {
     Rect modal;
     Rect path;
     Rect fmt[REC_FMT_COUNT];
+    Rect efx_slider[EFX_SLIDER_COUNT];      /* the draggable slider track */
+    Rect phos[PHOSPHOR_COUNT];              /* 4 phosphor mode buttons */
+    Rect speed[EFX_SPEED_COUNT];            /* 5 playback-speed buttons */
     Rect save_btn, close_btn, preview_btn;
 } RecSaveLayout;
 
-/* Compute the modal layout: path text field, six format buttons,
-   action buttons. Shared by draw + click hit-test. */
 static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout L);
 
 static RecSaveLayout rec_save_layout(int win_w, int win_h) {
     RecSaveLayout L = {0};
-    /* Width sized so the typical "wrote NN KB <fmt> to /Users/<user>/<long>/rbterm-….<ext>"
-       status line fits in full at 16pt mono. The status row sits
-       above the button row (separate y), so it can use the full
-       modal interior. Falls back to window-width-minus-margin on
-       small windows; middle-ellipsis kicks in only if even that
-       isn't enough. */
-    int w = 1080, h = 280;
+    /* Width: keeps the format pills + status path readable at 16pt mono.
+       Height grew from 280→460 when the effects panel landed; we still
+       clamp to window-minus-margin so small displays stay usable. */
+    int w = 1080, h = 460;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -9192,6 +10006,43 @@ static RecSaveLayout rec_save_layout(int win_w, int win_h) {
     int fmt_h = 30;
     for (int i = 0; i < REC_FMT_COUNT; i++)
         L.fmt[i] = (Rect){ field_x + i * (fmt_w + fmt_gap), fmt_y, fmt_w, fmt_h };
+
+    /* Effects panel: header + three slider rows in two columns + one
+       picker row (phosphor / pixelate) + the speed row. */
+    int efx_top   = fmt_y + fmt_h + 22;             /* leaves room for "Effects" header */
+    int efx_row_h = 28;
+    int efx_gap_y = 8;
+    int half_w    = (field_w - 14) / 2;             /* gap between columns */
+    int slider_label_w = 80;                        /* fixed-width label, slider takes the rest */
+    int col_lx    = field_x;
+    int col_rx    = field_x + half_w + 14;
+    for (int i = 0; i < 3; i++) {
+        int yy = efx_top + i * (efx_row_h + efx_gap_y);
+        L.efx_slider[k_efx_left_col[i]]  =
+            (Rect){ col_lx + slider_label_w, yy,
+                    half_w - slider_label_w, efx_row_h };
+        L.efx_slider[k_efx_right_col[i]] =
+            (Rect){ col_rx + slider_label_w, yy,
+                    half_w - slider_label_w, efx_row_h };
+    }
+
+    /* Phosphor row (left col) — pill-button picker, 4th row down. The
+       right column at this y is reserved for the speed picker so we
+       fit the full effects panel into the modal without scrolling. */
+    int picker_y = efx_top + 3 * (efx_row_h + efx_gap_y);
+    int phos_track_w = half_w - slider_label_w;
+    int phos_btn_w   = (phos_track_w - 3 * 4) / PHOSPHOR_COUNT;
+    for (int i = 0; i < PHOSPHOR_COUNT; i++)
+        L.phos[i] = (Rect){ col_lx + slider_label_w + i * (phos_btn_w + 4),
+                            picker_y, phos_btn_w, efx_row_h };
+
+    /* Speed row — sits in the right column at the same y as Phosphor. */
+    int speed_track_w = half_w - slider_label_w;
+    int speed_btn_w   = (speed_track_w - (EFX_SPEED_COUNT - 1) * 4) / EFX_SPEED_COUNT;
+    for (int i = 0; i < EFX_SPEED_COUNT; i++)
+        L.speed[i] = (Rect){ col_rx + slider_label_w + i * (speed_btn_w + 4),
+                             picker_y, speed_btn_w, efx_row_h };
+
     /* Footer row, right-anchored: [Preview] [Close] [Save].
        Save / Preview keep the modal open so the user can export the
        same recording to multiple formats; Close (or Esc) dismisses
@@ -9513,6 +10364,30 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
         cast_free(cf);
         return false;
     }
+    /* Effects pass — only allocated when at least one visual effect
+       is enabled. The shader reads from `rt` (the freshly-rendered
+       terminal frame) and writes here; readback then comes from rt_fx
+       instead of rt. Speed is purely temporal so it doesn't need
+       another texture. */
+    bool use_effects = rec_effects_any_visual(&g_rec_save.effects);
+    RenderTexture2D rt_fx = {0};
+    if (use_effects) {
+        rt_fx = LoadRenderTexture(width, height);
+        if (rt_fx.id == 0) {
+            /* Soft-fail: if we can't allocate the second target, just
+               disable visual effects and continue with the speed
+               modifier alone — better than failing the whole save. */
+            use_effects = false;
+            TraceLog(LOG_WARNING,
+                     "rec_effects: failed to allocate %dx%d FX target — "
+                     "rendering without visual effects", width, height);
+        }
+    }
+    /* Speed multiplier: 1.0 = real-time. >1 compresses, <1 stretches.
+       Captured once and clamped to a sane range so a stale 0 doesn't
+       divide-by-zero downstream. */
+    float speed = g_rec_save.effects.speed;
+    if (speed < 0.05f) speed = 1.0f;
 
     /* Output sink. Three direct paths + one fallback:
        - GIF  → native encoder (gif_encoder.c)
@@ -9541,14 +10416,14 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
         gif = gif_begin(gif_dst, width, height, delay_cs);
         if (!gif) {
             snprintf(err, errsz, "couldn't open %s for writing", gif_dst);
-            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx); screen_free(scr); cast_free(cf);
             return false;
         }
     } else if (fmt == REC_FMT_WEBP) {
         webp = webp_begin(dst, width, height, delay_ms);
         if (!webp) {
             snprintf(err, errsz, "couldn't open %s for webp encoding", dst);
-            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx); screen_free(scr); cast_free(cf);
             return false;
         }
     } else {
@@ -9588,7 +10463,7 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
         pipe_fp = ffmpeg_open_pipe(argv, &pipe_pid, ff_log);
         if (!pipe_fp) {
             snprintf(err, errsz, "couldn't run ffmpeg (bundled: %s)", ff);
-            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx); screen_free(scr); cast_free(cf);
             return false;
         }
     }
@@ -9601,18 +10476,22 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
         snprintf(err, errsz, "out of memory for pixel buffer");
         if (gif) gif_end(gif);
         if (pipe_fp) { fclose(pipe_fp); waitpid(pipe_pid, NULL, 0); }
-        UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+        UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx);
+        screen_free(scr); cast_free(cf);
         return false;
     }
     /* Skip every blank frame before the first event so the gif
        opens on actual content instead of a couple of seconds of
        blank screen while the user was thinking. Frame 0 fires
-       events[0] immediately. */
+       events[0] immediately. The speed multiplier divides total
+       output duration: speed=2 produces half the frames over half
+       the wall-clock time, while the per-frame cast lookup
+       multiplies by speed so the same events still play out. */
     double t0 = cf->events[0].t;
     if (t0 < 0.0) t0 = 0.0;
     double total = cf->duration_s - t0 + 0.3;
     if (total < 0.3) total = 0.3;
-    int total_frames = (int)(total * fps) + 1;
+    int total_frames = (int)((total / (double)speed) * fps) + 1;
     size_t ev_idx = 0;
     /* Drive the render in chunks, presenting a fresh modal frame
        between chunks so the user sees a live progress message + a
@@ -9626,7 +10505,10 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
         int chunk_end = f + CHUNK_SZ;
         if (chunk_end > total_frames) chunk_end = total_frames;
         for (; f < chunk_end; f++) {
-            double frame_t = t0 + (double)f / fps;
+            /* Map output frame index → source-cast timestamp via the
+               speed multiplier: each step of `1/fps` of output time
+               consumes `speed/fps` seconds of cast time. */
+            double frame_t = t0 + ((double)f * (double)speed) / (double)fps;
             while (ev_idx < cf->count && cf->events[ev_idx].t <= frame_t) {
                 screen_feed(scr, cf->events[ev_idx].data, cf->events[ev_idx].n);
                 ev_idx++;
@@ -9635,7 +10517,18 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
                 ClearBackground(BLACK);
                 renderer_draw(g_renderer, scr, 0.0, false, NULL, 0, 0, -1, -1);
             EndTextureMode();
-            Image img = LoadImageFromTexture(rt.texture);
+            /* Visual effects pass: shader copies rt → rt_fx with all
+               enabled effects applied. `time_s` advances per frame so
+               grain / VHS / glitch animate across the recording. */
+            RenderTexture2D *src_rt = &rt;
+            if (use_effects) {
+                rec_effects_apply(&rt.texture, &rt_fx,
+                                  width, height,
+                                  &g_rec_save.effects,
+                                  (double)f / (double)fps);
+                src_rt = &rt_fx;
+            }
+            Image img = LoadImageFromTexture(src_rt->texture);
             ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
             int row = width * 4;
             for (int y = 0; y < height; y++) {
@@ -9677,7 +10570,7 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
     if (webp) {
         if (!webp_end(webp)) {
             snprintf(err, errsz, "webp encode failed");
-            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx); screen_free(scr); cast_free(cf);
             return false;
         }
     }
@@ -9692,7 +10585,7 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
             unlink(ff_log);
             snprintf(err, errsz, "ffmpeg failed: %s",
                      tail[0] ? tail : "(no stderr captured)");
-            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx); screen_free(scr); cast_free(cf);
             return false;
         }
         unlink(ff_log);
@@ -9720,13 +10613,14 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
             unlink(gif_intermediate);
             snprintf(err, errsz, "ffmpeg %s pass: %s",
                      rec_fmt_ext(fmt), tail[0] ? tail : "(no stderr)");
-            UnloadRenderTexture(rt); screen_free(scr); cast_free(cf);
+            UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx); screen_free(scr); cast_free(cf);
             return false;
         }
         unlink(ff_log);
         unlink(gif_intermediate);
     }
     UnloadRenderTexture(rt);
+    if (rt_fx.id) UnloadRenderTexture(rt_fx);
     screen_free(scr);
     cast_free(cf);
     return true;
@@ -9738,13 +10632,41 @@ static bool rec_convert(RecFmt fmt, const char *src_cast, const char *dst,
     return rec_render_native(fmt, src_cast, dst, err, errsz);
 }
 
+/* Update a slider's value from the current mouse X position, clamped
+   to the track. Called both on initial click (snap-to-cursor) and
+   while dragging. */
+static void efx_slider_set_from_mouse(RecSaveLayout L, EfxSlider s, int mx) {
+    Rect r = L.efx_slider[s];
+    float v = (float)(mx - r.x) / (float)(r.w > 1 ? r.w : 1);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    float *target = efx_slider_value(&g_rec_save.effects, s);
+    if (target) *target = v;
+}
+
 /* Click-handling for the save modal. Tracks consecutive clicks on
-   the path field for double-click-to-select-all (~0.45s gap). */
+   the path field for double-click-to-select-all (~0.45s gap). Also
+   owns slider-thumb drag state on the effects panel: a button-press
+   inside any slider rect captures, subsequent movement updates the
+   value while held, release lets go. */
 static void rec_save_handle_mouse(RecSaveLayout L) {
     static double last_click_t = -1.0;
     static int    click_count = 0;
     Vector2 mp = GetMousePosition();
     int mx = (int)mp.x, my = (int)mp.y;
+
+    /* Slider drag continuation. Runs every frame the button is held
+       down after a press inside one of the slider tracks. We service
+       this *before* the early-return so dragging works without
+       requiring a fresh press each frame. */
+    if (g_rec_save.slider_drag) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            efx_slider_set_from_mouse(L, (EfxSlider)g_rec_save.slider_drag_idx, mx);
+        } else {
+            g_rec_save.slider_drag = false;
+        }
+    }
+
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
     if (rect_hit(L.path, mx, my)) {
         double now = GetTime();
@@ -9767,6 +10689,30 @@ static void rec_save_handle_mouse(RecSaveLayout L) {
             g_rec_save.fmt = (RecFmt)i;
             rec_replace_ext(g_rec_save.dst_path, sizeof(g_rec_save.dst_path),
                             rec_fmt_ext((RecFmt)i));
+            g_rec_save.status[0] = 0;
+            return;
+        }
+    }
+    /* Effects panel: sliders, phosphor pickers, pixelate factors, speed. */
+    for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
+        if (rect_hit(L.efx_slider[i], mx, my)) {
+            g_rec_save.slider_drag = true;
+            g_rec_save.slider_drag_idx = i;
+            efx_slider_set_from_mouse(L, (EfxSlider)i, mx);
+            g_rec_save.status[0] = 0;
+            return;
+        }
+    }
+    for (int i = 0; i < PHOSPHOR_COUNT; i++) {
+        if (rect_hit(L.phos[i], mx, my)) {
+            g_rec_save.effects.phosphor = (PhosphorMode)i;
+            g_rec_save.status[0] = 0;
+            return;
+        }
+    }
+    for (int i = 0; i < EFX_SPEED_COUNT; i++) {
+        if (rect_hit(L.speed[i], mx, my)) {
+            g_rec_save.effects.speed = k_speed_values[i];
             g_rec_save.status[0] = 0;
             return;
         }
@@ -9981,6 +10927,95 @@ static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout
                    (Vector2){rr.x + (rr.w - ts.x) / 2,
                              rr.y + (rr.h - ts.y) / 2},
                    13, 0, fg);
+    }
+
+    /* ---- Effects panel: section header, sliders, picker rows. ---- */
+    {
+        /* Section header sits in the gap above the first slider row. */
+        int hdr_y = L.efx_slider[k_efx_left_col[0]].y - 18;
+        DrawTextEx(*f, "Effects",
+                   (Vector2){L.modal.x + 22, hdr_y},
+                   14, 0, (Color){200, 205, 220, 255});
+        DrawLine(L.modal.x + 22 + 60, hdr_y + 9,
+                 L.modal.x + L.modal.w - 22, hdr_y + 9,
+                 (Color){70, 74, 90, 255});
+
+        /* Six sliders. Left edge of each gets the effect name, right
+           side is the track + filled bar + thumb. The slider rect IS
+           the track; thumb position derives from value. */
+        Color slider_bg     = (Color){22, 25, 34, 255};
+        Color slider_fill   = (Color){46, 92, 150, 220};
+        Color slider_border = (Color){70, 74, 90, 255};
+        Color slider_thumb  = (Color){125, 207, 255, 255};
+        Color label_col     = (Color){200, 205, 220, 255};
+        Color val_col       = (Color){170, 200, 235, 255};
+        for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
+            Rect rr = L.efx_slider[i];
+            float v = *efx_slider_value(&g_rec_save.effects, (EfxSlider)i);
+            int   fill_w = (int)(v * (float)rr.w);
+            /* Label text just left of the track. */
+            const char *lbl = efx_slider_label((EfxSlider)i);
+            DrawTextEx(*f, lbl,
+                       (Vector2){rr.x - 76, rr.y + (rr.h - 13) / 2 + 1},
+                       13, 0, label_col);
+            /* Track. */
+            int track_h = 8;
+            int track_y = rr.y + (rr.h - track_h) / 2;
+            DrawRectangle(rr.x, track_y, rr.w, track_h, slider_bg);
+            DrawRectangle(rr.x, track_y, fill_w, track_h, slider_fill);
+            DrawRectangleLines(rr.x, track_y, rr.w, track_h, slider_border);
+            /* Thumb (filled circle, raised against the track). */
+            int thumb_x = rr.x + fill_w;
+            DrawCircle(thumb_x, track_y + track_h / 2, 7, slider_thumb);
+            DrawCircleLines(thumb_x, track_y + track_h / 2, 7, (Color){30, 34, 46, 255});
+            /* Value readout, right-aligned past the track. */
+            char vbuf[8];
+            snprintf(vbuf, sizeof(vbuf), "%.0f%%", v * 100.0f);
+            Vector2 vsz = MeasureTextEx(*f, vbuf, 12, 0);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){rr.x + rr.w + 6,
+                                 rr.y + (rr.h - vsz.y) / 2},
+                       12, 0, val_col);
+        }
+
+        /* Phosphor row (left col) — pill buttons. */
+        DrawTextEx(*f, "Phosphor",
+                   (Vector2){L.phos[0].x - 76,
+                             L.phos[0].y + (L.phos[0].h - 13) / 2 + 1},
+                   13, 0, label_col);
+        for (int i = 0; i < PHOSPHOR_COUNT; i++) {
+            Rect rr = L.phos[i];
+            bool sel = (g_rec_save.effects.phosphor == (PhosphorMode)i);
+            Color bg = sel ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255};
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, bg);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               (Color){125, 207, 255, sel ? 255 : 120});
+            const char *plbl = phosphor_label((PhosphorMode)i);
+            Vector2 ts = MeasureTextEx(*f, plbl, 12, 0);
+            DrawTextEx(*f, plbl,
+                       (Vector2){rr.x + (rr.w - ts.x) / 2,
+                                 rr.y + (rr.h - ts.y) / 2},
+                       12, 0, (Color){230, 232, 240, 255});
+        }
+
+        /* Speed row — right column, same y as Phosphor. */
+        DrawTextEx(*f, "Speed",
+                   (Vector2){L.speed[0].x - 76,
+                             L.speed[0].y + (L.speed[0].h - 13) / 2 + 1},
+                   13, 0, label_col);
+        for (int i = 0; i < EFX_SPEED_COUNT; i++) {
+            Rect rr = L.speed[i];
+            bool sel = (g_rec_save.effects.speed == k_speed_values[i]);
+            Color bg = sel ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255};
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, bg);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               (Color){125, 207, 255, sel ? 255 : 120});
+            Vector2 ts = MeasureTextEx(*f, k_speed_labels[i], 13, 0);
+            DrawTextEx(*f, k_speed_labels[i],
+                       (Vector2){rr.x + (rr.w - ts.x) / 2,
+                                 rr.y + (rr.h - ts.y) / 2},
+                       13, 0, (Color){230, 232, 240, 255});
+        }
     }
 
     /* Action buttons. */
@@ -10277,7 +11312,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     /* Tab bar. Active tab gets an accent fill; others sit dim. */
     {
         const char *labels[SETTINGS_TAB_COUNT] = {
-            "Font", "Theme", "Cursor", "Session", "Window",
+            "Font", "Theme", "Cursor", "Effects", "Session", "Window",
             "Recording", "HUD", "Launch", "Keys"
         };
         for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
@@ -10659,6 +11694,111 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                18, 0, (Color){230, 232, 240, 255});
 
     }  /* end Font tab (padding + spacing) */
+    if (g_settings_tab == SETTINGS_TAB_EFFECTS) {
+        /* Six slider rows + Phosphor pills + Reset button. The
+           interaction model matches the rec-save modal: click track
+           to set + capture for drag, drag updates while held. */
+        Color slider_bg     = (Color){22, 25, 34, 255};
+        Color slider_fill   = (Color){46, 92, 150, 220};
+        Color slider_border = (Color){70, 74, 90, 255};
+        Color slider_thumb  = (Color){125, 207, 255, 255};
+        Color label_col     = (Color){200, 205, 220, 255};
+        Color val_col       = (Color){170, 200, 235, 255};
+
+        for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
+            Rect rr = L.efx_set_slider[i];
+            float v = *efx_slider_value(&g_app_settings.effects, (EfxSlider)i);
+            int   fill_w = (int)(v * (float)rr.w);
+            const char *lbl = efx_slider_label((EfxSlider)i);
+            DrawTextEx(*f, lbl,
+                       (Vector2){rr.x - 96, rr.y + (rr.h - 13) / 2 + 1},
+                       13, 0, label_col);
+            int track_h = 8;
+            int track_y = rr.y + (rr.h - track_h) / 2;
+            DrawRectangle(rr.x, track_y, rr.w, track_h, slider_bg);
+            DrawRectangle(rr.x, track_y, fill_w, track_h, slider_fill);
+            DrawRectangleLines(rr.x, track_y, rr.w, track_h, slider_border);
+            int thumb_x = rr.x + fill_w;
+            DrawCircle(thumb_x, track_y + track_h / 2, 7, slider_thumb);
+            DrawCircleLines(thumb_x, track_y + track_h / 2, 7, (Color){30, 34, 46, 255});
+            char vbuf[8];
+            snprintf(vbuf, sizeof(vbuf), "%.0f%%", v * 100.0f);
+            Vector2 vsz = MeasureTextEx(*f, vbuf, 12, 0);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){rr.x + rr.w + 6,
+                                 rr.y + (rr.h - vsz.y) / 2},
+                       12, 0, val_col);
+        }
+        /* Decay slider — own row below the six main sliders. */
+        {
+            Rect rr = L.efx_set_decay;
+            float v = g_app_settings.effects.decay;
+            int   fill_w = (int)(v * (float)rr.w);
+            DrawTextEx(*f, "Decay",
+                       (Vector2){rr.x - 96, rr.y + (rr.h - 13) / 2 + 1},
+                       13, 0, label_col);
+            int track_h = 8;
+            int track_y = rr.y + (rr.h - track_h) / 2;
+            DrawRectangle(rr.x, track_y, rr.w, track_h, slider_bg);
+            DrawRectangle(rr.x, track_y, fill_w, track_h, slider_fill);
+            DrawRectangleLines(rr.x, track_y, rr.w, track_h, slider_border);
+            int thumb_x = rr.x + fill_w;
+            DrawCircle(thumb_x, track_y + track_h / 2, 7, slider_thumb);
+            DrawCircleLines(thumb_x, track_y + track_h / 2, 7, (Color){30, 34, 46, 255});
+            char vbuf[8];
+            snprintf(vbuf, sizeof(vbuf), "%.0f%%", v * 100.0f);
+            Vector2 vsz = MeasureTextEx(*f, vbuf, 12, 0);
+            DrawTextEx(*f, vbuf,
+                       (Vector2){rr.x + rr.w + 6,
+                                 rr.y + (rr.h - vsz.y) / 2},
+                       12, 0, val_col);
+        }
+        DrawTextEx(*f, "Phosphor",
+                   (Vector2){L.efx_set_phos[0].x - 96,
+                             L.efx_set_phos[0].y + (L.efx_set_phos[0].h - 13) / 2 + 1},
+                   13, 0, label_col);
+        for (int i = 0; i < PHOSPHOR_COUNT; i++) {
+            Rect rr = L.efx_set_phos[i];
+            bool sel = (g_app_settings.effects.phosphor == (PhosphorMode)i);
+            Color bg = sel ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255};
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, bg);
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h,
+                               (Color){125, 207, 255, sel ? 255 : 120});
+            const char *plbl = phosphor_label((PhosphorMode)i);
+            Vector2 ts = MeasureTextEx(*f, plbl, 12, 0);
+            DrawTextEx(*f, plbl,
+                       (Vector2){rr.x + (rr.w - ts.x) / 2,
+                                 rr.y + (rr.h - ts.y) / 2},
+                       12, 0, (Color){230, 232, 240, 255});
+        }
+        /* Preset row — one-click cinema looks. */
+        DrawTextEx(*f, "Preset",
+                   (Vector2){L.efx_set_preset[0].x - 60,
+                             L.efx_set_preset[0].y - 16},
+                   13, 0, label_col);
+        for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+            Rect rr = L.efx_set_preset[i];
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, (Color){34, 38, 52, 255});
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h, (Color){125, 207, 255, 140});
+            const char *lbl = rec_effects_preset_label((EfxPreset)i);
+            Vector2 ts = MeasureTextEx(*f, lbl, 12, 0);
+            DrawTextEx(*f, lbl,
+                       (Vector2){rr.x + (rr.w - ts.x) / 2,
+                                 rr.y + (rr.h - ts.y) / 2},
+                       12, 0, (Color){230, 232, 240, 255});
+        }
+        DrawRectangle(L.efx_set_reset.x, L.efx_set_reset.y,
+                      L.efx_set_reset.w, L.efx_set_reset.h,
+                      (Color){48, 52, 66, 255});
+        DrawRectangleLines(L.efx_set_reset.x, L.efx_set_reset.y,
+                           L.efx_set_reset.w, L.efx_set_reset.h,
+                           (Color){150, 160, 180, 200});
+        Vector2 rs = MeasureTextEx(*f, "Reset all", 13, 0);
+        DrawTextEx(*f, "Reset all",
+                   (Vector2){L.efx_set_reset.x + (L.efx_set_reset.w - rs.x) / 2,
+                             L.efx_set_reset.y + (L.efx_set_reset.h - rs.y) / 2},
+                   13, 0, (Color){210, 220, 235, 255});
+    }
     if (g_settings_tab == SETTINGS_TAB_SESSION) {
     /* Session logging rows. */
     DrawTextEx(*f, "Log session",
@@ -11952,6 +13092,7 @@ int main(int argc, char **argv) {
                     prof && prof->color[0]        ? prof->color        : NULL,
                     prof && prof->cursor_color[0] ? prof->cursor_color : NULL,
                     prof && prof->hud.override    ? &prof->hud         : NULL,
+                    prof && prof->effects_override ? &prof->effects    : NULL,
                     prof && prof->init_cwd[0]     ? prof->init_cwd     : NULL,
                     prof && prof->init_cmd[0]     ? prof->init_cmd     : NULL,
                     derive_cols, derive_rows, err, sizeof(err));
@@ -13040,6 +14181,7 @@ int main(int argc, char **argv) {
     }
 
     for (int i = g_num_tabs - 1; i >= 0; i--) tab_close(i);
+    rec_effects_shutdown();
     renderer_shutdown(&r);
     CloseWindow();
     return 0;

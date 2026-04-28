@@ -52,6 +52,7 @@ set(RBTERM_SOURCES
     src/cast.c
     src/gif_encoder.c
     src/hud.c
+    src/rec_effects.c
 )
 # Native webp + libwebpmux on desktop when the libs are available;
 # stub otherwise (Emscripten always; desktop CI runners that don't
