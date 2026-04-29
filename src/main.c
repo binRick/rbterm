@@ -6,7 +6,9 @@
 #include "rec_effects.h"
 #include "shape.h"
 #include <stdarg.h>
+#ifdef RBTERM_SSH
 #include <pthread.h>
+#endif
 #include "screen.h"
 #include "render.h"
 #include "input.h"
@@ -1522,11 +1524,14 @@ static bool parse_hex_color(const char *hex, Color *out) {
 #define SSH_PROFILES_MAX 128
 static SshProfile g_ssh_profiles[SSH_PROFILES_MAX];
 
+#ifdef RBTERM_SSH
 /* Parallel SSH connect for startup launches. Each pending SSH entry
    gets a worker thread that runs pty_open_ssh concurrently with the
    others; the main loop polls completion flags and integrates each
    finished Pty into a fresh Tab. Total wait drops from the sum of
-   per-host handshake latencies to the max. */
+   per-host handshake latencies to the max. Windows builds compile
+   pty_ssh_stub.c (no real SSH) and don't have <pthread.h>, so the
+   whole worker apparatus is gated on RBTERM_SSH. */
 typedef struct {
     pthread_t    th;
     int          started;
@@ -1556,6 +1561,7 @@ typedef struct {
 static SshLaunchWorker g_launch_workers[LAUNCH_WORKERS_MAX];
 static int  g_launch_workers_count  = 0;
 static bool g_launch_workers_kicked = false;
+#endif /* RBTERM_SSH */
 static int        g_ssh_profile_count = 0;
 static int        g_ssh_list_scroll = 0;   /* in rows */
 static int        g_ssh_list_selected = -1; /* highlighted row, -1 = none */
@@ -14451,6 +14457,7 @@ static void usage(void) {
            "  Cmd + C / V       copy selection / paste\n");
 }
 
+#ifdef RBTERM_SSH
 /* SSH-launch worker entry point. Calls pty_open_ssh on a dedicated
    thread so multiple startup hosts can handshake in parallel; the
    main thread polls w->done and integrates the resulting Pty. */
@@ -14469,6 +14476,7 @@ static void *ssh_launch_worker_run(void *arg) {
     __atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
     return NULL;
 }
+#endif /* RBTERM_SSH */
 
 int main(int argc, char **argv) {
     const char *font_path = NULL;
@@ -14856,6 +14864,7 @@ int main(int argc, char **argv) {
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
+#ifdef RBTERM_SSH
         /* Parallel SSH launch. On the very first iteration we
            snapshot every pending entry into a worker struct and
            kick a thread per host that calls pty_open_ssh. Each
@@ -14956,6 +14965,7 @@ int main(int argc, char **argv) {
                                     w->cols, w->rows);
             dirty = true;
         }
+#endif /* RBTERM_SSH */
 
         /* Whole-window content cell dims — still used by tab_open for
            its initial PTY size; individual pane resizing goes through
