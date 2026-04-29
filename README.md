@@ -494,27 +494,34 @@ per-byte feed_byte() function-call overhead, packed Cell layout so
 `tools/parser_bench` microbench harness so future contributors can
 profile the parser cleanly.
 
-### Round-trip latency — rbterm wins by 4× or more
+### Round-trip latency — rbterm wins by 2× to 1500×
 
 vtebench measures throughput. The other axis is **round-trip
 latency**: when a program issues an ANSI query (e.g. `CSI 6n` for
 cursor position), how fast does the terminal reply? `tools/echo_bench`
 times the round-trip end to end — kernel write, terminal parse,
-terminal reply, kernel read — across 1000 samples per terminal:
+terminal reply, kernel read — across 1000 samples per terminal,
+all five fired in turn on the same M-series MacBook:
 
 | Terminal | min | **median** | mean | p99 | max | stdev |
 |---|---:|---:|---:|---:|---:|---:|
-| **rbterm** | 0.006 | **0.009** ★ | 0.009 | 0.015 | 0.035 | 0.002 |
-| alacritty | 0.023 | 0.036 | 0.056 | 0.077 | 7.702 | 0.319 |
-| Apple Terminal | 0.027 | 0.053 | 0.066 | 0.122 | 7.250 | 0.237 |
-| kitty | 3.082 | 3.493 | 3.487 | 3.709 | 9.808 | 0.231 |
+| **rbterm** | 0.010 | **0.014** ★ | 0.014 | 0.025 | 0.057 | 0.003 |
+| alacritty | 0.020 | 0.029 | 0.077 | 0.068 | 14.687 | 0.647 |
+| Apple Terminal | 0.037 | 0.053 | 0.065 | 0.152 | 3.969 | 0.126 |
+| kitty | 3.081 | 3.485 | 3.484 | 3.766 | 16.452 | 0.458 |
+| iTerm2 ¹ | 5.719 | 20.346 | 21.663 | 32.497 | 45.346 | 6.043 |
 
-(values: ms per round trip, lower is better)
+(values: ms per round trip, lower is better. ¹ iTerm2 hit
+echo_bench's 5-second total deadline at n=231 — its parser is
+slow enough that 1000 samples takes longer than 5 seconds.)
 
-- **4× faster than alacritty** on median round-trip
-- **5.9× faster than Apple Terminal**
-- **388× faster than kitty**
-- **stdev of 0.002 ms** — essentially deterministic, no jitter
+Median ratios vs rbterm:
+
+- **2.1× faster** than alacritty
+- **3.8× faster** than Apple Terminal
+- **249× faster** than kitty
+- **1453× faster** than iTerm2
+- **stdev of 0.003 ms** — essentially deterministic, no jitter
 
 Why so fast? `pty_unix.c`'s reader thread peeks at incoming bytes
 for the 4-byte `\e[6n` pattern and emits the reply directly using a
@@ -522,11 +529,27 @@ cursor snapshot the main thread refreshes after every parser drain
 (two relaxed atomic stores, ~free). No parser. No frame budget. No
 GUI thread hop. The reply path is deterministic memcmp + write.
 
-Reproduce with:
+The previous personal best on this benchmark was 0.009 ms median
+(`bench/echo-rbterm-fast.txt`, April 25), still tracked in the
+results dir. Today's 0.014 ms is the post-recursive-split-tree
+build — a small regression from rerouting the reader thread's
+cursor snapshot through the new pane node abstraction. Closing
+that delta is a known follow-up.
+
+Reproduce, with the bench scripts checked into `tools/`:
+
 ```bash
-make echo_bench
-./echo_bench   # run inside each terminal you want to compare
+# In each terminal you want to compare:
+cd ~/Desktop/repos/rbterm && ./tools/bench-here.sh
+
+# Then, once you've covered the field:
+./tools/bench-summary.sh
 ```
+
+`bench-here.sh` auto-detects the host terminal via `$TERM_PROGRAM`,
+runs 1000-sample echo_bench, and writes
+`bench/echo-<slug>-<stamp>.txt`. `bench-summary.sh` reads the
+newest result per terminal and prints the side-by-side table.
 
 ### Idle resource use — smallest memory, low idle CPU
 

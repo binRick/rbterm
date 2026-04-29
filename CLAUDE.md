@@ -346,6 +346,57 @@ load and save paths if they're meant to survive restarts.
   `tab_open_ssh`, which writes any libssh error back into a fixed
   buffer the modal renders in red.
 
+## Benchmark harness — driving the field
+
+Two scripts cover the round-trip-latency comparison against
+competitor terminals.
+
+**Manual / interactive flow (preferred — works for every
+terminal, no scripting glue needed):**
+
+```bash
+# Open kitty / alacritty / iTerm2 / Terminal / rbterm. In each:
+cd ~/Desktop/repos/rbterm
+./tools/bench-here.sh             # 1000 samples; N=200 for a quick run
+
+# Once you've covered the field, from any terminal:
+./tools/bench-summary.sh
+```
+
+`bench-here.sh` auto-detects the host via `$TERM_PROGRAM` (rbterm
+sets `TERM_PROGRAM=rbterm` itself; iTerm2/Terminal/alacritty/kitty/
+WezTerm/ghostty are all known) and writes
+`bench/echo-<slug>-<stamp>.txt` with the standard
+`term=… n=… min=… med=… mean=… p99=… max=… sd=… ms` summary line.
+`bench-summary.sh` reads the newest file per slug and prints a
+side-by-side table.
+
+**Automated flow (less reliable — GUI focus + window-open timing
+get flaky):**
+
+```bash
+N=1000 TIMEOUT_S=120 ./tools/run-benchmark.sh
+```
+
+This drives every terminal from a single command using:
+
+- **rbterm**: `SHELL=<shim>` so its shell auto-runs the bench
+  wrapper and exits.
+- **alacritty / kitty**: their built-in `-e <cmd>` / `<cmd>` form.
+- **iTerm2 / Apple Terminal**: AppleScript via `osascript` (open
+  new tab, write the command, exit).
+
+In practice the manual flow is faster end-to-end because the
+automated one waits on each terminal's open animation + window
+focus settling. Keep `run-benchmark.sh` for CI-style automated
+sweeps; use `bench-here.sh` for interactive runs.
+
+`echo_bench` (built from `tools/echo_bench.c`) measures the round
+trip on `CSI 6n` device-status-report queries: time to write the
+query, the terminal parses + replies with `CSI <row>;<col>R`, and
+we read the answer. Captures parser + I/O path latency without
+needing pixel-level event injection.
+
 ## Commit + release flow
 
 When the user says **"commit"** or **"commit to github"**: `git add -A`,
