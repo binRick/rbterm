@@ -31,9 +31,13 @@ relevant README section in the same commit.
         +-------------+        +--------------+        +-----------+
 ```
 
-Each tab owns a `Pty *`, a `Screen *`, a `Selection`, and a `title` / `cwd`.
-The main loop drains every tab's PTY each frame so background tabs
-remain up to date.
+Each tab owns a `PaneNode *root` — a recursive split tree whose
+leaves each carry a `Pane` (PTY + Screen + Selection + title +
+cwd). Internal nodes carry a SplitMode (V/H), a ratio, and two
+children. `tab_split` replaces the active leaf with a fresh
+internal node; `tab_close_leaf` collapses the parent into the
+sibling. The main loop drains every leaf's PTY each frame so
+background panes stay up to date.
 
 ## Files
 
@@ -184,6 +188,62 @@ checks ensure clicking directly on punctuation still selects it.
 - Tabs live in a `Tab *g_tabs[MAX_TABS]` pointer array. `tab_close`
   shifts remaining slots down. Each `Screen`'s `io.user` is the stable
   heap-allocated `Tab *`, so the shift doesn't invalidate callbacks.
+
+## Recursive split tree
+
+Each `Tab` owns a `PaneNode *root` plus `PaneNode *active` (the
+current focused leaf). A node is either:
+
+- **Leaf**: `split == SPLIT_NONE`, `pane != NULL`. Owns a heap-
+  allocated `Pane` (so the address handed to Screen as `io.user`
+  stays stable across collapses — no `screen_set_io_user`
+  re-pointing needed).
+- **Internal**: `split == SPLIT_VERTICAL/HORIZONTAL`, `child[0/1]`
+  populated, owns a `ratio` (0.15..0.85) and a `splitter_drag`
+  bool. Carries no `Pane`.
+
+Helpers in `src/main.c`:
+
+- `pane_node_new_leaf` / `pane_node_free_recursive`
+- `pane_tree_count` / `pane_tree_first_leaf` / `pane_tree_next_leaf`
+  / `pane_tree_prev_leaf` — flat iteration in tree order
+- `pane_tree_cycle_leaf` — wraps; used by Cmd+K
+- `pane_tree_split_children` — given an internal node + outer
+  rect, computes the child rects (and stash space for splitter)
+- `pane_tree_node_rect_walk` — outer rect of any node in the tree
+- `leaf_rect` (Tab convenience wrapper) — leaf's rect within the
+  current window
+- `pane_tree_at` — leaf hit-test for click-to-focus
+- `pane_tree_splitter_at` — internal node whose splitter strip
+  (padded by `SPLITTER_GRAB`) contains a point; also returns its
+  outer rect for drag math
+- `pane_node_split_leaf` — replaces a leaf with a new internal
+  node whose children are (the original leaf, a fresh leaf)
+- `pane_node_close_leaf` — frees a leaf, promotes its sibling
+  into the parent's slot. Returns true if the tab should die.
+- `tab_split` / `tab_close_leaf` / `pane_close_active` —
+  Tab-level wrappers that update `t->active` and re-open per-pane
+  log files.
+
+Splitter dragging: each internal node has its own `splitter_drag`
+bool. The main loop's mouse handler walks the tree to find the
+dragging node, and stashes the outer rect of the press in a
+function-local static so the drag math stays consistent across
+frames even as the tree mutates.
+
+When adding code that iterates panes, the canonical pattern is:
+
+```c
+for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+     leaf = pane_tree_next_leaf(leaf)) {
+    Pane *p = leaf->pane;
+    if (!p) continue;
+    /* ... */
+}
+```
+
+Avoid hardcoding "pane 0" / "pane 1" or `t->active_pane` — those
+field names no longer exist.
 
 ## User preferences (learned this session)
 
@@ -853,6 +913,100 @@ session — no second auth, no scp/rsync wrapper.
 appends to `~/rbterm-upload.log` with libssh + sftp error codes
 on failure. Released `open -a rbterm` users see no log file.
 
+## Broadcast input
+
+`Cmd+Shift+I` (or the radio-tower button on the tab bar) toggles
+`g_broadcast_active`. While on, every keystroke and every paste in
+the active tab is fanned out to **every leaf** of the tab's pane
+tree instead of just the focused leaf. Output stays per-pane.
+
+Visual cues (deliberately redundant — fanned-out typing is
+destructive enough that you should always be able to tell):
+
+- The toolbar button glows red when active.
+- A `BROADCAST` pill appears in the right cluster (left of the
+  REC pill if both are on).
+- A 3px red border outlines every leaf in the active tab.
+
+Safety belts:
+
+- The button is hidden when `pane_tree_count(t->root) < 2` — single-
+  pane broadcast would just be typing.
+- Broadcast auto-disarms whenever `g_active` changes (tab switch).
+  The detection happens in the same `prev_active` snapshot block
+  that drives the dirty-flag dance, so this can't drift.
+- Mouse clicks / selection drags are **not** broadcast. Only
+  keystrokes (`input_poll` output) and paste payloads.
+
+Implementation:
+
+- The fan-out lives in the input section of the main loop. When
+  `g_broadcast_active && pane_tree_count(cur->root) >= 2`, the
+  per-pane `pty_write` is replaced with a tree-walk that writes
+  to every leaf. Same for the paste branch (each leaf checks its
+  own `screen_bracketed_paste(_p->scr)` so leaves with different
+  bracketed-paste modes round-trip cleanly).
+- Per-leaf `screen_scroll_reset` and selection-clear run inside
+  the fan-out so a stale highlight doesn't linger anywhere.
+
+Future: a per-pane "broadcast member" toggle (`Cmd+Shift+B` on a
+focused leaf) so the user can curate which subset of leaves gets
+fanned-to. Today everything in the active tab is the group.
+
+## Per-host SSH layout
+
+Saved hosts can predefine a recursive split layout that's replayed
+on connect: pane tree shape, ratios, and per-leaf cwd. Authored via
+the **Save Layout from Active Tab** button on the SSH form's
+Connection tab — splits the active SSH tab's tree into a string
+descriptor and writes it back into `~/.ssh/config` as new
+`# rbterm-*` comment lines.
+
+Format in ssh_config:
+
+```
+Host mia
+    HostName 172.238.205.61
+    User rich
+    # rbterm-layout: V0.50(H0.50(0,1),2)
+    # rbterm-pane-0-cwd: /var/log
+    # rbterm-pane-1-cwd: /etc
+    # rbterm-pane-2-cwd: /home/rich
+    # rbterm-pane-2-cmd: htop
+```
+
+Grammar: `expr := DIGIT | ('V'|'H') ratio '(' expr ',' expr ')'`,
+where ratio is `0.NN` (clamped to 0.15..0.85), and integers are leaf
+indices into pane_cwds[] / pane_cmds[]. Indices are assigned in DFS
+pre-order so the serializer and parser agree without a separate
+numbering pass. `SSH_LAYOUT_MAX_PANES = 8` is the leaf cap.
+
+Implementation:
+
+- `layout_serialize` walks `t->root`, emits the descriptor string,
+  and snapshots each leaf's cwd. Doesn't capture cmd — we don't
+  reliably know what's running. Users can hand-edit the
+  `# rbterm-pane-N-cmd:` lines or set them via the form (TODO).
+- `layout_parse` is a recursive-descent parser that returns a
+  `LayoutNode` tree (leaves carry indices, internals carry split
+  + ratio). Malformed input → NULL → caller falls back to single-
+  pane.
+- `layout_replay_walk` does the splits in DFS pre-order. Starts
+  from the first PaneNode (the one created by the SSH connect),
+  sets `t->active = current_leaf` before each `tab_split` so the
+  split lands in the right place, then sends `cd "<cwd>"; <cmd>\r`
+  to each leaf via `ssh_send_init_line`.
+- `tab_open_ssh` takes `layout`, `pane_cwds`, `pane_cmds` as new
+  params. If layout is non-empty AND parses, it owns the per-leaf
+  init; otherwise the legacy `init_cwd`/`init_cmd` fires for the
+  single first pane.
+- Single-pane saves are a no-op: the Save Layout handler clears
+  the layout string when leaf count == 1, so users can't
+  accidentally clobber their `init_cwd`/`init_cmd` by hitting Save
+  on a not-yet-split tab.
+- Per-pane cmd is preserved across saves (we re-snapshot cwd but
+  leave the cmd array alone) so hand-edited commands stick.
+
 ## Per-host SSH startup commands
 
 `SshProfile` / `Tab` / `SshForm` carry `init_cwd` and `init_cmd`
@@ -1104,8 +1258,7 @@ Not a roadmap — a shopping list to prioritise from.
 ### Window / layout
 - **Broadcast input** to all panes / tabs (iTerm2: Cmd+Shift+I) — useful
   for fleet-of-ssh sessions.
-- **Recursive splits** — rbterm has 2-pane splits (horiz + vert) but
-  not N-way recursion.
+- (was: recursive N-way splits — shipped; see "Recursive split tree" below.)
 - **Per-tab / per-pane title override** that survives shell rewrites.
 - **Tab bar styles** (top/bottom/left, powerline separators) — kitty.
 - **Hotkey window** — system-wide drop-down terminal (iTerm2).

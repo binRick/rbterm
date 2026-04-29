@@ -17,7 +17,7 @@ how the OS, the shell, and a graphics library all meet.
 
 ## Pure C99 — fast, lean, no runtime
 
-The whole thing is ~25,000 lines of straight C99 — no C++, no
+The whole thing is ~27,000 lines of straight C99 — no C++, no
 garbage collector, no Electron, no JavaScript engine, no embedded
 scripting language. Every keystroke goes from raylib's input → a
 fixed-state-machine parser → a flat cell-grid → a single glyph atlas
@@ -241,7 +241,17 @@ flowchart TB
 
 Default save folder is configurable in **Settings → Recording**.
 One recording at a time globally; switching tabs while recording
-works but only the originally-selected pane is captured.
+works but only the originally-selected tab is captured.
+
+**Multi-pane capture.** Hit Rec on a tab that's been split N ways
+and rbterm grabs every leaf simultaneously — one `.cast` per pane.
+The save modal then emits one output file per pane (e.g.
+`session.txt` becomes `session-p0.txt`, `session-p1.txt`, …) so a
+4-pane SSH fleet records as four independent timelines you can
+diff or replay side-by-side. Single-pane tabs keep the legacy
+"one filename, no suffix" output. Per-pane numbering follows DFS
+pre-order so the indices line up with the layout-string format
+used in `~/.ssh/config`'s saved layouts.
 
 ## System-info HUD — local *and* remote, in the corner of every pane
 
@@ -429,7 +439,7 @@ drains every pane's PTY each frame so background tabs stay live.
 
 ## Performance — fastest of the field on 9 of 10 benchmarks
 
-~25k lines of straight C99, hand-tuned, no runtime, no scripting
+~27k lines of straight C99, hand-tuned, no runtime, no scripting
 language, no shaders in the text-render hot path (the cinema-look
 effects shader is opt-in and only runs when a pane has it
 enabled) — and on real
@@ -578,9 +588,27 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 - **Tabs** — up to 16 concurrent shells, each with its own PTY,
   scrollback, selection and title. Background tabs stay live.
   Drag tabs to reorder; Ctrl+Tab / Cmd+1..9 to jump.
-- **Split panes** — Cmd+D splits vertically, Cmd+Shift+D horizontally
-  (max two panes per tab). Each pane owns its own PTY, screen state,
-  selection and palette so an OSC 4 applied in one doesn't leak.
+- **Split panes** — Cmd+D splits vertically, Cmd+Shift+D horizontally;
+  splits are recursive so you can keep subdividing the focused pane.
+  Cmd+K cycles focus to the next pane (Cmd+Shift+K for previous).
+  Each pane owns its own PTY, screen state, selection and palette
+  so an OSC 4 applied in one doesn't leak.
+- **Broadcast input** (Cmd+Shift+I or the radio-tower button) fans
+  every keystroke and paste in the active tab to *all* its panes —
+  type once, run on every SSH session in the split. Active panes
+  get a red 3px border + a `BROADCAST` pill in the tab bar so
+  you can never miss when it's armed. Auto-disarms on tab switch.
+- **Predefined SSH layouts** — split a host's tab the way you want
+  it, click **Save Layout from Active Tab** in the SSH form, and
+  the tree shape + per-pane cwd is written into `~/.ssh/config`
+  (as `# rbterm-layout: V0.50(H0.50(0,1),2)` plus
+  `# rbterm-pane-N-cwd:` lines). Reconnect to the host and the
+  layout replays automatically — splits get recreated and each
+  pane lands in its saved cwd. Per-pane commands are picked up
+  from `# rbterm-pane-N-cmd:` so `htop` in pane 2 starts itself.
+- **Tab-bar tooltips** — hover any of the top-row action buttons
+  and a small label slides in below the bar with the action name
+  and chord (e.g. *Split vertically (Cmd+D)*).
 - **Inline images** — **sixel** (`img2sixel`, `chafa -f sixel`,
   `timg -ps`, `gnuplot`, `ranger`) and the **kitty graphics
   protocol** (PNGs over base64, single + chunked transfer). Images
@@ -867,7 +895,6 @@ Setup, permissions, and per-terminal procedure are documented in
 - Cmd+N spawns a new OS process per window, so macOS shows each as
   a separate Dock icon and Cmd+` only cycles within one window.
   Same-process multi-window is a future project; see CLAUDE.md.
-- Splits are limited to two panes per tab; no recursive nesting.
 - Recording's mp4 / webm / apng output paths still require `ffmpeg`
   on PATH (gif and webp ship with native encoders and always work).
 

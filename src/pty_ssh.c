@@ -58,7 +58,24 @@ typedef struct {
     pthread_mutex_t hud_lock;
     PtyHudSnapshot  hud_snap;
     bool            hud_snap_valid;
+
+    /* Writer thread + ring buffer. Decouples the main thread from
+       libssh's network-bound ssh_channel_write so broadcast typing
+       across N SSH panes doesn't cost N × per-pane network latency
+       on the input path. ssh_write_impl just appends to write_ring
+       under write_lock + signals write_cond, and returns
+       immediately. The writer thread wakes, drains the ring, and
+       calls ssh_channel_write under session_lock. */
+    pthread_t       writer;
+    bool            writer_started;
+    pthread_mutex_t write_lock;
+    pthread_cond_t  write_cond;
+    uint8_t        *write_ring;
+    size_t          write_head;
+    size_t          write_tail;
 } SshPty;
+
+#define SSH_WRITE_RING_CAP (1u << 14)   /* 16 KB queued bytes — plenty for any keystroke burst */
 
 /* Reader-thread entry. Polls the SSH channel non-blocking under a
    briefly-held session lock; sleeps a few ms between empty polls
@@ -89,6 +106,59 @@ static int rbterm_passphrase_cb(const char *prompt, char *buf, size_t len,
     memcpy(buf, pass, n);
     buf[n] = 0;
     return 0;
+}
+
+/* Writer thread. Sleeps on write_cond until ssh_write_impl deposits
+   bytes in the ring; drains them in chunks to ssh_channel_write
+   under session_lock. Two locks are held briefly in sequence
+   (write_lock to copy out of the ring, then session_lock to send
+   over libssh) so neither blocks the other. */
+static void *ssh_writer(void *arg) {
+    SshPty *p = (SshPty *)arg;
+    uint8_t buf[4096];
+    while (!__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&p->write_lock);
+        while (!__atomic_load_n(&p->stop, __ATOMIC_RELAXED) &&
+               p->write_head == p->write_tail) {
+            pthread_cond_wait(&p->write_cond, &p->write_lock);
+        }
+        size_t avail = (p->write_head + SSH_WRITE_RING_CAP - p->write_tail)
+                       & (SSH_WRITE_RING_CAP - 1);
+        size_t take = avail < sizeof(buf) ? avail : sizeof(buf);
+        for (size_t i = 0; i < take; i++) {
+            buf[i] = p->write_ring[p->write_tail];
+            p->write_tail = (p->write_tail + 1) & (SSH_WRITE_RING_CAP - 1);
+        }
+        pthread_mutex_unlock(&p->write_lock);
+        if (__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) break;
+        if (take == 0) continue;
+        /* Send under session_lock, same loop as the old synchronous
+           ssh_write_impl. SSH_AGAIN means libssh's outgoing buffer
+           is full — back off briefly and retry rather than dropping
+           bytes the user just typed. */
+        size_t off = 0;
+        while (off < take) {
+            pthread_mutex_lock(&p->session_lock);
+            int w = p->channel
+                ? ssh_channel_write(p->channel, buf + off,
+                                    (uint32_t)(take - off))
+                : SSH_ERROR;
+            pthread_mutex_unlock(&p->session_lock);
+            if (w == SSH_ERROR) {
+                __atomic_store_n(&p->eof, 1, __ATOMIC_RELAXED);
+                p->alive = false;
+                break;
+            }
+            if (w <= 0) {
+                /* Would-block / partial — yield and retry. */
+                struct timespec ts = { 0, 1 * 1000 * 1000 };  /* 1 ms */
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            off += (size_t)w;
+        }
+    }
+    return NULL;
 }
 
 static void *ssh_reader(void *arg) {
@@ -449,8 +519,24 @@ void *ssh_open_impl(const char *user, const char *host, int port,
     pthread_mutex_init(&p->session_lock, NULL);
     pthread_mutex_init(&p->ring_lock, NULL);
     pthread_mutex_init(&p->hud_lock, NULL);
+    pthread_mutex_init(&p->write_lock, NULL);
+    pthread_cond_init(&p->write_cond, NULL);
+    p->write_ring = malloc(SSH_WRITE_RING_CAP);
+    if (!p->write_ring) {
+        set_err(err, errsz, "out of memory (write ring)");
+        pthread_cond_destroy(&p->write_cond);
+        pthread_mutex_destroy(&p->write_lock);
+        pthread_mutex_destroy(&p->session_lock);
+        pthread_mutex_destroy(&p->ring_lock);
+        pthread_mutex_destroy(&p->hud_lock);
+        free(p->ring);
+        goto fail;
+    }
     if (pthread_create(&p->reader, NULL, ssh_reader, p) != 0) {
         set_err(err, errsz, "pthread_create");
+        free(p->write_ring); p->write_ring = NULL;
+        pthread_cond_destroy(&p->write_cond);
+        pthread_mutex_destroy(&p->write_lock);
         pthread_mutex_destroy(&p->session_lock);
         pthread_mutex_destroy(&p->ring_lock);
         pthread_mutex_destroy(&p->hud_lock);
@@ -458,6 +544,25 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         goto fail;
     }
     p->reader_started = true;
+    /* Writer thread — drains write_ring into ssh_channel_write so
+       the main thread's enqueue is O(memcpy) instead of O(network
+       round-trip). Failure here would force fallback to synchronous
+       writes (a regression we don't tolerate), so we abort the open
+       on pthread_create failure rather than degrade silently. */
+    if (pthread_create(&p->writer, NULL, ssh_writer, p) != 0) {
+        set_err(err, errsz, "pthread_create (writer)");
+        __atomic_store_n(&p->stop, 1, __ATOMIC_RELAXED);
+        pthread_join(p->reader, NULL);
+        free(p->write_ring); p->write_ring = NULL;
+        pthread_cond_destroy(&p->write_cond);
+        pthread_mutex_destroy(&p->write_lock);
+        pthread_mutex_destroy(&p->session_lock);
+        pthread_mutex_destroy(&p->ring_lock);
+        pthread_mutex_destroy(&p->hud_lock);
+        free(p->ring);
+        goto fail;
+    }
+    p->writer_started = true;
     /* HUD probe runs in its own thread so the 100-500ms exec
        round-trip can't stall the shell reader. Failure is silent —
        the snapshot just stays !valid and main.c will treat the
@@ -727,6 +832,14 @@ void ssh_close_impl(void *impl) {
         pthread_join(p->hud_probe, NULL);
         p->hud_probe_started = false;
     }
+    /* Wake the writer so it sees the stop flag and exits. */
+    if (p->writer_started) {
+        pthread_mutex_lock(&p->write_lock);
+        pthread_cond_broadcast(&p->write_cond);
+        pthread_mutex_unlock(&p->write_lock);
+        pthread_join(p->writer, NULL);
+        p->writer_started = false;
+    }
     if (p->reader_started) {
         pthread_join(p->reader, NULL);
         p->reader_started = false;
@@ -741,6 +854,12 @@ void ssh_close_impl(void *impl) {
     if (p->session) {
         ssh_disconnect(p->session);
         ssh_free(p->session);
+    }
+    if (p->write_ring) {
+        free(p->write_ring);
+        p->write_ring = NULL;
+        pthread_cond_destroy(&p->write_cond);
+        pthread_mutex_destroy(&p->write_lock);
     }
     if (p->ring) {
         pthread_mutex_destroy(&p->ring_lock);
@@ -780,21 +899,31 @@ int ssh_read_impl(void *impl, uint8_t *buf, size_t cap) {
     return 0;
 }
 
-/* Send bytes to the remote shell. Holds session_lock so it can't
-   collide with the reader thread's libssh call. SSH_ERROR marks
-   the channel dead so pty_alive() flips false on the next poll. */
+/* Enqueue bytes for the writer thread to send. Returns immediately
+   so the main thread isn't blocked on libssh's network-bound
+   ssh_channel_write — critical for broadcast typing across N SSH
+   panes, where the synchronous version had to pay per-pane lock +
+   socket latency in series for every keystroke.
+
+   When the ring is full we drop the oldest queued bytes to make
+   room. That can only happen if a remote SSH session is unresponsive
+   (or paused under SIGSTOP); typing anyway would have failed there
+   regardless, and dropping the oldest keeps the most-recent
+   keystrokes intact. */
 void ssh_write_impl(void *impl, const uint8_t *buf, size_t n) {
     SshPty *p = impl;
-    if (!p || !p->channel) return;
-    pthread_mutex_lock(&p->session_lock);
-    size_t off = 0;
-    while (off < n && p->channel) {
-        int w = ssh_channel_write(p->channel, buf + off, (uint32_t)(n - off));
-        if (w == SSH_ERROR) { p->alive = false; break; }
-        if (w <= 0) break;
-        off += (size_t)w;
+    if (!p || !p->write_ring || !p->writer_started || n == 0) return;
+    pthread_mutex_lock(&p->write_lock);
+    for (size_t i = 0; i < n; i++) {
+        p->write_ring[p->write_head] = buf[i];
+        p->write_head = (p->write_head + 1) & (SSH_WRITE_RING_CAP - 1);
+        if (p->write_head == p->write_tail) {
+            /* Buffer full — advance tail (drop oldest). */
+            p->write_tail = (p->write_tail + 1) & (SSH_WRITE_RING_CAP - 1);
+        }
     }
-    pthread_mutex_unlock(&p->session_lock);
+    pthread_cond_signal(&p->write_cond);
+    pthread_mutex_unlock(&p->write_lock);
 }
 
 /* Send a "window-change" SSH_MSG_CHANNEL_REQUEST under the session

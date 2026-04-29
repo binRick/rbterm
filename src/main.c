@@ -732,20 +732,36 @@ typedef struct {
 
 typedef enum {
     SPLIT_NONE = 0,
-    SPLIT_VERTICAL   = 1,   /* pane[0] left, pane[1] right   — splitter is a vertical line */
-    SPLIT_HORIZONTAL = 2    /* pane[0] top,  pane[1] bottom  — splitter is a horizontal line */
+    SPLIT_VERTICAL   = 1,   /* child[0] left, child[1] right   — splitter is a vertical line */
+    SPLIT_HORIZONTAL = 2    /* child[0] top,  child[1] bottom  — splitter is a horizontal line */
 } SplitMode;
 
+/* Recursive split layout: each node is either a leaf (split == SPLIT_NONE,
+   pane != NULL) or an internal split (split != SPLIT_NONE, child[0/1] !=
+   NULL, pane == NULL). Pane is heap-allocated under each leaf so its
+   address (handed to Screen as io.user) stays stable across collapses
+   and tree mutations. */
+typedef struct PaneNode PaneNode;
+struct PaneNode {
+    PaneNode *parent;
+    SplitMode split;             /* SPLIT_NONE on leaves */
+    float     ratio;             /* internal: 0.15..0.85, fraction given to child[0] */
+    PaneNode *child[2];          /* internal */
+    bool      splitter_drag;     /* internal: true while user drags this splitter */
+    Pane     *pane;              /* leaf */
+};
+
 typedef struct {
-    Pane panes[2];
-    int  num_panes;              /* 1 or 2 */
-    int  active_pane;            /* 0 or 1 */
-    SplitMode split;
-    float split_ratio;           /* fraction of available extent given to panes[0] (0.15..0.85) */
-    bool splitter_drag;
+    PaneNode *root;              /* tree of leaves + splits */
+    PaneNode *active;            /* current focused leaf */
     bool dead;
     bool  is_ssh;
     char  ssh_target[256];       /* user@host[:port] for SSH tabs */
+    /* `Host <alias>` from ~/.ssh/config that opened this tab. Empty
+       for ad-hoc connections. Used by ssh_form_open to round-trip
+       to the *exact* saved profile when two aliases share the same
+       (HostName, User, Port). */
+    char  ssh_alias[128];
     /* Stashed SSH connect params so a split can re-dial the same host. */
     char  ssh_host[256];
     char  ssh_user[96];
@@ -785,19 +801,18 @@ typedef struct {
        channel opens. Empty = no-op. See ssh_form's matching fields. */
     char  ssh_init_cwd[256];
     char  ssh_init_cmd[256];
+    /* Predefined split layout for this SSH host. After the first
+       pane is up, tab_open_ssh parses ssh_layout, performs the
+       splits in DFS pre-order, and sends per-leaf cwd/cmd to each
+       new pane. Empty layout = single pane, init_cwd/init_cmd
+       fallback. Mirrors SshProfile/SshForm. */
+    char  ssh_layout[256];
+    char  ssh_pane_cwds[8][256];
+    char  ssh_pane_cmds[8][256];
     /* Background-tab activity: set when any pane of a non-active tab
        receives PTY output. Cleared when the tab becomes active. */
     bool  activity;
 } Tab;
-
-/* Returns the HudConfig the renderer should consult for `t`. SSH
-   tab with override flag set → use the per-host config; otherwise
-   fall back to the global app settings. Returned by value so call
-   sites can read fields uniformly. */
-static HudConfig hud_effective(const Tab *t) {
-    if (t && t->is_ssh && t->ssh_hud.override) return t->ssh_hud;
-    return hud_config_from_app_settings();
-}
 
 #define MAX_TABS 16
 #define TAB_BAR_H 30
@@ -813,6 +828,427 @@ static HudConfig hud_effective(const Tab *t) {
 #define TAB_SSH_W   48
 #define TAB_UPLOAD_W 28         /* SFTP upload button (only visible on SSH tabs) */
 #define TAB_DOWNLOAD_W 28       /* SFTP download button (only visible on SSH tabs) */
+#define TAB_BCAST_W 30          /* Broadcast-input toggle (only visible when 2+ panes) */
+
+/* ---------- PaneNode tree helpers ---------- */
+
+typedef struct {
+    int x, y, w, h;
+} PaneRect;
+
+#define SPLITTER_PX   2
+#define SPLITTER_GRAB 6
+
+static void pane_free(Pane *p);
+
+static PaneNode *pane_node_new_leaf(void) {
+    PaneNode *n = calloc(1, sizeof(PaneNode));
+    n->pane = calloc(1, sizeof(Pane));
+    n->ratio = 0.5f;
+    return n;
+}
+
+static void pane_node_free_recursive(PaneNode *n) {
+    if (!n) return;
+    if (n->split == SPLIT_NONE) {
+        if (n->pane) {
+            pane_free(n->pane);
+            free(n->pane);
+        }
+    } else {
+        pane_node_free_recursive(n->child[0]);
+        pane_node_free_recursive(n->child[1]);
+    }
+    free(n);
+}
+
+static int pane_tree_count(const PaneNode *n) {
+    if (!n) return 0;
+    if (n->split == SPLIT_NONE) return 1;
+    return pane_tree_count(n->child[0]) + pane_tree_count(n->child[1]);
+}
+
+static PaneNode *pane_tree_first_leaf(PaneNode *n) {
+    if (!n) return NULL;
+    while (n->split != SPLIT_NONE) n = n->child[0];
+    return n;
+}
+
+static PaneNode *pane_tree_last_leaf(PaneNode *n) {
+    if (!n) return NULL;
+    while (n->split != SPLIT_NONE) n = n->child[1];
+    return n;
+}
+
+/* Tree-order next/prev leaf — used by Cmd-cycle-pane chords. NULL at
+   the ends of the tree. */
+static PaneNode *pane_tree_next_leaf(PaneNode *leaf) {
+    if (!leaf) return NULL;
+    PaneNode *cur = leaf;
+    while (cur->parent && cur == cur->parent->child[1]) cur = cur->parent;
+    if (!cur->parent) return NULL;
+    return pane_tree_first_leaf(cur->parent->child[1]);
+}
+
+static PaneNode *pane_tree_prev_leaf(PaneNode *leaf) {
+    if (!leaf) return NULL;
+    PaneNode *cur = leaf;
+    while (cur->parent && cur == cur->parent->child[0]) cur = cur->parent;
+    if (!cur->parent) return NULL;
+    return pane_tree_last_leaf(cur->parent->child[0]);
+}
+
+/* Wraps next/prev around so cycling never lands on NULL. */
+static PaneNode *pane_tree_cycle_leaf(PaneNode *root, PaneNode *leaf, int dir) {
+    if (!root) return NULL;
+    PaneNode *next = (dir > 0) ? pane_tree_next_leaf(leaf)
+                               : pane_tree_prev_leaf(leaf);
+    if (next) return next;
+    return (dir > 0) ? pane_tree_first_leaf(root) : pane_tree_last_leaf(root);
+}
+
+/* Compute child rects for an internal node within `outer`. */
+static void pane_tree_split_children(const PaneNode *n, PaneRect outer,
+                                     PaneRect *a_out, PaneRect *b_out) {
+    float ratio = n->ratio;
+    if (ratio < 0.15f) ratio = 0.15f;
+    if (ratio > 0.85f) ratio = 0.85f;
+    if (n->split == SPLIT_VERTICAL) {
+        int left_w = (int)((outer.w - SPLITTER_PX) * ratio);
+        if (left_w < 0) left_w = 0;
+        a_out->x = outer.x; a_out->y = outer.y;
+        a_out->w = left_w;  a_out->h = outer.h;
+        b_out->x = outer.x + left_w + SPLITTER_PX;
+        b_out->y = outer.y;
+        b_out->w = outer.w - left_w - SPLITTER_PX;
+        b_out->h = outer.h;
+        if (b_out->w < 0) b_out->w = 0;
+    } else { /* SPLIT_HORIZONTAL */
+        int top_h = (int)((outer.h - SPLITTER_PX) * ratio);
+        if (top_h < 0) top_h = 0;
+        a_out->x = outer.x; a_out->y = outer.y;
+        a_out->w = outer.w; a_out->h = top_h;
+        b_out->x = outer.x;
+        b_out->y = outer.y + top_h + SPLITTER_PX;
+        b_out->w = outer.w;
+        b_out->h = outer.h - top_h - SPLITTER_PX;
+        if (b_out->h < 0) b_out->h = 0;
+    }
+}
+
+/* Outer rect of `target` (any node) within the tree rooted at `root`.
+   Returns false if not found. */
+static bool pane_tree_node_rect_walk(const PaneNode *n, const PaneNode *target,
+                                     PaneRect outer, PaneRect *out) {
+    if (!n) return false;
+    if (n == target) { *out = outer; return true; }
+    if (n->split == SPLIT_NONE) return false;
+    PaneRect ra, rb;
+    pane_tree_split_children(n, outer, &ra, &rb);
+    if (pane_tree_node_rect_walk(n->child[0], target, ra, out)) return true;
+    return pane_tree_node_rect_walk(n->child[1], target, rb, out);
+}
+
+static PaneRect pane_tree_terminal_outer(int win_w, int win_h) {
+    PaneRect r = { 0, TAB_BAR_H, win_w, win_h - TAB_BAR_H };
+    if (r.h < 0) r.h = 0;
+    return r;
+}
+
+/* Find the leaf containing (mx, my) inside `outer`. */
+static PaneNode *pane_tree_at(PaneNode *n, PaneRect outer, int mx, int my) {
+    if (!n) return NULL;
+    if (mx < outer.x || mx >= outer.x + outer.w ||
+        my < outer.y || my >= outer.y + outer.h) return NULL;
+    if (n->split == SPLIT_NONE) return n;
+    PaneRect ra, rb;
+    pane_tree_split_children(n, outer, &ra, &rb);
+    PaneNode *r = pane_tree_at(n->child[0], ra, mx, my);
+    if (r) return r;
+    return pane_tree_at(n->child[1], rb, mx, my);
+}
+
+/* Find an internal node whose splitter rect (padded by `grab`)
+   contains (mx, my). Optionally returns its outer rect (needed for
+   drag math). */
+static PaneNode *pane_tree_splitter_at(PaneNode *n, PaneRect outer,
+                                       int mx, int my, int grab,
+                                       PaneRect *outer_out) {
+    if (!n || n->split == SPLIT_NONE) return NULL;
+    PaneRect ra, rb;
+    pane_tree_split_children(n, outer, &ra, &rb);
+    int gx, gy, gw, gh;
+    if (n->split == SPLIT_VERTICAL) {
+        gx = ra.x + ra.w - grab;
+        gy = ra.y;
+        gw = SPLITTER_PX + 2 * grab;
+        gh = ra.h;
+    } else {
+        gx = ra.x;
+        gy = ra.y + ra.h - grab;
+        gw = ra.w;
+        gh = SPLITTER_PX + 2 * grab;
+    }
+    if (mx >= gx && mx < gx + gw && my >= gy && my < gy + gh) {
+        if (outer_out) *outer_out = outer;
+        return n;
+    }
+    PaneNode *r = pane_tree_splitter_at(n->child[0], ra, mx, my, grab, outer_out);
+    if (r) return r;
+    return pane_tree_splitter_at(n->child[1], rb, mx, my, grab, outer_out);
+}
+
+/* Replace `leaf` in the tree with a fresh internal split node whose
+   first child is the original leaf and second child is a fresh leaf.
+   Returns the new (right/bottom) leaf so the caller can spawn a PTY
+   into it. */
+static PaneNode *pane_node_split_leaf(Tab *t, PaneNode *leaf, SplitMode mode) {
+    if (!t || !leaf || leaf->split != SPLIT_NONE) return NULL;
+    PaneNode *split = calloc(1, sizeof(PaneNode));
+    PaneNode *new_leaf = pane_node_new_leaf();
+    split->split = mode;
+    split->ratio = 0.5f;
+    split->child[0] = leaf;
+    split->child[1] = new_leaf;
+    split->parent = leaf->parent;
+    if (leaf->parent) {
+        int slot = (leaf->parent->child[0] == leaf) ? 0 : 1;
+        leaf->parent->child[slot] = split;
+    } else {
+        t->root = split;
+    }
+    leaf->parent = split;
+    new_leaf->parent = split;
+    return new_leaf;
+}
+
+/* Close a leaf and collapse its parent into the surviving sibling.
+   Returns true if the tab itself should now die (the leaf was the
+   only pane). */
+static bool pane_node_close_leaf(Tab *t, PaneNode *leaf) {
+    if (!t || !leaf || leaf->split != SPLIT_NONE) return false;
+    PaneNode *parent = leaf->parent;
+    if (!parent) {
+        return true;   /* caller marks tab dead */
+    }
+    PaneNode *sibling = (parent->child[0] == leaf) ? parent->child[1]
+                                                   : parent->child[0];
+    /* Free the leaf (its Pane and the node itself). */
+    pane_node_free_recursive(leaf);
+    parent->child[0] = parent->child[1] = NULL;
+    /* Promote `sibling` into `parent`'s slot. */
+    sibling->parent = parent->parent;
+    if (parent->parent) {
+        int slot = (parent->parent->child[0] == parent) ? 0 : 1;
+        parent->parent->child[slot] = sibling;
+    } else {
+        t->root = sibling;
+    }
+    free(parent);
+    return false;
+}
+
+/* Maximum number of leaves in an SSH host's predefined split layout.
+   8 is a soft cap — covers everything from a single pane to a
+   3-deep recursion (3 splits = 4 leaves) plus headroom. Picked over
+   "unlimited" so the descriptor strings stay one-digit-per-leaf. */
+#define SSH_LAYOUT_MAX_PANES 8
+
+/* ---------- Layout descriptor: serialize/parse + replay ----------
+
+   The layout descriptor encodes a split tree as a string. Grammar:
+
+       expr  := leaf | split
+       leaf  := DIGIT (single-digit pane index, 0..7)
+       split := ('V' | 'H') ratio '(' expr ',' expr ')'
+       ratio := '0' '.' DIGIT DIGIT          (e.g. "0.50")
+
+   Examples:
+       "0"                             single pane
+       "V0.50(0,1)"                    side-by-side
+       "V0.50(H0.50(0,1),2)"           three panes, 2-over-1 on the left
+       "H0.40(V0.30(0,1),V0.60(2,3))"  4-pane 2x2 grid
+
+   Indices number leaves in DFS pre-order so the serializer and
+   parser agree without an explicit numbering pass.
+
+   Serializer + parser cap at SSH_LAYOUT_MAX_PANES (8) leaves and
+   reject deeper recursion. Malformed input is treated as empty —
+   the host opens with a single pane. */
+
+/* Walk `t->root` in DFS pre-order, emitting the layout descriptor
+   and capturing each leaf's cwd into cwds_out (one per leaf). The
+   cmd array is left untouched — capturing what's "running" is out
+   of scope for v1; the caller initialises cmds_out to whatever
+   default it wants. Returns the leaf count, or -1 on overflow. */
+static int layout_serialize_walk(const PaneNode *n, char *buf, size_t cap,
+                                 size_t *off,
+                                 char cwds_out[][256],
+                                 int *next_idx) {
+    if (!n) return -1;
+    if (n->split == SPLIT_NONE) {
+        if (*next_idx >= SSH_LAYOUT_MAX_PANES) return -1;
+        int written = snprintf(buf + *off, cap - *off, "%d", *next_idx);
+        if (written < 0 || (size_t)written >= cap - *off) return -1;
+        *off += (size_t)written;
+        if (n->pane && n->pane->cwd[0]) {
+            strncpy(cwds_out[*next_idx], n->pane->cwd, 255);
+            cwds_out[*next_idx][255] = 0;
+        } else {
+            cwds_out[*next_idx][0] = 0;
+        }
+        (*next_idx)++;
+        return 0;
+    }
+    /* Internal split. */
+    char head = (n->split == SPLIT_VERTICAL) ? 'V' : 'H';
+    float ratio = n->ratio;
+    if (ratio < 0.15f) ratio = 0.15f;
+    if (ratio > 0.85f) ratio = 0.85f;
+    int written = snprintf(buf + *off, cap - *off, "%c%.2f(", head, ratio);
+    if (written < 0 || (size_t)written >= cap - *off) return -1;
+    *off += (size_t)written;
+    if (layout_serialize_walk(n->child[0], buf, cap, off, cwds_out, next_idx) < 0) return -1;
+    if (*off + 1 >= cap) return -1;
+    buf[(*off)++] = ',';
+    buf[*off] = 0;
+    if (layout_serialize_walk(n->child[1], buf, cap, off, cwds_out, next_idx) < 0) return -1;
+    if (*off + 1 >= cap) return -1;
+    buf[(*off)++] = ')';
+    buf[*off] = 0;
+    return 0;
+}
+
+/* Captures `t`'s layout into `out` and `cwds_out`. Returns the leaf
+   count on success, 0 on overflow / no tree. Caller pre-zeroes
+   cwds_out + cmds_out (we don't touch cmds). */
+static int layout_serialize(const Tab *t, char *out, size_t cap,
+                            char cwds_out[][256]) {
+    if (!t || !t->root || cap < 2) return 0;
+    out[0] = 0;
+    size_t off = 0;
+    int next = 0;
+    if (layout_serialize_walk(t->root, out, cap, &off, cwds_out, &next) < 0) {
+        out[0] = 0;
+        return 0;
+    }
+    return next;
+}
+
+/* Parsed layout tree node — internal-only is { split, ratio, two
+   children }; leaves carry their pane index. Recursive-descent
+   parser allocates these on the heap; the replay walker frees the
+   tree as it goes. Capping at SSH_LAYOUT_MAX_PANES leaves keeps
+   total nodes <= 15. */
+typedef struct LayoutNode LayoutNode;
+struct LayoutNode {
+    bool is_leaf;
+    int  leaf_idx;          /* leaves only */
+    SplitMode split;        /* internal only */
+    float ratio;
+    LayoutNode *child[2];
+};
+
+static void layout_node_free(LayoutNode *n) {
+    if (!n) return;
+    if (!n->is_leaf) {
+        layout_node_free(n->child[0]);
+        layout_node_free(n->child[1]);
+    }
+    free(n);
+}
+
+/* Returns NULL on parse failure. *cur is advanced past consumed
+   chars on success. Caller frees the result with layout_node_free. */
+static LayoutNode *layout_parse_expr(const char **cur, int depth) {
+    if (depth > SSH_LAYOUT_MAX_PANES) return NULL;   /* runaway */
+    const char *p = *cur;
+    if (!p || !*p) return NULL;
+    if (*p >= '0' && *p <= '9') {
+        /* Leaf: single decimal digit. (We only support 0..7 so a
+           single digit is enough.) */
+        LayoutNode *n = calloc(1, sizeof(LayoutNode));
+        n->is_leaf = true;
+        n->leaf_idx = *p - '0';
+        if (n->leaf_idx >= SSH_LAYOUT_MAX_PANES) { free(n); return NULL; }
+        *cur = p + 1;
+        return n;
+    }
+    if (*p != 'V' && *p != 'H') return NULL;
+    SplitMode sp = (*p == 'V') ? SPLIT_VERTICAL : SPLIT_HORIZONTAL;
+    p++;
+    /* Ratio: 0.NN */
+    if (*p != '0' || p[1] != '.') return NULL;
+    char *end = NULL;
+    float ratio = strtof(p, &end);
+    if (!end || end == p) return NULL;
+    if (ratio < 0.15f) ratio = 0.15f;
+    if (ratio > 0.85f) ratio = 0.85f;
+    p = end;
+    if (*p != '(') return NULL;
+    p++;
+    *cur = p;
+    LayoutNode *left = layout_parse_expr(cur, depth + 1);
+    if (!left) return NULL;
+    p = *cur;
+    if (*p != ',') { layout_node_free(left); return NULL; }
+    p++;
+    *cur = p;
+    LayoutNode *right = layout_parse_expr(cur, depth + 1);
+    if (!right) { layout_node_free(left); return NULL; }
+    p = *cur;
+    if (*p != ')') { layout_node_free(left); layout_node_free(right); return NULL; }
+    p++;
+    *cur = p;
+    LayoutNode *n = calloc(1, sizeof(LayoutNode));
+    n->is_leaf = false;
+    n->split = sp;
+    n->ratio = ratio;
+    n->child[0] = left;
+    n->child[1] = right;
+    return n;
+}
+
+/* Parse a complete layout descriptor. Returns NULL on malformed
+   input (caller should treat as "no layout"). */
+static LayoutNode *layout_parse(const char *str) {
+    if (!str || !*str) return NULL;
+    const char *cur = str;
+    LayoutNode *n = layout_parse_expr(&cur, 0);
+    if (!n) return NULL;
+    /* Must consume the entire string. */
+    while (*cur == ' ' || *cur == '\t' || *cur == '\n' || *cur == '\r') cur++;
+    if (*cur != 0) { layout_node_free(n); return NULL; }
+    return n;
+}
+
+/* Verify the parsed tree's leaf indices form 0..N-1 with no
+   duplicates (the serializer always assigns DFS pre-order, but we
+   want to be tolerant of hand-edited layouts). Returns N >= 1 on
+   success, 0 on failure. */
+static int layout_count_leaves(const LayoutNode *n, bool seen[SSH_LAYOUT_MAX_PANES]) {
+    if (!n) return 0;
+    if (n->is_leaf) {
+        if (n->leaf_idx < 0 || n->leaf_idx >= SSH_LAYOUT_MAX_PANES) return 0;
+        if (seen[n->leaf_idx]) return 0;
+        seen[n->leaf_idx] = true;
+        return 1;
+    }
+    int a = layout_count_leaves(n->child[0], seen);
+    if (a == 0) return 0;
+    int b = layout_count_leaves(n->child[1], seen);
+    if (b == 0) return 0;
+    return a + b;
+}
+
+/* Returns the HudConfig the renderer should consult for `t`. SSH
+   tab with override flag set → use the per-host config; otherwise
+   fall back to the global app settings. Returned by value so call
+   sites can read fields uniformly. */
+static HudConfig hud_effective(const Tab *t) {
+    if (t && t->is_ssh && t->ssh_hud.override) return t->ssh_hud;
+    return hud_config_from_app_settings();
+}
 
 static Tab *g_tabs[MAX_TABS];
 
@@ -825,6 +1261,13 @@ static int  g_tab_press_mx  = 0;
 static bool g_tab_dragging  = false;
 static int g_num_tabs = 0;
 static int g_active = 0;
+
+/* Broadcast input mode: when true, every keystroke (and paste) fans
+   out to every leaf of the active tab's pane tree instead of going
+   to just the focused pane. Auto-disarms when the user switches
+   tabs so a stray Cmd+T doesn't drop a local shell into the
+   broadcast group. Toggle via Cmd+Shift+I or the tab-bar button. */
+static bool g_broadcast_active = false;
 
 /* Modal SSH connection form. When non-NORMAL, the terminal is locked:
    keystrokes edit form fields and mouse clicks focus them instead of
@@ -870,9 +1313,18 @@ typedef struct {
        program (vim, tmux attach, etc.). Empty = no-op. */
     char init_cwd[256];
     char init_cmd[256];
+    /* Predefined split layout. Mirror of SshProfile.layout — see
+       there for the descriptor-string grammar. Filled by the
+       "Save Layout" button (capturing the active SSH tab's tree)
+       and by ssh_form_apply_profile when an existing host is
+       picked. Layout is replayed after connect by tab_open_ssh. */
+    char layout[256];
+    char pane_cwds[8][256];
+    char pane_cmds[8][256];
     int  focus;              /* SshField */
     bool sel_all;            /* focused text field's contents are fully selected */
     char error[256];
+    char layout_status[128]; /* feedback line under the Save Layout button */
 } SshForm;
 static UiMode  g_ui_mode = UI_NORMAL;
 static SshForm g_form;
@@ -994,7 +1446,19 @@ typedef struct {
        right after the channel opens. */
     char init_cwd[256];
     char init_cmd[256];
+    /* Predefined split layout for this host. `layout` is a
+       descriptor string like `V0.50(H0.50(0,1),2)` where letters
+       are split orientations, decimals are 0.15..0.85 ratios, and
+       integers are leaf indices into pane_cwds[] / pane_cmds[].
+       Empty layout means "single pane, fall back to init_cwd /
+       init_cmd". When the layout has N leaves, the first N entries
+       in pane_cwds / pane_cmds are sent to the matching pane after
+       its PTY opens. See SSH_LAYOUT_*. */
+    char layout[256];
+    char pane_cwds[8][256];
+    char pane_cmds[8][256];
 } SshProfile;
+
 
 /* Curated palette for SSH tab accents. 8 saturated colours that all
    read well as a tab background plus a "none" sentinel handled
@@ -1089,6 +1553,9 @@ typedef struct {
        rows; scroll if more. */
     Rect key_pick_btn;
     Rect key_pick_list;
+    /* Save-current-layout button (Connection tab). Captures the active
+       SSH tab's split tree + per-pane cwd into ~/.ssh/config. */
+    Rect save_layout;
 } SshFormLayout;
 
 /* Per-list scroll state for the SSH form (independent of the Settings
@@ -1256,7 +1723,7 @@ static void pane_log_open(Tab *t, Pane *p, int pane_idx) {
        same second. */
     int slot = 0;
     for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { slot = i; break; }
-    if (t->num_panes > 1 || pane_idx > 0) {
+    if (pane_tree_count(t->root) > 1 || pane_idx > 0) {
         snprintf(p->log_path, sizeof(p->log_path),
                  "%s/rbterm-%s-tab%d-p%d.log", dir, stamp, slot, pane_idx);
     } else {
@@ -1287,13 +1754,20 @@ static void pane_log_write(Pane *p, const uint8_t *buf, size_t n) {
 
 /* Open log files on every pane in a tab. */
 static void tab_log_open_all(Tab *t) {
-    if (!t) return;
-    for (int i = 0; i < t->num_panes; i++) pane_log_open(t, &t->panes[i], i);
+    if (!t || !t->root) return;
+    int i = 0;
+    for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+         leaf = pane_tree_next_leaf(leaf), i++) {
+        pane_log_open(t, leaf->pane, i);
+    }
 }
 /* Symmetric — close every pane's log in a tab. */
 static void tab_log_close_all(Tab *t) {
-    if (!t) return;
-    for (int i = 0; i < t->num_panes; i++) pane_log_close(&t->panes[i]);
+    if (!t || !t->root) return;
+    for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+         leaf = pane_tree_next_leaf(leaf)) {
+        pane_log_close(leaf->pane);
+    }
 }
 
 /* (Re-)open logs on every pane in every tab based on the current
@@ -1465,16 +1939,21 @@ static bool pane_open_ssh(Pane *p, const char *user, const char *host, int port,
 static void open_url(const char *url);
 
 /* Asciinema recording — global singleton. We tap the PTY drain in
-   the main loop and write timestamped events to a .cast file
-   (asciinema v2 spec). Cmd-style buttons in the tab bar start /
-   stop. Pinned to whichever pane was active when start fired so
-   the user can tab around without losing the recording. */
+   the main loop and write timestamped events to one .cast file per
+   captured pane (asciinema v2 spec). Multi-pane tabs record every
+   leaf so split workflows produce per-pane outputs the user can
+   diff or replay independently. The capture set is fixed at start
+   time (so a split *during* recording doesn't add a new file mid-
+   stream — same trade-off as recording staying tied to the
+   originally-active tab). */
 typedef struct {
     bool   active;
-    Pane  *pane;
-    FILE  *fp;
+    /* Per-pane capture slots, populated DFS pre-order at rec_start. */
+    Pane  *panes[8];
+    FILE  *fps[8];
+    char   paths[8][PATH_MAX];
+    int    count;
     double start_time;
-    char   path[PATH_MAX];
 } Recording;
 static Recording g_rec;
 static void rec_stop(void);
@@ -1495,7 +1974,15 @@ typedef enum {
     REC_FMT_COUNT
 } RecFmt;
 typedef struct {
-    char       src_path[PATH_MAX];   /* the temp .cast file already on disk */
+    /* Up to 8 source casts captured during the recording. src_paths[0]
+       is the legacy single-pane slot; on multi-pane tabs every leaf
+       gets its own slot. The save action loops over `src_count` and
+       emits one output per pane. */
+    char       src_paths[8][PATH_MAX];
+    int        src_count;
+    /* Convenience alias for code paths that only use the first
+       capture (e.g. preview / single-output formats). */
+    char       src_path[PATH_MAX];
     double     duration_s;
     char       dst_path[PATH_MAX];   /* user-editable destination */
     RecFmt     fmt;
@@ -1517,9 +2004,13 @@ static RecSave g_rec_save;
    pane (e.g. after a failed pane_open_*). */
 static void pane_free(Pane *p) {
     if (!p) return;
-    /* Stop a recording if its target pane is going away — the file
-       pointer would dangle otherwise. */
-    if (g_rec.active && g_rec.pane == p) rec_stop();
+    /* Stop a recording if any of its captured panes is going away —
+       the matching file pointer would dangle otherwise. */
+    if (g_rec.active) {
+        for (int _r = 0; _r < g_rec.count; _r++) {
+            if (g_rec.panes[_r] == p) { rec_stop(); break; }
+        }
+    }
     /* Cancel + join any in-flight SFTP transfers before tearing
        down the PTY (the worker threads hold the session lock). */
     if (p->upload)   { pty_upload_release(p->upload);     p->upload = NULL; }
@@ -1653,17 +2144,15 @@ static double g_snap_status_at;
    active pane's on-screen rect. */
 static bool screenshot_active_pane(Renderer *r);
 
-/* Begin recording the bytes coming out of pane `p`. Writes the
-   asciinema v2 header (cols, rows, unix timestamp), seeds the
-   recording with a snapshot of the current screen state so
-   playback opens with what the user sees, and pins the pane
-   pointer so they can switch tabs without disturbing the
-   recording. Returns false on file-open failure. */
-static bool rec_start(Pane *p) {
-    if (!p || !p->scr || g_rec.active) return false;
+/* Begin recording every leaf of `t`'s pane tree. Writes one v2 .cast
+   per leaf, seeds each with that leaf's current screen state so
+   playback opens on what the user sees, and pins the leaf pointers
+   so the capture set is fixed for the lifetime of the recording.
+   Returns false if no leaves are recordable or any file-open fails
+   (in which case anything we did open is closed before returning). */
+static bool rec_start(Tab *t) {
+    if (!t || !t->root || g_rec.active) return false;
     char dir[PATH_MAX];
-    /* Use the Settings → Recording directory; fall back to
-       ~/Downloads if it's empty (first run with a stale config). */
     const char *want = g_app_settings.rec_dir[0]
                        ? g_app_settings.rec_dir : "~/Downloads";
     expand_home_path(want, dir, sizeof(dir));
@@ -1677,29 +2166,56 @@ static bool rec_start(Pane *p) {
     localtime_r(&now, &tmv);
 #endif
     strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tmv);
-    snprintf(g_rec.path, sizeof(g_rec.path),
-             "%s/rbterm-%s.cast", dir, stamp);
-    FILE *fp = fopen(g_rec.path, "wb");
-    if (!fp) {
-        fprintf(stderr, "rbterm: rec_start: %s: %s\n",
-                g_rec.path, strerror(errno));
-        return false;
+
+    /* Walk leaves in DFS pre-order — same numbering the layout
+       descriptor uses, so save filenames line up with rbterm's
+       per-pane mental model. */
+    int count = 0;
+    for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+         leaf = pane_tree_next_leaf(leaf)) {
+        Pane *p = leaf->pane;
+        if (!p || !p->scr) continue;
+        if (count >= (int)(sizeof(g_rec.panes) / sizeof(g_rec.panes[0]))) break;
+        /* Single-pane recordings keep the legacy "one filename per
+           recording" feel; multi-pane add a -p<I> suffix so they
+           land alongside each other in the recording dir. */
+        bool many = pane_tree_count(t->root) >= 2;
+        if (many) {
+            snprintf(g_rec.paths[count], sizeof(g_rec.paths[count]),
+                     "%s/rbterm-%s-p%d.cast", dir, stamp, count);
+        } else {
+            snprintf(g_rec.paths[count], sizeof(g_rec.paths[count]),
+                     "%s/rbterm-%s.cast", dir, stamp);
+        }
+        FILE *fp = fopen(g_rec.paths[count], "wb");
+        if (!fp) {
+            fprintf(stderr, "rbterm: rec_start: %s: %s\n",
+                    g_rec.paths[count], strerror(errno));
+            /* Roll back any earlier opens. */
+            for (int k = 0; k < count; k++) {
+                if (g_rec.fps[k]) { fclose(g_rec.fps[k]); g_rec.fps[k] = NULL; }
+                g_rec.panes[k] = NULL;
+            }
+            return false;
+        }
+        int cols = screen_cols(p->scr);
+        int rows = screen_rows(p->scr);
+        fprintf(fp,
+                "{\"version\": 2, \"width\": %d, \"height\": %d, "
+                "\"timestamp\": %lld}\n",
+                cols, rows, (long long)now);
+        rec_emit_initial_snapshot(fp, p);
+        g_rec.panes[count] = p;
+        g_rec.fps[count]   = fp;
+        count++;
     }
-    int cols = screen_cols(p->scr);
-    int rows = screen_rows(p->scr);
-    fprintf(fp,
-            "{\"version\": 2, \"width\": %d, \"height\": %d, "
-            "\"timestamp\": %lld}\n",
-            cols, rows, (long long)now);
-    /* Seed the recording with the current screen so playback opens
-       on what the user already sees, rather than a blank terminal
-       until the next byte happens to arrive. */
-    rec_emit_initial_snapshot(fp, p);
+    if (count == 0) return false;
     g_rec.active = true;
-    g_rec.pane = p;
-    g_rec.fp = fp;
+    g_rec.count = count;
     g_rec.start_time = GetTime();
-    fprintf(stderr, "rbterm: recording → %s\n", g_rec.path);
+    fprintf(stderr, "rbterm: recording %d pane%s → %s%s\n",
+            count, count == 1 ? "" : "s",
+            g_rec.paths[0], count > 1 ? " (+ siblings)" : "");
     return true;
 }
 
@@ -1728,39 +2244,62 @@ static void rec_replace_ext(char *path, size_t cap, const char *new_ext) {
     snprintf(path + cur, cap - cur, ".%s", new_ext);
 }
 
-/* Close the recording file and pop the post-record save modal so
-   the user can pick a destination path + format. Caller transitions
-   into UI_REC_SAVE; the actual save / discard / cancel work happens
-   in the modal handlers. */
+/* Close every captured cast and pop the post-record save modal so
+   the user can pick a destination path + format. Multi-pane
+   recordings stage all source paths so the save action can emit a
+   matching set of outputs. */
 static void rec_stop(void) {
     if (!g_rec.active) return;
     double dur = GetTime() - g_rec.start_time;
-    if (g_rec.fp) { fclose(g_rec.fp); g_rec.fp = NULL; }
-    fprintf(stderr, "rbterm: recording stopped (%.1fs) → %s\n",
-            dur, g_rec.path);
-    /* Stage save-modal state. The .cast file lives at g_rec.path
-       until the user picks a final destination. */
+    for (int i = 0; i < g_rec.count; i++) {
+        if (g_rec.fps[i]) { fclose(g_rec.fps[i]); g_rec.fps[i] = NULL; }
+    }
+    fprintf(stderr, "rbterm: recording stopped (%.1fs, %d pane%s)\n",
+            dur, g_rec.count, g_rec.count == 1 ? "" : "s");
     memset(&g_rec_save, 0, sizeof(g_rec_save));
-    strncpy(g_rec_save.src_path, g_rec.path, sizeof(g_rec_save.src_path) - 1);
+    g_rec_save.src_count = g_rec.count;
+    for (int i = 0; i < g_rec.count; i++) {
+        strncpy(g_rec_save.src_paths[i], g_rec.paths[i],
+                sizeof(g_rec_save.src_paths[i]) - 1);
+    }
+    /* src_path is the legacy single-source convenience alias used
+       by preview / non-multi-aware code paths. Always points at
+       slot 0 so existing call sites keep working. */
+    if (g_rec.count > 0) {
+        strncpy(g_rec_save.src_path, g_rec.paths[0],
+                sizeof(g_rec_save.src_path) - 1);
+    }
     g_rec_save.duration_s = dur;
     g_rec_save.fmt = REC_FMT_CAST;
     rec_effects_defaults(&g_rec_save.effects);
-    /* Default destination = the temp path itself (user can edit). */
-    strncpy(g_rec_save.dst_path, g_rec.path, sizeof(g_rec_save.dst_path) - 1);
+    /* Default destination = the first cast's path; the save action
+       strips the -pN suffix when it loops over panes. */
+    strncpy(g_rec_save.dst_path, g_rec_save.src_path,
+            sizeof(g_rec_save.dst_path) - 1);
     g_ui_mode = UI_REC_SAVE;
     g_rec.active = false;
-    g_rec.pane = NULL;
+    g_rec.count = 0;
+    for (int i = 0; i < (int)(sizeof(g_rec.panes) / sizeof(g_rec.panes[0])); i++) {
+        g_rec.panes[i] = NULL;
+    }
 }
 
-/* Append a chunk of PTY-output bytes as one asciinema event row.
-   No-op when no recording is active or `p` isn't the pinned pane. */
+/* Append a chunk of PTY-output bytes as one asciinema event row in
+   the matching pane's slot. No-op when no recording is active or
+   `p` isn't one of the captured panes. */
 static void rec_write(Pane *p, const uint8_t *buf, size_t n) {
-    if (!g_rec.active || g_rec.pane != p || !g_rec.fp || n == 0) return;
+    if (!g_rec.active || n == 0) return;
     double t = GetTime() - g_rec.start_time;
-    fprintf(g_rec.fp, "[%.6f, \"o\", \"", t);
-    rec_json_escape(g_rec.fp, buf, n);
-    fputs("\"]\n", g_rec.fp);
-    fflush(g_rec.fp);
+    for (int i = 0; i < g_rec.count; i++) {
+        if (g_rec.panes[i] != p) continue;
+        FILE *fp = g_rec.fps[i];
+        if (!fp) return;
+        fprintf(fp, "[%.6f, \"o\", \"", t);
+        rec_json_escape(fp, buf, n);
+        fputs("\"]\n", fp);
+        fflush(fp);
+        return;
+    }
 }
 
 static Tab *tab_open(int cols, int rows) {
@@ -1772,18 +2311,20 @@ static Tab *tab_open(int cols, int rows) {
     const char *inherit_cwd = NULL;
     if (g_num_tabs > 0) {
         Tab *cur_t = g_tabs[g_active];
-        if (cur_t && cur_t->active_pane >= 0
-            && cur_t->active_pane < cur_t->num_panes) {
-            const Pane *cp = &cur_t->panes[cur_t->active_pane];
-            if (cp->cwd[0]) inherit_cwd = cp->cwd;
+        if (cur_t && cur_t->active && cur_t->active->pane &&
+            cur_t->active->pane->cwd[0]) {
+            inherit_cwd = cur_t->active->pane->cwd;
         }
     }
     Tab *t = calloc(1, sizeof(Tab));
-    t->num_panes = 1;
-    t->active_pane = 0;
-    t->split = SPLIT_NONE;
-    t->split_ratio = 0.5f;
-    if (!pane_open_local(&t->panes[0], cols, rows, inherit_cwd)) { free(t); return NULL; }
+    PaneNode *leaf = pane_node_new_leaf();
+    if (!pane_open_local(leaf->pane, cols, rows, inherit_cwd)) {
+        pane_node_free_recursive(leaf);
+        free(t);
+        return NULL;
+    }
+    t->root = leaf;
+    t->active = leaf;
     g_tabs[g_num_tabs] = t;
     g_active = g_num_tabs;
     g_num_tabs++;
@@ -1792,6 +2333,77 @@ static Tab *tab_open(int cols, int rows) {
 }
 
 static void pane_apply_tab_appearance(const Tab *t, Pane *p);
+
+/* Forward decl — tab_split lives below tab_open_ssh but the layout
+   replay walker needs it. */
+static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
+                      char *err, size_t errsz);
+
+/* Send `cd "<cwd>"; <cmd>\r` to a pane's PTY. Either argument can
+   be empty / NULL; an empty pair is a no-op. Used by both the
+   legacy single-pane init path and the per-leaf layout replay. */
+static void ssh_send_init_line(Pane *p, const char *cwd, const char *cmd) {
+    if (!p || !p->pty) return;
+    bool have_cwd = (cwd && cwd[0]);
+    bool have_cmd = (cmd && cmd[0]);
+    if (!have_cwd && !have_cmd) return;
+    char buf[1024];
+    int n = 0;
+    if (have_cwd) {
+        n = snprintf(buf, sizeof(buf), "cd \"%s\"", cwd);
+        if (have_cmd && n > 0 && n < (int)sizeof(buf)) {
+            int m = snprintf(buf + n, sizeof(buf) - n, "; %s", cmd);
+            if (m > 0) n += m;
+        }
+    } else {
+        n = snprintf(buf, sizeof(buf), "%s", cmd);
+    }
+    if (n > 0 && n < (int)sizeof(buf) - 1) {
+        buf[n++] = '\r';
+        pty_write(p->pty, (const uint8_t *)buf, (size_t)n);
+    }
+}
+
+/* Walk the parsed layout tree, performing splits in DFS pre-order.
+   `current_leaf` is the actual tree leaf that maps to `node`; on a
+   split, the original leaf becomes child[0] and the new leaf
+   (returned by tab_split) becomes child[1]. After reaching a layout
+   leaf, pane-N's cwd/cmd are sent. */
+static bool layout_replay_walk(Tab *t, const LayoutNode *node,
+                               PaneNode *current_leaf,
+                               char cwds[][256], char cmds[][256],
+                               int cols, int rows) {
+    if (!t || !node || !current_leaf) return false;
+    if (node->is_leaf) {
+        ssh_send_init_line(current_leaf->pane,
+                           cwds[node->leaf_idx],
+                           cmds[node->leaf_idx]);
+        return true;
+    }
+    /* Split the existing leaf. tab_split focuses the new leaf and
+       does the SSH re-dial; we restore active afterwards. */
+    PaneNode *prev_active = t->active;
+    t->active = current_leaf;
+    char err[256] = {0};
+    if (!tab_split(t, node->split, cols, rows, err, sizeof(err))) {
+        if (err[0]) fprintf(stderr,
+                            "rbterm: layout replay split failed: %s\n", err);
+        t->active = prev_active;
+        return false;
+    }
+    /* tab_split sets the parent's ratio to 0.5; honour the layout's
+       requested ratio. */
+    if (current_leaf->parent) current_leaf->parent->ratio = node->ratio;
+    /* The new internal node's children: child[0] is the original
+       leaf, child[1] is the freshly-split one. */
+    PaneNode *new_leaf = current_leaf->parent->child[1];
+    bool ok = layout_replay_walk(t, node->child[0], current_leaf,
+                                 cwds, cmds, cols, rows);
+    if (ok) ok = layout_replay_walk(t, node->child[1], new_leaf,
+                                    cwds, cmds, cols, rows);
+    t->active = prev_active;
+    return ok;
+}
 
 static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const char *password, const char *keyfile,
@@ -1802,14 +2414,16 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
                          const HudConfig *hud,
                          const RecEffects *effects, /* NULL = no override */
                          const char *init_cwd, const char *init_cmd,
+                         const char *layout,
+                         const char (*pane_cwds)[256],
+                         const char (*pane_cmds)[256],
                          int cols, int rows,
                          char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
     Tab *t = calloc(1, sizeof(Tab));
-    t->num_panes = 1;
-    t->active_pane = 0;
-    t->split = SPLIT_NONE;
-    t->split_ratio = 0.5f;
+    PaneNode *leaf = pane_node_new_leaf();
+    t->root = leaf;
+    t->active = leaf;
     if (port <= 0) port = 22;
     /* Build a pretty label for the tab. */
     if (user && *user) {
@@ -1852,36 +2466,54 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
         t->ssh_init_cmd[sizeof(t->ssh_init_cmd) - 1] = 0;
     }
     t->ssh_port = port;
-    snprintf(t->panes[0].title, sizeof(t->panes[0].title), "%s", t->ssh_target);
-    if (!pane_open_ssh(&t->panes[0], user, host, port, password, keyfile,
+    Pane *first_pane = leaf->pane;
+    snprintf(first_pane->title, sizeof(first_pane->title), "%s", t->ssh_target);
+    if (!pane_open_ssh(first_pane, user, host, port, password, keyfile,
                        cols, rows, err, errsz)) {
+        pane_node_free_recursive(t->root);
         free(t); return NULL;
     }
-    pane_apply_tab_appearance(t, &t->panes[0]);
-    /* Send per-host startup commands now that the channel is up.
-       Composed as a single line: `cd <dir>; <cmd>\r`. The shell
-       reads from its stdin queue when it's ready, so even if the
-       prompt hasn't drawn yet the bytes land in the right order.
-       Quoting init_cwd guards against spaces; init_cmd is sent
-       verbatim — power users can pipe / chain however they like. */
-    if (t->ssh_init_cwd[0] || t->ssh_init_cmd[0]) {
-        char init_buf[768];
-        int n = 0;
-        if (t->ssh_init_cwd[0]) {
-            n = snprintf(init_buf, sizeof(init_buf), "cd \"%s\"",
-                         t->ssh_init_cwd);
-            if (t->ssh_init_cmd[0] && n > 0 && n < (int)sizeof(init_buf)) {
-                int m = snprintf(init_buf + n, sizeof(init_buf) - n,
-                                 "; %s", t->ssh_init_cmd);
-                if (m > 0) n += m;
-            }
-        } else {
-            n = snprintf(init_buf, sizeof(init_buf), "%s", t->ssh_init_cmd);
+    pane_apply_tab_appearance(t, first_pane);
+    /* Stash layout fields on the Tab — useful for diagnostics, and
+       so a future reconnect path could re-apply without rebuilding
+       the Tab struct. */
+    if (layout) {
+        strncpy(t->ssh_layout, layout, sizeof(t->ssh_layout) - 1);
+        t->ssh_layout[sizeof(t->ssh_layout) - 1] = 0;
+    }
+    if (pane_cwds) {
+        for (int i = 0; i < SSH_LAYOUT_MAX_PANES; i++) {
+            strncpy(t->ssh_pane_cwds[i], pane_cwds[i],
+                    sizeof(t->ssh_pane_cwds[i]) - 1);
+            t->ssh_pane_cwds[i][sizeof(t->ssh_pane_cwds[i]) - 1] = 0;
         }
-        if (n > 0 && n < (int)sizeof(init_buf) - 1) {
-            init_buf[n++] = '\r';
-            pty_write(t->panes[0].pty, (const uint8_t *)init_buf, (size_t)n);
+    }
+    if (pane_cmds) {
+        for (int i = 0; i < SSH_LAYOUT_MAX_PANES; i++) {
+            strncpy(t->ssh_pane_cmds[i], pane_cmds[i],
+                    sizeof(t->ssh_pane_cmds[i]) - 1);
+            t->ssh_pane_cmds[i][sizeof(t->ssh_pane_cmds[i]) - 1] = 0;
         }
+    }
+    /* Layout replay vs legacy init send. If the host has a
+       predefined layout AND it parses cleanly, the layout owns the
+       per-pane init: pane-0's cwd/cmd is sent to the first pane,
+       and tab_split is called for each non-leaf node to spawn the
+       remaining panes. Otherwise fall back to the single-pane
+       init_cwd/init_cmd path. */
+    LayoutNode *layout_root = NULL;
+    if (layout && layout[0]) layout_root = layout_parse(layout);
+    bool seen[SSH_LAYOUT_MAX_PANES] = {0};
+    int leaf_count = layout_root ? layout_count_leaves(layout_root, seen) : 0;
+    if (layout_root && leaf_count > 0) {
+        layout_replay_walk(t, layout_root, leaf,
+                           t->ssh_pane_cwds, t->ssh_pane_cmds, cols, rows);
+        layout_node_free(layout_root);
+        /* Restore focus to the first leaf. */
+        t->active = pane_tree_first_leaf(t->root);
+    } else {
+        if (layout_root) layout_node_free(layout_root);
+        ssh_send_init_line(first_pane, t->ssh_init_cwd, t->ssh_init_cmd);
     }
     /* Per-host font / font-size applied globally when we connect. Windows
        runs a single renderer so this affects every pane for the rest of
@@ -1922,7 +2554,9 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
 static void tab_close(int idx) {
     if (idx < 0 || idx >= g_num_tabs) return;
     Tab *t = g_tabs[idx];
-    for (int i = 0; i < t->num_panes; i++) pane_free(&t->panes[i]);
+    pane_node_free_recursive(t->root);
+    t->root = NULL;
+    t->active = NULL;
     /* Scrub any stashed SSH credentials before freeing. */
     memset(t->ssh_pass, 0, sizeof(t->ssh_pass));
     free(t);
@@ -1934,11 +2568,14 @@ static void tab_close(int idx) {
 }
 
 /* Pointer to the currently-focused pane of a tab, or NULL when the
-   tab itself is NULL. Self-corrects an out-of-range active_pane. */
+   tab itself is NULL. Self-corrects when t->active is stale (e.g.
+   was the last leaf to close). */
 static inline Pane *active_pane_of(Tab *t) {
     if (!t) return NULL;
-    if (t->active_pane < 0 || t->active_pane >= t->num_panes) t->active_pane = 0;
-    return &t->panes[t->active_pane];
+    if (!t->active || t->active->split != SPLIT_NONE) {
+        t->active = pane_tree_first_leaf(t->root);
+    }
+    return t->active ? t->active->pane : NULL;
 }
 
 /* Apply the tab's stashed appearance (theme + cursor style) to a fresh
@@ -1968,18 +2605,19 @@ static void pane_apply_tab_appearance(const Tab *t, Pane *p) {
     }
 }
 
-/* Split the active tab. If the tab was opened via SSH, re-dial the same
-   host into the new pane; otherwise open a local shell. No-op when the
-   tab already has two panes. cols/rows are the current full-window cell
-   dims; the pane's real size is resized to fit afterwards by the main
-   loop's tabs_resize_all call. Returns true on success. */
+/* Split the currently-active leaf of `t`. If the tab was opened via
+   SSH, re-dial the same host into the new pane; otherwise open a
+   local shell. cols/rows are the current full-window cell dims; the
+   pane's real size is fitted by the main loop's tabs_resize_all
+   call. Returns true on success. */
 static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
                       char *err, size_t errsz) {
-    if (!t) return false;
-    if (t->num_panes >= 2) return false;
+    if (!t || !t->active) return false;
     if (mode != SPLIT_VERTICAL && mode != SPLIT_HORIZONTAL) return false;
-    Pane *np = &t->panes[1];
-    memset(np, 0, sizeof(*np));
+    PaneNode *target = t->active;
+    PaneNode *new_leaf = pane_node_split_leaf(t, target, mode);
+    if (!new_leaf) return false;
+    Pane *np = new_leaf->pane;
     bool ok;
     if (t->is_ssh) {
         ok = pane_open_ssh(np,
@@ -1991,45 +2629,49 @@ static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
                            cols, rows, err, errsz);
         if (ok) snprintf(np->title, sizeof(np->title), "%s", t->ssh_target);
     } else {
-        /* New split pane inherits cwd from the other pane in the same tab. */
-        const char *split_cwd = t->panes[0].cwd[0] ? t->panes[0].cwd : NULL;
+        /* New split inherits cwd from the leaf it was split off. */
+        const char *split_cwd = target->pane->cwd[0] ? target->pane->cwd : NULL;
         ok = pane_open_local(np, cols, rows, split_cwd);
     }
     if (!ok) {
-        memset(np, 0, sizeof(*np));
+        /* Roll back: collapse the brand-new internal node, restoring
+           the original leaf in its place. */
+        pane_node_close_leaf(t, new_leaf);
         return false;
     }
     pane_apply_tab_appearance(t, np);
-    t->split = mode;
-    t->split_ratio = 0.5f;
-    t->num_panes = 2;
-    t->active_pane = 1;
-    pane_log_open(t, np, 1);
+    t->active = new_leaf;
+    /* Use the leaf's tree-order index for a stable per-pane log filename. */
+    int idx = 0;
+    for (PaneNode *l = pane_tree_first_leaf(t->root); l && l != new_leaf;
+         l = pane_tree_next_leaf(l)) idx++;
+    pane_log_open(t, np, idx);
     return true;
 }
 
-/* Close one specific pane of a tab. If it's the only pane, mark the
-   tab itself dead (caller collects via the tab_close sweep). */
-static void tab_close_pane(Tab *t, int pane_idx) {
-    if (!t || pane_idx < 0 || pane_idx >= t->num_panes) return;
-    if (t->num_panes < 2) { t->dead = true; return; }
-    pane_free(&t->panes[pane_idx]);
-    /* Collapse: if we closed pane 0, shift pane 1 down into slot 0. */
-    if (pane_idx == 0) {
-        t->panes[0] = t->panes[1];
-        /* Re-point the screen's io.user to the new Pane address. */
-        if (t->panes[0].scr) screen_set_io_user(t->panes[0].scr, &t->panes[0]);
-        memset(&t->panes[1], 0, sizeof(t->panes[1]));
-    } else {
-        memset(&t->panes[1], 0, sizeof(t->panes[1]));
+/* Close one leaf of a tab. If it's the only leaf, mark the tab dead
+   (the caller collects via the tab_close sweep). */
+static void tab_close_leaf(Tab *t, PaneNode *leaf) {
+    if (!t || !leaf || leaf->split != SPLIT_NONE) return;
+    bool was_active = (leaf == t->active);
+    /* Pick a successor leaf BEFORE we mutate the tree. */
+    PaneNode *succ = NULL;
+    if (was_active) {
+        succ = pane_tree_next_leaf(leaf);
+        if (!succ) succ = pane_tree_prev_leaf(leaf);
     }
-    t->num_panes = 1;
-    t->active_pane = 0;
-    t->split = SPLIT_NONE;
-    t->splitter_drag = false;
-    /* Force a retitle so the tab label and window title pick up the
-       surviving pane. */
-    t->panes[0].title_dirty = true;
+    if (pane_node_close_leaf(t, leaf)) {
+        /* Was the only leaf in the tab. */
+        t->dead = true;
+        return;
+    }
+    if (was_active) {
+        t->active = succ ? succ : pane_tree_first_leaf(t->root);
+    }
+    /* Force a retitle so the tab label / window title pick up the
+       new active leaf. */
+    Pane *ap = active_pane_of(t);
+    if (ap) ap->title_dirty = true;
 }
 
 /* Close the active pane. If the tab only has one pane, defer to
@@ -2037,8 +2679,8 @@ static void tab_close_pane(Tab *t, int pane_idx) {
 static void pane_close_active(int tab_idx) {
     if (tab_idx < 0 || tab_idx >= g_num_tabs) return;
     Tab *t = g_tabs[tab_idx];
-    if (t->num_panes < 2) { tab_close(tab_idx); return; }
-    tab_close_pane(t, t->active_pane);
+    if (pane_tree_count(t->root) < 2) { tab_close(tab_idx); return; }
+    tab_close_leaf(t, t->active);
 }
 
 /* ---------- Clipboard + selection helpers ---------- */
@@ -2826,7 +3468,8 @@ static void search_handle_input(Pane *p) {
  * explicitly set a title (tmux, vim, ssh foo, `ansi --title=wow`)
  * surface until the shell's next prompt rewrites it. */
 static const char *tab_label(const Tab *t) {
-    const Pane *p = &t->panes[t->active_pane];
+    if (!t || !t->active || !t->active->pane) return "rbterm";
+    const Pane *p = t->active->pane;
     /* SSH tabs: prefix with the target so two remote hosts don't look
        identical in the bar. Show "user@host title" when a title has
        been set, or "user@host cwd-basename" otherwise. */
@@ -2879,78 +3522,37 @@ static const char *tab_label(const Tab *t) {
 
 /* ---------- Pane layout ---------- */
 
-/* One pane's rectangle within the terminal area below the tab bar, in
-   window-pixel coords. For an unsplit tab, pane 0 fills the whole area.
-   For a split, the splitter itself is SPLITTER_PX thick and sits
-   between the two panes. */
-/* Visual thickness of the splitter line. Kept thin so split panes
-   feel adjacent; the drag hit-test below pads it with SPLITTER_GRAB
-   so it's still easy to grab. */
-#define SPLITTER_PX   2
-#define SPLITTER_GRAB 6
+/* PaneRect / SPLITTER_PX / SPLITTER_GRAB and the tree-walking helpers
+   live up at the top of the file (next to the PaneNode definition). */
 
-typedef struct {
-    int x, y, w, h;
-} PaneRect;
-
-static void pane_rect(const Tab *t, int pane_idx, int win_w, int win_h,
+/* On-screen rect of a leaf within a tab's tree, given the current
+   window size. Returns false if the leaf isn't in the tab. */
+static bool leaf_rect(const Tab *t, const PaneNode *leaf, int win_w, int win_h,
                       PaneRect *out) {
-    int top = TAB_BAR_H;
-    int area_x = 0;
-    int area_y = top;
-    int area_w = win_w;
-    int area_h = win_h - top;
-    if (area_h < 0) area_h = 0;
-    if (t->split == SPLIT_NONE || t->num_panes < 2) {
-        out->x = area_x; out->y = area_y;
-        out->w = area_w; out->h = area_h;
-        return;
-    }
-    float ratio = t->split_ratio;
-    if (ratio < 0.15f) ratio = 0.15f;
-    if (ratio > 0.85f) ratio = 0.85f;
-    if (t->split == SPLIT_VERTICAL) {
-        int half = SPLITTER_PX / 2;
-        int left_w = (int)((area_w - SPLITTER_PX) * ratio);
-        if (pane_idx == 0) {
-            out->x = area_x; out->y = area_y;
-            out->w = left_w; out->h = area_h;
-        } else {
-            out->x = area_x + left_w + SPLITTER_PX;
-            out->y = area_y;
-            out->w = area_w - left_w - SPLITTER_PX;
-            out->h = area_h;
-        }
-        (void)half;
-    } else { /* SPLIT_HORIZONTAL */
-        int top_h = (int)((area_h - SPLITTER_PX) * ratio);
-        if (pane_idx == 0) {
-            out->x = area_x; out->y = area_y;
-            out->w = area_w; out->h = top_h;
-        } else {
-            out->x = area_x;
-            out->y = area_y + top_h + SPLITTER_PX;
-            out->w = area_w;
-            out->h = area_h - top_h - SPLITTER_PX;
-        }
-    }
+    if (!t || !leaf) return false;
+    PaneRect outer = pane_tree_terminal_outer(win_w, win_h);
+    return pane_tree_node_rect_walk(t->root, leaf, outer, out);
 }
 
-/* The splitter's own rectangle (the draggable strip between panes). */
-static bool splitter_rect(const Tab *t, int win_w, int win_h, PaneRect *out) {
-    if (t->split == SPLIT_NONE || t->num_panes < 2) return false;
-    PaneRect a, b;
-    pane_rect(t, 0, win_w, win_h, &a);
-    pane_rect(t, 1, win_w, win_h, &b);
-    if (t->split == SPLIT_VERTICAL) {
-        out->x = a.x + a.w;
-        out->y = a.y;
+/* On-screen rect of an internal split node's splitter strip. */
+static bool internal_splitter_rect(const Tab *t, const PaneNode *node,
+                                   int win_w, int win_h, PaneRect *out) {
+    if (!t || !node || node->split == SPLIT_NONE) return false;
+    PaneRect outer;
+    if (!pane_tree_node_rect_walk(t->root, node,
+                                  pane_tree_terminal_outer(win_w, win_h),
+                                  &outer)) return false;
+    PaneRect ra, rb;
+    pane_tree_split_children(node, outer, &ra, &rb);
+    if (node->split == SPLIT_VERTICAL) {
+        out->x = ra.x + ra.w;
+        out->y = ra.y;
         out->w = SPLITTER_PX;
-        out->h = a.h;
+        out->h = ra.h;
     } else {
-        out->x = a.x;
-        out->y = a.y + a.h;
-        out->w = a.w;
+        out->x = ra.x;
+        out->y = ra.y + ra.h;
+        out->w = ra.w;
         out->h = SPLITTER_PX;
     }
     return true;
@@ -2982,7 +3584,7 @@ static bool screenshot_active_pane(Renderer *r) {
     int win_w = GetScreenWidth();
     int win_h = GetScreenHeight();
     PaneRect pr;
-    pane_rect(t, t->active_pane, win_w, win_h, &pr);
+    if (!leaf_rect(t, t->active, win_w, win_h, &pr)) return false;
     if (pr.w <= 0 || pr.h <= 0) return false;
     /* RenderTexture sizes must be even on some drivers; round up. */
     int rw = pr.w, rh = pr.h;
@@ -3044,32 +3646,39 @@ static bool screenshot_active_pane(Renderer *r) {
     return ok;
 }
 
-/* Find which pane of the active tab a window-pixel coordinate falls
-   into (or -1 if neither). Used for click-to-focus. */
-static int pane_at(const Tab *t, int win_w, int win_h, int mx, int my) {
-    if (!t) return -1;
-    for (int i = 0; i < t->num_panes; i++) {
-        PaneRect pr;
-        pane_rect(t, i, win_w, win_h, &pr);
-        if (mx >= pr.x && mx < pr.x + pr.w &&
-            my >= pr.y && my < pr.y + pr.h)
-            return i;
-    }
-    return -1;
+/* Find which leaf of the active tab a window-pixel coordinate falls
+   into (or NULL if neither). Used for click-to-focus. */
+static PaneNode *pane_at(Tab *t, int win_w, int win_h, int mx, int my) {
+    if (!t) return NULL;
+    return pane_tree_at(t->root, pane_tree_terminal_outer(win_w, win_h),
+                        mx, my);
 }
 
-/* Draw every pane of one tab (plus the splitter bar between them). */
+/* Walk every internal split node, calling cb for each. */
+static void pane_tree_visit_splits(PaneNode *n, PaneRect outer,
+                                   void (*cb)(PaneNode *, PaneRect, void *),
+                                   void *user) {
+    if (!n || n->split == SPLIT_NONE) return;
+    PaneRect ra, rb;
+    pane_tree_split_children(n, outer, &ra, &rb);
+    cb(n, outer, user);
+    pane_tree_visit_splits(n->child[0], ra, cb, user);
+    pane_tree_visit_splits(n->child[1], rb, cb, user);
+}
+
+/* Draw every pane of one tab (plus the splitter bars between them). */
 static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                               double time_sec, bool focused) {
     if (!t) return;
     Vector2 mpos = GetMousePosition();
     bool want_url_cursor = false;
-    for (int pi = 0; pi < t->num_panes; pi++) {
-        Pane *p = &t->panes[pi];
-        if (!p->scr) continue;
+    for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+         leaf = pane_tree_next_leaf(leaf)) {
+        Pane *p = leaf->pane;
+        if (!p || !p->scr) continue;
         PaneRect pr;
-        pane_rect(t, pi, win_w, win_h, &pr);
-        bool pane_focused = focused && (pi == t->active_pane);
+        if (!leaf_rect(t, leaf, win_w, win_h, &pr)) continue;
+        bool pane_focused = focused && (leaf == t->active);
         /* Hover coords in viewport cells for this pane. -1 when the
            cursor is outside the pane so OSC 8 highlight doesn't leak. */
         int hcol = -1, hrow = -1;
@@ -3336,9 +3945,49 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             }
         }
     }
-    PaneRect sp;
-    if (splitter_rect(t, win_w, win_h, &sp)) {
-        DrawRectangle(sp.x, sp.y, sp.w, sp.h, (Color){60, 60, 75, 255});
+    /* Broadcast-mode border. A 3px red outline on every leaf in the
+       active tab when broadcast is on, so the user can never lose
+       track of which panes are receiving fanned input. Drawn after
+       pane content + search overlays so it sits clearly on top, but
+       before the splitter strip so the border doesn't paint over
+       the splitter line. */
+    if (g_broadcast_active && t == active_tab() &&
+        pane_tree_count(t->root) >= 2) {
+        for (PaneNode *_l = pane_tree_first_leaf(t->root); _l;
+             _l = pane_tree_next_leaf(_l)) {
+            PaneRect pr;
+            if (!leaf_rect(t, _l, win_w, win_h, &pr)) continue;
+            Color bc = (Color){240, 100, 110, 230};
+            DrawRectangleLinesEx(
+                (Rectangle){(float)pr.x, (float)pr.y, (float)pr.w, (float)pr.h},
+                3.0f, bc);
+        }
+    }
+
+    /* One splitter bar per internal node, walked iteratively so we
+       don't recurse and don't allocate a closure. */
+    {
+        PaneRect outer = pane_tree_terminal_outer(win_w, win_h);
+        PaneNode *stack[64]; PaneRect rstack[64]; int sp_top = 0;
+        if (t->root) { stack[sp_top] = t->root; rstack[sp_top] = outer; sp_top++; }
+        while (sp_top > 0) {
+            sp_top--;
+            PaneNode *n = stack[sp_top]; PaneRect o = rstack[sp_top];
+            if (!n || n->split == SPLIT_NONE) continue;
+            PaneRect ra, rb;
+            pane_tree_split_children(n, o, &ra, &rb);
+            PaneRect sp;
+            if (n->split == SPLIT_VERTICAL) {
+                sp.x = ra.x + ra.w; sp.y = ra.y;
+                sp.w = SPLITTER_PX; sp.h = ra.h;
+            } else {
+                sp.x = ra.x; sp.y = ra.y + ra.h;
+                sp.w = ra.w; sp.h = SPLITTER_PX;
+            }
+            DrawRectangle(sp.x, sp.y, sp.w, sp.h, (Color){60, 60, 75, 255});
+            if (sp_top + 1 < 64) { stack[sp_top] = n->child[0]; rstack[sp_top] = ra; sp_top++; }
+            if (sp_top + 1 < 64) { stack[sp_top] = n->child[1]; rstack[sp_top] = rb; sp_top++; }
+        }
     }
 
     /* HUD overlay — corner of each pane. Per-field colour and size
@@ -3361,16 +4010,21 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
     }
     bool hud_hover = false;
     HudConfig hud = hud_effective(t);
-    if (hud.show) {
+    /* HUD: one slab per window, sourced from the active pane. With
+       recursive splits, repeating the slab in every leaf would tile
+       the screen; the active pane is the only one whose stats the
+       user is actively reading. The slab anchors to the terminal
+       area below the tab bar, not to the active leaf's rect, so it
+       lives in the same screen corner regardless of split layout. */
+    if (hud.show && t->active && t->active->pane) {
         const int x_pad  = 8;
         const int y_pad  = 6;
         const int margin = 8;
         Vector2 _mp = GetMousePosition();
         bool _click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
-        for (int pi = 0; pi < t->num_panes; pi++) {
-            Pane *p = &t->panes[pi];
-            PaneRect pr;
-            pane_rect(t, pi, win_w, win_h, &pr);
+        do {
+            Pane *p = t->active->pane;
+            PaneRect pr = pane_tree_terminal_outer(win_w, win_h);
 
             /* Build the per-field string + style table. Skipped fields
                just have show=false. */
@@ -3559,7 +4213,7 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                 }
             }
             EndScissorMode();
-        }
+        } while (0);
     }
 
     /* SFTP transfer toasts — bottom-left of each pane. Upload (if
@@ -3567,14 +4221,16 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
        state from the worker so this is safe to call every frame
        without locking. ASCII-only labels because raylib's bundled
        font doesn't carry ↑/✓/✗ codepoints. */
-    for (int pi = 0; pi < t->num_panes; pi++) {
-        Pane *p = &t->panes[pi];
+    for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+         leaf = pane_tree_next_leaf(leaf)) {
+        Pane *p = leaf->pane;
+        if (!p) continue;
         struct { void *handle; const char *prefix; bool is_upload; } slots[2] = {
             { p->upload,   "up",  true  },
             { p->download, "dn",  false },
         };
         PaneRect pr;
-        pane_rect(t, pi, win_w, win_h, &pr);
+        if (!leaf_rect(t, leaf, win_w, win_h, &pr)) continue;
         int fs = 12, x_pad = 8, y_pad = 4, margin = 8;
         int slab_h = fs + y_pad * 2;
         int stack_offset = 0;
@@ -3638,13 +4294,14 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
 static void tabs_resize_all(const Renderer *r, int win_w, int win_h) {
     for (int i = 0; i < g_num_tabs; i++) {
         Tab *t = g_tabs[i];
-        for (int pi = 0; pi < t->num_panes; pi++) {
-            Pane *p = &t->panes[pi];
+        for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+             leaf = pane_tree_next_leaf(leaf)) {
+            Pane *p = leaf->pane;
+            if (!p || !p->scr) continue;
             PaneRect pr;
-            pane_rect(t, pi, win_w, win_h, &pr);
+            if (!leaf_rect(t, leaf, win_w, win_h, &pr)) continue;
             int cols, rows;
             pane_dims(r, &pr, &cols, &rows);
-            if (!p->scr) continue;
             if (screen_cols(p->scr) != cols || screen_rows(p->scr) != rows) {
                 screen_resize(p->scr, cols, rows);
                 pty_resize(p->pty, cols, rows);
@@ -3669,14 +4326,13 @@ typedef struct {
     bool on_snap;          /* take screenshot of active pane */
     bool on_upload;        /* SFTP upload — only present on SSH tabs */
     bool on_download;      /* SFTP download — only present on SSH tabs */
+    bool on_bcast;         /* Broadcast-input toggle — only when multi-pane */
 } TabBarHit;
 
-/* Split buttons are hidden when the active tab is already split — there's
-   nothing useful clicking them would do, and the tabs reclaim the space. */
+/* Split buttons are always available now that splits are recursive —
+   the kept-as-stub function preserves the existing call sites. */
 static bool split_buttons_visible(void) {
-    if (g_active < 0 || g_active >= g_num_tabs) return true;
-    Tab *t = g_tabs[g_active];
-    return t && t->split == SPLIT_NONE;
+    return true;
 }
 
 /* True iff the active tab is an SSH session — controls visibility of
@@ -3690,6 +4346,15 @@ static bool download_button_visible(void) {
     return upload_button_visible();
 }
 
+/* Broadcast button only renders when the active tab has 2+ panes
+   — broadcasting to a single pane is just typing, so the button
+   would be useless real estate. */
+static bool bcast_button_visible(void) {
+    if (g_active < 0 || g_active >= g_num_tabs) return false;
+    Tab *t = g_tabs[g_active];
+    return t && pane_tree_count(t->root) >= 2;
+}
+
 /* Compute the per-tab pixel width in the tab bar from the
    available room (window width minus the SSH/help/+/-/split
    buttons). Splits the leftover width evenly across the open
@@ -3698,8 +4363,9 @@ static int tab_width_for(int win_w) {
     int split_w  = split_buttons_visible() ? 2 * TAB_SPLIT_W : 0;
     int upload_w = upload_button_visible()  ? TAB_UPLOAD_W   : 0;
     int dl_w     = download_button_visible() ? TAB_DOWNLOAD_W : 0;
+    int bcast_w  = bcast_button_visible()    ? TAB_BCAST_W   : 0;
     int avail = win_w - TAB_PLUS_W - TAB_GEAR_W - 2 * TAB_REC_W - TAB_SNAP_W
-                - TAB_HELP_W - split_w - upload_w - dl_w - TAB_SSH_W;
+                - TAB_HELP_W - split_w - upload_w - dl_w - bcast_w - TAB_SSH_W;
     if (g_num_tabs <= 0) return TAB_MIN_W;
     int w = avail / g_num_tabs;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -3712,15 +4378,17 @@ static int tab_width_for(int win_w) {
    The "+" was on the far right; moved next to [ssh] so the two
    "open something" buttons live together. */
 static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
-    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false, false, false, false };
+    TabBarHit h = { -1, false, false, false, false, false, false, false, false, false, false, false, false, false };
     if (my < 0 || my >= TAB_BAR_H) return h;
     bool show_splits = split_buttons_visible();
     bool show_up     = upload_button_visible();
     bool show_dl     = download_button_visible();
+    bool show_bcast  = bcast_button_visible();
     int help_x      = win_w - TAB_HELP_W;
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W     : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
-    int snap_x      = split_v_x - TAB_SNAP_W;
+    int bcast_x     = show_bcast ? split_v_x - TAB_BCAST_W : split_v_x;
+    int snap_x      = bcast_x - TAB_SNAP_W;
     int rec_stop_x  = snap_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
     int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
@@ -3734,6 +4402,7 @@ static TabBarHit tab_bar_hit_test(int win_w, int mx, int my) {
     if (mx >= help_x)       { h.on_help    = true; return h; }
     if (show_splits && mx >= split_h_x) { h.on_split_h = true; return h; }
     if (show_splits && mx >= split_v_x) { h.on_split_v = true; return h; }
+    if (show_bcast && mx >= bcast_x)    { h.on_bcast    = true; return h; }
     if (mx >= snap_x)       { h.on_snap      = true; return h; }
     if (mx >= rec_stop_x)   { h.on_rec_stop  = true; return h; }
     if (mx >= rec_start_x)  { h.on_rec_start = true; return h; }
@@ -3845,9 +4514,11 @@ static void draw_tab_bar(Renderer *r, int win_w) {
     bool show_splits = split_buttons_visible();
     bool show_up     = upload_button_visible();
     bool show_dl     = download_button_visible();
+    bool show_bcast  = bcast_button_visible();
     int split_h_x   = show_splits ? help_x - TAB_SPLIT_W    : help_x;
     int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W : help_x;
-    int snap_x      = split_v_x - TAB_SNAP_W;
+    int bcast_x     = show_bcast ? split_v_x - TAB_BCAST_W : split_v_x;
+    int snap_x      = bcast_x - TAB_SNAP_W;
     int rec_stop_x  = snap_x - TAB_REC_W;
     int rec_start_x = rec_stop_x - TAB_REC_W;
     int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
@@ -3888,6 +4559,38 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                    (Vector2){pill_x + pill_pad + dot_w + 6,
                              (TAB_BAR_H - lsz.y) / 2.0f},
                    13, 0, text_col);
+    }
+
+    /* BROADCAST pill — same shape as REC, sits just left of either
+       the rec pill (when both are active) or the gear (when broadcast
+       is the only one). Pulses gently so it stays salient even when
+       the user's reading the terminal. */
+    if (g_broadcast_active) {
+        const char *blabel = "BROADCAST";
+        Vector2 blsz = MeasureTextEx(*f, blabel, 13, 0);
+        int bpill_pad = 8;
+        int bpill_w = (int)blsz.x + bpill_pad * 2;
+        int bpill_anchor = gear_x;
+        if (g_rec.active) {
+            /* Slot it left of the REC pill. We approximate the
+               width of REC since we don't keep its rect around;
+               80 px is conservative for "REC mm:ss". */
+            bpill_anchor = gear_x - 80 - 12;
+        }
+        int bpill_x = bpill_anchor - bpill_w - 6;
+        if (bpill_x < TAB_SSH_W + 4) bpill_x = TAB_SSH_W + 4;
+        /* Solid bg — cursor-blink-style animation isn't a dirty
+           trigger so it would freeze on whichever phase the last
+           redraw landed in. Solid red still reads "active". */
+        Color bpill_bg = (Color){70, 22, 28, 255};
+        Color bpill_outline = (Color){240, 100, 110, 230};
+        Color btext_col = (Color){255, 220, 220, 255};
+        DrawRectangle(bpill_x, 4, bpill_w, TAB_BAR_H - 8, bpill_bg);
+        DrawRectangleLines(bpill_x, 4, bpill_w, TAB_BAR_H - 8, bpill_outline);
+        DrawTextEx(*f, blabel,
+                   (Vector2){bpill_x + bpill_pad,
+                             (TAB_BAR_H - blsz.y) / 2.0f},
+                   13, 0, btext_col);
     }
 
     /* Gear (settings). */
@@ -3986,6 +4689,33 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                    (Vector2){cx, cy + size * 0.55f}, 2.0f, dl_glyph);
     }
 
+    /* Broadcast-input toggle. The icon is a small radio-tower glyph:
+       a centre dot with three concentric arcs above/below to suggest
+       transmission. When active the whole button glows red so the
+       user can't miss that input is fanning out. */
+    if (show_bcast) {
+        bool on = g_broadcast_active;
+        Color bc_bg      = on ? (Color){90, 30, 40, 255} : (Color){38, 48, 66, 255};
+        Color bc_outline = on ? (Color){240, 100, 110, 255}
+                              : (Color){125, 207, 255, 200};
+        Color bc_glyph   = on ? (Color){255, 220, 220, 255}
+                              : (Color){220, 235, 255, 255};
+        DrawRectangle(bcast_x, 0, TAB_BCAST_W, TAB_BAR_H, bc_bg);
+        DrawRectangleLines(bcast_x, 2, TAB_BCAST_W - 1, TAB_BAR_H - 4, bc_outline);
+        float cx = bcast_x + TAB_BCAST_W / 2.0f;
+        float cy = TAB_BAR_H / 2.0f;
+        /* Centre dot. */
+        DrawCircle((int)cx, (int)cy, 2.0f, bc_glyph);
+        /* Two arcs of "wave fronts" on either side. We approximate
+           with thin DrawCircleSector calls — raylib's API needs a
+           start/end angle in degrees. Left arcs: 110..160, right
+           arcs: 20..70 (so the open mouths face outward). */
+        DrawRing((Vector2){cx, cy}, 4.0f, 5.5f, 110.0f, 160.0f, 20, bc_glyph);
+        DrawRing((Vector2){cx, cy}, 7.0f, 8.5f, 110.0f, 160.0f, 20, bc_glyph);
+        DrawRing((Vector2){cx, cy}, 4.0f, 5.5f, 20.0f, 70.0f, 20, bc_glyph);
+        DrawRing((Vector2){cx, cy}, 7.0f, 8.5f, 20.0f, 70.0f, 20, bc_glyph);
+    }
+
     /* Split buttons — vertical (side-by-side) then horizontal
        (top/bottom). Hidden once the active tab is already split. */
     if (show_splits) {
@@ -4045,9 +4775,10 @@ static void draw_tab_bar(Renderer *r, int win_w) {
            informative signal. */
         int label_x = x + 10;
         bool any_running = false;
-        for (int pi = 0; pi < g_tabs[i]->num_panes; pi++) {
-            const Pane *_pp = &g_tabs[i]->panes[pi];
-            if (_pp->scr && screen_command_running(_pp->scr)) {
+        for (PaneNode *_leaf = pane_tree_first_leaf(g_tabs[i]->root); _leaf;
+             _leaf = pane_tree_next_leaf(_leaf)) {
+            const Pane *_pp = _leaf->pane;
+            if (_pp && _pp->scr && screen_command_running(_pp->scr)) {
                 any_running = true;
                 break;
             }
@@ -4087,7 +4818,103 @@ static void draw_tab_bar(Renderer *r, int win_w) {
                    fs, 0, fg);
         if (i > 0) DrawLine(x, 4, x, TAB_BAR_H - 4, (Color){60, 60, 75, 255});
     }
+}
 
+/* Hover tooltip for the top-bar buttons. Drawn AFTER
+   draw_tab_contents so the pane background painted below the tab
+   bar doesn't cover it. Single tooltip per frame. */
+static void draw_tab_bar_tooltip(Renderer *r, int win_w) {
+    if (g_ui_mode != UI_NORMAL) return;
+    Vector2 mp_tt = GetMousePosition();
+    if (mp_tt.y < 0 || mp_tt.y >= TAB_BAR_H) return;
+#ifdef __APPLE__
+    const char *MOD = "Cmd";
+#else
+    const char *MOD = "Ctrl";
+#endif
+    /* Re-derive button x positions exactly the way tab_bar_hit_test
+       does so the tooltip lines up with whichever rect produced the
+       hover. */
+    bool show_splits = split_buttons_visible();
+    bool show_up     = upload_button_visible();
+    bool show_dl     = download_button_visible();
+    bool show_bcast  = bcast_button_visible();
+    int help_x      = win_w - TAB_HELP_W;
+    int split_h_x   = show_splits ? help_x - TAB_SPLIT_W     : help_x;
+    int split_v_x   = show_splits ? split_h_x - TAB_SPLIT_W  : help_x;
+    int bcast_x     = show_bcast ? split_v_x - TAB_BCAST_W : split_v_x;
+    int snap_x      = bcast_x - TAB_SNAP_W;
+    int rec_stop_x  = snap_x - TAB_REC_W;
+    int rec_start_x = rec_stop_x - TAB_REC_W;
+    int upload_x    = show_up ? rec_start_x - TAB_UPLOAD_W : rec_start_x;
+    int dl_x        = show_dl ? upload_x - TAB_DOWNLOAD_W  : upload_x;
+    int gear_x      = dl_x - TAB_GEAR_W;
+
+    const char *label = NULL;
+    int btn_x = -1, btn_w = 0;
+    int mx = (int)mp_tt.x;
+    char buf[96];
+    if (mx >= 0 && mx < TAB_SSH_W) {
+        snprintf(buf, sizeof(buf), "Connect to SSH host  (%s+Shift+T)", MOD);
+        label = buf; btn_x = 0; btn_w = TAB_SSH_W;
+    } else if (mx < TAB_SSH_W + TAB_PLUS_W) {
+        snprintf(buf, sizeof(buf), "New tab  (%s+T)", MOD);
+        label = buf; btn_x = TAB_SSH_W; btn_w = TAB_PLUS_W;
+    } else if (mx >= help_x) {
+        label = "Keyboard shortcuts";
+        btn_x = help_x; btn_w = TAB_HELP_W;
+    } else if (show_splits && mx >= split_h_x) {
+        snprintf(buf, sizeof(buf), "Split horizontally  (%s+Shift+D)", MOD);
+        label = buf; btn_x = split_h_x; btn_w = TAB_SPLIT_W;
+    } else if (show_splits && mx >= split_v_x) {
+        snprintf(buf, sizeof(buf), "Split vertically  (%s+D)", MOD);
+        label = buf; btn_x = split_v_x; btn_w = TAB_SPLIT_W;
+    } else if (show_bcast && mx >= bcast_x) {
+        snprintf(buf, sizeof(buf),
+                 g_broadcast_active
+                   ? "Broadcast input: ON — click to stop  (%s+Shift+I)"
+                   : "Broadcast input to all panes  (%s+Shift+I)",
+                 MOD);
+        label = buf; btn_x = bcast_x; btn_w = TAB_BCAST_W;
+    } else if (mx >= snap_x) {
+        snprintf(buf, sizeof(buf),
+                 "Screenshot active pane  (%s+Shift+S)", MOD);
+        label = buf; btn_x = snap_x; btn_w = TAB_SNAP_W;
+    } else if (mx >= rec_stop_x) {
+        label = g_rec.active ? "Stop recording"
+                             : "(Stop) — start a recording first";
+        btn_x = rec_stop_x; btn_w = TAB_REC_W;
+    } else if (mx >= rec_start_x) {
+        label = g_rec.active ? "(Start) — already recording"
+                             : "Record active pane to .cast";
+        btn_x = rec_start_x; btn_w = TAB_REC_W;
+    } else if (show_up && mx >= upload_x) {
+        label = "Upload file via SFTP";
+        btn_x = upload_x; btn_w = TAB_UPLOAD_W;
+    } else if (show_dl && mx >= dl_x) {
+        label = "Download file via SFTP";
+        btn_x = dl_x; btn_w = TAB_DOWNLOAD_W;
+    } else if (mx >= gear_x) {
+        snprintf(buf, sizeof(buf), "Settings  (%s+,)", MOD);
+        label = buf; btn_x = gear_x; btn_w = TAB_GEAR_W;
+    }
+    if (!label || btn_x < 0) return;
+    Font *f = (Font *)r->font_data;
+    int tt_pad_x = 8, tt_pad_y = 5;
+    int tt_fs = 12;
+    Vector2 tsz = MeasureTextEx(*f, label, tt_fs, 0);
+    int tt_w = (int)tsz.x + tt_pad_x * 2;
+    int tt_h = (int)tsz.y + tt_pad_y * 2;
+    int tt_x = btn_x + (btn_w - tt_w) / 2;
+    if (tt_x < 4) tt_x = 4;
+    if (tt_x + tt_w > win_w - 4) tt_x = win_w - 4 - tt_w;
+    int tt_y = TAB_BAR_H + 4;
+    DrawRectangle(tt_x, tt_y, tt_w, tt_h, (Color){10, 12, 18, 235});
+    DrawRectangleLines(tt_x, tt_y, tt_w, tt_h,
+                       (Color){125, 207, 255, 200});
+    DrawTextEx(*f, label,
+               (Vector2){tt_x + tt_pad_x, tt_y + tt_pad_y},
+               tt_fs, 0, (Color){230, 235, 245, 255});
 }
 
 /* ---------- SSH connection form (PuTTY-style) ---------- */
@@ -4553,6 +5380,40 @@ static void ssh_profiles_load(void) {
                     trim_end(q);
                     strncpy(cur->init_cmd, q, sizeof(cur->init_cmd) - 1);
                     cur->init_cmd[sizeof(cur->init_cmd) - 1] = 0;
+                } else if (strncmp(q, "rbterm-layout:", 14) == 0) {
+                    q += 14;
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    strncpy(cur->layout, q, sizeof(cur->layout) - 1);
+                    cur->layout[sizeof(cur->layout) - 1] = 0;
+                } else if (strncmp(q, "rbterm-pane-", 12) == 0) {
+                    /* `rbterm-pane-<N>-{cwd,cmd}: <value>` — leaf-
+                       indexed init lines. Index must be 0..7. */
+                    const char *r = q + 12;
+                    if (*r >= '0' && *r <= '0' + (SSH_LAYOUT_MAX_PANES - 1) &&
+                        r[1] == '-') {
+                        int idx = *r - '0';
+                        const char *kind = r + 2;
+                        if (strncmp(kind, "cwd:", 4) == 0) {
+                            const char *vv = kind + 4;
+                            while (*vv == ' ' || *vv == '\t') vv++;
+                            char tmp[256];
+                            snprintf(tmp, sizeof(tmp), "%s", vv);
+                            trim_end(tmp);
+                            strncpy(cur->pane_cwds[idx], tmp,
+                                    sizeof(cur->pane_cwds[idx]) - 1);
+                            cur->pane_cwds[idx][sizeof(cur->pane_cwds[idx]) - 1] = 0;
+                        } else if (strncmp(kind, "cmd:", 4) == 0) {
+                            const char *vv = kind + 4;
+                            while (*vv == ' ' || *vv == '\t') vv++;
+                            char tmp[256];
+                            snprintf(tmp, sizeof(tmp), "%s", vv);
+                            trim_end(tmp);
+                            strncpy(cur->pane_cmds[idx], tmp,
+                                    sizeof(cur->pane_cmds[idx]) - 1);
+                            cur->pane_cmds[idx][sizeof(cur->pane_cmds[idx]) - 1] = 0;
+                        }
+                    }
                 } else if (strncmp(q, ccol_pfx, strlen(ccol_pfx)) == 0) {
                     q += strlen(ccol_pfx);
                     while (*q == ' ' || *q == '\t') q++;
@@ -4757,6 +5618,17 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     g_form.init_cwd[sizeof(g_form.init_cwd) - 1] = 0;
     strncpy(g_form.init_cmd, prof->init_cmd, sizeof(g_form.init_cmd) - 1);
     g_form.init_cmd[sizeof(g_form.init_cmd) - 1] = 0;
+    strncpy(g_form.layout, prof->layout, sizeof(g_form.layout) - 1);
+    g_form.layout[sizeof(g_form.layout) - 1] = 0;
+    for (int i = 0; i < SSH_LAYOUT_MAX_PANES; i++) {
+        strncpy(g_form.pane_cwds[i], prof->pane_cwds[i],
+                sizeof(g_form.pane_cwds[i]) - 1);
+        g_form.pane_cwds[i][sizeof(g_form.pane_cwds[i]) - 1] = 0;
+        strncpy(g_form.pane_cmds[i], prof->pane_cmds[i],
+                sizeof(g_form.pane_cmds[i]) - 1);
+        g_form.pane_cmds[i][sizeof(g_form.pane_cmds[i]) - 1] = 0;
+    }
+    g_form.layout_status[0] = 0;
     /* If this profile has any HUD override, copy it; otherwise seed
        the form's per-host HUD from the global app settings so the
        user starts editing from a sensible baseline if they enable
@@ -4854,6 +5726,42 @@ static void ssh_form_open(void) {
        entries even if Settings hasn't been opened yet. */
     if (g_font_count == 0)
         fonts_load(g_renderer ? g_renderer->font_path : NULL);
+    /* If the active tab is an SSH session, auto-select the matching
+       saved profile so the user's likely next action ("save layout"
+       / "tweak this host") is one click away. Prefer the stored
+       alias (handles two aliases pointing at the same backend) and
+       fall back to (HostName, User, Port) for ad-hoc tabs that
+       didn't come through a saved profile. */
+    Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
+    if (t && t->is_ssh) {
+        int matched = -1;
+        if (t->ssh_alias[0]) {
+            for (int i = 0; i < g_ssh_profile_count; i++) {
+                if (strcmp(g_ssh_profiles[i].name, t->ssh_alias) == 0) {
+                    matched = i;
+                    break;
+                }
+            }
+        }
+        if (matched < 0 && t->ssh_host[0]) {
+            int port = t->ssh_port > 0 ? t->ssh_port : 22;
+            for (int i = 0; i < g_ssh_profile_count; i++) {
+                const SshProfile *p = &g_ssh_profiles[i];
+                const char *p_host = p->hostname[0] ? p->hostname : p->name;
+                int p_port = p->port > 0 ? p->port : 22;
+                if (strcmp(p_host, t->ssh_host) != 0) continue;
+                if (port != p_port) continue;
+                if (t->ssh_user[0] && p->user[0] &&
+                    strcmp(t->ssh_user, p->user) != 0) continue;
+                matched = i;
+                break;
+            }
+        }
+        if (matched >= 0) {
+            g_ssh_list_selected = matched;
+            ssh_form_apply_profile(&g_ssh_profiles[matched]);
+        }
+    }
 }
 
 /* Open the SFTP upload modal pre-populated with the active pane's
@@ -4867,7 +5775,7 @@ static void upload_form_open(void) {
     /* Default remote path: active pane's last-known cwd (set by
        OSC 7) if present, else home. */
     Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
-    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    Pane *ap = active_pane_of(t);
     if (ap && ap->cwd[0]) {
         size_t cl = strlen(ap->cwd);
         snprintf(g_upload_form.remote_path,
@@ -4944,7 +5852,7 @@ static void upload_form_submit(void) {
         return;
     }
     Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
-    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    Pane *ap = active_pane_of(t);
     if (!ap) {
         snprintf(g_upload_form.status, sizeof(g_upload_form.status),
                  "no active pane");
@@ -5190,7 +6098,7 @@ static void download_form_refresh(void) {
     g_download_form.scroll = 0;
     g_download_form.status[0] = 0;
     Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
-    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    Pane *ap = active_pane_of(t);
     if (!ap || !ap->pty) {
         snprintf(g_download_form.status, sizeof(g_download_form.status),
                  "no active pane");
@@ -5260,7 +6168,7 @@ static void download_form_open(void) {
     memset(&g_download_form, 0, sizeof(g_download_form));
     g_download_form.selected = -1;
     Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
-    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    Pane *ap = active_pane_of(t);
     if (ap && ap->cwd[0]) {
         snprintf(g_download_form.remote_dir,
                  sizeof(g_download_form.remote_dir), "%s", ap->cwd);
@@ -5402,7 +6310,7 @@ static void download_form_submit_selected(void) {
     }
 
     Tab *t = (g_active >= 0 && g_active < g_num_tabs) ? g_tabs[g_active] : NULL;
-    Pane *ap = t ? &t->panes[t->active_pane] : NULL;
+    Pane *ap = active_pane_of(t);
     if (!ap) {
         snprintf(g_download_form.status, sizeof(g_download_form.status),
                  "no active pane");
@@ -5912,6 +6820,9 @@ static SshFormLayout ssh_form_layout(int win_w, int win_h) {
             L.field[F_KEY].y + field_h + 2,
             kr_w, kr_h
         };
+        /* Save-layout button below the field stack. Captures the
+           active SSH tab's tree into the host's stanza. */
+        L.save_layout = (Rect){ field_x, y + 6, 220, field_h };
     }
 
     /* APPEARANCE tab — theme/font pickers, font-size row, cursor
@@ -6140,8 +7051,18 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.effects_override ? &g_form.effects : NULL,
         g_form.init_cwd[0] ? g_form.init_cwd : NULL,
         g_form.init_cmd[0] ? g_form.init_cmd : NULL,
+        g_form.layout[0] ? g_form.layout : NULL,
+        g_form.layout[0] ? g_form.pane_cwds : NULL,
+        g_form.layout[0] ? g_form.pane_cmds : NULL,
         cols, rows, err, sizeof(err));
     if (t) {
+        /* Stash the saved-host alias on the tab so a later `[ssh]`
+           click round-trips back to this exact profile, even if
+           another alias resolves to the same (HostName, User, Port). */
+        if (g_form.name[0]) {
+            strncpy(t->ssh_alias, g_form.name, sizeof(t->ssh_alias) - 1);
+            t->ssh_alias[sizeof(t->ssh_alias) - 1] = 0;
+        }
         /* Clear the password from memory as soon as we no longer need it. */
         memset(g_form.pass, 0, sizeof(g_form.pass));
         g_ui_mode = UI_NORMAL;
@@ -6346,6 +7267,20 @@ static void emit_form_managed_lines(FILE *fp) {
         fprintf(fp, "    # rbterm-init-cwd: %s\n", g_form.init_cwd);
     if (g_form.init_cmd[0])
         fprintf(fp, "    # rbterm-init-cmd: %s\n", g_form.init_cmd);
+    /* Predefined split layout — string descriptor + per-pane
+       cwd/cmd. Skipped entirely when no layout is set so the
+       stanza stays clean for hosts that haven't been "Save Layout"-d. */
+    if (g_form.layout[0]) {
+        fprintf(fp, "    # rbterm-layout: %s\n", g_form.layout);
+        for (int i = 0; i < SSH_LAYOUT_MAX_PANES; i++) {
+            if (g_form.pane_cwds[i][0])
+                fprintf(fp, "    # rbterm-pane-%d-cwd: %s\n",
+                        i, g_form.pane_cwds[i]);
+            if (g_form.pane_cmds[i][0])
+                fprintf(fp, "    # rbterm-pane-%d-cmd: %s\n",
+                        i, g_form.pane_cmds[i]);
+        }
+    }
     /* Per-host HUD override. Writes a few lines so plain ssh still
        parses it cleanly. We write the master toggle + position +
        per-field rows + the cpu-graph toggle so the round-trip is
@@ -6823,6 +7758,64 @@ static void ssh_form_handle_mouse(SshFormLayout L, int cols, int rows) {
     }
     for (int i = 0; i < F_TEXT_FIELDS; i++) {
         if (rect_hit(L.field[i], mx, my)) { g_form.focus = i; g_form.sel_all = false; return; }
+    }
+    /* Save Layout — capture the active SSH tab's split tree + per-pane
+       cwd into the form, then write the host's stanza to ~/.ssh/config.
+       Errors land in g_form.layout_status so the user sees feedback
+       inline. The active tab must be SSH-flavoured AND have a non-
+       empty target; otherwise we refuse with a helpful message. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_CONNECTION &&
+        L.save_layout.w > 0 && rect_hit(L.save_layout, mx, my)) {
+        if (!g_form.name[0]) {
+            snprintf(g_form.layout_status, sizeof(g_form.layout_status),
+                     "Set a Name first, then connect, split panes, and click here.");
+            return;
+        }
+        Tab *src = (g_active >= 0 && g_active < g_num_tabs)
+                       ? g_tabs[g_active] : NULL;
+        if (!src || !src->is_ssh || !src->root) {
+            snprintf(g_form.layout_status, sizeof(g_form.layout_status),
+                     "No active SSH tab — connect first, split, then save.");
+            return;
+        }
+        /* Reset cwd snapshot — we recapture every leaf's cwd from
+           scratch. cmd is preserved across saves: we don't auto-
+           detect what's running, so wiping it would silently drop
+           anything the user hand-edited in ~/.ssh/config. */
+        memset(g_form.pane_cwds, 0, sizeof(g_form.pane_cwds));
+        int n = layout_serialize(src, g_form.layout, sizeof(g_form.layout),
+                                 g_form.pane_cwds);
+        if (n <= 0) {
+            snprintf(g_form.layout_status, sizeof(g_form.layout_status),
+                     "Layout too deep or too many panes (max %d).",
+                     SSH_LAYOUT_MAX_PANES);
+            g_form.layout[0] = 0;
+            return;
+        }
+        if (n == 1) {
+            /* Single pane = nothing to layout. Clear the layout
+               string so the legacy init_cwd / init_cmd path drives
+               the next connect, and tell the user. */
+            g_form.layout[0] = 0;
+            memset(g_form.pane_cwds, 0, sizeof(g_form.pane_cwds));
+            memset(g_form.pane_cmds, 0, sizeof(g_form.pane_cmds));
+            if (ssh_form_save_to_config()) {
+                snprintf(g_form.layout_status, sizeof(g_form.layout_status),
+                         "No splits to save. Cleared any previous layout.");
+                ssh_profiles_load();
+            }
+            return;
+        }
+        if (ssh_form_save_to_config()) {
+            snprintf(g_form.layout_status, sizeof(g_form.layout_status),
+                     "Saved %d-pane layout for '%s'.", n, g_form.name);
+            ssh_profiles_load();
+        } else {
+            snprintf(g_form.layout_status, sizeof(g_form.layout_status),
+                     "Save failed: %s",
+                     g_form.error[0] ? g_form.error : "unknown error");
+        }
+        return;
     }
     /* Cursor-style buttons act as radio: clicking one sets the form's
        cursor_style. The choice takes effect on Connect (or Save). */
@@ -7523,6 +8516,38 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                    (Vector2){kb.x + (kb.w - asz.x) / 2,
                              kb.y + (kb.h - asz.y) / 2},
                    14, 0, (Color){200, 215, 240, 255});
+    }
+    /* Save-layout button (Connection tab). Greyed out when no
+       active SSH tab — the button still draws so the user knows
+       it exists. The status line shows the most recent feedback,
+       which sticks until the user re-clicks or picks another host. */
+    if (g_ssh_form_tab == SSH_FORM_TAB_CONNECTION && L.save_layout.w > 0) {
+        Tab *src = (g_active >= 0 && g_active < g_num_tabs)
+                       ? g_tabs[g_active] : NULL;
+        bool armed = src && src->is_ssh && src->root && g_form.name[0];
+        Rect sl = L.save_layout;
+        DrawRectangle(sl.x, sl.y, sl.w, sl.h,
+                      armed ? (Color){46, 92, 150, 255}
+                            : (Color){34, 38, 52, 255});
+        DrawRectangleLines(sl.x, sl.y, sl.w, sl.h,
+                           armed ? (Color){125, 207, 255, 255}
+                                 : (Color){70, 74, 90, 255});
+        const char *txt = "Save Layout from Active Tab";
+        Vector2 tsz = MeasureTextEx(*f, txt, 13, 0);
+        DrawTextEx(*f, txt,
+                   (Vector2){sl.x + (sl.w - tsz.x) / 2,
+                             sl.y + (sl.h - tsz.y) / 2},
+                   13, 0, armed ? (Color){230, 232, 240, 255}
+                                : (Color){140, 145, 160, 255});
+        /* Status line right of the button. */
+        const char *msg = g_form.layout_status[0]
+                            ? g_form.layout_status
+                            : (g_form.layout[0]
+                                  ? g_form.layout
+                                  : "(no saved layout for this host)");
+        DrawTextEx(*f, msg,
+                   (Vector2){sl.x + sl.w + 12, sl.y + 7},
+                   13, 0, (Color){170, 180, 200, 255});
     }
 
     if (g_ssh_form_tab == SSH_FORM_TAB_APPEARANCE) {
@@ -8227,8 +9252,8 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                   xf ? (Color){72, 76, 96, 255} : (Color){48, 52, 66, 255});
     DrawRectangleLines(L.cancel.x, L.cancel.y, L.cancel.w, L.cancel.h,
                        (Color){150, 155, 170, xf ? 255 : 150});
-    Vector2 xsz = MeasureTextEx(*f, "Cancel", 14, 0);
-    DrawTextEx(*f, "Cancel",
+    Vector2 xsz = MeasureTextEx(*f, "Close", 14, 0);
+    DrawTextEx(*f, "Close",
                (Vector2){L.cancel.x + (L.cancel.w - xsz.x) / 2,
                          L.cancel.y + (L.cancel.h - xsz.y) / 2},
                14, 0, (Color){210, 215, 230, 255});
@@ -9314,8 +10339,10 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             for (int ti = 0; ti < g_num_tabs; ti++) {
                 Tab *tt = g_tabs[ti];
                 if (!tt) continue;
-                for (int pi = 0; pi < tt->num_panes; pi++)
-                    tt->panes[pi].effects = g_app_settings.effects;
+                for (PaneNode *_l = pane_tree_first_leaf(tt->root); _l;
+                     _l = pane_tree_next_leaf(_l)) {
+                    if (_l->pane) _l->pane->effects = g_app_settings.effects;
+                }
             }
             return;
         }
@@ -9444,10 +10471,10 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                         uint32_t rgb = ((uint32_t)cc.r << 16) |
                                        ((uint32_t)cc.g << 8) | cc.b;
                         for (int ti = 0; ti < g_num_tabs; ti++) {
-                            for (int pi = 0; pi < g_tabs[ti]->num_panes; pi++) {
-                                if (g_tabs[ti]->panes[pi].scr) {
-                                    screen_set_cursor_color(
-                                        g_tabs[ti]->panes[pi].scr, rgb);
+                            for (PaneNode *_l = pane_tree_first_leaf(g_tabs[ti]->root);
+                                 _l; _l = pane_tree_next_leaf(_l)) {
+                                if (_l->pane && _l->pane->scr) {
+                                    screen_set_cursor_color(_l->pane->scr, rgb);
                                 }
                             }
                         }
@@ -9459,14 +10486,12 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 g_app_settings.cursor_color[0] = 0;
                 /* "Default" — re-apply each Screen's seed colour. */
                 for (int ti = 0; ti < g_num_tabs; ti++) {
-                    for (int pi = 0; pi < g_tabs[ti]->num_panes; pi++) {
-                        if (g_tabs[ti]->panes[pi].scr) {
-                            /* SEED_CURSOR_COLOR is screen.c-private; use
-                               whatever screen_default_fg returns as a
-                               sensible "natural" fallback. */
+                    for (PaneNode *_l = pane_tree_first_leaf(g_tabs[ti]->root);
+                         _l; _l = pane_tree_next_leaf(_l)) {
+                        if (_l->pane && _l->pane->scr) {
                             screen_set_cursor_color(
-                                g_tabs[ti]->panes[pi].scr,
-                                screen_default_fg(g_tabs[ti]->panes[pi].scr));
+                                _l->pane->scr,
+                                screen_default_fg(_l->pane->scr));
                         }
                     }
                 }
@@ -9534,8 +10559,10 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             for (int ti = 0; ti < g_num_tabs; ti++) {                   \
                 Tab *tt = g_tabs[ti];                                   \
                 if (!tt) continue;                                      \
-                for (int pi = 0; pi < tt->num_panes; pi++)              \
-                    tt->panes[pi].effects = g_app_settings.effects;     \
+                for (PaneNode *_l = pane_tree_first_leaf(tt->root); _l; \
+                     _l = pane_tree_next_leaf(_l)) {                    \
+                    if (_l->pane) _l->pane->effects = g_app_settings.effects; \
+                }                                                       \
             }                                                           \
         } while (0)
         for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
@@ -10951,6 +11978,23 @@ static bool rec_convert(RecFmt fmt, const char *src_cast, const char *dst,
     return rec_render_native(fmt, src_cast, dst, err, errsz);
 }
 
+/* Compose `<dst-without-ext>-p<idx>.<ext>` into `out`. Used by the
+   Save handler when the recording captured multiple panes — each
+   slot writes to its own file alongside the user-typed dst. */
+static void rec_dst_for_pane(const char *dst, int idx, char *out, size_t cap) {
+    char base[PATH_MAX];
+    snprintf(base, sizeof(base), "%s", dst);
+    char *slash = strrchr(base, '/');
+    char *dot   = strrchr(base, '.');
+    char ext[16];
+    ext[0] = 0;
+    if (dot && (!slash || dot > slash)) {
+        snprintf(ext, sizeof(ext), "%s", dot);
+        *dot = 0;
+    }
+    snprintf(out, cap, "%s-p%d%s", base, idx, ext);
+}
+
 /* Update a slider's value from the current mouse X position, clamped
    to the track. Called both on initial click (snap-to-cursor) and
    while dragging. */
@@ -11067,40 +12111,63 @@ static void rec_save_handle_mouse(RecSaveLayout L) {
         return;
     }
     if (rect_hit(L.save_btn, mx, my)) {
-        fprintf(stderr, "rbterm: save → fmt=%s dst=%s src=%s\n",
-                rec_fmt_ext(g_rec_save.fmt), g_rec_save.dst_path,
-                g_rec_save.src_path);
+        int n = g_rec_save.src_count > 0 ? g_rec_save.src_count : 1;
+        fprintf(stderr, "rbterm: save → fmt=%s dst=%s panes=%d\n",
+                rec_fmt_ext(g_rec_save.fmt), g_rec_save.dst_path, n);
         snprintf(g_rec_save.status, sizeof(g_rec_save.status),
-                 "rendering %s — this can take a few seconds…",
-                 rec_fmt_ext(g_rec_save.fmt));
-        char err[256] = {0};
-        if (!rec_convert(g_rec_save.fmt, g_rec_save.src_path,
-                         g_rec_save.dst_path, err, sizeof(err))) {
-            snprintf(g_rec_save.status, sizeof(g_rec_save.status),
-                     "%s", err[0] ? err : "(no error message captured)");
-            fprintf(stderr, "rbterm: save FAILED: %s\n", g_rec_save.status);
-            return;
+                 "rendering %d %s file%s — this can take a few seconds…",
+                 n, rec_fmt_ext(g_rec_save.fmt), n == 1 ? "" : "s");
+        long long total_sz = 0;
+        char last_dst[PATH_MAX];
+        last_dst[0] = 0;
+        for (int i = 0; i < n; i++) {
+            const char *src = g_rec_save.src_count > 0
+                                  ? g_rec_save.src_paths[i]
+                                  : g_rec_save.src_path;
+            char dst[PATH_MAX];
+            if (n > 1) {
+                rec_dst_for_pane(g_rec_save.dst_path, i, dst, sizeof(dst));
+            } else {
+                snprintf(dst, sizeof(dst), "%s", g_rec_save.dst_path);
+            }
+            char err[256] = {0};
+            if (!rec_convert(g_rec_save.fmt, src, dst, err, sizeof(err))) {
+                snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                         "pane %d: %s", i,
+                         err[0] ? err : "(no error message captured)");
+                fprintf(stderr, "rbterm: save FAILED (pane %d): %s\n",
+                        i, g_rec_save.status);
+                return;
+            }
+            struct stat st;
+            if (stat(dst, &st) == 0) total_sz += (long long)st.st_size;
+            snprintf(last_dst, sizeof(last_dst), "%s", dst);
+            /* Cast saves move the source to the destination; pin the
+               new location so a follow-up re-export from the modal
+               still finds data. */
+            if (g_rec_save.fmt == REC_FMT_CAST) {
+                strncpy(g_rec_save.src_paths[i], dst,
+                        sizeof(g_rec_save.src_paths[i]) - 1);
+                g_rec_save.src_paths[i][sizeof(g_rec_save.src_paths[i]) - 1] = 0;
+                if (i == 0) {
+                    strncpy(g_rec_save.src_path, dst,
+                            sizeof(g_rec_save.src_path) - 1);
+                    g_rec_save.src_path[sizeof(g_rec_save.src_path) - 1] = 0;
+                }
+            }
         }
-        /* For .cast we just renamed the temp file; everything else
-           leaves the source intact so the user can re-export to
-           another format without re-recording. */
-        if (g_rec_save.fmt == REC_FMT_CAST) {
-            /* The src has moved to dst — point future operations at
-               the new location so they still find data. */
-            strncpy(g_rec_save.src_path, g_rec_save.dst_path,
-                    sizeof(g_rec_save.src_path) - 1);
-            g_rec_save.src_path[sizeof(g_rec_save.src_path) - 1] = 0;
-        }
-        /* Stat the freshly-written file and report a friendly size. */
-        struct stat st;
-        long long sz = 0;
-        if (stat(g_rec_save.dst_path, &st) == 0) sz = (long long)st.st_size;
-        const char *unit = "B"; double v = (double)sz;
+        const char *unit = "B"; double v = (double)total_sz;
         if (v >= 1024.0)        { v /= 1024.0;        unit = "KB"; }
         if (v >= 1024.0)        { v /= 1024.0;        unit = "MB"; }
-        snprintf(g_rec_save.status, sizeof(g_rec_save.status),
-                 "wrote %.0f %s %s to %s",
-                 v, unit, rec_fmt_ext(g_rec_save.fmt), g_rec_save.dst_path);
+        if (n > 1) {
+            snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                     "wrote %d %s files (%.0f %s total) — last: %s",
+                     n, rec_fmt_ext(g_rec_save.fmt), v, unit, last_dst);
+        } else {
+            snprintf(g_rec_save.status, sizeof(g_rec_save.status),
+                     "wrote %.0f %s %s to %s",
+                     v, unit, rec_fmt_ext(g_rec_save.fmt), last_dst);
+        }
         fprintf(stderr, "rbterm: %s\n", g_rec_save.status);
         return;
     }
@@ -13457,13 +14524,20 @@ int main(int argc, char **argv) {
                     prof && prof->effects_override ? &prof->effects    : NULL,
                     prof && prof->init_cwd[0]     ? prof->init_cwd     : NULL,
                     prof && prof->init_cmd[0]     ? prof->init_cmd     : NULL,
+                    (prof && prof->layout[0])     ? prof->layout       : NULL,
+                    (prof && prof->layout[0])     ? prof->pane_cwds    : NULL,
+                    (prof && prof->layout[0])     ? prof->pane_cmds    : NULL,
                     derive_cols, derive_rows, err, sizeof(err));
                 if (!t) {
                     fprintf(stderr,
                             "rbterm: launch ssh '%s' failed: %s\n",
                             alias, err[0] ? err : "(unknown)");
-                } else if (g_launch_pending[q].is_active) {
-                    g_active = g_num_tabs - 1;
+                } else {
+                    strncpy(t->ssh_alias, alias, sizeof(t->ssh_alias) - 1);
+                    t->ssh_alias[sizeof(t->ssh_alias) - 1] = 0;
+                    if (g_launch_pending[q].is_active) {
+                        g_active = g_num_tabs - 1;
+                    }
                 }
                 dirty = true;   /* tab list changed; force a render */
             }
@@ -13495,11 +14569,18 @@ int main(int argc, char **argv) {
             g_tabs[g_active]->activity = false;
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            bool pane_dead[2] = { false, false };
-            for (int pi = 0; pi < t->num_panes; pi++) {
-                Pane *p = &t->panes[pi];
+            /* Collect dead leaves first; close after the iteration so
+               we don't mutate the tree mid-walk. Tree depth is small
+               in practice; 64 leaves is already an absurd split. */
+            PaneNode *dead_leaves[64];
+            int dead_count = 0;
+            for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+                 leaf = pane_tree_next_leaf(leaf)) {
+                Pane *p = leaf->pane;
+                if (!p) continue;
                 size_t drained = 0;
                 const size_t drain_cap = 16 * 1024 * 1024;
+                bool dead = false;
                 for (;;) {
                     int n = pty_read(p->pty, readbuf, sizeof(readbuf));
                     if (n > 0) {
@@ -13510,29 +14591,22 @@ int main(int argc, char **argv) {
                         if (drained >= drain_cap) break;
                         continue;
                     }
-                    if (n < 0) pane_dead[pi] = true;
+                    if (n < 0) dead = true;
                     break;
                 }
-                /* Refresh the PTY's cursor snapshot so the reader
-                   thread can fast-path CSI 6n responses without
-                   waiting for the next frame. Cheap (two relaxed
-                   atomic stores). */
                 if (drained > 0) {
                     pty_snap_cursor(p->pty,
                                     screen_cursor_y(p->scr),
                                     screen_cursor_x(p->scr));
                 }
-                if (!pty_alive(p->pty)) pane_dead[pi] = true;
-                /* Activity on a background tab lights the tab-bar
-                   indicator until the user switches to it. */
+                if (!pty_alive(p->pty)) dead = true;
                 if (drained > 0) dirty = true;
                 if (drained > 0 && i != g_active) t->activity = true;
+                if (dead && dead_count < 64) dead_leaves[dead_count++] = leaf;
             }
-            /* Close dead panes in reverse so indices stay valid during
-               the sweep. A single-pane tab promotes to t->dead inside
-               tab_close_pane. */
-            for (int pi = t->num_panes - 1; pi >= 0; pi--) {
-                if (pane_dead[pi]) tab_close_pane(t, pi);
+            for (int d = 0; d < dead_count; d++) {
+                tab_close_leaf(t, dead_leaves[d]);
+                if (t->dead) break;
             }
         }
         for (int i = g_num_tabs - 1; i >= 0; i--) {
@@ -13546,8 +14620,10 @@ int main(int argc, char **argv) {
         double now = GetTime();
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            for (int pi = 0; pi < t->num_panes; pi++) {
-                Pane *p = &t->panes[pi];
+            for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+                 leaf = pane_tree_next_leaf(leaf)) {
+                Pane *p = leaf->pane;
+                if (!p) continue;
                 if (now - p->cwd_poll_at < 0.3) continue;
                 p->cwd_poll_at = now;
                 char buf[PATH_MAX];
@@ -13555,7 +14631,7 @@ int main(int argc, char **argv) {
                     strcmp(buf, p->cwd) != 0) {
                     strncpy(p->cwd, buf, sizeof(p->cwd) - 1);
                     p->cwd[sizeof(p->cwd) - 1] = 0;
-                    if (i == g_active && pi == t->active_pane)
+                    if (i == g_active && leaf == t->active)
                         p->title_dirty = true;
                 }
             }
@@ -13568,8 +14644,10 @@ int main(int argc, char **argv) {
            buffer logic. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            for (int pi = 0; pi < t->num_panes; pi++) {
-                Pane *p = &t->panes[pi];
+            for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+                 leaf = pane_tree_next_leaf(leaf)) {
+                Pane *p = leaf->pane;
+                if (!p) continue;
                 if (now < p->hud_next_poll_at) continue;
                 p->hud_next_poll_at = now + 1.0;
 
@@ -13634,8 +14712,10 @@ int main(int argc, char **argv) {
            so the toast can fade; after 4 s release the handle. */
         for (int i = 0; i < g_num_tabs; i++) {
             Tab *t = g_tabs[i];
-            for (int pi = 0; pi < t->num_panes; pi++) {
-                Pane *p = &t->panes[pi];
+            for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+                 leaf = pane_tree_next_leaf(leaf)) {
+                Pane *p = leaf->pane;
+                if (!p) continue;
                 if (p->upload) {
                     int st = pty_upload_status(p->upload, NULL, NULL, NULL, 0);
                     if (st != 0 && p->upload_done_at == 0.0) {
@@ -13694,8 +14774,7 @@ int main(int argc, char **argv) {
                 else if (h.on_rec_start) {
                     if (!g_rec.active) {
                         Tab *_t = active_tab();
-                        Pane *_p = _t ? active_pane_of(_t) : NULL;
-                        if (_p) rec_start(_p);
+                        if (_t) rec_start(_t);
                     }
                 }
                 else if (h.on_rec_stop) {
@@ -13726,6 +14805,9 @@ int main(int argc, char **argv) {
                             if (err[0]) fprintf(stderr, "rbterm: split failed: %s\n", err);
                         }
                     }
+                }
+                else if (h.on_bcast) {
+                    g_broadcast_active = !g_broadcast_active;
                 }
                 else if (h.tab_idx >= 0) {
                     if (h.on_close) tab_close(h.tab_idx);
@@ -13785,56 +14867,85 @@ int main(int argc, char **argv) {
                The grab zone is padded by SPLITTER_GRAB on each side of
                the visual line so the cursor can find it without
                pixel-perfect aim. */
-            PaneRect sp;
-            bool has_split = splitter_rect(cur, win_w_now, win_h_now, &sp);
-            bool on_splitter = false;
-            if (has_split) {
-                int gx = sp.x, gy = sp.y, gw = sp.w, gh = sp.h;
-                if (cur->split == SPLIT_VERTICAL) {
-                    gx -= SPLITTER_GRAB;
-                    gw += 2 * SPLITTER_GRAB;
-                } else {
-                    gy -= SPLITTER_GRAB;
-                    gh += 2 * SPLITTER_GRAB;
+            /* Locate the dragging splitter, if any: either an in-flight
+               drag (some node has splitter_drag set) or a fresh press
+               on a splitter strip. */
+            static PaneRect s_drag_outer;
+            static PaneNode *s_drag_node;
+            PaneNode *drag_node = NULL;
+            PaneRect drag_outer = {0};
+            /* If a previous frame set a node's splitter_drag, find it. */
+            {
+                PaneNode *stack[64]; int sp_top = 0;
+                if (cur->root) stack[sp_top++] = cur->root;
+                while (sp_top > 0) {
+                    PaneNode *n = stack[--sp_top];
+                    if (!n || n->split == SPLIT_NONE) continue;
+                    if (n->splitter_drag) {
+                        drag_node = n;
+                        if (n == s_drag_node) drag_outer = s_drag_outer;
+                        else {
+                            /* Recompute outer if we don't have a stash. */
+                            pane_tree_node_rect_walk(cur->root, n,
+                                pane_tree_terminal_outer(win_w_now, win_h_now),
+                                &drag_outer);
+                        }
+                        break;
+                    }
+                    if (sp_top + 1 < 64) stack[sp_top++] = n->child[0];
+                    if (sp_top + 1 < 64) stack[sp_top++] = n->child[1];
                 }
-                on_splitter = mp.x >= gx && mp.x < gx + gw &&
-                              mp.y >= gy && mp.y < gy + gh;
+            }
+            bool on_splitter = false;
+            PaneNode *hit_node = NULL;
+            PaneRect hit_outer = {0};
+            if (!drag_node) {
+                hit_node = pane_tree_splitter_at(cur->root,
+                    pane_tree_terminal_outer(win_w_now, win_h_now),
+                    (int)mp.x, (int)mp.y, SPLITTER_GRAB, &hit_outer);
+                on_splitter = (hit_node != NULL);
             }
             if (on_splitter && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                cur->splitter_drag = true;
+                hit_node->splitter_drag = true;
+                drag_node = hit_node;
+                drag_outer = hit_outer;
+                s_drag_node = hit_node;
+                s_drag_outer = hit_outer;
             }
-            if (cur->splitter_drag) {
+            if (drag_node) {
                 if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                    int top = TAB_BAR_H;
-                    int area_w = win_w_now;
-                    int area_h = win_h_now - top;
                     float nr;
-                    if (cur->split == SPLIT_VERTICAL) {
-                        nr = (area_w > SPLITTER_PX)
-                             ? (float)((int)mp.x) / (float)(area_w - SPLITTER_PX)
+                    if (drag_node->split == SPLIT_VERTICAL) {
+                        int span = drag_outer.w - SPLITTER_PX;
+                        nr = (span > 0)
+                             ? (float)((int)mp.x - drag_outer.x) / (float)span
                              : 0.5f;
                     } else {
-                        nr = (area_h > SPLITTER_PX)
-                             ? (float)((int)mp.y - top) / (float)(area_h - SPLITTER_PX)
+                        int span = drag_outer.h - SPLITTER_PX;
+                        nr = (span > 0)
+                             ? (float)((int)mp.y - drag_outer.y) / (float)span
                              : 0.5f;
                     }
                     if (nr < 0.15f) nr = 0.15f;
                     if (nr > 0.85f) nr = 0.85f;
-                    cur->split_ratio = nr;
+                    drag_node->ratio = nr;
                 } else {
-                    cur->splitter_drag = false;
+                    drag_node->splitter_drag = false;
+                    s_drag_node = NULL;
                 }
             } else {
                 /* Click-to-focus: left-press inside a pane makes it the active one. */
                 if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                    int pi = pane_at(cur, win_w_now, win_h_now, (int)mp.x, (int)mp.y);
-                    if (pi >= 0) cur->active_pane = pi;
+                    PaneNode *hit = pane_at(cur, win_w_now, win_h_now,
+                                            (int)mp.x, (int)mp.y);
+                    if (hit) cur->active = hit;
                 }
                 Pane *p = active_pane_of(cur);
                 if (p && p->scr) {
                     /* Translate window-pixel coords → active pane's cell coords. */
                     PaneRect pr;
-                    pane_rect(cur, cur->active_pane, win_w_now, win_h_now, &pr);
+                    if (!leaf_rect(cur, cur->active, win_w_now, win_h_now, &pr))
+                        pr = pane_tree_terminal_outer(win_w_now, win_h_now);
                     int mcol = (int)((mp.x - pr.x - r.pad_x) / r.cell_w);
                     int mrow = (int)((mp.y - pr.y - r.pad_y) / r.cell_h);
                     int cmax = screen_cols(p->scr) - 1;
@@ -14273,6 +15384,12 @@ int main(int argc, char **argv) {
                    the camera button in the tab bar uses. */
                 screenshot_active_pane(&r);
             }
+            else if (shift_held && IsKeyPressed(KEY_I)) {
+                /* Cmd+Shift+I — toggle broadcast input. Only useful
+                   on a multi-pane tab; we still let the user toggle
+                   when single-pane (it just won't fan out). */
+                g_broadcast_active = !g_broadcast_active;
+            }
             else if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
             /* Cmd+W closes the active tab. macOS's AppKit ordinarily
                eats this for "Close Window" — disable_close_menu_item()
@@ -14325,6 +15442,14 @@ int main(int argc, char **argv) {
                            can see why an SSH re-dial didn't take. */
                         if (err[0]) fprintf(stderr, "rbterm: split failed: %s\n", err);
                     }
+                }
+            }
+            /* Cmd+K cycles focus to the next leaf in the tab's pane
+               tree (Cmd+Shift+K goes the other way). Wraps around. */
+            else if (IsKeyPressed(KEY_K)) {
+                if (cur && cur->root) {
+                    cur->active = pane_tree_cycle_leaf(cur->root, cur->active,
+                                                       shift_held ? -1 : +1);
                 }
             }
             else if (IsKeyPressed(KEY_LEFT_BRACKET))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
@@ -14434,7 +15559,25 @@ int main(int argc, char **argv) {
         if (ap && acts.paste) {
             const char *t = GetClipboardText();
             if (t && *t) {
-                if (screen_bracketed_paste(ap->scr)) {
+                /* Broadcast: fan to every leaf of the active tab.
+                   Each leaf decides on its own whether bracketed-
+                   paste is in effect (a server-side mode flag), so
+                   we ask each Screen rather than reusing ap->scr's
+                   answer. */
+                if (g_broadcast_active && cur && pane_tree_count(cur->root) >= 2) {
+                    for (PaneNode *_l = pane_tree_first_leaf(cur->root); _l;
+                         _l = pane_tree_next_leaf(_l)) {
+                        Pane *_p = _l->pane;
+                        if (!_p || !_p->pty) continue;
+                        if (_p->scr && screen_bracketed_paste(_p->scr)) {
+                            pty_write(_p->pty, (const uint8_t *)"\x1b[200~", 6);
+                            pty_write(_p->pty, (const uint8_t *)t, strlen(t));
+                            pty_write(_p->pty, (const uint8_t *)"\x1b[201~", 6);
+                        } else {
+                            pty_write(_p->pty, (const uint8_t *)t, strlen(t));
+                        }
+                    }
+                } else if (screen_bracketed_paste(ap->scr)) {
                     pty_write(ap->pty, (const uint8_t *)"\x1b[200~", 6);
                     pty_write(ap->pty, (const uint8_t *)t, strlen(t));
                     pty_write(ap->pty, (const uint8_t *)"\x1b[201~", 6);
@@ -14470,9 +15613,25 @@ int main(int argc, char **argv) {
         if (in_n > 0) dirty = true;
         if (acts.font_delta != 100) dirty = true;
         if (ap && in_n > 0) {
-            screen_scroll_reset(ap->scr);
-            pty_write(ap->pty, inputbuf, in_n);
-            if (ap->sel.active && !ap->sel.dragging) ap->sel.active = false;
+            if (g_broadcast_active && cur && pane_tree_count(cur->root) >= 2) {
+                /* Broadcast: write the same byte stream to every
+                   leaf and reset their scrollback so each pane
+                   jumps to the live edge. Selection clearing is
+                   per-leaf so a stale highlight doesn't linger
+                   anywhere in the group. */
+                for (PaneNode *_l = pane_tree_first_leaf(cur->root); _l;
+                     _l = pane_tree_next_leaf(_l)) {
+                    Pane *_p = _l->pane;
+                    if (!_p || !_p->pty) continue;
+                    if (_p->scr) screen_scroll_reset(_p->scr);
+                    pty_write(_p->pty, inputbuf, in_n);
+                    if (_p->sel.active && !_p->sel.dragging) _p->sel.active = false;
+                }
+            } else {
+                screen_scroll_reset(ap->scr);
+                pty_write(ap->pty, inputbuf, in_n);
+                if (ap->sel.active && !ap->sel.dragging) ap->sel.active = false;
+            }
         }
 
         if (ap && ap->title_dirty) {
@@ -14511,7 +15670,13 @@ int main(int argc, char **argv) {
            without this the new tab wouldn't paint until the next
            unrelated dirty trigger (mouse move, etc.) — felt like
            "extreme sluggishness" on tab switches. */
-        if (g_active != prev_active) dirty = true;
+        if (g_active != prev_active) {
+            dirty = true;
+            /* Safety: stepping into a different tab disarms broadcast
+               so a stray Cmd+T or [+] doesn't sneak typing into a
+               local shell that wasn't part of the original group. */
+            g_broadcast_active = false;
+        }
         if ((int)g_ui_mode != prev_ui_mode) dirty = true;
         prev_active = g_active;
         prev_ui_mode = (int)g_ui_mode;
@@ -14527,6 +15692,7 @@ int main(int argc, char **argv) {
             ClearBackground((Color){0, 0, 0, 255});
             draw_tab_bar(&r, win_w_now);
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
+            draw_tab_bar_tooltip(&r, win_w_now);
             EndDrawing();
         } else {
             /* Idle path: pump events + sleep. PollInputEvents on
