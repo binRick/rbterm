@@ -6,6 +6,7 @@
 #include "rec_effects.h"
 #include "shape.h"
 #include <stdarg.h>
+#include <pthread.h>
 #include "screen.h"
 #include "render.h"
 #include "input.h"
@@ -292,6 +293,10 @@ static struct {
 } g_launch_pending[16];
 static int g_launch_pending_count = 0;
 static int g_launch_pending_pos   = 0;
+
+/* Parallel SSH connect storage for startup launches. The actual
+   struct + state live further down (declared after SshProfile so
+   each worker can hold a snapshot). See SshLaunchWorker. */
 
 /* Per-instance HUD configuration. Used both as the per-SSH-host
    override (Tab/SshProfile/SshForm) and as the value returned by
@@ -755,6 +760,13 @@ typedef struct {
     PaneNode *root;              /* tree of leaves + splits */
     PaneNode *active;            /* current focused leaf */
     bool dead;
+    /* User-set tab name. When non-empty, tab_label() prefixes the
+       auto-derived label (OSC 0/2 title or cwd basename) as
+       `<tab_name> · <auto>` so the user's mnemonic stays visible
+       even when the shell rewrites the title every prompt. Set
+       interactively via Cmd+R, or seeded from an SSH profile's
+       display_name. */
+    char  tab_name[128];
     bool  is_ssh;
     char  ssh_target[256];       /* user@host[:port] for SSH tabs */
     /* `Host <alias>` from ~/.ssh/config that opened this tab. Empty
@@ -1269,6 +1281,15 @@ static int g_active = 0;
    broadcast group. Toggle via Cmd+Shift+I or the tab-bar button. */
 static bool g_broadcast_active = false;
 
+/* Tab-rename overlay state. Cmd+R captures the keyboard for the
+   active tab's label; the user types into g_tab_rename_buf and
+   commits with Enter (Esc cancels). Drawn in draw_tab_bar over
+   the active tab's slot. */
+static bool g_tab_rename_active = false;
+static int  g_tab_rename_idx    = -1;
+static char g_tab_rename_buf[128];
+static int  g_tab_rename_caret  = 0;
+
 /* Modal SSH connection form. When non-NORMAL, the terminal is locked:
    keystrokes edit form fields and mouse clicks focus them instead of
    going to the active tab. Layout is computed on the fly in
@@ -1279,11 +1300,11 @@ typedef enum {
 } UiMode;
 typedef enum {
     F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
-    F_INIT_CWD, F_INIT_CMD,
+    F_INIT_CWD, F_INIT_CMD, F_DNAME,
     F_NEW, F_CONNECT, F_DELETE, F_CLONE, F_SAVE, F_CANCEL,
     F_COUNT
 } SshField;
-#define F_TEXT_FIELDS 8    /* name, host, port, user, pass, key, init_cwd, init_cmd */
+#define F_TEXT_FIELDS 9    /* name, host, port, user, pass, key, init_cwd, init_cmd, display_name */
 typedef struct {
     char name[128];
     char host[256];
@@ -1313,6 +1334,9 @@ typedef struct {
        program (vim, tmux attach, etc.). Empty = no-op. */
     char init_cwd[256];
     char init_cmd[256];
+    /* Manual tab name persisted with the profile. Empty = use the
+       auto-derived label only. */
+    char display_name[128];
     /* Predefined split layout. Mirror of SshProfile.layout — see
        there for the descriptor-string grammar. Filled by the
        "Save Layout" button (capturing the active SSH tab's tree)
@@ -1446,6 +1470,10 @@ typedef struct {
        right after the channel opens. */
     char init_cwd[256];
     char init_cmd[256];
+    /* User-assigned tab name persisted with this profile. Seeds
+       Tab.tab_name on connect; overrides any auto-derived label
+       in the tab bar (with the auto label appended as a suffix). */
+    char display_name[128];
     /* Predefined split layout for this host. `layout` is a
        descriptor string like `V0.50(H0.50(0,1),2)` where letters
        are split orientations, decimals are 0.15..0.85 ratios, and
@@ -1493,6 +1521,41 @@ static bool parse_hex_color(const char *hex, Color *out) {
 
 #define SSH_PROFILES_MAX 128
 static SshProfile g_ssh_profiles[SSH_PROFILES_MAX];
+
+/* Parallel SSH connect for startup launches. Each pending SSH entry
+   gets a worker thread that runs pty_open_ssh concurrently with the
+   others; the main loop polls completion flags and integrates each
+   finished Pty into a fresh Tab. Total wait drops from the sum of
+   per-host handshake latencies to the max. */
+typedef struct {
+    pthread_t    th;
+    int          started;
+    volatile int done;
+    int          integrated;
+    char         alias[128];
+    bool         is_active;
+    /* Connect inputs (copies — g_ssh_profiles can be reloaded
+       under us when the SSH form opens during startup). */
+    char         user[96];
+    char         host[256];
+    char         keyfile[PATH_MAX];
+    int          port;
+    int          cols, rows;
+    /* Full profile snapshot for post-connect Tab setup
+       (theme/cursor/font/HUD/effects/init/layout). */
+    SshProfile   prof;
+    bool         prof_valid;
+    /* Placeholder Tab created at kick time. The integration step
+       attaches the worker's Pty to this Tab once handshake done. */
+    Tab         *placeholder;
+    /* Result. */
+    Pty         *pty;
+    char         err[256];
+} SshLaunchWorker;
+#define LAUNCH_WORKERS_MAX 16
+static SshLaunchWorker g_launch_workers[LAUNCH_WORKERS_MAX];
+static int  g_launch_workers_count  = 0;
+static bool g_launch_workers_kicked = false;
 static int        g_ssh_profile_count = 0;
 static int        g_ssh_list_scroll = 0;   /* in rows */
 static int        g_ssh_list_selected = -1; /* highlighted row, -1 = none */
@@ -1918,21 +1981,26 @@ static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
     return true;
 }
 
+/* Attach a pre-built Pty to a fresh Pane. Used by both
+   pane_open_ssh (synchronous connect) and the parallel-launch path,
+   where the worker thread already produced the Pty. */
+static void pane_attach_pty(Pane *p, Pty *pty, int cols, int rows) {
+    pane_init_click_state(p);
+    p->pty = pty;
+    p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    p->effects = g_app_settings.effects;
+}
+
 /* Like pane_open_local but the PTY is an SSH session. On failure
    (handshake / auth / channel) writes the libssh error message
    into `err` and returns false. */
 static bool pane_open_ssh(Pane *p, const char *user, const char *host, int port,
                           const char *password, const char *keyfile,
                           int cols, int rows, char *err, size_t errsz) {
-    pane_init_click_state(p);
-    p->pty = pty_open_ssh(user, host, port, password, keyfile,
-                          cols, rows, err, errsz);
-    if (!p->pty) return false;
-    p->scr = screen_new(cols, rows, 5000, pane_io(p));
-    /* Same seed as a local pane; the SSH-specific override path
-       layers any `# rbterm-effects-*` directives on top after the
-       host stanza is parsed. */
-    p->effects = g_app_settings.effects;
+    Pty *pty = pty_open_ssh(user, host, port, password, keyfile,
+                            cols, rows, err, errsz);
+    if (!pty) return false;
+    pane_attach_pty(p, pty, cols, rows);
     return true;
 }
 
@@ -2405,20 +2473,25 @@ static bool layout_replay_walk(Tab *t, const LayoutNode *node,
     return ok;
 }
 
-static Tab *tab_open_ssh(const char *user, const char *host, int port,
-                         const char *password, const char *keyfile,
-                         const char *theme, int cursor_style,
-                         const char *font, int font_size,
-                         const char *log_dir, int log_mode,
-                         const char *color, const char *cursor_color,
-                         const HudConfig *hud,
-                         const RecEffects *effects, /* NULL = no override */
-                         const char *init_cwd, const char *init_cmd,
-                         const char *layout,
-                         const char (*pane_cwds)[256],
-                         const char (*pane_cmds)[256],
-                         int cols, int rows,
-                         char *err, size_t errsz) {
+/* Build a Tab around an SSH connection. When `pre_pty` is non-NULL
+   the network handshake is assumed to have already happened on a
+   worker thread — we just attach the Pty and finish setup. When
+   pre_pty is NULL the call blocks on pty_open_ssh inline. */
+static Tab *tab_open_ssh_ex(const char *user, const char *host, int port,
+                            const char *password, const char *keyfile,
+                            const char *theme, int cursor_style,
+                            const char *font, int font_size,
+                            const char *log_dir, int log_mode,
+                            const char *color, const char *cursor_color,
+                            const HudConfig *hud,
+                            const RecEffects *effects,
+                            const char *init_cwd, const char *init_cmd,
+                            const char *layout,
+                            const char (*pane_cwds)[256],
+                            const char (*pane_cmds)[256],
+                            int cols, int rows,
+                            Pty *pre_pty,
+                            char *err, size_t errsz) {
     if (g_num_tabs >= MAX_TABS) return NULL;
     Tab *t = calloc(1, sizeof(Tab));
     PaneNode *leaf = pane_node_new_leaf();
@@ -2468,8 +2541,10 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     t->ssh_port = port;
     Pane *first_pane = leaf->pane;
     snprintf(first_pane->title, sizeof(first_pane->title), "%s", t->ssh_target);
-    if (!pane_open_ssh(first_pane, user, host, port, password, keyfile,
-                       cols, rows, err, errsz)) {
+    if (pre_pty) {
+        pane_attach_pty(first_pane, pre_pty, cols, rows);
+    } else if (!pane_open_ssh(first_pane, user, host, port, password, keyfile,
+                              cols, rows, err, errsz)) {
         pane_node_free_recursive(t->root);
         free(t); return NULL;
     }
@@ -2546,6 +2621,188 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
     g_num_tabs++;
     tab_log_open_all(t);
     return t;
+}
+
+/* Build a placeholder Tab for an in-flight SSH connect — visible
+   in the tab bar immediately, so the user gets feedback that the
+   handshake is in progress. The Pane has a Screen but no PTY; the
+   pane area shows a "Connecting to <alias>..." banner via
+   screen_feed. The drain / cwd-poll / hud-poll loops skip panes
+   with a NULL pty so this is safe. The matching `tab_attach_ssh_*`
+   helper attaches the worker's Pty when the handshake completes. */
+static Tab *tab_open_ssh_placeholder(const SshProfile *prof,
+                                     const char *alias, bool is_active,
+                                     int cols, int rows) {
+    if (g_num_tabs >= MAX_TABS) return NULL;
+    Tab *t = calloc(1, sizeof(Tab));
+    PaneNode *leaf = pane_node_new_leaf();
+    t->root = leaf;
+    t->active = leaf;
+    t->is_ssh = true;
+    /* Stash connection metadata so split + reconnect paths can use
+       it later (and so the SSH-form auto-select round-trips). */
+    if (alias) {
+        strncpy(t->ssh_alias, alias, sizeof(t->ssh_alias) - 1);
+        t->ssh_alias[sizeof(t->ssh_alias) - 1] = 0;
+    }
+    if (prof) {
+        const char *user = prof->user[0] ? prof->user : NULL;
+        const char *host = prof->hostname[0] ? prof->hostname : alias;
+        int         port = prof->port > 0 ? prof->port : 22;
+        if (user) {
+            if (port == 22) snprintf(t->ssh_target, sizeof(t->ssh_target), "%s@%s", user, host);
+            else            snprintf(t->ssh_target, sizeof(t->ssh_target), "%s@%s:%d", user, host, port);
+        } else {
+            if (port == 22) snprintf(t->ssh_target, sizeof(t->ssh_target), "%s", host);
+            else            snprintf(t->ssh_target, sizeof(t->ssh_target), "%s:%d", host, port);
+        }
+        if (host) { strncpy(t->ssh_host, host, sizeof(t->ssh_host) - 1); t->ssh_host[sizeof(t->ssh_host) - 1] = 0; }
+        if (user) { strncpy(t->ssh_user, user, sizeof(t->ssh_user) - 1); t->ssh_user[sizeof(t->ssh_user) - 1] = 0; }
+        if (prof->identity[0]) { strncpy(t->ssh_key, prof->identity, sizeof(t->ssh_key) - 1); t->ssh_key[sizeof(t->ssh_key) - 1] = 0; }
+        t->ssh_port = port;
+        if (prof->display_name[0]) {
+            strncpy(t->tab_name, prof->display_name, sizeof(t->tab_name) - 1);
+            t->tab_name[sizeof(t->tab_name) - 1] = 0;
+        }
+    } else {
+        snprintf(t->ssh_target, sizeof(t->ssh_target), "%s", alias ? alias : "ssh");
+        if (alias) {
+            strncpy(t->ssh_host, alias, sizeof(t->ssh_host) - 1);
+            t->ssh_host[sizeof(t->ssh_host) - 1] = 0;
+        }
+        t->ssh_port = 22;
+    }
+    Pane *p = leaf->pane;
+    pane_init_click_state(p);
+    p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    p->effects = g_app_settings.effects;
+    /* Banner inside the pane area. ANSI: clear + home, bold cyan
+       caption, dim line below it. The shell's first redraw blows
+       this away as soon as the PTY is attached. */
+    char banner[512];
+    int n = snprintf(banner, sizeof(banner),
+                     "\x1b[2J\x1b[H\x1b[1;36mConnecting to %s...\x1b[0m\r\n"
+                     "\x1b[2;37m(libssh handshake in progress)\x1b[0m\r\n",
+                     t->ssh_target);
+    if (n > 0 && n < (int)sizeof(banner)) {
+        screen_feed(p->scr, (const uint8_t *)banner, (size_t)n);
+    }
+    snprintf(p->title, sizeof(p->title), "Connecting to %s",
+             t->ssh_target);
+    p->title_dirty = true;
+    g_tabs[g_num_tabs] = t;
+    if (is_active) g_active = g_num_tabs;
+    g_num_tabs++;
+    tab_log_open_all(t);
+    return t;
+}
+
+/* Attach a worker-produced Pty to a placeholder Tab and finish all
+   the post-connect setup tab_open_ssh_ex would normally do
+   inline (appearance, layout/init, font). Mirrors the second half
+   of tab_open_ssh_ex but on an existing Tab. */
+static void tab_attach_ssh_finalize(Tab *t, Pty *pty, const SshProfile *prof,
+                                    int cols, int rows) {
+    if (!t || !pty || !t->active || !t->active->pane) return;
+    Pane *p = t->active->pane;
+    /* Clear the placeholder banner so the shell's first paint
+       lands on a fresh grid. */
+    screen_feed(p->scr, (const uint8_t *)"\x1b[2J\x1b[H", 6);
+    p->pty = pty;
+    /* Refresh title to the SSH target (the shell will rewrite via
+       OSC 0/2 once it draws). */
+    snprintf(p->title, sizeof(p->title), "%s", t->ssh_target);
+    p->title_dirty = true;
+    /* Lift profile fields onto the Tab the same way tab_open_ssh_ex
+       would have. */
+    if (prof) {
+        if (prof->theme[0])   { strncpy(t->ssh_theme, prof->theme, sizeof(t->ssh_theme) - 1); t->ssh_theme[sizeof(t->ssh_theme) - 1] = 0; }
+        t->ssh_cursor_style = prof->cursor_style;
+        if (prof->font[0])    { strncpy(t->ssh_font, prof->font, sizeof(t->ssh_font) - 1); t->ssh_font[sizeof(t->ssh_font) - 1] = 0; }
+        t->ssh_font_size = prof->font_size;
+        if (prof->log_dir[0]) { strncpy(t->ssh_log_dir, prof->log_dir, sizeof(t->ssh_log_dir) - 1); t->ssh_log_dir[sizeof(t->ssh_log_dir) - 1] = 0; }
+        t->ssh_log_mode = prof->log_mode;
+        if (prof->color[0])   { strncpy(t->ssh_color, prof->color, sizeof(t->ssh_color) - 1); t->ssh_color[sizeof(t->ssh_color) - 1] = 0; }
+        if (prof->cursor_color[0]) {
+            strncpy(t->ssh_cursor_color, prof->cursor_color, sizeof(t->ssh_cursor_color) - 1);
+            t->ssh_cursor_color[sizeof(t->ssh_cursor_color) - 1] = 0;
+        }
+        if (prof->hud.override) t->ssh_hud = prof->hud;
+        if (prof->effects_override) {
+            t->ssh_effects_override = true;
+            t->ssh_effects = prof->effects;
+        }
+        if (prof->init_cwd[0]) { strncpy(t->ssh_init_cwd, prof->init_cwd, sizeof(t->ssh_init_cwd) - 1); t->ssh_init_cwd[sizeof(t->ssh_init_cwd) - 1] = 0; }
+        if (prof->init_cmd[0]) { strncpy(t->ssh_init_cmd, prof->init_cmd, sizeof(t->ssh_init_cmd) - 1); t->ssh_init_cmd[sizeof(t->ssh_init_cmd) - 1] = 0; }
+        if (prof->layout[0])   { strncpy(t->ssh_layout, prof->layout, sizeof(t->ssh_layout) - 1); t->ssh_layout[sizeof(t->ssh_layout) - 1] = 0; }
+        for (int i = 0; i < SSH_LAYOUT_MAX_PANES; i++) {
+            strncpy(t->ssh_pane_cwds[i], prof->pane_cwds[i], sizeof(t->ssh_pane_cwds[i]) - 1);
+            t->ssh_pane_cwds[i][sizeof(t->ssh_pane_cwds[i]) - 1] = 0;
+            strncpy(t->ssh_pane_cmds[i], prof->pane_cmds[i], sizeof(t->ssh_pane_cmds[i]) - 1);
+            t->ssh_pane_cmds[i][sizeof(t->ssh_pane_cmds[i]) - 1] = 0;
+        }
+    }
+    pane_apply_tab_appearance(t, p);
+    /* Layout replay (if any) or legacy single-pane init send. */
+    LayoutNode *layout_root = NULL;
+    if (t->ssh_layout[0]) layout_root = layout_parse(t->ssh_layout);
+    bool seen[SSH_LAYOUT_MAX_PANES] = {0};
+    int leaf_count = layout_root ? layout_count_leaves(layout_root, seen) : 0;
+    if (layout_root && leaf_count > 0) {
+        layout_replay_walk(t, layout_root, t->root,
+                           t->ssh_pane_cwds, t->ssh_pane_cmds, cols, rows);
+        layout_node_free(layout_root);
+        t->active = pane_tree_first_leaf(t->root);
+    } else {
+        if (layout_root) layout_node_free(layout_root);
+        ssh_send_init_line(p, t->ssh_init_cwd, t->ssh_init_cmd);
+    }
+    /* Per-host font / size — apply globally. */
+    if (g_renderer) {
+        bool resized = false;
+        if (t->ssh_font[0]) {
+            const EmbeddedFont *ef = embedded_font_lookup(t->ssh_font);
+            bool ok = ef
+                ? renderer_set_font_data(g_renderer, ef->data,
+                                         (int)ef->data_size,
+                                         ef->ext, t->ssh_font)
+                : renderer_set_font_path(g_renderer, t->ssh_font);
+            if (ok) resized = true;
+        }
+        if (t->ssh_font_size > 0) {
+            if (renderer_set_font_size(g_renderer, t->ssh_font_size)) resized = true;
+        }
+        if (resized) {
+            tabs_resize_all(g_renderer, GetScreenWidth(), GetScreenHeight());
+            SetWindowMinSize(g_renderer->cell_w * 20 + 2 * g_renderer->pad_x,
+                             g_renderer->cell_h * 5 + TAB_BAR_H + 2 * g_renderer->pad_y);
+        }
+    }
+}
+
+/* Wrapper for the legacy synchronous-connect call sites. Forwards
+   to tab_open_ssh_ex with pre_pty=NULL so pty_open_ssh is invoked
+   inline (blocking). */
+static Tab *tab_open_ssh(const char *user, const char *host, int port,
+                         const char *password, const char *keyfile,
+                         const char *theme, int cursor_style,
+                         const char *font, int font_size,
+                         const char *log_dir, int log_mode,
+                         const char *color, const char *cursor_color,
+                         const HudConfig *hud,
+                         const RecEffects *effects,
+                         const char *init_cwd, const char *init_cmd,
+                         const char *layout,
+                         const char (*pane_cwds)[256],
+                         const char (*pane_cmds)[256],
+                         int cols, int rows,
+                         char *err, size_t errsz) {
+    return tab_open_ssh_ex(user, host, port, password, keyfile,
+                           theme, cursor_style, font, font_size,
+                           log_dir, log_mode, color, cursor_color,
+                           hud, effects, init_cwd, init_cmd,
+                           layout, pane_cwds, pane_cmds,
+                           cols, rows, NULL, err, errsz);
 }
 
 /* Close tab at index `idx`: free all panes, scrub stashed SSH
@@ -3467,21 +3724,27 @@ static void search_handle_input(Pane *p) {
  * title-first still shows the cwd at an idle prompt. Programs that
  * explicitly set a title (tmux, vim, ssh foo, `ansi --title=wow`)
  * surface until the shell's next prompt rewrites it. */
-static const char *tab_label(const Tab *t) {
+/* Slot in per-tab static buffer space so multiple tab labels can
+   coexist within one frame. Returns the buffer for `t`'s slot. */
+static char *tab_label_buf(const Tab *t) {
+    static char buf[MAX_TABS][320];
+    static int  slot = 0;
+    int idx = -1;
+    for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { idx = i; break; }
+    if (idx < 0) idx = slot++ % MAX_TABS;
+    return buf[idx];
+}
+
+/* The "auto" label: what the tab would show with no manual name —
+   shell title, cwd basename, or a fallback. tab_label() prefixes
+   the manual name (when set) onto whatever this returns. */
+static const char *tab_label_auto(const Tab *t) {
     if (!t || !t->active || !t->active->pane) return "rbterm";
     const Pane *p = t->active->pane;
-    /* SSH tabs: prefix with the target so two remote hosts don't look
-       identical in the bar. Show "user@host title" when a title has
-       been set, or "user@host cwd-basename" otherwise. */
     if (t->is_ssh) {
-        static char buf[MAX_TABS][320];
-        static int  slot = 0;
-        int idx = -1;
-        for (int i = 0; i < g_num_tabs; i++) if (g_tabs[i] == t) { idx = i; break; }
-        if (idx < 0) idx = slot++ % MAX_TABS;
-        char *out = buf[idx];
+        char *out = tab_label_buf(t);
         if (p->title[0]) {
-            snprintf(out, sizeof(buf[0]), "%s %s", t->ssh_target, p->title);
+            snprintf(out, 320, "%s %s", t->ssh_target, p->title);
             return out;
         }
         if (!p->cwd[0]) {
@@ -3491,7 +3754,7 @@ static const char *tab_label(const Tab *t) {
         const char *b = strrchr(p->cwd, '/');
         if (strcmp(p->cwd, "/") == 0) dir_label = "/";
         else if (b) dir_label = (*(b + 1) ? b + 1 : b);
-        snprintf(out, sizeof(buf[0]), "%s %s", t->ssh_target, dir_label);
+        snprintf(out, 320, "%s %s", t->ssh_target, dir_label);
         return out;
     }
     if (p->title[0]) return p->title;
@@ -3518,6 +3781,43 @@ static const char *tab_label(const Tab *t) {
        not yet detected). Use the brand so the macOS title bar +
        Cmd-Tab label read as "rbterm" instead of a generic "shell". */
     return "rbterm";
+}
+
+/* The "short" suffix shown after a manual tab_name. Just whatever
+   the shell currently advertises (OSC 0/2 title, or cwd basename),
+   without the SSH-target prefix — the manual name is the identity
+   now, so doubling up on host info would just be clutter. */
+static const char *tab_label_suffix(const Tab *t) {
+    if (!t || !t->active || !t->active->pane) return "";
+    const Pane *p = t->active->pane;
+    if (p->title[0]) return p->title;
+    if (p->cwd[0]) {
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            size_t hn = strlen(home);
+            if (strncmp(p->cwd, home, hn) == 0 &&
+                (p->cwd[hn] == 0 || p->cwd[hn] == '/' || p->cwd[hn] == '\\'))
+                return p->cwd[hn] == 0 ? "~" : (p->cwd + hn);
+        }
+        if (strcmp(p->cwd, "/") == 0) return "/";
+        const char *b = strrchr(p->cwd, '/');
+        if (b && *(b + 1)) return b + 1;
+        return p->cwd;
+    }
+    return "";
+}
+
+/* Public label: the user's manual tab name (if any) followed by
+   the auto-derived label as a suffix. The interpunct keeps the two
+   visually distinct and matches what other terminals do. */
+static const char *tab_label(const Tab *t) {
+    if (!t) return "rbterm";
+    if (!t->tab_name[0]) return tab_label_auto(t);
+    const char *suf = tab_label_suffix(t);
+    if (!suf || !suf[0]) return t->tab_name;
+    char *out = tab_label_buf(t);
+    snprintf(out, 320, "%s · %s", t->tab_name, suf);
+    return out;
 }
 
 /* ---------- Pane layout ---------- */
@@ -4804,11 +5104,48 @@ static void draw_tab_bar(Renderer *r, int win_w) {
             DrawCircle(dx + 3, dy, 3.0f, (Color){255, 180, 60, 255});
             label_x = dx + 12;
         }
-        const char *title = tab_label(g_tabs[i]);
+        bool renaming = g_tab_rename_active && i == g_tab_rename_idx;
         BeginScissorMode(label_x - 2, 0, tw - TAB_CLOSE_W - (label_x - x) - 4, TAB_BAR_H);
-        Vector2 tsz = MeasureTextEx(*f, title, fs, 0);
-        Vector2 tp  = { label_x, (TAB_BAR_H - tsz.y) / 2.0f };
-        DrawTextEx(*f, title, tp, fs, 0, fg);
+        if (renaming) {
+            const char *title = g_tab_rename_buf;
+            float rfs = fs + 2.0f;
+            Vector2 tsz = MeasureTextEx(*f, title, rfs, 0);
+            Vector2 tp  = { label_x, (TAB_BAR_H - tsz.y) / 2.0f };
+            DrawTextEx(*f, title, tp, rfs, 0,
+                       (Color){255, 230, 150, 255});
+            if (((long long)(GetTime() * 2.0) & 1) == 0) {
+                int cx = (int)(tp.x + tsz.x + 1);
+                DrawRectangle(cx, 6, 2, TAB_BAR_H - 12, (Color){255, 230, 150, 255});
+            }
+        } else if (g_tabs[i]->tab_name[0]) {
+            /* Manual name: bigger, brighter. The auto suffix
+               trails in the regular fs/fg so the eye locks onto
+               the user's mnemonic first. */
+            float mfs = fs + 2.0f;
+            const char *manual = g_tabs[i]->tab_name;
+            const char *suf = tab_label_suffix(g_tabs[i]);
+            Vector2 msz = MeasureTextEx(*f, manual, mfs, 0);
+            Color manual_col = active ? (Color){255, 220, 140, 255}
+                                      : (Color){200, 175, 120, 255};
+            Vector2 mp_t = { label_x, (TAB_BAR_H - msz.y) / 2.0f };
+            DrawTextEx(*f, manual, mp_t, mfs, 0, manual_col);
+            if (suf && suf[0]) {
+                /* Separator + suffix at the original size, dimmer. */
+                char trail[256];
+                snprintf(trail, sizeof(trail), "  · %s", suf);
+                Color suf_col = active ? (Color){180, 185, 200, 255}
+                                       : (Color){110, 115, 130, 255};
+                DrawTextEx(*f, trail,
+                           (Vector2){mp_t.x + msz.x,
+                                     (TAB_BAR_H - msz.y) / 2.0f + (msz.y - fs) * 0.5f},
+                           fs, 0, suf_col);
+            }
+        } else {
+            const char *title = tab_label(g_tabs[i]);
+            Vector2 tsz = MeasureTextEx(*f, title, fs, 0);
+            Vector2 tp  = { label_x, (TAB_BAR_H - tsz.y) / 2.0f };
+            DrawTextEx(*f, title, tp, fs, 0, fg);
+        }
         EndScissorMode();
         const char *cross = "x";
         Vector2 csz = MeasureTextEx(*f, cross, fs, 0);
@@ -5380,6 +5717,13 @@ static void ssh_profiles_load(void) {
                     trim_end(q);
                     strncpy(cur->init_cmd, q, sizeof(cur->init_cmd) - 1);
                     cur->init_cmd[sizeof(cur->init_cmd) - 1] = 0;
+                } else if (strncmp(q, "rbterm-name:", 12) == 0) {
+                    q += 12;
+                    while (*q == ' ' || *q == '\t') q++;
+                    trim_end(q);
+                    strncpy(cur->display_name, q,
+                            sizeof(cur->display_name) - 1);
+                    cur->display_name[sizeof(cur->display_name) - 1] = 0;
                 } else if (strncmp(q, "rbterm-layout:", 14) == 0) {
                     q += 14;
                     while (*q == ' ' || *q == '\t') q++;
@@ -5618,6 +5962,9 @@ static void ssh_form_apply_profile(const SshProfile *prof) {
     g_form.init_cwd[sizeof(g_form.init_cwd) - 1] = 0;
     strncpy(g_form.init_cmd, prof->init_cmd, sizeof(g_form.init_cmd) - 1);
     g_form.init_cmd[sizeof(g_form.init_cmd) - 1] = 0;
+    strncpy(g_form.display_name, prof->display_name,
+            sizeof(g_form.display_name) - 1);
+    g_form.display_name[sizeof(g_form.display_name) - 1] = 0;
     strncpy(g_form.layout, prof->layout, sizeof(g_form.layout) - 1);
     g_form.layout[sizeof(g_form.layout) - 1] = 0;
     for (int i = 0; i < SSH_LAYOUT_MAX_PANES; i++) {
@@ -6643,6 +6990,7 @@ static char *form_buf(int field, size_t *cap) {
     case F_KEY:      *cap = sizeof(g_form.key);      return g_form.key;
     case F_INIT_CWD: *cap = sizeof(g_form.init_cwd); return g_form.init_cwd;
     case F_INIT_CMD: *cap = sizeof(g_form.init_cmd); return g_form.init_cmd;
+    case F_DNAME:    *cap = sizeof(g_form.display_name); return g_form.display_name;
     default: *cap = 0; return NULL;
     }
 }
@@ -7063,6 +7411,12 @@ static void ssh_form_submit(int cols, int rows) {
             strncpy(t->ssh_alias, g_form.name, sizeof(t->ssh_alias) - 1);
             t->ssh_alias[sizeof(t->ssh_alias) - 1] = 0;
         }
+        /* Seed the manual tab name from the profile's display_name. */
+        if (g_form.display_name[0]) {
+            strncpy(t->tab_name, g_form.display_name,
+                    sizeof(t->tab_name) - 1);
+            t->tab_name[sizeof(t->tab_name) - 1] = 0;
+        }
         /* Clear the password from memory as soon as we no longer need it. */
         memset(g_form.pass, 0, sizeof(g_form.pass));
         g_ui_mode = UI_NORMAL;
@@ -7267,6 +7621,8 @@ static void emit_form_managed_lines(FILE *fp) {
         fprintf(fp, "    # rbterm-init-cwd: %s\n", g_form.init_cwd);
     if (g_form.init_cmd[0])
         fprintf(fp, "    # rbterm-init-cmd: %s\n", g_form.init_cmd);
+    if (g_form.display_name[0])
+        fprintf(fp, "    # rbterm-name: %s\n", g_form.display_name);
     /* Predefined split layout — string descriptor + per-pane
        cwd/cmd. Skipped entirely when no layout is set so the
        stanza stays clean for hosts that haven't been "Save Layout"-d. */
@@ -8101,7 +8457,7 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
     bool cmd   = false;
 #endif
     bool mod   = ctrl || cmd;
-    bool is_text_field = (g_form.focus >= F_NAME && g_form.focus <= F_INIT_CMD);
+    bool is_text_field = (g_form.focus >= F_NAME && g_form.focus <= F_DNAME);
 
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (g_form_key_dropdown) { g_form_key_dropdown = false; return; }
@@ -8380,18 +8736,19 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     /* Fields. */
     const char *labels[F_TEXT_FIELDS] = {
         "Name", "Host", "Port", "Username", "Password", "Key file",
-        "Init dir", "Init command"
+        "Init dir", "Init command", "Tab name"
     };
     const char *hints[F_TEXT_FIELDS]  = {
         "(ssh_config alias, e.g. mia)", "example.com", "22", getenv("USER"),
         "(leave blank to use key)",
         "(default: ssh-agent + ~/.ssh/id_*)",
         "(optional: cd here on connect, e.g. ~/projects)",
-        "(optional: command to run, e.g. tmux attach)"
+        "(optional: command to run, e.g. tmux attach)",
+        "(optional: shows in the tab bar; auto label suffixed)"
     };
     const char *values[F_TEXT_FIELDS] = {
         g_form.name, g_form.host, g_form.port, g_form.user, g_form.pass, g_form.key,
-        g_form.init_cwd, g_form.init_cmd
+        g_form.init_cwd, g_form.init_cmd, g_form.display_name
     };
 
     /* Saved-hosts sidebar. */
@@ -14094,6 +14451,25 @@ static void usage(void) {
            "  Cmd + C / V       copy selection / paste\n");
 }
 
+/* SSH-launch worker entry point. Calls pty_open_ssh on a dedicated
+   thread so multiple startup hosts can handshake in parallel; the
+   main thread polls w->done and integrates the resulting Pty. */
+static void *ssh_launch_worker_run(void *arg) {
+    SshLaunchWorker *w = arg;
+    char err[256] = {0};
+    w->pty = pty_open_ssh(
+        w->user[0] ? w->user : NULL,
+        w->host,
+        w->port,
+        NULL,                                  /* password */
+        w->keyfile[0] ? w->keyfile : NULL,
+        w->cols, w->rows,
+        err, sizeof(err));
+    if (!w->pty) snprintf(w->err, sizeof(w->err), "%s", err);
+    __atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *font_path = NULL;
     int font_size = 20;
@@ -14480,67 +14856,105 @@ int main(int argc, char **argv) {
         int win_w_now = GetScreenWidth();
         int win_h_now = GetScreenHeight();
 
-        /* Deferred SSH-launch drain. Open one queued host per loop
-           iteration so the user sees the window up immediately
-           and remote tabs pop in over the next 1-2 s × N hosts.
-           pty_open_ssh blocks during the handshake — running it
-           after the first frame keeps the startup-blank-screen
-           window short. */
-        if (g_launch_pending_pos < g_launch_pending_count) {
-            int q = g_launch_pending_pos++;
-            const char *alias = g_launch_pending[q].host;
-            if (alias[0]) {
+        /* Parallel SSH launch. On the very first iteration we
+           snapshot every pending entry into a worker struct and
+           kick a thread per host that calls pty_open_ssh. Each
+           subsequent iteration polls for completion and integrates
+           any finished worker into a real Tab. The user sees the
+           tabs pop in as their handshakes finish (in handshake-
+           latency order, not queue order), and total wall time is
+           max(per-host) instead of sum. */
+        if (!g_launch_workers_kicked && g_launch_pending_count > 0) {
+            g_launch_workers_kicked = true;
+            int derive_cols, derive_rows;
+            {
+                int win_w_dr = GetScreenWidth();
+                int win_h_dr = GetScreenHeight();
+                derive_cols = (win_w_dr - 2 * r.pad_x) / r.cell_w;
+                derive_rows = (win_h_dr - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
+                if (derive_cols < 20) derive_cols = 20;
+                if (derive_rows < 5)  derive_rows = 5;
+            }
+            for (int q = 0; q < g_launch_pending_count
+                            && g_launch_workers_count < LAUNCH_WORKERS_MAX; q++) {
+                const char *alias = g_launch_pending[q].host;
+                if (!alias[0]) continue;
                 const SshProfile *prof = NULL;
                 for (int k = 0; k < g_ssh_profile_count; k++) {
                     if (strcmp(g_ssh_profiles[k].name, alias) == 0) {
                         prof = &g_ssh_profiles[k]; break;
                     }
                 }
-                int derive_cols, derive_rows;
-                {
-                    int win_w_dr = GetScreenWidth();
-                    int win_h_dr = GetScreenHeight();
-                    derive_cols = (win_w_dr - 2 * r.pad_x) / r.cell_w;
-                    derive_rows = (win_h_dr - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
-                    if (derive_cols < 20) derive_cols = 20;
-                    if (derive_rows < 5)  derive_rows = 5;
-                }
-                char err[256] = {0};
-                Tab *t = tab_open_ssh(
-                    prof && prof->user[0]     ? prof->user     : NULL,
-                    prof && prof->hostname[0] ? prof->hostname : alias,
-                    prof ? prof->port : 0,
-                    NULL,
-                    prof && prof->identity[0] ? prof->identity : NULL,
-                    prof && prof->theme[0]    ? prof->theme    : NULL,
-                    prof ? prof->cursor_style : 0,
-                    prof && prof->font[0]     ? prof->font     : NULL,
-                    prof ? prof->font_size : 0,
-                    prof && prof->log_dir[0]  ? prof->log_dir  : NULL,
-                    prof ? prof->log_mode : 0,
-                    prof && prof->color[0]        ? prof->color        : NULL,
-                    prof && prof->cursor_color[0] ? prof->cursor_color : NULL,
-                    prof && prof->hud.override    ? &prof->hud         : NULL,
-                    prof && prof->effects_override ? &prof->effects    : NULL,
-                    prof && prof->init_cwd[0]     ? prof->init_cwd     : NULL,
-                    prof && prof->init_cmd[0]     ? prof->init_cmd     : NULL,
-                    (prof && prof->layout[0])     ? prof->layout       : NULL,
-                    (prof && prof->layout[0])     ? prof->pane_cwds    : NULL,
-                    (prof && prof->layout[0])     ? prof->pane_cmds    : NULL,
-                    derive_cols, derive_rows, err, sizeof(err));
-                if (!t) {
-                    fprintf(stderr,
-                            "rbterm: launch ssh '%s' failed: %s\n",
-                            alias, err[0] ? err : "(unknown)");
+                SshLaunchWorker *w = &g_launch_workers[g_launch_workers_count++];
+                memset(w, 0, sizeof(*w));
+                strncpy(w->alias, alias, sizeof(w->alias) - 1);
+                w->is_active = g_launch_pending[q].is_active;
+                if (prof) {
+                    w->prof = *prof;
+                    w->prof_valid = true;
+                    if (prof->user[0])     strncpy(w->user, prof->user, sizeof(w->user) - 1);
+                    strncpy(w->host,
+                            prof->hostname[0] ? prof->hostname : alias,
+                            sizeof(w->host) - 1);
+                    w->port = prof->port > 0 ? prof->port : 22;
+                    if (prof->identity[0])
+                        strncpy(w->keyfile, prof->identity, sizeof(w->keyfile) - 1);
                 } else {
-                    strncpy(t->ssh_alias, alias, sizeof(t->ssh_alias) - 1);
-                    t->ssh_alias[sizeof(t->ssh_alias) - 1] = 0;
-                    if (g_launch_pending[q].is_active) {
-                        g_active = g_num_tabs - 1;
-                    }
+                    strncpy(w->host, alias, sizeof(w->host) - 1);
+                    w->port = 22;
                 }
-                dirty = true;   /* tab list changed; force a render */
+                w->cols = derive_cols;
+                w->rows = derive_rows;
+                /* Create the placeholder tab right now so the user
+                   sees a "Connecting to <alias>..." tab immediately
+                   instead of staring at the local-only tab bar
+                   while the handshake runs. */
+                w->placeholder = tab_open_ssh_placeholder(prof, alias,
+                                                          w->is_active,
+                                                          derive_cols,
+                                                          derive_rows);
+                w->started = 1;
+                pthread_create(&w->th, NULL, ssh_launch_worker_run, w);
             }
+            g_launch_pending_pos = g_launch_pending_count;   /* legacy drain dormant */
+        }
+
+        /* Integrate completed workers. */
+        for (int wi = 0; wi < g_launch_workers_count; wi++) {
+            SshLaunchWorker *w = &g_launch_workers[wi];
+            if (!w->started || w->integrated) continue;
+            if (!__atomic_load_n(&w->done, __ATOMIC_ACQUIRE)) continue;
+            pthread_join(w->th, NULL);
+            w->integrated = 1;
+            if (!w->pty) {
+                fprintf(stderr,
+                        "rbterm: launch ssh '%s' failed: %s\n",
+                        w->alias, w->err[0] ? w->err : "(unknown)");
+                /* Surface the failure on the placeholder so the user
+                   sees what went wrong instead of an empty tab. */
+                if (w->placeholder && w->placeholder->active &&
+                    w->placeholder->active->pane) {
+                    Pane *pp = w->placeholder->active->pane;
+                    char msg[512];
+                    int n = snprintf(msg, sizeof(msg),
+                                     "\x1b[2J\x1b[H\x1b[1;31mFailed to connect to %s\x1b[0m\r\n"
+                                     "\x1b[2;37m%s\x1b[0m\r\n",
+                                     w->alias,
+                                     w->err[0] ? w->err : "(no error message)");
+                    if (n > 0 && n < (int)sizeof(msg)) {
+                        screen_feed(pp->scr, (const uint8_t *)msg, (size_t)n);
+                    }
+                    snprintf(pp->title, sizeof(pp->title),
+                             "Failed: %s", w->alias);
+                    pp->title_dirty = true;
+                }
+                dirty = true;
+                continue;
+            }
+            const SshProfile *prof = w->prof_valid ? &w->prof : NULL;
+            tab_attach_ssh_finalize(w->placeholder, w->pty, prof,
+                                    w->cols, w->rows);
+            dirty = true;
         }
 
         /* Whole-window content cell dims — still used by tab_open for
@@ -14578,6 +14992,11 @@ int main(int argc, char **argv) {
                  leaf = pane_tree_next_leaf(leaf)) {
                 Pane *p = leaf->pane;
                 if (!p) continue;
+                /* Skip placeholder panes (in-flight SSH connect). They
+                   have a Screen but no Pty yet; pty_read on NULL would
+                   return -1 and mark the leaf dead, which would close
+                   the tab before the worker could attach the real Pty. */
+                if (!p->pty) continue;
                 size_t drained = 0;
                 const size_t drain_cap = 16 * 1024 * 1024;
                 bool dead = false;
@@ -14812,13 +15231,38 @@ int main(int argc, char **argv) {
                 else if (h.tab_idx >= 0) {
                     if (h.on_close) tab_close(h.tab_idx);
                     else {
+                        /* Double-click on the tab body (not the close
+                           'x') opens the rename overlay — same effect
+                           as Cmd+R. ~0.45s gap mirrors the saved-host
+                           list's double-click timing. */
+                        static double last_tab_click_t   = -1.0;
+                        static int    last_tab_click_idx = -1;
+                        double now = GetTime();
+                        bool is_dbl = (last_tab_click_idx == h.tab_idx) &&
+                                      (last_tab_click_t > 0) &&
+                                      (now - last_tab_click_t < 0.45);
+                        last_tab_click_idx = h.tab_idx;
+                        last_tab_click_t   = now;
                         g_active = h.tab_idx;
-                        /* Arm a potential drag — the hold-handler below
-                           promotes this to a real drag once the cursor
-                           moves past the threshold. */
-                        g_tab_press_idx = h.tab_idx;
-                        g_tab_press_mx  = (int)mp.x;
-                        g_tab_dragging  = false;
+                        if (is_dbl) {
+                            Tab *rt = g_tabs[h.tab_idx];
+                            g_tab_rename_active = true;
+                            g_tab_rename_idx    = h.tab_idx;
+                            snprintf(g_tab_rename_buf,
+                                     sizeof(g_tab_rename_buf),
+                                     "%s", rt->tab_name);
+                            g_tab_rename_caret =
+                                (int)strlen(g_tab_rename_buf);
+                            g_tab_press_idx = -1;
+                            last_tab_click_idx = -1;   /* eat triple-click */
+                        } else {
+                            /* Arm a potential drag — the hold-handler
+                               below promotes this to a real drag once
+                               the cursor moves past the threshold. */
+                            g_tab_press_idx = h.tab_idx;
+                            g_tab_press_mx  = (int)mp.x;
+                            g_tab_dragging  = false;
+                        }
                     }
                 }
                 cur = active_tab();
@@ -15390,6 +15834,18 @@ int main(int argc, char **argv) {
                    when single-pane (it just won't fan out). */
                 g_broadcast_active = !g_broadcast_active;
             }
+            else if (IsKeyPressed(KEY_R)) {
+                /* Cmd+R — rename the active tab. Pre-fill the buffer
+                   with whatever name is set so the user can edit
+                   instead of starting from scratch. */
+                if (cur && g_active >= 0 && g_active < g_num_tabs) {
+                    g_tab_rename_active = true;
+                    g_tab_rename_idx    = g_active;
+                    snprintf(g_tab_rename_buf, sizeof(g_tab_rename_buf),
+                             "%s", cur->tab_name);
+                    g_tab_rename_caret = (int)strlen(g_tab_rename_buf);
+                }
+            }
             else if (IsKeyPressed(KEY_T)) { tab_open(content_cols, content_rows); cur = active_tab(); }
             /* Cmd+W closes the active tab. macOS's AppKit ordinarily
                eats this for "Close Window" — disable_close_menu_item()
@@ -15523,7 +15979,47 @@ int main(int argc, char **argv) {
         Pane *ap = active_pane_of(cur);
         InputActions acts = {0};
         size_t in_n = 0;
-        if (ap && ap->search.active) {
+        if (g_tab_rename_active) {
+            /* Rename overlay owns the keyboard — drain chars +
+               backspace + Enter/Esc here so they don't reach the
+               shell or fire chords. */
+            if (IsKeyPressed(KEY_ESCAPE)) {
+                g_tab_rename_active = false;
+                g_tab_rename_idx = -1;
+                dirty = true;
+            } else if (IsKeyPressed(KEY_ENTER) ||
+                       IsKeyPressed(KEY_KP_ENTER)) {
+                if (g_tab_rename_idx >= 0 && g_tab_rename_idx < g_num_tabs) {
+                    Tab *rt = g_tabs[g_tab_rename_idx];
+                    snprintf(rt->tab_name, sizeof(rt->tab_name), "%s",
+                             g_tab_rename_buf);
+                    /* Force a window-title repaint via the active
+                       pane's title_dirty flag — easiest way to push
+                       the new label into the macOS title bar. */
+                    Pane *rp = rt->active ? rt->active->pane : NULL;
+                    if (rp) rp->title_dirty = true;
+                }
+                g_tab_rename_active = false;
+                g_tab_rename_idx = -1;
+                dirty = true;
+            } else if (IsKeyPressed(KEY_BACKSPACE) ||
+                       IsKeyPressedRepeat(KEY_BACKSPACE)) {
+                if (g_tab_rename_caret > 0) {
+                    g_tab_rename_caret--;
+                    g_tab_rename_buf[g_tab_rename_caret] = 0;
+                    dirty = true;
+                }
+            } else {
+                int ch;
+                while ((ch = GetCharPressed()) != 0) {
+                    if (ch < 32 || ch >= 127) continue;
+                    if (g_tab_rename_caret + 1 >= (int)sizeof(g_tab_rename_buf)) break;
+                    g_tab_rename_buf[g_tab_rename_caret++] = (char)ch;
+                    g_tab_rename_buf[g_tab_rename_caret]   = 0;
+                    dirty = true;
+                }
+            }
+        } else if (ap && ap->search.active) {
             /* Search bar owns the keyboard — consume raylib's key
                events here so they don't also land in the shell. */
             search_handle_input(ap);

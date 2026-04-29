@@ -243,6 +243,16 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         set_err(err, errsz, "Host is required");
         return NULL;
     }
+    /* Global log level — set once. libssh emits warnings before the
+       session-level verbosity gets a chance to apply (the
+       ssh_strict_fopen probes for /dev/null and ssh_known_hosts
+       fire during ssh_options_parse_config). Setting the global
+       level to NOLOG silences them too. */
+    static int s_log_silenced = 0;
+    if (!s_log_silenced) {
+        ssh_set_log_level(SSH_LOG_NOLOG);
+        s_log_silenced = 1;
+    }
 
     SshPty *p = calloc(1, sizeof(*p));
     if (!p) { set_err(err, errsz, "out of memory"); return NULL; }
@@ -253,7 +263,13 @@ void *ssh_open_impl(const char *user, const char *host, int port,
         return NULL;
     }
 
-    int verbosity = SSH_LOG_WARNING;
+    /* libssh's WARNING level prints harmless noise on every connect
+       — "ssh_strict_fopen: /dev/null is not a regular file" and
+       "/etc/ssh/ssh_known_hosts: No such file or directory" both
+       fire from libssh's internal probing of optional hostkey
+       store paths. They're not actionable; suppress entirely so
+       stderr stays clean for real errors. */
+    int verbosity = SSH_LOG_NOLOG;
     ssh_options_set(p->session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
     long timeout_s = 10;
     ssh_options_set(p->session, SSH_OPTIONS_TIMEOUT, &timeout_s);
