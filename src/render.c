@@ -883,6 +883,8 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
     static int      lig_head[4096];
     static uint32_t lig_glyph[4096];
     static int      lig_span[4096];
+    static int      lig_xoff[4096];
+    static int      lig_yoff[4096];
     static uint32_t lig_cps[4096];
     static ShapedGlyph lig_out[4096];
     int lig_cols = (cols < 4096) ? cols : 4096;
@@ -903,6 +905,23 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             }
             int n = shape_row((ShapeFont *)r->shape_font, lig_cps, lig_cols,
                               lig_out, 4096);
+            /* Strict allow-list: rbterm ligates only the arrow
+               family (=>, ->, <-, <--, -->). Programmer fonts ship
+               many other ligatures (==, !=, <=, >=, ||, &&, ::, ..,
+               //, etc.) that look weird inside shell paths and
+               command lines — and the rendering of split-glyph
+               substitutions has alignment issues that make even
+               "correct" ones (`==` etc.) read as broken. Suppressing
+               anything outside the allow-list short-circuits all of
+               that without a per-bug patch. */
+            #define IS_ARROW_PAIR(a,b)                              \
+                (((a) == '=' && (b) == '>') ||                      \
+                 ((a) == '-' && (b) == '>') ||                      \
+                 ((a) == '<' && (b) == '-'))
+            #define IS_ARROW_TRIPLE(a,b,c)                          \
+                (((a) == '<' && (b) == '-' && (c) == '-') ||        \
+                 ((a) == '-' && (b) == '-' && (c) == '>'))
+
             for (int g = 0; g < n; g++) {
                 if (lig_out[g].glyph_id == 0) continue;    /* .notdef → fall back */
                 int head = lig_out[g].cell_col;
@@ -910,6 +929,33 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                 if (head < 0 || head >= lig_cols) continue;
                 if (sp < 1) continue;
                 if (head + sp > lig_cols) sp = lig_cols - head;
+
+                /* Multi-cell merged cluster: input must spell out
+                   an allowed arrow exactly. */
+                if (sp >= 2) {
+                    bool ok = false;
+                    if (sp == 2) {
+                        ok = IS_ARROW_PAIR(lig_cps[head], lig_cps[head+1]);
+                    } else if (sp == 3) {
+                        ok = IS_ARROW_TRIPLE(lig_cps[head],
+                                             lig_cps[head+1],
+                                             lig_cps[head+2]);
+                    }
+                    if (!ok) continue;
+                }
+                /* Single-cell split substitution: this glyph replaces
+                   one of the two glyphs in an arrow pair. Only allow
+                   when this cell IS part of an arrow context with a
+                   valid neighbour. */
+                if (sp == 1) {
+                    uint32_t cp = lig_cps[head];
+                    uint32_t prev = (head > 0) ? lig_cps[head-1] : 0;
+                    uint32_t next = (head+1 < lig_cols) ? lig_cps[head+1] : 0;
+                    bool arrow_ctx =
+                        IS_ARROW_PAIR(cp, next) ||
+                        IS_ARROW_PAIR(prev, cp);
+                    if (!arrow_ctx) continue;
+                }
 
                 /* Two flavours of OpenType ligature substitution:
                      - multi-cell cluster (sp > 1): classic =>⇒. Always
@@ -941,6 +987,14 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                 for (int k = 0; k < sp; k++) lig_head[head + k] = head;
                 lig_glyph[head] = lig_out[g].glyph_id;
                 lig_span[head]  = sp;
+                /* HarfBuzz GPOS y_offset / x_offset — needed for
+                   split-substitution ligatures like Cascadia's `==`
+                   where the two `=` glyphs each carry a vertical
+                   nudge to align their bars at the same height.
+                   Without this, the bars sit at the font's natural
+                   per-glyph baseline and look offset. */
+                lig_xoff[head]  = lig_out[g].x_offset_px;
+                lig_yoff[head]  = lig_out[g].y_offset_px;
             }
         }
 
@@ -950,8 +1004,23 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
             if (c.attrs & ATTR_HIDDEN) continue;
             /* Blank/space cells skip glyph drawing but still get
                underline / strike / link decorations so an underlined
-               "foo bar" doesn't drop the underline under the space. */
-            bool blank = (c.cp == 0 || c.cp == ' ');
+               "foo bar" doesn't drop the underline under the space.
+               Unicode whitespace codepoints (NBSP, narrow-NBSP, en/em
+               spaces, ideographic space, zero-width spaces, BOM) are
+               treated as blanks too — without this, fonts that lack a
+               glyph for e.g. U+00A0 fall through to the "?" placeholder.
+               (Showed up in claude-code prompts which used NBSP after
+               the `❯` glyph; iTerm2's Cocoa font substitution masked
+               it.) */
+            bool blank = (c.cp == 0 || c.cp == ' ' ||
+                          c.cp == 0x00A0 ||                       /* NBSP */
+                          c.cp == 0x1680 ||                       /* Ogham space */
+                          (c.cp >= 0x2000 && c.cp <= 0x200B) ||   /* en/em/thin/.../zero-width */
+                          c.cp == 0x202F ||                       /* narrow NBSP */
+                          c.cp == 0x205F ||                       /* medium math space */
+                          c.cp == 0x2060 ||                       /* word joiner */
+                          c.cp == 0x3000 ||                       /* ideographic space */
+                          c.cp == 0xFEFF);                        /* BOM / ZWNBSP */
 
             uint32_t fg = (c.attrs & ATTR_REVERSE) ? resolve_bg(s, c) : resolve_fg(s, c);
 
@@ -1000,6 +1069,7 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
                         float dst_x = (float)(x * cw + (total_w - sg->display_w) / 2);
                         float dst_y = (float)(y * ch + glyph_y_offset
                                               + ascent + sg->bearing_y);
+                        (void)lig_xoff; (void)lig_yoff;
                         Rectangle src = { 0, 0, (float)sg->width, (float)sg->height };
                         Rectangle dst = { dst_x, dst_y,
                                           (float)sg->display_w,

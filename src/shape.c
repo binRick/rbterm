@@ -143,12 +143,19 @@ int shape_row(ShapeFont *sf,
        most of their substitution lookups behind it, and HarfBuzz's
        default Latin shaping enables it but only for some font types.
        Enabling them explicitly avoids the "ligatures are silent"
-       footgun where the font ships them but they don't fire. */
+       footgun where the font ships them but they don't fire.
+
+       `dlig` (discretionary ligatures) is INTENTIONALLY off — it's
+       where fonts hide `..` → ‥ / `...` style substitutions that
+       look wrong in shell paths (`cd ../` rendering as three dots,
+       fixed by leaving dlig at its disabled default). Standard
+       programmer-font ligatures live in liga/clig/calt and aren't
+       affected. */
     static const hb_feature_t k_features[] = {
         { HB_TAG('l','i','g','a'), 1, 0, (unsigned int)-1 },
         { HB_TAG('c','l','i','g'), 1, 0, (unsigned int)-1 },
         { HB_TAG('c','a','l','t'), 1, 0, (unsigned int)-1 },
-        { HB_TAG('d','l','i','g'), 1, 0, (unsigned int)-1 },
+        { HB_TAG('d','l','i','g'), 0, 0, (unsigned int)-1 },
     };
     hb_shape(sf->font, sf->buffer, k_features,
              sizeof(k_features) / sizeof(k_features[0]));
