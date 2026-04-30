@@ -276,7 +276,19 @@ size_t input_poll(Screen *s, uint8_t *out, size_t cap, InputActions *actions) {
     for (size_t i = 0; i < sizeof(special_keys)/sizeof(special_keys[0]); i++) {
         /* Same user-tunable repeat for arrows — matters for holding Left
            to walk back along a long command line or Up to scrub shell
-           history. */
+           history.
+
+           Skip this dispatch when the UI modifier is held (Cmd on
+           macOS, Ctrl elsewhere): main.c owns Cmd+arrow (OSC 133 nav),
+           Cmd+Shift+arrow (tab reorder), and Cmd+Opt+arrow (pane
+           focus). Without this gate the arrow bytes leak to the PTY
+           and the user sees stray `[A`/`[B`/`[C`/`[D` in their shell. */
+        if (ui && (special_keys[i].key == KEY_UP    ||
+                   special_keys[i].key == KEY_DOWN  ||
+                   special_keys[i].key == KEY_LEFT  ||
+                   special_keys[i].key == KEY_RIGHT)) {
+            continue;
+        }
         if (repeat_fire(special_keys[i].key)) {
             const char *seq = app_cursor ? special_keys[i].app : special_keys[i].normal;
             if (alt) n = app_byte(out, cap, n, 0x1b);

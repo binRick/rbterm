@@ -210,14 +210,17 @@ typedef struct {
        Otherwise we open one tab per entry, in order. SSH entries
        resolve `host` against ~/.ssh/config via libssh's normal
        parsing; the user's saved-host appearance overrides apply.
-       Persisted as `launch.<i>=local` or `launch.<i>=ssh:<alias>`.
-       `launch_active` is the index of the entry whose tab should
-       be focused once the launch sweep finishes (clamped at boot
-       to a valid index). */
+       Persisted as `launch.<i>=local`, `launch.<i>=ssh:<alias>`,
+       or `launch.<i>=session:<name>`. `launch_active` is the index
+       of the entry whose tab should be focused once the launch
+       sweep finishes (clamped at boot to a valid index). */
 #define LAUNCH_ENTRY_MAX 16
+#define LAUNCH_KIND_LOCAL   0
+#define LAUNCH_KIND_SSH     1
+#define LAUNCH_KIND_SESSION 2
     struct {
-        int  kind;          /* 0 = local, 1 = ssh */
-        char host[128];     /* ssh alias from ~/.ssh/config; "" for local */
+        int  kind;          /* 0 = local, 1 = ssh, 2 = session */
+        char host[128];     /* ssh alias OR session name; "" for local */
     } launch[LAUNCH_ENTRY_MAX];
     int  launch_count;
     int  launch_active;     /* row index that becomes the active tab on startup */
@@ -447,19 +450,26 @@ static void config_load_into_defaults(void) {
             g_app_settings.ligatures = (strcmp(v, "true") == 0 ||
                                         strcmp(v, "1") == 0);
         } else if (strncmp(k, "launch.", 7) == 0) {
-            /* launch.<i>=local | ssh:<alias>. Index is informational
-               for humans editing the file; we always append in the
-               order seen so re-saving rewrites the slots cleanly. */
+            /* launch.<i> = local | ssh:<alias> | session:<name>.
+               Index is informational for humans editing the file;
+               we always append in the order seen so re-saving
+               rewrites the slots cleanly. */
             if (g_app_settings.launch_count < LAUNCH_ENTRY_MAX) {
                 int i = g_app_settings.launch_count++;
                 if (strncmp(v, "ssh:", 4) == 0) {
-                    g_app_settings.launch[i].kind = 1;
+                    g_app_settings.launch[i].kind = LAUNCH_KIND_SSH;
                     strncpy(g_app_settings.launch[i].host, v + 4,
                             sizeof(g_app_settings.launch[i].host) - 1);
                     g_app_settings.launch[i].host[
                         sizeof(g_app_settings.launch[i].host) - 1] = 0;
+                } else if (strncmp(v, "session:", 8) == 0) {
+                    g_app_settings.launch[i].kind = LAUNCH_KIND_SESSION;
+                    strncpy(g_app_settings.launch[i].host, v + 8,
+                            sizeof(g_app_settings.launch[i].host) - 1);
+                    g_app_settings.launch[i].host[
+                        sizeof(g_app_settings.launch[i].host) - 1] = 0;
                 } else {
-                    g_app_settings.launch[i].kind = 0;
+                    g_app_settings.launch[i].kind = LAUNCH_KIND_LOCAL;
                     g_app_settings.launch[i].host[0] = 0;
                 }
             }
@@ -517,8 +527,10 @@ static bool config_save(Renderer *r) {
     /* Launch entries — one line per slot, in order. We rewrite all
        of them on save so deletes propagate cleanly. */
     for (int i = 0; i < g_app_settings.launch_count; i++) {
-        if (g_app_settings.launch[i].kind == 1) {
+        if (g_app_settings.launch[i].kind == LAUNCH_KIND_SSH) {
             fprintf(fp, "launch.%d=ssh:%s\n", i, g_app_settings.launch[i].host);
+        } else if (g_app_settings.launch[i].kind == LAUNCH_KIND_SESSION) {
+            fprintf(fp, "launch.%d=session:%s\n", i, g_app_settings.launch[i].host);
         } else {
             fprintf(fp, "launch.%d=local\n", i);
         }
@@ -1283,6 +1295,26 @@ static int g_active = 0;
    broadcast group. Toggle via Cmd+Shift+I or the tab-bar button. */
 static bool g_broadcast_active = false;
 
+/* Long-press menu on the [+] tab-bar button. Quick click opens a
+   local shell (legacy behaviour); pressing and holding for
+   PLUS_HOLD_MS surfaces a drag-out menu with three primary items:
+   Local shell, SSH host, Session. SSH host and Session expand a
+   submenu (saved hosts / saved sessions) on hover; releasing over
+   a submenu item fires it directly. Releasing on a primary item
+   when its submenu is empty falls back to the corresponding
+   discovery page (SSH form / Settings → Sessions). */
+#define PLUS_HOLD_MS  350
+#define PLUS_MENU_W   180
+#define PLUS_MENU_H   28
+#define PLUS_SUBMENU_W 220
+#define PLUS_PRIMARY_LOCAL   0
+#define PLUS_PRIMARY_SSH     1
+#define PLUS_PRIMARY_SESSION 2
+static bool   g_plus_pressing    = false;
+static double g_plus_press_at    = 0.0;
+static bool   g_plus_menu_active = false;
+static int    g_plus_submenu     = -1;   /* -1 = none, else PLUS_PRIMARY_* of the expanded row */
+
 /* Tab-rename overlay state. Cmd+R captures the keyboard for the
    active tab's label; the user types into g_tab_rename_buf and
    commits with Enter (Esc cancels). Drawn in draw_tab_bar over
@@ -1298,6 +1330,7 @@ static int  g_tab_rename_caret  = 0;
    ssh_form_layout() so draw and hit-test share one source of truth. */
 typedef enum {
     UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP, UI_REC_SAVE,
+    UI_SESSION_DESIGNER,
     UI_SFTP_UPLOAD, UI_SFTP_DOWNLOAD
 } UiMode;
 typedef enum {
@@ -1544,6 +1577,9 @@ typedef struct {
     char         user[96];
     char         host[256];
     char         keyfile[PATH_MAX];
+    /* Password is form-only (saved profiles never carry one). The
+       worker scrubs this slot the moment pty_open_ssh returns. */
+    char         password[256];
     int          port;
     int          cols, rows;
     /* Full profile snapshot for post-connect Tab setup
@@ -1561,10 +1597,1382 @@ typedef struct {
 static SshLaunchWorker g_launch_workers[LAUNCH_WORKERS_MAX];
 static int  g_launch_workers_count  = 0;
 static bool g_launch_workers_kicked = false;
+/* Forward decl — ssh_launch_kick lives near the worker thread
+   function (file-bottom) but is called from the SSH form's Connect
+   path and the [+] menu's SSH branch (both file-middle). */
+static bool ssh_launch_kick(const SshProfile *prof, const char *alias,
+                            const char *password, bool is_active,
+                            int cols, int rows);
+/* Background SSH ops (forward decls). Each runs the previously-
+   synchronous helper on a short-lived pthread so the main thread
+   can keep redrawing while libssh handshakes / pki_generate runs.
+   Result strings land in the right visible status field via
+   bg_ssh_integrate(), called once per main-loop iteration. */
+static bool bg_test_auth_kick(int cols, int rows);
+static bool bg_key_install_kick(const SshProfile *prof,
+                                const char *pubkey,
+                                const char *key_label,
+                                const char *host_label);
+static bool bg_key_generate_kick(const char *type_name,
+                                 const char *file_stem,
+                                 const char *passphrase);
+static bool bg_ssh_integrate(void);
+/* Busy predicates so the UI can show "Testing..." / "Installing..."
+   / "Generating..." while a thread is in flight, and so re-clicks
+   on the trigger short-circuit instead of stacking. */
+static bool bg_test_auth_busy(void);
+static bool bg_key_install_busy(void);
+static bool bg_key_generate_busy(void);
 #endif /* RBTERM_SSH */
 static int        g_ssh_profile_count = 0;
 static int        g_ssh_list_scroll = 0;   /* in rows */
 static int        g_ssh_list_selected = -1; /* highlighted row, -1 = none */
+
+/* ---------- Sessions: multi-host pre-defined splits ---------- */
+
+/* A Session is a saved tab template: a recursive split tree where
+   each leaf carries its own kind (local shell vs SSH host), so
+   one tab can host multiple SSH connections side-by-side. The user
+   designs sessions interactively in the Session Designer modal,
+   they're persisted to ~/.config/rbterm/sessions.ini, and listed
+   in Settings → Sessions where each row has Open / Edit / Delete.
+
+   Reuses the same descriptor-string grammar as the per-host SSH
+   layout (V0.50(H0.50(0,1),2)) for the tree shape; per-leaf
+   metadata lives in parallel arrays indexed by DFS-pre-order leaf
+   number. */
+#define SESSION_NAME_MAX     128
+#define SESSION_LAYOUT_MAX   256
+#define SESSION_MAX_LEAVES   8
+#define SESSION_HOST_MAX     128
+#define SESSION_CWD_MAX      256
+#define SESSION_CMD_MAX      256
+
+typedef enum {
+    SESSION_LEAF_LOCAL = 0,
+    SESSION_LEAF_SSH   = 1,
+} SessionLeafKind;
+
+typedef struct SessionNode SessionNode;
+struct SessionNode {
+    SessionNode *parent;
+    SplitMode    split;          /* SPLIT_NONE for leaves */
+    float        ratio;          /* internal nodes only */
+    SessionNode *child[2];
+    /* Leaf-only metadata. Internal nodes leave these zero. */
+    SessionLeafKind kind;
+    char         host[SESSION_HOST_MAX];
+    char         cwd[SESSION_CWD_MAX];
+    char         cmd[SESSION_CMD_MAX];
+};
+
+typedef struct {
+    char         name[SESSION_NAME_MAX];
+    SessionNode *root;
+} Session;
+
+#define SESSIONS_MAX 32
+static Session g_sessions[SESSIONS_MAX];
+static int     g_sessions_count = 0;
+
+/* SessionNode helpers — mirror the runtime PaneNode API but
+   manipulate the saved descriptor instead of the live tree. */
+
+static SessionNode *session_node_new_leaf(void) {
+    SessionNode *n = calloc(1, sizeof(SessionNode));
+    n->ratio = 0.5f;
+    n->kind = SESSION_LEAF_LOCAL;
+    return n;
+}
+
+static void session_node_free(SessionNode *n) {
+    if (!n) return;
+    if (n->split != SPLIT_NONE) {
+        session_node_free(n->child[0]);
+        session_node_free(n->child[1]);
+    }
+    free(n);
+}
+
+static int session_count_leaves(const SessionNode *n) {
+    if (!n) return 0;
+    if (n->split == SPLIT_NONE) return 1;
+    return session_count_leaves(n->child[0]) +
+           session_count_leaves(n->child[1]);
+}
+
+static SessionNode *session_first_leaf(SessionNode *n) {
+    if (!n) return NULL;
+    while (n->split != SPLIT_NONE) n = n->child[0];
+    return n;
+}
+
+static SessionNode *session_next_leaf(SessionNode *leaf) {
+    if (!leaf) return NULL;
+    SessionNode *cur = leaf;
+    while (cur->parent && cur == cur->parent->child[1]) cur = cur->parent;
+    if (!cur->parent) return NULL;
+    return session_first_leaf(cur->parent->child[1]);
+}
+
+/* Replace `leaf` with an internal split node whose children are the
+   original leaf and a fresh second leaf. Returns the new leaf so
+   the caller can inspect / fill it. */
+static SessionNode *session_split_leaf(Session *s, SessionNode *leaf,
+                                       SplitMode mode) {
+    if (!s || !leaf || leaf->split != SPLIT_NONE) return NULL;
+    if (mode != SPLIT_VERTICAL && mode != SPLIT_HORIZONTAL) return NULL;
+    if (session_count_leaves(s->root) >= SESSION_MAX_LEAVES) return NULL;
+    SessionNode *split = calloc(1, sizeof(SessionNode));
+    SessionNode *new_leaf = session_node_new_leaf();
+    split->split = mode;
+    split->ratio = 0.5f;
+    split->child[0] = leaf;
+    split->child[1] = new_leaf;
+    split->parent = leaf->parent;
+    if (leaf->parent) {
+        int slot = (leaf->parent->child[0] == leaf) ? 0 : 1;
+        leaf->parent->child[slot] = split;
+    } else {
+        s->root = split;
+    }
+    leaf->parent = split;
+    new_leaf->parent = split;
+    return new_leaf;
+}
+
+/* Close a leaf and collapse its parent into the surviving sibling.
+   Returns the surviving leaf for selection update; NULL when the
+   leaf was the only one (caller should refuse — designer shouldn't
+   allow zero-leaf sessions). */
+static SessionNode *session_close_leaf(Session *s, SessionNode *leaf) {
+    if (!s || !leaf || leaf->split != SPLIT_NONE) return NULL;
+    SessionNode *parent = leaf->parent;
+    if (!parent) return NULL;
+    SessionNode *sibling = (parent->child[0] == leaf) ? parent->child[1]
+                                                      : parent->child[0];
+    session_node_free(leaf);
+    parent->child[0] = parent->child[1] = NULL;
+    sibling->parent = parent->parent;
+    if (parent->parent) {
+        int slot = (parent->parent->child[0] == parent) ? 0 : 1;
+        parent->parent->child[slot] = sibling;
+    } else {
+        s->root = sibling;
+    }
+    free(parent);
+    return session_first_leaf(sibling);
+}
+
+/* Serialize the SessionNode tree into the same descriptor-string
+   format as ~/.ssh/config layouts: V0.50(H0.50(0,1),2) etc. */
+static int session_serialize_walk(const SessionNode *n, char *buf, size_t cap,
+                                  size_t *off, int *next_idx) {
+    if (!n) return -1;
+    if (n->split == SPLIT_NONE) {
+        if (*next_idx >= SESSION_MAX_LEAVES) return -1;
+        int written = snprintf(buf + *off, cap - *off, "%d", *next_idx);
+        if (written < 0 || (size_t)written >= cap - *off) return -1;
+        *off += (size_t)written;
+        (*next_idx)++;
+        return 0;
+    }
+    char head = (n->split == SPLIT_VERTICAL) ? 'V' : 'H';
+    float ratio = n->ratio;
+    if (ratio < 0.15f) ratio = 0.15f;
+    if (ratio > 0.85f) ratio = 0.85f;
+    int written = snprintf(buf + *off, cap - *off, "%c%.2f(", head, ratio);
+    if (written < 0 || (size_t)written >= cap - *off) return -1;
+    *off += (size_t)written;
+    if (session_serialize_walk(n->child[0], buf, cap, off, next_idx) < 0) return -1;
+    if (*off + 1 >= cap) return -1;
+    buf[(*off)++] = ',';
+    buf[*off] = 0;
+    if (session_serialize_walk(n->child[1], buf, cap, off, next_idx) < 0) return -1;
+    if (*off + 1 >= cap) return -1;
+    buf[(*off)++] = ')';
+    buf[*off] = 0;
+    return 0;
+}
+
+/* Walk the tree in DFS pre-order, filling per-leaf metadata arrays
+   matching the indices the descriptor uses. Caller pre-zeroes the
+   arrays. */
+static void session_collect_leaves(const SessionNode *n,
+                                   SessionLeafKind *kinds,
+                                   char hosts[][SESSION_HOST_MAX],
+                                   char cwds[][SESSION_CWD_MAX],
+                                   char cmds[][SESSION_CMD_MAX],
+                                   int  *next_idx) {
+    if (!n) return;
+    if (n->split == SPLIT_NONE) {
+        if (*next_idx >= SESSION_MAX_LEAVES) return;
+        int i = (*next_idx)++;
+        kinds[i] = n->kind;
+        snprintf(hosts[i], SESSION_HOST_MAX, "%s", n->host);
+        snprintf(cwds[i],  SESSION_CWD_MAX,  "%s", n->cwd);
+        snprintf(cmds[i],  SESSION_CMD_MAX,  "%s", n->cmd);
+        return;
+    }
+    session_collect_leaves(n->child[0], kinds, hosts, cwds, cmds, next_idx);
+    session_collect_leaves(n->child[1], kinds, hosts, cwds, cmds, next_idx);
+}
+
+static void session_apply_leaves(SessionNode *n,
+                                 const SessionLeafKind *kinds,
+                                 const char hosts[][SESSION_HOST_MAX],
+                                 const char cwds[][SESSION_CWD_MAX],
+                                 const char cmds[][SESSION_CMD_MAX],
+                                 int  *next_idx, int max_idx) {
+    if (!n) return;
+    if (n->split == SPLIT_NONE) {
+        int i = (*next_idx)++;
+        if (i >= max_idx) return;
+        n->kind = kinds[i];
+        snprintf(n->host, SESSION_HOST_MAX, "%s", hosts[i]);
+        snprintf(n->cwd,  SESSION_CWD_MAX,  "%s", cwds[i]);
+        snprintf(n->cmd,  SESSION_CMD_MAX,  "%s", cmds[i]);
+        return;
+    }
+    session_apply_leaves(n->child[0], kinds, hosts, cwds, cmds, next_idx, max_idx);
+    session_apply_leaves(n->child[1], kinds, hosts, cwds, cmds, next_idx, max_idx);
+}
+
+/* Same recursive-descent grammar as layout_parse but materialises
+   SessionNode internal/leaf nodes. Used to re-hydrate sessions
+   loaded from sessions.ini. */
+static SessionNode *session_parse_expr(const char **cur, int depth) {
+    if (depth > SESSION_MAX_LEAVES) return NULL;
+    const char *p = *cur;
+    if (!p || !*p) return NULL;
+    if (*p >= '0' && *p <= '9') {
+        SessionNode *n = session_node_new_leaf();
+        int idx = *p - '0';
+        if (idx >= SESSION_MAX_LEAVES) { session_node_free(n); return NULL; }
+        /* Stash the leaf index temporarily in cwd[0..1] for the
+           caller to use during apply_leaves; cleared afterwards. */
+        n->cwd[0] = (char)('0' + idx);
+        n->cwd[1] = 0;
+        *cur = p + 1;
+        return n;
+    }
+    if (*p != 'V' && *p != 'H') return NULL;
+    SplitMode sp = (*p == 'V') ? SPLIT_VERTICAL : SPLIT_HORIZONTAL;
+    p++;
+    if (*p != '0' || p[1] != '.') return NULL;
+    char *end = NULL;
+    float ratio = strtof(p, &end);
+    if (!end || end == p) return NULL;
+    if (ratio < 0.15f) ratio = 0.15f;
+    if (ratio > 0.85f) ratio = 0.85f;
+    p = end;
+    if (*p != '(') return NULL;
+    p++;
+    *cur = p;
+    SessionNode *left = session_parse_expr(cur, depth + 1);
+    if (!left) return NULL;
+    p = *cur;
+    if (*p != ',') { session_node_free(left); return NULL; }
+    p++;
+    *cur = p;
+    SessionNode *right = session_parse_expr(cur, depth + 1);
+    if (!right) { session_node_free(left); return NULL; }
+    p = *cur;
+    if (*p != ')') { session_node_free(left); session_node_free(right); return NULL; }
+    p++;
+    *cur = p;
+    SessionNode *n = calloc(1, sizeof(SessionNode));
+    n->split = sp;
+    n->ratio = ratio;
+    n->child[0] = left;  left->parent  = n;
+    n->child[1] = right; right->parent = n;
+    return n;
+}
+
+static SessionNode *session_parse_layout(const char *str) {
+    if (!str || !*str) return NULL;
+    const char *cur = str;
+    SessionNode *n = session_parse_expr(&cur, 0);
+    if (!n) return NULL;
+    while (*cur == ' ' || *cur == '\t' || *cur == '\n' || *cur == '\r') cur++;
+    if (*cur != 0) { session_node_free(n); return NULL; }
+    return n;
+}
+
+/* Forward decls for the sessions block — helpers all live further
+   down. */
+static void trim_end(char *s);
+static bool rect_hit(Rect r, int x, int y);
+static void ssh_profiles_load(void);
+static void pane_init_click_state(Pane *p);
+static ScreenIO pane_io(Pane *p);
+static void ssh_send_init_line(Pane *p, const char *cwd, const char *cmd);
+static void tab_log_open_all(Tab *t);
+
+/* ---------- Sessions: persistence ---------- */
+
+/* Format on disk (~/.config/rbterm/sessions.ini):
+ *
+ *   [session.prod-monitoring]
+ *   layout = V0.50(H0.50(0,1),2)
+ *   pane.0 = ssh:mia
+ *   pane.0.cwd = /var/log
+ *   pane.0.cmd = tail -f *.log
+ *   pane.1 = local
+ *   pane.1.cwd = ~/work
+ *   pane.2 = ssh:win
+ *
+ * Round-trippable; the writer always emits a fresh file from
+ * g_sessions[] so hand-edits to fields the designer doesn't manage
+ * (currently none beyond what's listed above) would be lost. */
+static void sessions_load(void) {
+    /* Free any existing sessions first. */
+    for (int i = 0; i < g_sessions_count; i++) {
+        session_node_free(g_sessions[i].root);
+        g_sessions[i].root = NULL;
+        g_sessions[i].name[0] = 0;
+    }
+    g_sessions_count = 0;
+
+    char path[PATH_MAX];
+    expand_home_path("~/.config/rbterm/sessions.ini", path, sizeof(path));
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    /* Per-session staging — we collect the layout + per-leaf metadata
+       under the current section, then materialise a SessionNode tree
+       on the next [section] header (or EOF). */
+    char        cur_name[SESSION_NAME_MAX] = {0};
+    char        cur_layout[SESSION_LAYOUT_MAX] = {0};
+    SessionLeafKind cur_kinds[SESSION_MAX_LEAVES] = {0};
+    char        cur_hosts[SESSION_MAX_LEAVES][SESSION_HOST_MAX] = {{0}};
+    char        cur_cwds[SESSION_MAX_LEAVES][SESSION_CWD_MAX]   = {{0}};
+    char        cur_cmds[SESSION_MAX_LEAVES][SESSION_CMD_MAX]   = {{0}};
+
+    #define FLUSH_CURRENT() do {                                              \
+        if (cur_name[0] && cur_layout[0] &&                                   \
+            g_sessions_count < SESSIONS_MAX) {                                \
+            SessionNode *root = session_parse_layout(cur_layout);             \
+            if (root) {                                                       \
+                int idx = 0;                                                  \
+                int max = session_count_leaves(root);                         \
+                if (max > SESSION_MAX_LEAVES) max = SESSION_MAX_LEAVES;       \
+                session_apply_leaves(root, cur_kinds, cur_hosts,              \
+                                     cur_cwds, cur_cmds, &idx, max);          \
+                Session *s = &g_sessions[g_sessions_count++];                 \
+                snprintf(s->name, sizeof(s->name), "%s", cur_name);           \
+                s->root = root;                                               \
+            }                                                                 \
+        }                                                                     \
+        cur_name[0] = 0;                                                      \
+        cur_layout[0] = 0;                                                    \
+        for (int _i = 0; _i < SESSION_MAX_LEAVES; _i++) {                     \
+            cur_kinds[_i] = SESSION_LEAF_LOCAL;                               \
+            cur_hosts[_i][0] = 0;                                             \
+            cur_cwds[_i][0]  = 0;                                             \
+            cur_cmds[_i][0]  = 0;                                             \
+        }                                                                     \
+    } while (0)
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == ';' || *p == '\n' || *p == 0) continue;
+        trim_end(p);
+        if (*p == '[') {
+            FLUSH_CURRENT();
+            const char *prefix = "[session.";
+            size_t plen = strlen(prefix);
+            if (strncmp(p, prefix, plen) != 0) continue;
+            const char *q = p + plen;
+            const char *close = strchr(q, ']');
+            if (!close) continue;
+            size_t nlen = (size_t)(close - q);
+            if (nlen >= sizeof(cur_name)) nlen = sizeof(cur_name) - 1;
+            memcpy(cur_name, q, nlen);
+            cur_name[nlen] = 0;
+            continue;
+        }
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = p;
+        char *val = eq + 1;
+        /* Trim trailing whitespace on key, leading on val. */
+        size_t klen = strlen(key);
+        while (klen > 0 && (key[klen-1] == ' ' || key[klen-1] == '\t')) {
+            key[--klen] = 0;
+        }
+        while (*val == ' ' || *val == '\t') val++;
+
+        if (!cur_name[0]) continue;
+        if (strcmp(key, "layout") == 0) {
+            snprintf(cur_layout, sizeof(cur_layout), "%s", val);
+        } else if (strncmp(key, "pane.", 5) == 0) {
+            const char *r = key + 5;
+            if (*r < '0' || *r > '0' + (SESSION_MAX_LEAVES - 1)) continue;
+            int idx = *r - '0';
+            r++;
+            if (*r == 0) {
+                /* `pane.N = local | ssh:<alias>` */
+                if (strcmp(val, "local") == 0) {
+                    cur_kinds[idx] = SESSION_LEAF_LOCAL;
+                    cur_hosts[idx][0] = 0;
+                } else if (strncmp(val, "ssh:", 4) == 0) {
+                    cur_kinds[idx] = SESSION_LEAF_SSH;
+                    snprintf(cur_hosts[idx], SESSION_HOST_MAX, "%s", val + 4);
+                }
+            } else if (strcmp(r, ".cwd") == 0) {
+                snprintf(cur_cwds[idx], SESSION_CWD_MAX, "%s", val);
+            } else if (strcmp(r, ".cmd") == 0) {
+                snprintf(cur_cmds[idx], SESSION_CMD_MAX, "%s", val);
+            }
+        }
+    }
+    FLUSH_CURRENT();
+    #undef FLUSH_CURRENT
+    fclose(fp);
+}
+
+static void sessions_save(void) {
+    char path[PATH_MAX];
+    expand_home_path("~/.config/rbterm/sessions.ini", path, sizeof(path));
+    /* Ensure parent dir exists. */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = 0; mkdir_p(dir); }
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "rbterm: sessions_save: %s: %s\n",
+                path, strerror(errno));
+        return;
+    }
+    fprintf(fp,
+            "# Auto-generated by rbterm (Session Designer).\n"
+            "# Each [session.NAME] block describes a multi-pane tab\n"
+            "# template. layout uses the same descriptor grammar as\n"
+            "# ~/.ssh/config's # rbterm-layout: comments — V/H + ratio\n"
+            "# + nested expressions; integers are leaf indices into\n"
+            "# the pane.N entries below.\n\n");
+    for (int i = 0; i < g_sessions_count; i++) {
+        Session *s = &g_sessions[i];
+        if (!s->name[0] || !s->root) continue;
+        char layout[SESSION_LAYOUT_MAX];
+        layout[0] = 0;
+        size_t off = 0;
+        int next = 0;
+        if (session_serialize_walk(s->root, layout, sizeof(layout), &off, &next) < 0)
+            continue;
+        SessionLeafKind kinds[SESSION_MAX_LEAVES] = {0};
+        char hosts[SESSION_MAX_LEAVES][SESSION_HOST_MAX] = {{0}};
+        char cwds[SESSION_MAX_LEAVES][SESSION_CWD_MAX]   = {{0}};
+        char cmds[SESSION_MAX_LEAVES][SESSION_CMD_MAX]   = {{0}};
+        int idx = 0;
+        session_collect_leaves(s->root, kinds, hosts, cwds, cmds, &idx);
+        fprintf(fp, "[session.%s]\n", s->name);
+        fprintf(fp, "layout = %s\n", layout);
+        for (int k = 0; k < idx; k++) {
+            if (kinds[k] == SESSION_LEAF_SSH && hosts[k][0]) {
+                fprintf(fp, "pane.%d = ssh:%s\n", k, hosts[k]);
+            } else {
+                fprintf(fp, "pane.%d = local\n", k);
+            }
+            if (cwds[k][0]) fprintf(fp, "pane.%d.cwd = %s\n", k, cwds[k]);
+            if (cmds[k][0]) fprintf(fp, "pane.%d.cmd = %s\n", k, cmds[k]);
+        }
+        fprintf(fp, "\n");
+    }
+    fclose(fp);
+}
+
+/* ---------- Sessions: in-memory list helpers ---------- */
+
+static int sessions_find_by_name(const char *name) {
+    if (!name || !*name) return -1;
+    for (int i = 0; i < g_sessions_count; i++) {
+        if (strcmp(g_sessions[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+/* Replace a session's tree (used by the designer when committing).
+   The passed-in tree is adopted; the previous tree is freed. Caller
+   must not free `new_root` after this returns. */
+static void session_replace_tree(int idx, const char *name, SessionNode *new_root) {
+    if (idx < 0 || idx >= SESSIONS_MAX) return;
+    if (idx == g_sessions_count) g_sessions_count++;
+    Session *s = &g_sessions[idx];
+    if (s->root) session_node_free(s->root);
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    s->root = new_root;
+}
+
+/* Remove a session by index, shifting later entries down. */
+static void sessions_remove(int idx) {
+    if (idx < 0 || idx >= g_sessions_count) return;
+    if (g_sessions[idx].root) session_node_free(g_sessions[idx].root);
+    for (int i = idx; i < g_sessions_count - 1; i++) {
+        g_sessions[i] = g_sessions[i + 1];
+    }
+    g_sessions_count--;
+    g_sessions[g_sessions_count].root = NULL;
+    g_sessions[g_sessions_count].name[0] = 0;
+}
+
+/* ---------- Sessions: layout helpers (canvas hit-test + rect walk) ---------- */
+
+/* Same shape as pane_tree_split_children but for SessionNode trees,
+   with a 2-px gap between siblings so the canvas reads as discrete
+   rectangles instead of a continuous grid. */
+static void session_node_split_children(const SessionNode *n, PaneRect outer,
+                                        PaneRect *a_out, PaneRect *b_out) {
+    const int gap = 2;
+    float ratio = n->ratio;
+    if (ratio < 0.15f) ratio = 0.15f;
+    if (ratio > 0.85f) ratio = 0.85f;
+    if (n->split == SPLIT_VERTICAL) {
+        int left_w = (int)((outer.w - gap) * ratio);
+        if (left_w < 0) left_w = 0;
+        a_out->x = outer.x; a_out->y = outer.y;
+        a_out->w = left_w;  a_out->h = outer.h;
+        b_out->x = outer.x + left_w + gap;
+        b_out->y = outer.y;
+        b_out->w = outer.w - left_w - gap;
+        b_out->h = outer.h;
+    } else {
+        int top_h = (int)((outer.h - gap) * ratio);
+        if (top_h < 0) top_h = 0;
+        a_out->x = outer.x; a_out->y = outer.y;
+        a_out->w = outer.w; a_out->h = top_h;
+        b_out->x = outer.x;
+        b_out->y = outer.y + top_h + gap;
+        b_out->w = outer.w;
+        b_out->h = outer.h - top_h - gap;
+    }
+}
+
+/* Find the leaf containing (mx, my) inside `outer`, or NULL. */
+static SessionNode *session_node_at(SessionNode *n, PaneRect outer,
+                                    int mx, int my) {
+    if (!n) return NULL;
+    if (mx < outer.x || mx >= outer.x + outer.w ||
+        my < outer.y || my >= outer.y + outer.h) return NULL;
+    if (n->split == SPLIT_NONE) return n;
+    PaneRect ra, rb;
+    session_node_split_children(n, outer, &ra, &rb);
+    SessionNode *r = session_node_at(n->child[0], ra, mx, my);
+    if (r) return r;
+    return session_node_at(n->child[1], rb, mx, my);
+}
+
+/* ---------- Sessions: designer modal ---------- */
+
+typedef enum {
+    SDF_NONE = 0,
+    SDF_NAME,
+    SDF_CWD,
+    SDF_CMD,
+} SessionDesignerField;
+
+static Session              g_sd_session;        /* working copy */
+static int                  g_sd_idx = -1;       /* -1 = new */
+static SessionNode         *g_sd_selected = NULL;
+static SessionDesignerField g_sd_focus = SDF_NONE;
+static bool                 g_sd_host_dropdown = false;
+static int                  g_sd_host_scroll = 0;
+static char                 g_sd_status[256];
+static bool                 g_sd_open_after_save = false;   /* Save & Open path */
+
+typedef struct {
+    Rect modal;
+    Rect name_field;
+    Rect canvas;
+    Rect btn_split_v;
+    Rect btn_split_h;
+    Rect btn_close_pane;
+    /* Inspector panel — rects for kind toggle, host dropdown,
+       cwd / cmd text fields. */
+    Rect ins_kind_local;
+    Rect ins_kind_ssh;
+    Rect ins_host;          /* dropdown trigger / display */
+    Rect ins_host_list;     /* expanded list when open */
+    Rect ins_cwd;
+    Rect ins_cmd;
+    /* Bottom action row. */
+    Rect btn_save;
+    Rect btn_save_open;
+    Rect btn_cancel;
+} SessionDesignerLayout;
+
+static SessionDesignerLayout session_designer_layout(int win_w, int win_h) {
+    SessionDesignerLayout L = {0};
+    int w = 760, h = 620;
+    if (w > win_w - 40) w = win_w - 40;
+    if (h > win_h - 40) h = win_h - 40;
+    L.modal.x = (win_w - w) / 2;
+    L.modal.y = (win_h - h) / 2;
+    L.modal.w = w;
+    L.modal.h = h;
+
+    int pad = 22;
+    int title_h = 38;
+    int inner_x = L.modal.x + pad;
+    int inner_w = w - 2 * pad;
+
+    /* Name field at the top of the content area. */
+    int name_y = L.modal.y + title_h + 14;
+    int label_w = 70;
+    L.name_field = (Rect){ inner_x + label_w, name_y,
+                           inner_w - label_w, 28 };
+
+    /* Canvas + side panel split: 60/40. */
+    int row_y = name_y + 28 + 18;
+    int canvas_w = (inner_w * 60) / 100 - 8;
+    int side_w   = inner_w - canvas_w - 16;
+    int row_h_total = h - (row_y - L.modal.y) - 60;   /* leave room for action row */
+    L.canvas = (Rect){ inner_x, row_y, canvas_w, row_h_total };
+
+    /* Side panel: toolbar at top, then inspector. */
+    int side_x = inner_x + canvas_w + 16;
+    int btn_h = 30;
+    int btn_w = (side_w - 8) / 2;
+    L.btn_split_v   = (Rect){ side_x,                     row_y, btn_w, btn_h };
+    L.btn_split_h   = (Rect){ side_x + btn_w + 8,         row_y, btn_w, btn_h };
+    L.btn_close_pane = (Rect){ side_x,                    row_y + btn_h + 6,
+                               side_w, btn_h };
+
+    int ins_y = row_y + 2 * (btn_h + 6) + 18;
+    int kw = (side_w - 8) / 2;
+    L.ins_kind_local = (Rect){ side_x,           ins_y, kw, btn_h };
+    L.ins_kind_ssh   = (Rect){ side_x + kw + 8,  ins_y, kw, btn_h };
+    ins_y += btn_h + 12;
+    L.ins_host = (Rect){ side_x, ins_y, side_w, btn_h };
+    L.ins_host_list = (Rect){ side_x, ins_y + btn_h + 2, side_w, 6 * 22 + 4 };
+    ins_y += btn_h + 12;
+    L.ins_cwd = (Rect){ side_x, ins_y, side_w, 26 };
+    ins_y += 26 + 8;
+    L.ins_cmd = (Rect){ side_x, ins_y, side_w, 26 };
+
+    /* Action row across the bottom. */
+    int abh = 32;
+    int aby = L.modal.y + h - 22 - abh;
+    L.btn_cancel    = (Rect){ L.modal.x + w - 22 - 90,     aby, 90,  abh };
+    L.btn_save_open = (Rect){ L.btn_cancel.x - 8 - 130,    aby, 130, abh };
+    L.btn_save      = (Rect){ L.btn_save_open.x - 8 - 80,  aby, 80,  abh };
+    return L;
+}
+
+static void session_designer_open_for(int idx) {
+    /* Free any previous working copy. */
+    if (g_sd_session.root) session_node_free(g_sd_session.root);
+    memset(&g_sd_session, 0, sizeof(g_sd_session));
+    g_sd_idx = idx;
+    /* New session → auto-focus Name so the user can type a name
+       immediately. Editing existing leaves focus off so a stray
+       keystroke doesn't mutate the saved name. */
+    g_sd_focus = (idx < 0) ? SDF_NAME : SDF_NONE;
+    g_sd_host_dropdown = false;
+    g_sd_host_scroll = 0;
+    g_sd_status[0] = 0;
+    g_sd_open_after_save = false;
+
+    if (idx >= 0 && idx < g_sessions_count) {
+        /* Edit existing — deep-copy the tree. */
+        snprintf(g_sd_session.name, sizeof(g_sd_session.name),
+                 "%s", g_sessions[idx].name);
+        char layout[SESSION_LAYOUT_MAX];
+        layout[0] = 0;
+        size_t off = 0;
+        int next = 0;
+        session_serialize_walk(g_sessions[idx].root, layout, sizeof(layout),
+                               &off, &next);
+        g_sd_session.root = session_parse_layout(layout);
+        if (g_sd_session.root) {
+            SessionLeafKind kinds[SESSION_MAX_LEAVES] = {0};
+            char hosts[SESSION_MAX_LEAVES][SESSION_HOST_MAX] = {{0}};
+            char cwds[SESSION_MAX_LEAVES][SESSION_CWD_MAX]   = {{0}};
+            char cmds[SESSION_MAX_LEAVES][SESSION_CMD_MAX]   = {{0}};
+            int ix = 0;
+            session_collect_leaves(g_sessions[idx].root, kinds, hosts, cwds, cmds, &ix);
+            int ax = 0;
+            session_apply_leaves(g_sd_session.root, kinds, hosts, cwds, cmds,
+                                 &ax, ix);
+        }
+    } else {
+        /* Fresh session: one local-shell leaf, empty name (the
+           placeholder hint in the field invites the user to type
+           one). */
+        g_sd_session.name[0] = 0;
+        g_sd_session.root = session_node_new_leaf();
+    }
+    g_sd_selected = session_first_leaf(g_sd_session.root);
+    /* Refresh saved-host list so the dropdown is fresh. */
+    ssh_profiles_load();
+    g_ui_mode = UI_SESSION_DESIGNER;
+}
+
+/* Forward decl for the open-from-session path (defined further down). */
+static Tab *tab_open_from_session(const Session *s, int cols, int rows);
+
+static bool session_designer_commit(bool also_open, int cols_for_open, int rows_for_open) {
+    if (!g_sd_session.root) {
+        snprintf(g_sd_status, sizeof(g_sd_status), "Nothing to save.");
+        return false;
+    }
+    if (!g_sd_session.name[0]) {
+        snprintf(g_sd_status, sizeof(g_sd_status), "Session needs a name.");
+        return false;
+    }
+    /* Reject duplicate names when creating a new session. */
+    int existing = sessions_find_by_name(g_sd_session.name);
+    int dst = g_sd_idx;
+    if (dst < 0) {
+        if (existing >= 0) {
+            snprintf(g_sd_status, sizeof(g_sd_status),
+                     "A session named '%s' already exists.", g_sd_session.name);
+            return false;
+        }
+        if (g_sessions_count >= SESSIONS_MAX) {
+            snprintf(g_sd_status, sizeof(g_sd_status),
+                     "Session limit reached (%d).", SESSIONS_MAX);
+            return false;
+        }
+        dst = g_sessions_count;
+    } else if (existing >= 0 && existing != dst) {
+        snprintf(g_sd_status, sizeof(g_sd_status),
+                 "A session named '%s' already exists.", g_sd_session.name);
+        return false;
+    }
+    /* Deep-copy g_sd_session.root into the slot — we adopt the tree
+       directly, so clear g_sd_session.root afterwards to avoid a
+       double-free when the modal closes. */
+    session_replace_tree(dst, g_sd_session.name, g_sd_session.root);
+    g_sd_session.root = NULL;
+    g_sd_selected = NULL;
+    sessions_save();
+    if (also_open) {
+        const Session *s = &g_sessions[dst];
+        Tab *t = tab_open_from_session(s, cols_for_open, rows_for_open);
+        if (!t) {
+            snprintf(g_sd_status, sizeof(g_sd_status),
+                     "Saved, but failed to open the session.");
+            g_ui_mode = UI_NORMAL;
+            return false;
+        }
+    }
+    g_ui_mode = UI_NORMAL;
+    return true;
+}
+
+static void session_designer_handle_mouse(SessionDesignerLayout L,
+                                          int cols_for_open, int rows_for_open) {
+    Vector2 mp = GetMousePosition();
+    int mx = (int)mp.x, my = (int)mp.y;
+
+    /* Wheel scroll inside the host dropdown. */
+    if (g_sd_host_dropdown && rect_hit(L.ins_host_list, mx, my)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_sd_host_scroll -= (int)(wheel * 3.0f);
+            if (g_sd_host_scroll < 0) g_sd_host_scroll = 0;
+        }
+    }
+
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+
+    /* Host dropdown — handle FIRST so a click on a row doesn't
+       fall through to other rects. */
+    if (g_sd_host_dropdown) {
+        if (rect_hit(L.ins_host_list, mx, my)) {
+            int row_h = 22;
+            int idx = (my - L.ins_host_list.y) / row_h + g_sd_host_scroll;
+            if (g_sd_selected) {
+                if (idx == 0) {
+                    /* "(none)" sentinel — clears host. */
+                    g_sd_selected->host[0] = 0;
+                } else if (idx - 1 < g_ssh_profile_count) {
+                    snprintf(g_sd_selected->host, SESSION_HOST_MAX,
+                             "%s", g_ssh_profiles[idx - 1].name);
+                    g_sd_selected->kind = SESSION_LEAF_SSH;
+                }
+            }
+            g_sd_host_dropdown = false;
+            return;
+        }
+        if (!rect_hit(L.ins_host, mx, my)) g_sd_host_dropdown = false;
+    }
+
+    /* Click on the canvas → select that leaf. */
+    if (rect_hit(L.canvas, mx, my) && g_sd_session.root) {
+        PaneRect outer = { L.canvas.x, L.canvas.y, L.canvas.w, L.canvas.h };
+        SessionNode *hit = session_node_at(g_sd_session.root, outer, mx, my);
+        if (hit) g_sd_selected = hit;
+        return;
+    }
+
+    /* Toolbar. */
+    if (rect_hit(L.btn_split_v, mx, my)) {
+        if (g_sd_selected) {
+            SessionNode *nl = session_split_leaf(&g_sd_session, g_sd_selected,
+                                                 SPLIT_VERTICAL);
+            if (nl) g_sd_selected = nl;
+            else snprintf(g_sd_status, sizeof(g_sd_status),
+                          "Cannot split — leaf cap %d.", SESSION_MAX_LEAVES);
+        }
+        return;
+    }
+    if (rect_hit(L.btn_split_h, mx, my)) {
+        if (g_sd_selected) {
+            SessionNode *nl = session_split_leaf(&g_sd_session, g_sd_selected,
+                                                 SPLIT_HORIZONTAL);
+            if (nl) g_sd_selected = nl;
+            else snprintf(g_sd_status, sizeof(g_sd_status),
+                          "Cannot split — leaf cap %d.", SESSION_MAX_LEAVES);
+        }
+        return;
+    }
+    if (rect_hit(L.btn_close_pane, mx, my)) {
+        if (g_sd_selected && session_count_leaves(g_sd_session.root) > 1) {
+            SessionNode *succ = session_close_leaf(&g_sd_session, g_sd_selected);
+            g_sd_selected = succ ? succ : session_first_leaf(g_sd_session.root);
+        } else {
+            snprintf(g_sd_status, sizeof(g_sd_status),
+                     "Can't close the last pane.");
+        }
+        return;
+    }
+
+    /* Inspector — kind toggle. */
+    if (g_sd_selected && rect_hit(L.ins_kind_local, mx, my)) {
+        g_sd_selected->kind = SESSION_LEAF_LOCAL;
+        g_sd_selected->host[0] = 0;
+        return;
+    }
+    if (g_sd_selected && rect_hit(L.ins_kind_ssh, mx, my)) {
+        g_sd_selected->kind = SESSION_LEAF_SSH;
+        return;
+    }
+    /* Host dropdown trigger. */
+    if (g_sd_selected && rect_hit(L.ins_host, mx, my)) {
+        g_sd_host_dropdown = !g_sd_host_dropdown;
+        if (g_sd_host_dropdown) {
+            ssh_profiles_load();
+            g_sd_host_scroll = 0;
+        }
+        return;
+    }
+    /* Text-field focus selection. */
+    if (rect_hit(L.name_field, mx, my)) { g_sd_focus = SDF_NAME; return; }
+    if (g_sd_selected && rect_hit(L.ins_cwd, mx, my)) { g_sd_focus = SDF_CWD; return; }
+    if (g_sd_selected && rect_hit(L.ins_cmd, mx, my)) { g_sd_focus = SDF_CMD; return; }
+
+    /* Action buttons. */
+    if (rect_hit(L.btn_save, mx, my)) {
+        session_designer_commit(false, 0, 0);
+        return;
+    }
+    if (rect_hit(L.btn_save_open, mx, my)) {
+        session_designer_commit(true, cols_for_open, rows_for_open);
+        return;
+    }
+    if (rect_hit(L.btn_cancel, mx, my)) {
+        if (g_sd_session.root) {
+            session_node_free(g_sd_session.root);
+            g_sd_session.root = NULL;
+        }
+        g_sd_selected = NULL;
+        g_ui_mode = UI_NORMAL;
+        return;
+    }
+    /* Click anywhere else inside the modal drops field focus. */
+    if (rect_hit(L.modal, mx, my)) g_sd_focus = SDF_NONE;
+}
+
+static char *session_designer_focused_buf(size_t *cap) {
+    if (g_sd_focus == SDF_NAME) {
+        *cap = sizeof(g_sd_session.name);
+        return g_sd_session.name;
+    }
+    if (g_sd_focus == SDF_CWD && g_sd_selected) {
+        *cap = SESSION_CWD_MAX;
+        return g_sd_selected->cwd;
+    }
+    if (g_sd_focus == SDF_CMD && g_sd_selected) {
+        *cap = SESSION_CMD_MAX;
+        return g_sd_selected->cmd;
+    }
+    *cap = 0;
+    return NULL;
+}
+
+static void session_designer_handle_keys(int cols_for_open, int rows_for_open) {
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        if (g_sd_host_dropdown) { g_sd_host_dropdown = false; return; }
+        if (g_sd_session.root) {
+            session_node_free(g_sd_session.root);
+            g_sd_session.root = NULL;
+        }
+        g_sd_selected = NULL;
+        g_ui_mode = UI_NORMAL;
+        return;
+    }
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        if (g_sd_focus == SDF_NAME) {
+            g_sd_focus = SDF_NONE;
+            return;
+        }
+        session_designer_commit(false, cols_for_open, rows_for_open);
+        return;
+    }
+    size_t cap = 0;
+    char *buf = session_designer_focused_buf(&cap);
+    if (!buf || cap == 0) return;
+    size_t len = strlen(buf);
+    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+        if (len > 0) buf[len - 1] = 0;
+        return;
+    }
+    int ch;
+    while ((ch = GetCharPressed()) != 0) {
+        if (ch < 32 || ch >= 127) continue;
+        if (len + 1 >= cap) break;
+        buf[len++] = (char)ch;
+        buf[len] = 0;
+    }
+    (void)cols_for_open; (void)rows_for_open;
+}
+
+/* Recursive canvas paint — colours leaves by kind, highlights the
+   selected leaf, prints the leaf's label inside its rect when it's
+   tall enough to read. */
+static void session_canvas_paint(Renderer *r, const SessionNode *n,
+                                 PaneRect outer, const SessionNode *selected) {
+    if (!n) return;
+    if (n->split == SPLIT_NONE) {
+        Color base = (n->kind == SESSION_LEAF_SSH)
+                        ? (Color){46, 70, 110, 255}
+                        : (Color){38, 56, 46, 255};
+        if (n == selected) {
+            base.r = (unsigned char)(base.r + 30 > 255 ? 255 : base.r + 30);
+            base.g = (unsigned char)(base.g + 30 > 255 ? 255 : base.g + 30);
+            base.b = (unsigned char)(base.b + 30 > 255 ? 255 : base.b + 30);
+        }
+        DrawRectangle(outer.x, outer.y, outer.w, outer.h, base);
+        Color border = (n == selected) ? (Color){125, 207, 255, 255}
+                                       : (Color){70, 80, 100, 200};
+        DrawRectangleLinesEx(
+            (Rectangle){(float)outer.x, (float)outer.y,
+                        (float)outer.w, (float)outer.h},
+            (n == selected) ? 3.0f : 1.0f, border);
+        if (outer.h >= 24 && outer.w >= 60 && r->font_data) {
+            const char *label;
+            char buf[160];
+            if (n->kind == SESSION_LEAF_SSH) {
+                snprintf(buf, sizeof(buf), "ssh:%s",
+                         n->host[0] ? n->host : "(pick host)");
+                label = buf;
+            } else {
+                label = "local shell";
+            }
+            Font *f = (Font *)r->font_data;
+            DrawTextEx(*f, label,
+                       (Vector2){outer.x + 8, outer.y + 6},
+                       13, 0, (Color){220, 230, 245, 255});
+            if (outer.h >= 50 && (n->cwd[0] || n->cmd[0])) {
+                char sub[200];
+                snprintf(sub, sizeof(sub), "%s%s%s",
+                         n->cwd[0] ? n->cwd : "",
+                         (n->cwd[0] && n->cmd[0]) ? "  " : "",
+                         n->cmd[0] ? n->cmd : "");
+                DrawTextEx(*f, sub,
+                           (Vector2){outer.x + 8, outer.y + 22},
+                           11, 0, (Color){170, 180, 200, 220});
+            }
+        }
+        return;
+    }
+    PaneRect ra, rb;
+    session_node_split_children(n, outer, &ra, &rb);
+    session_canvas_paint(r, n->child[0], ra, selected);
+    session_canvas_paint(r, n->child[1], rb, selected);
+}
+
+static void draw_session_designer(Renderer *r, int win_w, int win_h,
+                                  SessionDesignerLayout L) {
+    Font *f = (Font *)r->font_data;
+    /* Backdrop. */
+    DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 160});
+    DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                  (Color){26, 28, 38, 255});
+    DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                       (Color){80, 90, 110, 255});
+    DrawTextEx(*f, "Session Designer",
+               (Vector2){L.modal.x + 20, L.modal.y + 11},
+               16, 0, (Color){230, 232, 240, 255});
+
+    /* Name field. */
+    DrawTextEx(*f, "Name",
+               (Vector2){L.modal.x + 22, L.name_field.y + 7},
+               13, 0, (Color){180, 185, 200, 255});
+    bool name_focus = (g_sd_focus == SDF_NAME);
+    DrawRectangle(L.name_field.x, L.name_field.y, L.name_field.w, L.name_field.h,
+                  (Color){22, 25, 34, 255});
+    DrawRectangleLines(L.name_field.x, L.name_field.y, L.name_field.w, L.name_field.h,
+                       name_focus ? (Color){125, 207, 255, 255}
+                                  : (Color){70, 74, 90, 255});
+    const char *name_shown = g_sd_session.name[0]
+                                ? g_sd_session.name
+                                : "(type a name)";
+    DrawTextEx(*f, name_shown,
+               (Vector2){L.name_field.x + 8, L.name_field.y + 7},
+               14, 0, g_sd_session.name[0]
+                          ? (Color){230, 232, 240, 255}
+                          : (Color){110, 115, 130, 255});
+    /* Caret when the field is focused — blinks at 2 Hz. */
+    if (name_focus && ((long long)(GetTime() * 2.0) & 1) == 0) {
+        Vector2 ns = MeasureTextEx(*f, g_sd_session.name, 14, 0);
+        int cx = (int)(L.name_field.x + 8 + ns.x + 1);
+        DrawRectangle(cx, L.name_field.y + 6, 2, 16,
+                      (Color){125, 207, 255, 255});
+    }
+
+    /* Canvas. */
+    DrawRectangle(L.canvas.x, L.canvas.y, L.canvas.w, L.canvas.h,
+                  (Color){12, 14, 22, 255});
+    DrawRectangleLines(L.canvas.x, L.canvas.y, L.canvas.w, L.canvas.h,
+                       (Color){70, 80, 100, 255});
+    if (g_sd_session.root) {
+        PaneRect outer = { L.canvas.x + 2, L.canvas.y + 2,
+                           L.canvas.w - 4, L.canvas.h - 4 };
+        session_canvas_paint(r, g_sd_session.root, outer, g_sd_selected);
+    }
+
+    /* Toolbar — split V / H / close pane. */
+    struct { Rect r; const char *lbl; bool danger; } tools[] = {
+        { L.btn_split_v,    "+ Split V",   false },
+        { L.btn_split_h,    "+ Split H",   false },
+        { L.btn_close_pane, "× Close pane", true  },
+    };
+    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
+        Rect tr = tools[i].r;
+        Color bg = tools[i].danger ? (Color){62, 30, 32, 255}
+                                   : (Color){38, 48, 66, 255};
+        Color outline = tools[i].danger ? (Color){200, 80, 80, 220}
+                                        : (Color){125, 207, 255, 200};
+        DrawRectangle(tr.x, tr.y, tr.w, tr.h, bg);
+        DrawRectangleLines(tr.x, tr.y, tr.w, tr.h, outline);
+        Vector2 sz = MeasureTextEx(*f, tools[i].lbl, 13, 0);
+        DrawTextEx(*f, tools[i].lbl,
+                   (Vector2){tr.x + (tr.w - sz.x) / 2,
+                             tr.y + (tr.h - sz.y) / 2},
+                   13, 0, (Color){230, 232, 240, 255});
+    }
+
+    /* Inspector header. */
+    DrawTextEx(*f, "Selected pane",
+               (Vector2){L.ins_kind_local.x, L.ins_kind_local.y - 18},
+               13, 0, (Color){180, 185, 200, 255});
+
+    /* Kind toggle. */
+    bool is_ssh = g_sd_selected && g_sd_selected->kind == SESSION_LEAF_SSH;
+    struct { Rect r; const char *lbl; bool active; } kinds[] = {
+        { L.ins_kind_local, "Local",  !is_ssh },
+        { L.ins_kind_ssh,   "SSH",    is_ssh  },
+    };
+    for (int i = 0; i < 2; i++) {
+        Rect kr = kinds[i].r;
+        Color bg = kinds[i].active ? (Color){46, 92, 150, 255}
+                                   : (Color){34, 38, 52, 255};
+        DrawRectangle(kr.x, kr.y, kr.w, kr.h, bg);
+        DrawRectangleLines(kr.x, kr.y, kr.w, kr.h,
+                           kinds[i].active ? (Color){125, 207, 255, 255}
+                                            : (Color){70, 74, 90, 255});
+        Vector2 sz = MeasureTextEx(*f, kinds[i].lbl, 13, 0);
+        DrawTextEx(*f, kinds[i].lbl,
+                   (Vector2){kr.x + (kr.w - sz.x) / 2,
+                             kr.y + (kr.h - sz.y) / 2},
+                   13, 0, (Color){230, 232, 240, 255});
+    }
+
+    /* Host dropdown trigger (visible only when SSH). */
+    {
+        Rect hr = L.ins_host;
+        Color bg = is_ssh ? (Color){22, 25, 34, 255} : (Color){18, 20, 28, 255};
+        Color outline = is_ssh ? (Color){70, 74, 90, 255}
+                               : (Color){50, 54, 66, 255};
+        DrawRectangle(hr.x, hr.y, hr.w, hr.h, bg);
+        DrawRectangleLines(hr.x, hr.y, hr.w, hr.h, outline);
+        const char *lbl = is_ssh
+            ? (g_sd_selected->host[0] ? g_sd_selected->host : "(pick a saved host)")
+            : "(host selection — switch to SSH)";
+        DrawTextEx(*f, lbl,
+                   (Vector2){hr.x + 10, hr.y + 6},
+                   13, 0, is_ssh ? (Color){230, 232, 240, 255}
+                                 : (Color){110, 115, 130, 255});
+        DrawTextEx(*f, "v",
+                   (Vector2){hr.x + hr.w - 22, hr.y + 6},
+                   13, 0, (Color){200, 215, 240, 255});
+    }
+
+    /* Cwd + cmd. */
+    struct { Rect r; SessionDesignerField field; const char *label;
+             const char *value; const char *hint; } fields[] = {
+        { L.ins_cwd, SDF_CWD, "Cwd",
+          g_sd_selected ? g_sd_selected->cwd : "",
+          "(optional working directory)" },
+        { L.ins_cmd, SDF_CMD, "Cmd",
+          g_sd_selected ? g_sd_selected->cmd : "",
+          "(optional startup command)" },
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        Rect fr = fields[i].r;
+        bool focused = g_sd_focus == fields[i].field;
+        DrawRectangle(fr.x, fr.y, fr.w, fr.h, (Color){22, 25, 34, 255});
+        DrawRectangleLines(fr.x, fr.y, fr.w, fr.h,
+                           focused ? (Color){125, 207, 255, 255}
+                                   : (Color){70, 74, 90, 255});
+        DrawTextEx(*f, fields[i].label,
+                   (Vector2){fr.x - 36, fr.y + 6},
+                   12, 0, (Color){180, 185, 200, 255});
+        const char *shown = fields[i].value[0] ? fields[i].value : fields[i].hint;
+        Color tc = fields[i].value[0] ? (Color){230, 232, 240, 255}
+                                      : (Color){110, 115, 130, 255};
+        DrawTextEx(*f, shown,
+                   (Vector2){fr.x + 8, fr.y + 6},
+                   13, 0, tc);
+        if (focused && ((long long)(GetTime() * 2.0) & 1) == 0) {
+            Vector2 vsz = MeasureTextEx(*f, fields[i].value, 13, 0);
+            int cx = (int)(fr.x + 8 + vsz.x + 1);
+            DrawRectangle(cx, fr.y + 5, 2, 16, (Color){125, 207, 255, 255});
+        }
+    }
+
+    /* Bottom action row. */
+    struct { Rect r; const char *lbl; bool primary; } actions[] = {
+        { L.btn_save,      "Save",        false },
+        { L.btn_save_open, "Save & Open", true  },
+        { L.btn_cancel,    "Cancel",      false },
+    };
+    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); i++) {
+        Rect ar = actions[i].r;
+        Color bg = actions[i].primary ? (Color){46, 92, 150, 255}
+                                      : (Color){48, 52, 66, 255};
+        Color outline = actions[i].primary ? (Color){125, 207, 255, 255}
+                                           : (Color){90, 96, 116, 255};
+        DrawRectangle(ar.x, ar.y, ar.w, ar.h, bg);
+        DrawRectangleLines(ar.x, ar.y, ar.w, ar.h, outline);
+        Vector2 sz = MeasureTextEx(*f, actions[i].lbl, 14, 0);
+        DrawTextEx(*f, actions[i].lbl,
+                   (Vector2){ar.x + (ar.w - sz.x) / 2,
+                             ar.y + (ar.h - sz.y) / 2},
+                   14, 0, (Color){230, 235, 248, 255});
+    }
+
+    /* Status line above the action row. */
+    if (g_sd_status[0]) {
+        DrawTextEx(*f, g_sd_status,
+                   (Vector2){L.modal.x + 22, L.btn_save.y - 22},
+                   12, 0, (Color){240, 180, 100, 255});
+    }
+
+    /* Host dropdown — drawn last so it overlaps everything below. */
+    if (g_sd_host_dropdown) {
+        Rect hl = L.ins_host_list;
+        DrawRectangle(hl.x, hl.y, hl.w, hl.h, (Color){22, 25, 34, 250});
+        DrawRectangleLines(hl.x, hl.y, hl.w, hl.h, (Color){125, 207, 255, 220});
+        int row_h = 22;
+        int rows = hl.h / row_h;
+        BeginScissorMode(hl.x + 2, hl.y + 2, hl.w - 4, hl.h - 4);
+        /* Row 0: "(none)" sentinel. Then saved profiles. */
+        for (int i = 0; i < rows + 1; i++) {
+            int row_idx = i + g_sd_host_scroll;
+            if (row_idx > g_ssh_profile_count) break;
+            int ry = hl.y + (i) * row_h;
+            const char *name = (row_idx == 0)
+                                  ? "(none)"
+                                  : g_ssh_profiles[row_idx - 1].name;
+            Color tc = (row_idx == 0) ? (Color){170, 175, 190, 255}
+                                      : (Color){230, 232, 240, 255};
+            DrawTextEx(*f, name,
+                       (Vector2){hl.x + 10, ry + 4},
+                       13, 0, tc);
+        }
+        EndScissorMode();
+    }
+}
+
+/* ---------- Sessions: open a saved session as a Tab ---------- */
+
+/* Lazy-allocate a Pane's Screen (without a Pty). Used by
+   tab_open_from_session to set up the placeholder rendering grid
+   for each leaf before its PTY is opened. */
+static void pane_ensure_screen(Pane *p, int cols, int rows) {
+    if (!p) return;
+    pane_init_click_state(p);
+    if (!p->scr) {
+        p->scr = screen_new(cols, rows, 5000, pane_io(p));
+        p->effects = g_app_settings.effects;
+    }
+}
+
+/* Open the actual PTY for a session leaf — local shell or SSH host
+   per kind. The Pane's Screen is assumed already set up by
+   pane_ensure_screen so the renderer can paint while we connect.
+   Synchronous for SSH leaves in v1; the user sees splits appear in
+   sequence as each handshake finishes. (Async per-leaf parallel
+   connect is a future step that'd reuse the existing
+   SshLaunchWorker apparatus.) */
+static bool session_open_leaf_pty(Pane *p,
+                                  SessionLeafKind kind,
+                                  const char *host_alias,
+                                  const char *cwd, const char *cmd,
+                                  int cols, int rows) {
+    if (!p || p->pty) return p && p->pty;
+    if (kind == SESSION_LEAF_SSH && host_alias && host_alias[0]) {
+#ifdef RBTERM_SSH
+        const SshProfile *prof = NULL;
+        for (int i = 0; i < g_ssh_profile_count; i++) {
+            if (strcmp(g_ssh_profiles[i].name, host_alias) == 0) {
+                prof = &g_ssh_profiles[i]; break;
+            }
+        }
+        char err[256] = {0};
+        Pty *pty = pty_open_ssh(
+            prof && prof->user[0]     ? prof->user     : NULL,
+            prof && prof->hostname[0] ? prof->hostname : host_alias,
+            prof ? (prof->port > 0 ? prof->port : 22) : 22,
+            NULL,
+            prof && prof->identity[0] ? prof->identity : NULL,
+            cols, rows, err, sizeof(err));
+        if (!pty) {
+            fprintf(stderr,
+                    "rbterm: session ssh '%s' failed: %s\n",
+                    host_alias, err[0] ? err : "(unknown)");
+            /* Surface the failure into the pane so the user sees it
+               in-place rather than just a blank tile. */
+            char msg[512];
+            int n = snprintf(msg, sizeof(msg),
+                             "\x1b[2J\x1b[H\x1b[1;31mFailed to connect to %s\x1b[0m\r\n"
+                             "\x1b[2;37m%s\x1b[0m\r\n",
+                             host_alias, err[0] ? err : "(no error)");
+            if (n > 0 && n < (int)sizeof(msg))
+                screen_feed(p->scr, (const uint8_t *)msg, (size_t)n);
+            snprintf(p->title, sizeof(p->title), "Failed: %s", host_alias);
+            return false;
+        }
+        p->pty = pty;
+        snprintf(p->title, sizeof(p->title), "%s", host_alias);
+#else
+        (void)cols; (void)rows;
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg),
+                         "\x1b[2J\x1b[H\x1b[1;31mSSH not built into this rbterm.\x1b[0m\r\n");
+        if (n > 0) screen_feed(p->scr, (const uint8_t *)msg, (size_t)n);
+        return false;
+#endif
+    } else {
+        const char *want_cwd = (cwd && cwd[0]) ? cwd : NULL;
+        p->pty = pty_open(cols, rows, want_cwd);
+        if (!p->pty) {
+            fprintf(stderr, "rbterm: session local pane: pty_open failed\n");
+            return false;
+        }
+        if (want_cwd) {
+            strncpy(p->cwd, want_cwd, sizeof(p->cwd) - 1);
+            p->cwd[sizeof(p->cwd) - 1] = 0;
+        }
+        snprintf(p->title, sizeof(p->title), "shell");
+    }
+    /* Send cwd / cmd as init lines. For SSH the cwd doubles as a
+       cd command (libssh's cwd doesn't follow ssh's HostName); for
+       local panes it was already the spawn cwd, so cd-ing into it
+       is a no-op but echoes the path which matches the user's
+       expectation. */
+    if (cwd && cwd[0])
+        ssh_send_init_line(p, cwd, NULL);
+    if (cmd && cmd[0])
+        ssh_send_init_line(p, NULL, cmd);
+    return true;
+}
+
+/* Recursive replay walker. Mirrors layout_replay_walk's shape but
+   uses per-leaf kind/host metadata from the Session instead of
+   re-dialing the parent tab's host. */
+static void session_replay_recurse(Tab *t, const SessionNode *sn,
+                                   PaneNode *current_leaf, int *next_idx,
+                                   const SessionLeafKind *kinds,
+                                   const char hosts[][SESSION_HOST_MAX],
+                                   const char cwds[][SESSION_CWD_MAX],
+                                   const char cmds[][SESSION_CMD_MAX],
+                                   int cols, int rows) {
+    if (!sn || !current_leaf) return;
+    if (sn->split == SPLIT_NONE) {
+        int i = (*next_idx)++;
+        if (i >= SESSION_MAX_LEAVES) return;
+        session_open_leaf_pty(current_leaf->pane, kinds[i], hosts[i],
+                              cwds[i], cmds[i], cols, rows);
+        return;
+    }
+    /* Structural split. Allocate the new leaf with a Screen but no
+       Pty yet; the recursion fills its PTY when it reaches a leaf. */
+    PaneNode *new_leaf = pane_node_split_leaf(t, current_leaf, sn->split);
+    if (!new_leaf) return;
+    if (new_leaf->parent) new_leaf->parent->ratio = sn->ratio;
+    pane_ensure_screen(new_leaf->pane, cols, rows);
+    snprintf(new_leaf->pane->title, sizeof(new_leaf->pane->title), "...");
+    /* Show a banner in the new pane while we wait. */
+    const char *wait =
+        "\x1b[2J\x1b[H\x1b[1;36mPreparing session pane...\x1b[0m\r\n";
+    screen_feed(new_leaf->pane->scr, (const uint8_t *)wait, strlen(wait));
+    session_replay_recurse(t, sn->child[0], current_leaf, next_idx,
+                           kinds, hosts, cwds, cmds, cols, rows);
+    session_replay_recurse(t, sn->child[1], new_leaf, next_idx,
+                           kinds, hosts, cwds, cmds, cols, rows);
+}
+
+/* Build a Tab from a saved Session. The first leaf gets opened
+   inline (with a Screen but no Pty), the recursive walker creates
+   the rest of the splits and opens each leaf's PTY in DFS pre-
+   order. Synchronous for now — multi-host parallel connect is the
+   natural follow-up. Returns NULL on failure (out of tab slots,
+   empty session, or first PTY open fails). */
+static Tab *tab_open_from_session(const Session *s, int cols, int rows) {
+    if (!s || !s->root) return NULL;
+    SessionLeafKind kinds[SESSION_MAX_LEAVES] = {0};
+    char hosts[SESSION_MAX_LEAVES][SESSION_HOST_MAX] = {{0}};
+    char cwds[SESSION_MAX_LEAVES][SESSION_CWD_MAX]   = {{0}};
+    char cmds[SESSION_MAX_LEAVES][SESSION_CMD_MAX]   = {{0}};
+    int count = 0;
+    session_collect_leaves(s->root, kinds, hosts, cwds, cmds, &count);
+    if (count == 0) return NULL;
+    if (g_num_tabs >= MAX_TABS) return NULL;
+
+    Tab *t = calloc(1, sizeof(Tab));
+    PaneNode *leaf = pane_node_new_leaf();
+    t->root = leaf;
+    t->active = leaf;
+    pane_ensure_screen(leaf->pane, cols, rows);
+    snprintf(leaf->pane->title, sizeof(leaf->pane->title), "...");
+    snprintf(t->tab_name, sizeof(t->tab_name), "%s", s->name);
+    /* Mark as SSH if any leaf is SSH — the SFTP / broadcast / etc.
+       UIs key off this flag and most session usage will be
+       SSH-heavy anyway. */
+    for (int k = 0; k < count; k++) {
+        if (kinds[k] == SESSION_LEAF_SSH) { t->is_ssh = true; break; }
+    }
+    g_tabs[g_num_tabs] = t;
+    g_active = g_num_tabs;
+    g_num_tabs++;
+
+    int next_idx = 0;
+    session_replay_recurse(t, s->root, leaf, &next_idx,
+                           kinds, hosts, cwds, cmds, cols, rows);
+    t->active = pane_tree_first_leaf(t->root);
+    tab_log_open_all(t);
+    return t;
+}
 
 typedef struct {
     Rect modal;
@@ -2817,6 +4225,17 @@ static Tab *tab_open_ssh(const char *user, const char *host, int port,
 static void tab_close(int idx) {
     if (idx < 0 || idx >= g_num_tabs) return;
     Tab *t = g_tabs[idx];
+#ifdef RBTERM_SSH
+    /* If a worker still considers this tab its placeholder, null
+       the back-reference so integration can detect the abandon
+       and release the resulting Pty without dereferencing a freed
+       Tab. */
+    for (int wi = 0; wi < g_launch_workers_count; wi++) {
+        if (g_launch_workers[wi].placeholder == t) {
+            g_launch_workers[wi].placeholder = NULL;
+        }
+    }
+#endif
     pane_node_free_recursive(t->root);
     t->root = NULL;
     t->active = NULL;
@@ -3840,6 +5259,69 @@ static bool leaf_rect(const Tab *t, const PaneNode *leaf, int win_w, int win_h,
     return pane_tree_node_rect_walk(t->root, leaf, outer, out);
 }
 
+/* Pick the best leaf to focus when the user presses a directional
+   pane-switch chord (Cmd+Opt+arrows). Direction is a (dx, dy) unit
+   vector — exactly one component non-zero.
+
+   Two-pass scoring matches tmux / iTerm2 convention:
+     1. Prefer panes that *overlap* on the perpendicular axis with
+        the active pane (i.e. share rows for ←/→, share columns for
+        ↑/↓). Pick the closest such pane along the primary axis.
+        This is what the user means by "the pane directly below me".
+     2. If nothing overlaps, fall back to the candidate with the
+        smallest Manhattan-ish score. Weighting perpendicular
+        distance 2× lets a pane in the same general band beat one
+        that's slightly closer along the primary axis but in a
+        different region.
+
+   Returns NULL if no candidate is in the requested direction. */
+static PaneNode *pane_focus_directional(Tab *t, int win_w, int win_h,
+                                        int dx, int dy) {
+    if (!t || !t->active) return NULL;
+    PaneRect ar;
+    if (!leaf_rect(t, t->active, win_w, win_h, &ar)) return NULL;
+    int acx = ar.x + ar.w / 2;
+    int acy = ar.y + ar.h / 2;
+    PaneNode *best_overlap = NULL, *best_any = NULL;
+    int best_overlap_primary = (1 << 30);
+    int best_any_score        = (1 << 30);
+    for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
+         leaf = pane_tree_next_leaf(leaf)) {
+        if (leaf == t->active) continue;
+        PaneRect br;
+        if (!leaf_rect(t, leaf, win_w, win_h, &br)) continue;
+        int bcx = br.x + br.w / 2;
+        int bcy = br.y + br.h / 2;
+        if (dx < 0 && bcx >= acx) continue;
+        if (dx > 0 && bcx <= acx) continue;
+        if (dy < 0 && bcy >= acy) continue;
+        if (dy > 0 && bcy <= acy) continue;
+        int primary, perp;
+        bool overlap;
+        if (dx != 0) {
+            primary = (dx > 0 ? (bcx - acx) : (acx - bcx));
+            perp    = (bcy > acy) ? (bcy - acy) : (acy - bcy);
+            /* Vertical overlap: any shared rows with active? */
+            overlap = !(br.y + br.h <= ar.y || ar.y + ar.h <= br.y);
+        } else {
+            primary = (dy > 0 ? (bcy - acy) : (acy - bcy));
+            perp    = (bcx > acx) ? (bcx - acx) : (acx - bcx);
+            /* Horizontal overlap: any shared columns? */
+            overlap = !(br.x + br.w <= ar.x || ar.x + ar.w <= br.x);
+        }
+        if (overlap && primary < best_overlap_primary) {
+            best_overlap_primary = primary;
+            best_overlap = leaf;
+        }
+        int score = primary + perp * 2;
+        if (score < best_any_score) {
+            best_any_score = score;
+            best_any = leaf;
+        }
+    }
+    return best_overlap ? best_overlap : best_any;
+}
+
 /* On-screen rect of an internal split node's splitter strip. */
 static bool internal_splitter_rect(const Tab *t, const PaneNode *node,
                                    int win_w, int win_h, PaneRect *out) {
@@ -4267,6 +5749,24 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             DrawRectangleLinesEx(
                 (Rectangle){(float)pr.x, (float)pr.y, (float)pr.w, (float)pr.h},
                 3.0f, bc);
+        }
+    }
+    /* Active-pane border. 2px cyan outline around the focused leaf
+       so multi-pane tabs make it obvious which pane will receive
+       the next keystroke. Only fires on multi-pane tabs (no point
+       outlining a single-pane tab — there's nothing to disambiguate)
+       and is suppressed while broadcast is on (the red border above
+       already covers the focus signal). Same draw stage as the
+       broadcast border so it sits over content but under splitters. */
+    if (!g_broadcast_active && t == active_tab() && t->active &&
+        pane_tree_count(t->root) >= 2) {
+        PaneRect pr;
+        if (leaf_rect(t, t->active, win_w, win_h, &pr)) {
+            Color bc = focused ? (Color){125, 207, 255, 230}
+                               : (Color){90, 130, 165, 180};
+            DrawRectangleLinesEx(
+                (Rectangle){(float)pr.x, (float)pr.y, (float)pr.w, (float)pr.h},
+                2.0f, bc);
         }
     }
 
@@ -7386,11 +8886,70 @@ static void ssh_form_submit(int cols, int rows) {
     }
     int port = atoi(g_form.port);
     if (port <= 0) port = 22;
+#ifdef RBTERM_SSH
+    /* Async path: synthesize a transient SshProfile from the form's
+       current values and kick a worker. The form modal closes
+       immediately, the user sees a "Connecting to ..." placeholder
+       tab while libssh handshakes off the main thread; the failure
+       banner (if any) lands in the placeholder, not the form's
+       error line. The synthetic profile is not persisted. */
+    SshProfile sp;
+    memset(&sp, 0, sizeof(sp));
+    if (g_form.name[0]) strncpy(sp.name, g_form.name, sizeof(sp.name) - 1);
+    strncpy(sp.hostname, g_form.host, sizeof(sp.hostname) - 1);
+    if (g_form.user[0]) strncpy(sp.user, g_form.user, sizeof(sp.user) - 1);
+    if (g_form.key[0])  strncpy(sp.identity, g_form.key, sizeof(sp.identity) - 1);
+    sp.port = port;
+    if (g_form.theme[0]) strncpy(sp.theme, g_form.theme, sizeof(sp.theme) - 1);
+    sp.cursor_style = g_form.cursor_style;
+    if (g_form.font[0]) strncpy(sp.font, g_form.font, sizeof(sp.font) - 1);
+    sp.font_size = g_form.font_size;
+    if (g_form.log_dir[0]) strncpy(sp.log_dir, g_form.log_dir, sizeof(sp.log_dir) - 1);
+    sp.log_mode = g_form.log_mode;
+    if (g_form.color[0]) strncpy(sp.color, g_form.color, sizeof(sp.color) - 1);
+    if (g_form.cursor_color[0])
+        strncpy(sp.cursor_color, g_form.cursor_color, sizeof(sp.cursor_color) - 1);
+    if (g_form.hud.override) sp.hud = g_form.hud;
+    if (g_form.effects_override) {
+        sp.effects_override = true;
+        sp.effects = g_form.effects;
+    }
+    if (g_form.init_cwd[0]) strncpy(sp.init_cwd, g_form.init_cwd, sizeof(sp.init_cwd) - 1);
+    if (g_form.init_cmd[0]) strncpy(sp.init_cmd, g_form.init_cmd, sizeof(sp.init_cmd) - 1);
+    if (g_form.display_name[0])
+        strncpy(sp.display_name, g_form.display_name, sizeof(sp.display_name) - 1);
+    if (g_form.layout[0]) {
+        strncpy(sp.layout, g_form.layout, sizeof(sp.layout) - 1);
+        for (int i = 0; i < 8; i++) {
+            strncpy(sp.pane_cwds[i], g_form.pane_cwds[i],
+                    sizeof(sp.pane_cwds[i]) - 1);
+            strncpy(sp.pane_cmds[i], g_form.pane_cmds[i],
+                    sizeof(sp.pane_cmds[i]) - 1);
+        }
+    }
+    /* Use the saved-profile name (round-trippable to the SSH form
+       by alias) when present, otherwise the host as a label so the
+       placeholder banner reads sensibly. */
+    const char *alias = g_form.name[0] ? g_form.name : g_form.host;
+    if (!ssh_launch_kick(&sp, alias,
+                         g_form.pass[0] ? g_form.pass : NULL,
+                         /* is_active */ true,
+                         cols, rows)) {
+        strncpy(g_form.error, "too many in-flight SSH connects",
+                sizeof(g_form.error) - 1);
+        g_form.error[sizeof(g_form.error) - 1] = 0;
+        return;
+    }
+    /* Scrub password from form memory now that the worker copied it. */
+    memset(g_form.pass, 0, sizeof(g_form.pass));
+    g_ui_mode = UI_NORMAL;
+#else
+    /* Stub builds (no libssh): synchronous path returns an error
+       immediately. No real connect, no beachball risk. */
     char err[256] = {0};
     Tab *t = tab_open_ssh(
         g_form.user[0] ? g_form.user : NULL,
-        g_form.host,
-        port,
+        g_form.host, port,
         g_form.pass[0] ? g_form.pass : NULL,
         g_form.key[0]  ? g_form.key  : NULL,
         g_form.theme[0] ? g_form.theme : NULL,
@@ -7410,20 +8969,6 @@ static void ssh_form_submit(int cols, int rows) {
         g_form.layout[0] ? g_form.pane_cmds : NULL,
         cols, rows, err, sizeof(err));
     if (t) {
-        /* Stash the saved-host alias on the tab so a later `[ssh]`
-           click round-trips back to this exact profile, even if
-           another alias resolves to the same (HostName, User, Port). */
-        if (g_form.name[0]) {
-            strncpy(t->ssh_alias, g_form.name, sizeof(t->ssh_alias) - 1);
-            t->ssh_alias[sizeof(t->ssh_alias) - 1] = 0;
-        }
-        /* Seed the manual tab name from the profile's display_name. */
-        if (g_form.display_name[0]) {
-            strncpy(t->tab_name, g_form.display_name,
-                    sizeof(t->tab_name) - 1);
-            t->tab_name[sizeof(t->tab_name) - 1] = 0;
-        }
-        /* Clear the password from memory as soon as we no longer need it. */
         memset(g_form.pass, 0, sizeof(g_form.pass));
         g_ui_mode = UI_NORMAL;
     } else {
@@ -7431,6 +8976,7 @@ static void ssh_form_submit(int cols, int rows) {
                 sizeof(g_form.error) - 1);
         g_form.error[sizeof(g_form.error) - 1] = 0;
     }
+#endif
 #endif
 }
 
@@ -7528,24 +9074,33 @@ static void ssh_form_test_auth(int cols, int rows) {
         g_form.focus = F_HOST;
         return;
     }
-    int port = atoi(g_form.port);
-    if (port <= 0) port = 22;
-    char err[256] = {0};
-#if !defined(_WIN32)
-    /* TCP preflight first — bogus port / unreachable host fails in
-       ~3s instead of waiting through the full libssh timeout. */
-    if (!ssh_form_tcp_check(g_form.host, port, 3000, err, sizeof(err))) {
-        g_form_status[0] = 0;
-        strncpy(g_form.error, err[0] ? err : "host unreachable",
+#ifdef RBTERM_SSH
+    /* Kick the test on a worker so the form doesn't beachball the
+       UI for up to ~13 s on an unreachable host (3 s TCP probe + 10 s
+       libssh timeout). bg_ssh_integrate() lands the result in
+       g_form_status / g_form.error on a future frame. */
+    if (bg_test_auth_busy()) {
+        return;  /* Already in flight — Test re-clicks are no-ops. */
+    }
+    if (!bg_test_auth_kick(cols, rows)) {
+        strncpy(g_form.error, "couldn't start test thread",
                 sizeof(g_form.error) - 1);
         g_form.error[sizeof(g_form.error) - 1] = 0;
         return;
     }
-#endif
+    int port = atoi(g_form.port); if (port <= 0) port = 22;
+    g_form.error[0] = 0;
+    snprintf(g_form_status, sizeof(g_form_status),
+             "Testing %s@%s:%d ...",
+             g_form.user[0] ? g_form.user : "(default)",
+             g_form.host, port);
+#else
+    /* Stub build — synchronous path returns instantly (no real SSH). */
+    char err[256] = {0};
+    int port = atoi(g_form.port); if (port <= 0) port = 22;
     Pty *p = pty_open_ssh(
         g_form.user[0] ? g_form.user : NULL,
-        g_form.host,
-        port,
+        g_form.host, port,
         g_form.pass[0] ? g_form.pass : NULL,
         g_form.key[0]  ? g_form.key  : NULL,
         cols, rows, err, sizeof(err));
@@ -7562,6 +9117,7 @@ static void ssh_form_test_auth(int cols, int rows) {
                 sizeof(g_form.error) - 1);
         g_form.error[sizeof(g_form.error) - 1] = 0;
     }
+#endif
 #endif
 }
 
@@ -9732,13 +11288,14 @@ typedef enum {
     SETTINGS_TAB_THEME      = 1,
     SETTINGS_TAB_CURSOR     = 2,
     SETTINGS_TAB_EFFECTS    = 3,
-    SETTINGS_TAB_SESSION    = 4,
+    SETTINGS_TAB_SESSION    = 4,    /* legacy "Session" — labelled "Logging" */
     SETTINGS_TAB_WINDOW     = 5,
     SETTINGS_TAB_RECORDING  = 6,
     SETTINGS_TAB_HUD        = 7,
     SETTINGS_TAB_LAUNCH     = 8,
     SETTINGS_TAB_KEYS       = 9,
-    SETTINGS_TAB_COUNT      = 10,
+    SETTINGS_TAB_SESSIONS   = 10,   /* multi-host split sessions (designer + list) */
+    SETTINGS_TAB_COUNT      = 11,
 } SettingsTab;
 static int g_settings_tab = SETTINGS_TAB_FONT;
 
@@ -9753,6 +11310,10 @@ static void settings_open(Renderer *r) {
        first open. Cheap — disk scan of ~/.ssh and a popen per
        .pub for the fingerprint. */
     ssh_keys_rescan();
+    /* Sessions list — load lazily on each Settings open so hand-
+       edits to ~/.config/rbterm/sessions.ini show up without
+       restarting rbterm. */
+    sessions_load();
     /* Reset Keys-tab modal state so a previously-open delete
        confirm doesn't reappear on the next open. */
     g_keys_delete_idx = -1;
@@ -9862,6 +11423,13 @@ typedef struct {
     Rect efx_set_phos[PHOSPHOR_COUNT];
     Rect efx_set_preset[EFX_PRESET_COUNT];
     Rect efx_set_reset;
+    /* Sessions tab — list with [Open][Edit][×] per row + a "+ New
+       session" button at top. Up to SESSIONS_MAX rows. */
+    Rect sess_new_btn;
+    Rect sess_row[SESSIONS_MAX];
+    Rect sess_open[SESSIONS_MAX];
+    Rect sess_edit[SESSIONS_MAX];
+    Rect sess_del[SESSIONS_MAX];
     Rect save_default; /* write current state to ~/.config/rbterm/config.ini */
     Rect close;
 } SettingsLayout;
@@ -10632,6 +12200,34 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         int add_w = (field_w_total - gap) / 2;
         L.launch_add_local = (Rect){ field_x,             row_y, add_w, row_h };
         L.launch_add_ssh   = (Rect){ field_x + add_w + gap, row_y, add_w, row_h };
+    } else if (g_settings_tab == SETTINGS_TAB_SESSIONS) {
+        /* Row per saved session: name + [Open] [Edit] [×]; "+ New
+           session" sits above the list. The designer modal handles
+           create/edit, this tab is just a dispatch surface. */
+        int row_y = content_y;
+        int row_h = btn;
+        int gap = 6;
+        int field_x = L.modal.x + 22;
+        int field_w_total = w - 22 - 22;
+        int btn_open = 70, btn_edit = 60, btn_del = 32;
+        int name_w = field_w_total - btn_open - btn_edit - btn_del - 3 * gap;
+        L.sess_new_btn = (Rect){ field_x, row_y, 200, row_h };
+        row_y += row_h + 12;
+        for (int i = 0; i < SESSIONS_MAX; i++) {
+            if (i < g_sessions_count) {
+                int x = field_x;
+                L.sess_row [i] = (Rect){ x, row_y, name_w,  row_h }; x += name_w  + gap;
+                L.sess_open[i] = (Rect){ x, row_y, btn_open, row_h }; x += btn_open + gap;
+                L.sess_edit[i] = (Rect){ x, row_y, btn_edit, row_h }; x += btn_edit + gap;
+                L.sess_del [i] = (Rect){ x, row_y, btn_del,  row_h };
+                row_y += row_h + 4;
+            } else {
+                L.sess_row [i] = (Rect){0,0,0,0};
+                L.sess_open[i] = (Rect){0,0,0,0};
+                L.sess_edit[i] = (Rect){0,0,0,0};
+                L.sess_del [i] = (Rect){0,0,0,0};
+            }
+        }
     }
 
     return L;
@@ -11094,9 +12690,29 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 return;
             }
             if (rect_hit(L.keygen_ok, mx, my)) {
-                char err[256] = {0};
                 const char *type_name =
                     (g_keygen_form.type_idx == 1) ? "rsa" : "ed25519";
+#ifdef RBTERM_SSH
+                /* RSA-4096 generation is CPU-bound for a few seconds
+                   on slow hardware — kick a worker so the modal can
+                   keep redrawing with a "Generating..." status. */
+                if (bg_key_generate_busy()) {
+                    snprintf(g_keygen_form.status,
+                             sizeof(g_keygen_form.status),
+                             "Generation already in progress");
+                } else if (!bg_key_generate_kick(type_name,
+                                                  g_keygen_form.name,
+                                                  g_keygen_form.pass)) {
+                    snprintf(g_keygen_form.status,
+                             sizeof(g_keygen_form.status),
+                             "Couldn't start generate thread");
+                } else {
+                    snprintf(g_keygen_form.status,
+                             sizeof(g_keygen_form.status),
+                             "Generating %s key ...", type_name);
+                }
+#else
+                char err[256] = {0};
                 bool ok = ssh_keys_generate_native(
                     type_name, g_keygen_form.name,
                     g_keygen_form.pass, err, sizeof(err));
@@ -11110,6 +12726,7 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                              sizeof(g_keygen_form.status),
                              "%s", err[0] ? err : "generate failed");
                 }
+#endif
                 return;
             }
             /* Click outside the sub-modal closes it. */
@@ -11136,6 +12753,27 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                     char pubtext[8192];
                     if (ssh_keys_read_pubfile(g_ssh_keys[ki].pubpath,
                                                pubtext, sizeof(pubtext))) {
+#ifdef RBTERM_SSH
+                        /* Async — install runs full libssh connect +
+                           auth + exec on a worker thread. UI shows
+                           "Installing..." while in flight; the result
+                           lands in g_keys_status via bg_ssh_integrate. */
+                        if (bg_key_install_busy()) {
+                            snprintf(g_keys_status, sizeof(g_keys_status),
+                                     "Install already in progress");
+                        } else if (!bg_key_install_kick(
+                                       &g_ssh_profiles[rel], pubtext,
+                                       g_ssh_keys[ki].name,
+                                       g_ssh_profiles[rel].name)) {
+                            snprintf(g_keys_status, sizeof(g_keys_status),
+                                     "Couldn't start install thread");
+                        } else {
+                            snprintf(g_keys_status, sizeof(g_keys_status),
+                                     "Installing %s on %s ...",
+                                     g_ssh_keys[ki].name,
+                                     g_ssh_profiles[rel].name);
+                        }
+#else
                         char err[256] = {0};
                         bool ok = ssh_keys_install_native(
                             &g_ssh_profiles[rel], pubtext,
@@ -11152,6 +12790,7 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                                      g_ssh_profiles[rel].name,
                                      err[0] ? err : "install failed");
                         }
+#endif
                     } else {
                         snprintf(g_keys_status, sizeof(g_keys_status),
                                  "Couldn't read %s", g_ssh_keys[ki].pubpath);
@@ -11189,6 +12828,41 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             return;
         }
     }
+    /* Sessions tab — list with [Open][Edit][×] per row + a "+ New
+       session" button. The designer modal handles create/edit; this
+       tab is just the dispatch surface. */
+    if (g_settings_tab == SETTINGS_TAB_SESSIONS) {
+        if (rect_hit(L.sess_new_btn, mx, my)) {
+            g_ui_mode = UI_NORMAL;             /* close Settings */
+            session_designer_open_for(-1);
+            return;
+        }
+        for (int i = 0; i < g_sessions_count; i++) {
+            if (rect_hit(L.sess_open[i], mx, my)) {
+                int win_w = GetScreenWidth();
+                int win_h = GetScreenHeight();
+                int derive_cols = (win_w - 2 * r->pad_x) / r->cell_w;
+                int derive_rows = (win_h - TAB_BAR_H - 2 * r->pad_y) / r->cell_h;
+                if (derive_cols < 20) derive_cols = 20;
+                if (derive_rows < 5)  derive_rows = 5;
+                g_ui_mode = UI_NORMAL;
+                tab_open_from_session(&g_sessions[i], derive_cols, derive_rows);
+                return;
+            }
+            if (rect_hit(L.sess_edit[i], mx, my)) {
+                g_ui_mode = UI_NORMAL;
+                session_designer_open_for(i);
+                return;
+            }
+            if (rect_hit(L.sess_del[i], mx, my)) {
+                sessions_remove(i);
+                sessions_save();
+                return;
+            }
+        }
+        return;
+    }
+
     /* Launch tab — add / delete entries, toggle kind, open the
        saved-host dropdown for SSH rows, pick from it. */
     if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
@@ -11199,7 +12873,11 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             int i = g_settings_launch_dropdown;
             Rect hb = L.launch_host[i];
             int row_h = 22;
-            int n = g_ssh_profile_count;
+            /* Pick the source list based on this row's kind so SSH
+               rows show saved hosts and Session rows show saved
+               sessions. */
+            bool is_session = (g_app_settings.launch[i].kind == LAUNCH_KIND_SESSION);
+            int n = is_session ? g_sessions_count : g_ssh_profile_count;
             int dh = n * row_h;
             int max_dh = 220;
             if (dh > max_dh) dh = max_dh;
@@ -11207,9 +12885,12 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
             if (rect_hit(dd, mx, my)) {
                 int rel = (my - dd.y) / row_h + g_settings_launch_scroll;
                 if (rel >= 0 && rel < n) {
+                    const char *pick = is_session
+                                          ? g_sessions[rel].name
+                                          : g_ssh_profiles[rel].name;
                     snprintf(g_app_settings.launch[i].host,
                              sizeof(g_app_settings.launch[i].host),
-                             "%s", g_ssh_profiles[rel].name);
+                             "%s", pick);
                     g_settings_launch_dropdown = -1;
                 }
                 return;
@@ -11321,21 +13002,32 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                 return;
             }
             if (rect_hit(L.launch_kind[i], mx, my)) {
-                g_app_settings.launch[i].kind = !g_app_settings.launch[i].kind;
-                if (g_app_settings.launch[i].kind == 0) {
+                /* Cycle through the three kinds: local → ssh →
+                   session → local. Resets the host field whenever
+                   we leave a non-local kind so the row doesn't
+                   carry stale ssh aliases into a session entry. */
+                int next = (g_app_settings.launch[i].kind + 1) % 3;
+                g_app_settings.launch[i].kind = next;
+                if (next == LAUNCH_KIND_LOCAL)
                     g_app_settings.launch[i].host[0] = 0;
-                }
                 g_settings_launch_dropdown = -1;
                 return;
             }
             if (rect_hit(L.launch_host[i], mx, my)) {
-                if (g_app_settings.launch[i].kind != 1) return;
-                /* Open the saved-hosts list for this row. Refresh
-                   the cached profile list so newly-added hosts
-                   show up without restarting Settings. */
-                ssh_profiles_load();
-                g_settings_launch_dropdown = i;
-                g_settings_launch_scroll = 0;
+                int kind = g_app_settings.launch[i].kind;
+                if (kind == LAUNCH_KIND_SSH) {
+                    /* Open the saved-hosts list for this row. */
+                    ssh_profiles_load();
+                    g_settings_launch_dropdown = i;
+                    g_settings_launch_scroll = 0;
+                } else if (kind == LAUNCH_KIND_SESSION) {
+                    /* Open the saved-sessions list for this row.
+                       The dropdown is rendered by the same path —
+                       drawn by index, picked from g_sessions. */
+                    sessions_load();
+                    g_settings_launch_dropdown = i;
+                    g_settings_launch_scroll = 0;
+                }
                 return;
             }
         }
@@ -11460,9 +13152,26 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
             g_keygen_form.sel_all = false;
         }
         if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-            char err[256] = {0};
             const char *type_name =
                 (g_keygen_form.type_idx == 1) ? "rsa" : "ed25519";
+#ifdef RBTERM_SSH
+            if (bg_key_generate_busy()) {
+                snprintf(g_keygen_form.status,
+                         sizeof(g_keygen_form.status),
+                         "Generation already in progress");
+            } else if (!bg_key_generate_kick(type_name,
+                                              g_keygen_form.name,
+                                              g_keygen_form.pass)) {
+                snprintf(g_keygen_form.status,
+                         sizeof(g_keygen_form.status),
+                         "Couldn't start generate thread");
+            } else {
+                snprintf(g_keygen_form.status,
+                         sizeof(g_keygen_form.status),
+                         "Generating %s key ...", type_name);
+            }
+#else
+            char err[256] = {0};
             bool ok = ssh_keys_generate_native(
                 type_name, g_keygen_form.name,
                 g_keygen_form.pass, err, sizeof(err));
@@ -11476,6 +13185,7 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
                          sizeof(g_keygen_form.status),
                          "%s", err[0] ? err : "generate failed");
             }
+#endif
             return;
         }
         int cp;
@@ -13061,8 +14771,8 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     /* Tab bar. Active tab gets an accent fill; others sit dim. */
     {
         const char *labels[SETTINGS_TAB_COUNT] = {
-            "Font", "Theme", "Cursor", "Effects", "Session", "Window",
-            "Recording", "HUD", "Launch", "Keys"
+            "Font", "Theme", "Cursor", "Effects", "Logging", "Window",
+            "Recording", "HUD", "Launch", "Keys", "Sessions"
         };
         for (int i = 0; i < SETTINGS_TAB_COUNT; i++) {
             Rect tr = L.tab[i];
@@ -13838,6 +15548,67 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                    12, 0, (Color){140, 150, 170, 255});
     }  /* end HUD tab */
 
+    if (g_settings_tab == SETTINGS_TAB_SESSIONS) {
+        int cap_y = L.sess_new_btn.y - 22;
+        DrawTextEx(*f, "Saved sessions",
+                   (Vector2){L.modal.x + 22, cap_y},
+                   14, 0, (Color){200, 205, 220, 255});
+        /* New-session button. */
+        Rect nb = L.sess_new_btn;
+        DrawRectangle(nb.x, nb.y, nb.w, nb.h, (Color){46, 92, 150, 255});
+        DrawRectangleLines(nb.x, nb.y, nb.w, nb.h, (Color){125, 207, 255, 255});
+        const char *nbl = "+ New session  (Cmd+Shift+P)";
+        Vector2 nsz = MeasureTextEx(*f, nbl, 13, 0);
+        DrawTextEx(*f, nbl,
+                   (Vector2){nb.x + (nb.w - nsz.x) / 2,
+                             nb.y + (nb.h - nsz.y) / 2},
+                   13, 0, (Color){230, 240, 255, 255});
+        /* Per-row layout. */
+        for (int i = 0; i < g_sessions_count; i++) {
+            Rect rb = L.sess_row[i];
+            Rect ob = L.sess_open[i];
+            Rect eb = L.sess_edit[i];
+            Rect xb = L.sess_del[i];
+            DrawRectangle(rb.x, rb.y, rb.w, rb.h, (Color){22, 25, 34, 255});
+            DrawRectangleLines(rb.x, rb.y, rb.w, rb.h, (Color){70, 74, 90, 255});
+            DrawTextEx(*f, g_sessions[i].name,
+                       (Vector2){rb.x + 10, rb.y + 7},
+                       13, 0, (Color){230, 232, 240, 255});
+            int n = session_count_leaves(g_sessions[i].root);
+            char meta[32];
+            snprintf(meta, sizeof(meta), "%d pane%s", n, n == 1 ? "" : "s");
+            Vector2 msz = MeasureTextEx(*f, meta, 11, 0);
+            DrawTextEx(*f, meta,
+                       (Vector2){rb.x + rb.w - msz.x - 10, rb.y + 9},
+                       11, 0, (Color){140, 145, 160, 255});
+            /* Open / Edit / Delete buttons. */
+            DrawRectangle(ob.x, ob.y, ob.w, ob.h, (Color){46, 92, 150, 255});
+            DrawRectangleLines(ob.x, ob.y, ob.w, ob.h, (Color){125, 207, 255, 220});
+            DrawTextEx(*f, "Open",
+                       (Vector2){ob.x + (ob.w - MeasureText("Open", 13)) / 2.0f,
+                                 ob.y + (ob.h - 13) / 2.0f},
+                       13, 0, (Color){230, 240, 255, 255});
+            DrawRectangle(eb.x, eb.y, eb.w, eb.h, (Color){48, 52, 66, 255});
+            DrawRectangleLines(eb.x, eb.y, eb.w, eb.h, (Color){150, 155, 170, 200});
+            DrawTextEx(*f, "Edit",
+                       (Vector2){eb.x + (eb.w - MeasureText("Edit", 13)) / 2.0f,
+                                 eb.y + (eb.h - 13) / 2.0f},
+                       13, 0, (Color){210, 215, 230, 255});
+            DrawRectangle(xb.x, xb.y, xb.w, xb.h, (Color){62, 30, 32, 255});
+            DrawRectangleLines(xb.x, xb.y, xb.w, xb.h, (Color){200, 80, 80, 220});
+            DrawTextEx(*f, "×",
+                       (Vector2){xb.x + (xb.w - MeasureText("×", 16)) / 2.0f,
+                                 xb.y + (xb.h - 16) / 2.0f},
+                       16, 0, (Color){240, 200, 200, 255});
+        }
+        if (g_sessions_count == 0) {
+            DrawTextEx(*f,
+                       "No saved sessions yet. Click + New session to design one.",
+                       (Vector2){L.modal.x + 22, L.sess_new_btn.y + 50},
+                       12, 0, (Color){140, 145, 160, 255});
+        }
+    }
+
     if (g_settings_tab == SETTINGS_TAB_LAUNCH) {
         /* Caption anchored just above the first row so it doesn't
            collide with the row pills (which sit at content_top).
@@ -13863,43 +15634,62 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
             Rect kb = L.launch_kind[i];
             Rect hb = L.launch_host[i];
             Rect xb = L.launch_del[i];
-            bool is_ssh = (g_app_settings.launch[i].kind == 1);
+            int kind = g_app_settings.launch[i].kind;
+            bool is_ssh     = (kind == LAUNCH_KIND_SSH);
+            bool is_session = (kind == LAUNCH_KIND_SESSION);
+            bool needs_pick = is_ssh || is_session;
 
-            /* Kind pill — Local (grey) vs SSH (cyan). */
-            Color kbg   = is_ssh ? (Color){46, 92, 150, 255} : (Color){48, 52, 66, 255};
-            Color kline = is_ssh ? (Color){125, 207, 255, 220} : (Color){150, 155, 170, 200};
+            /* Kind pill — Local (grey) / SSH (cyan) / Session
+               (purple) so the colour reads as a kind cue at a
+               glance. */
+            Color kbg, kline;
+            if (is_session) {
+                kbg   = (Color){82, 50, 122, 255};
+                kline = (Color){180, 130, 230, 220};
+            } else if (is_ssh) {
+                kbg   = (Color){46, 92, 150, 255};
+                kline = (Color){125, 207, 255, 220};
+            } else {
+                kbg   = (Color){48, 52, 66, 255};
+                kline = (Color){150, 155, 170, 200};
+            }
             DrawRectangle(kb.x, kb.y, kb.w, kb.h, kbg);
             DrawRectangleLines(kb.x, kb.y, kb.w, kb.h, kline);
-            const char *klbl = is_ssh ? "SSH" : "Local";
+            const char *klbl = is_session ? "Session" : (is_ssh ? "SSH" : "Local");
             Vector2 ksz = MeasureTextEx(*f, klbl, 13, 0);
             DrawTextEx(*f, klbl,
                        (Vector2){kb.x + (kb.w - ksz.x) / 2,
                                  kb.y + (kb.h - ksz.y) / 2},
                        13, 0, (Color){230, 232, 240, 255});
 
-            /* Host picker — for SSH rows it's a click-to-open
-               dropdown of saved hosts; for Local rows it's just a
-               disabled label. */
+            /* Host picker — for SSH/Session rows it's a click-to-open
+               dropdown; for Local it's a disabled label. */
             DrawRectangle(hb.x, hb.y, hb.w, hb.h, (Color){22, 25, 34, 255});
-            bool dd_open = (g_settings_launch_dropdown == i && is_ssh);
+            bool dd_open = (g_settings_launch_dropdown == i && needs_pick);
             DrawRectangleLines(hb.x, hb.y, hb.w, hb.h,
                                dd_open ? (Color){125, 207, 255, 255}
                                        : (Color){70, 74, 90, 255});
             BeginScissorMode(hb.x + 6, hb.y, hb.w - 12, hb.h);
-            const char *htext = is_ssh
-                ? (g_app_settings.launch[i].host[0]
+            const char *htext;
+            if (is_session) {
+                htext = g_app_settings.launch[i].host[0]
                     ? g_app_settings.launch[i].host
-                    : "(click to choose a saved host)")
-                : "(default shell — no remote host)";
-            Color htcol = (is_ssh && g_app_settings.launch[i].host[0])
+                    : "(click to choose a saved session)";
+            } else if (is_ssh) {
+                htext = g_app_settings.launch[i].host[0]
+                    ? g_app_settings.launch[i].host
+                    : "(click to choose a saved host)";
+            } else {
+                htext = "(default shell — no remote host)";
+            }
+            Color htcol = (needs_pick && g_app_settings.launch[i].host[0])
                            ? (Color){230, 232, 240, 255}
                            : (Color){110, 115, 130, 255};
             DrawTextEx(*f, htext, (Vector2){hb.x + 8, hb.y + 7},
                        14, 0, htcol);
             EndScissorMode();
-            /* Chevron on the right edge for SSH rows so users
-               recognise it as a picker. */
-            if (is_ssh) {
+            /* Chevron on the right edge for picker rows. */
+            if (needs_pick) {
                 float cx = hb.x + hb.w - 14, cy = hb.y + hb.h / 2;
                 Color ch = (Color){180, 195, 220, 220};
                 DrawLineEx((Vector2){cx - 4, cy - 2},
@@ -13995,47 +15785,59 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         }
 
         /* Dropdown panel — drawn last so it overlays the rows
-           below it. Only one is open at a time. */
+           below it. Only one is open at a time; sources from
+           g_ssh_profiles[] for SSH rows, g_sessions[] for Session
+           rows. */
         if (g_settings_launch_dropdown >= 0 &&
-            g_settings_launch_dropdown < g_app_settings.launch_count &&
-            g_app_settings.launch[g_settings_launch_dropdown].kind == 1) {
+            g_settings_launch_dropdown < g_app_settings.launch_count) {
             int i = g_settings_launch_dropdown;
-            Rect hb = L.launch_host[i];
-            int row_h = 22;
-            int n = g_ssh_profile_count;
-            int dh = n * row_h;
-            int max_dh = 220;
-            if (dh > max_dh) dh = max_dh;
-            Rect dd = (Rect){ hb.x, hb.y + hb.h, hb.w, dh };
-            DrawRectangle(dd.x, dd.y, dd.w, dd.h, (Color){22, 25, 34, 255});
-            DrawRectangleLines(dd.x, dd.y, dd.w, dd.h, (Color){125, 207, 255, 220});
-            BeginScissorMode(dd.x + 1, dd.y + 1, dd.w - 2, dd.h - 2);
-            int visible = dd.h / row_h;
-            int max_scroll = n - visible;
-            if (max_scroll < 0) max_scroll = 0;
-            if (g_settings_launch_scroll > max_scroll)
-                g_settings_launch_scroll = max_scroll;
-            for (int k = 0; k < n; k++) {
-                int ry = dd.y + (k - g_settings_launch_scroll) * row_h;
-                if (ry + row_h < dd.y || ry > dd.y + dd.h) continue;
-                bool current = (strcmp(g_ssh_profiles[k].name,
-                                       g_app_settings.launch[i].host) == 0);
-                if (current) {
-                    DrawRectangle(dd.x + 2, ry, dd.w - 4, row_h,
-                                  (Color){46, 62, 90, 220});
+            int kind = g_app_settings.launch[i].kind;
+            if (kind == LAUNCH_KIND_SSH || kind == LAUNCH_KIND_SESSION) {
+                Rect hb = L.launch_host[i];
+                int row_h = 22;
+                bool is_session = (kind == LAUNCH_KIND_SESSION);
+                int n = is_session ? g_sessions_count : g_ssh_profile_count;
+                int dh = n * row_h;
+                int max_dh = 220;
+                if (dh > max_dh) dh = max_dh;
+                if (n == 0) dh = row_h;   /* leave room for the empty hint */
+                Rect dd = (Rect){ hb.x, hb.y + hb.h, hb.w, dh };
+                DrawRectangle(dd.x, dd.y, dd.w, dd.h, (Color){22, 25, 34, 255});
+                DrawRectangleLines(dd.x, dd.y, dd.w, dd.h, (Color){125, 207, 255, 220});
+                BeginScissorMode(dd.x + 1, dd.y + 1, dd.w - 2, dd.h - 2);
+                int visible = dd.h / row_h;
+                int max_scroll = n - visible;
+                if (max_scroll < 0) max_scroll = 0;
+                if (g_settings_launch_scroll > max_scroll)
+                    g_settings_launch_scroll = max_scroll;
+                for (int k = 0; k < n; k++) {
+                    int ry = dd.y + (k - g_settings_launch_scroll) * row_h;
+                    if (ry + row_h < dd.y || ry > dd.y + dd.h) continue;
+                    const char *name = is_session
+                                          ? g_sessions[k].name
+                                          : g_ssh_profiles[k].name;
+                    bool current = (strcmp(name,
+                                           g_app_settings.launch[i].host) == 0);
+                    if (current) {
+                        DrawRectangle(dd.x + 2, ry, dd.w - 4, row_h,
+                                      (Color){46, 62, 90, 220});
+                    }
+                    DrawTextEx(*f, name,
+                               (Vector2){dd.x + 10, ry + 4},
+                               13, 0,
+                               current ? (Color){230, 232, 240, 255}
+                                       : (Color){200, 205, 220, 255});
                 }
-                DrawTextEx(*f, g_ssh_profiles[k].name,
-                           (Vector2){dd.x + 10, ry + 4},
-                           13, 0,
-                           current ? (Color){230, 232, 240, 255}
-                                   : (Color){200, 205, 220, 255});
+                if (n == 0) {
+                    DrawTextEx(*f,
+                               is_session
+                                   ? "(no saved sessions yet)"
+                                   : "(no saved hosts in ~/.ssh/config)",
+                               (Vector2){dd.x + 10, dd.y + 6},
+                               12, 0, (Color){140, 145, 160, 255});
+                }
+                EndScissorMode();
             }
-            if (n == 0) {
-                DrawTextEx(*f, "(no saved hosts in ~/.ssh/config)",
-                           (Vector2){dd.x + 10, dd.y + 6},
-                           12, 0, (Color){140, 145, 160, 255});
-            }
-            EndScissorMode();
         }
     }
 
@@ -14468,13 +16270,314 @@ static void *ssh_launch_worker_run(void *arg) {
         w->user[0] ? w->user : NULL,
         w->host,
         w->port,
-        NULL,                                  /* password */
+        w->password[0] ? w->password : NULL,
         w->keyfile[0] ? w->keyfile : NULL,
         w->cols, w->rows,
         err, sizeof(err));
     if (!w->pty) snprintf(w->err, sizeof(w->err), "%s", err);
+    /* Scrub the password copy as soon as the connect attempt finishes
+       — auth has already happened (or failed) by this point and we
+       don't want it sitting in worker memory until integration. */
+    memset(w->password, 0, sizeof(w->password));
     __atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
     return NULL;
+}
+
+/* Find or recycle a worker slot. Connects from the SSH form / [+]
+   menu can stack across a long session; reusing fully-integrated
+   slots keeps the bounded array from filling up. Returns NULL if
+   every slot is still in flight (LAUNCH_WORKERS_MAX simultaneously
+   pending — practically never). */
+static SshLaunchWorker *ssh_launch_alloc_slot(void) {
+    for (int i = 0; i < g_launch_workers_count; i++) {
+        SshLaunchWorker *w = &g_launch_workers[i];
+        if (!w->started || w->integrated) {
+            memset(w, 0, sizeof(*w));
+            return w;
+        }
+    }
+    if (g_launch_workers_count >= LAUNCH_WORKERS_MAX) return NULL;
+    SshLaunchWorker *w = &g_launch_workers[g_launch_workers_count++];
+    memset(w, 0, sizeof(*w));
+    return w;
+}
+
+/* Kick an SSH connect on a worker thread. Spawns a placeholder Tab
+   immediately ("Connecting to ...") and pthread_creates the worker.
+   The integration block in main() picks up the result on a future
+   frame and either runs tab_attach_ssh_finalize (success) or paints
+   the failure banner. Returns false if no slot was available or the
+   thread failed to start; in that case no Tab is created and the
+   caller should fall back / report. */
+static bool ssh_launch_kick(const SshProfile *prof, const char *alias,
+                            const char *password, bool is_active,
+                            int cols, int rows) {
+    SshLaunchWorker *w = ssh_launch_alloc_slot();
+    if (!w) return false;
+    if (alias) strncpy(w->alias, alias, sizeof(w->alias) - 1);
+    w->is_active = is_active;
+    w->cols = cols;
+    w->rows = rows;
+    if (prof) {
+        w->prof = *prof;
+        w->prof_valid = true;
+        if (prof->user[0])
+            strncpy(w->user, prof->user, sizeof(w->user) - 1);
+        const char *host = prof->hostname[0] ? prof->hostname
+                                             : (alias ? alias : "");
+        strncpy(w->host, host, sizeof(w->host) - 1);
+        w->port = prof->port > 0 ? prof->port : 22;
+        if (prof->identity[0])
+            strncpy(w->keyfile, prof->identity, sizeof(w->keyfile) - 1);
+    } else if (alias) {
+        strncpy(w->host, alias, sizeof(w->host) - 1);
+        w->port = 22;
+    }
+    if (password && *password)
+        strncpy(w->password, password, sizeof(w->password) - 1);
+    w->placeholder = tab_open_ssh_placeholder(prof, alias, is_active,
+                                              cols, rows);
+    w->started = 1;
+    if (pthread_create(&w->th, NULL, ssh_launch_worker_run, w) != 0) {
+        /* Thread spawn failed — recycle the slot. The placeholder
+           Tab is left in place with its banner; it'll just never
+           transition (rare; treat as best-effort). */
+        memset(w->password, 0, sizeof(w->password));
+        w->started = 0;
+        w->integrated = 1;
+        return false;
+    }
+    return true;
+}
+
+/* ---------- Background SSH ops ---------- */
+
+/* Test Auth (SSH form's Test button). Runs ssh_form_tcp_check then
+   pty_open_ssh on a worker; integration writes the result into the
+   form's status / error line. */
+typedef struct {
+    pthread_t    th;
+    int          started;
+    volatile int done;
+    int          integrated;
+    char user[96];
+    char host[256];
+    char keyfile[PATH_MAX];
+    char password[256];
+    int  port;
+    int  cols, rows;
+    bool ok;
+    char msg[256];
+} BgTestAuth;
+static BgTestAuth g_bg_test_auth;
+
+/* Key Install (Settings → Keys row → Install dropdown pick). Runs
+   ssh_keys_install_native on a worker; integration writes a one-
+   line status into g_keys_status. */
+typedef struct {
+    pthread_t    th;
+    int          started;
+    volatile int done;
+    int          integrated;
+    SshProfile   prof;
+    char         pubkey[8192];
+    char         key_label[128];
+    char         host_label[128];
+    bool         ok;
+    char         msg[256];
+} BgKeyInstall;
+static BgKeyInstall g_bg_key_install;
+
+/* Key Generate (keygen sub-modal). Runs ssh_keys_generate_native
+   on a worker; integration rescans ~/.ssh and either closes the
+   sub-modal (success) or fills its status line (failure). RSA-4096
+   takes a few seconds CPU-bound, so the worker matters even though
+   no network is involved. */
+typedef struct {
+    pthread_t    th;
+    int          started;
+    volatile int done;
+    int          integrated;
+    char         type_name[16];
+    char         file_stem[128];
+    char         passphrase[256];
+    bool         ok;
+    char         msg[256];
+} BgKeyGenerate;
+static BgKeyGenerate g_bg_key_generate;
+
+#define BG_BUSY(g) ((g).started && !(g).integrated)
+
+static bool bg_test_auth_busy(void)    { return BG_BUSY(g_bg_test_auth); }
+static bool bg_key_install_busy(void)  { return BG_BUSY(g_bg_key_install); }
+static bool bg_key_generate_busy(void) { return BG_BUSY(g_bg_key_generate); }
+
+static void *bg_test_auth_run(void *arg) {
+    BgTestAuth *t = arg;
+    char err[256] = {0};
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    /* TCP preflight: bogus port / unreachable host fails in ~3s
+       instead of waiting through the full libssh timeout. */
+    if (!ssh_form_tcp_check(t->host, t->port, 3000, err, sizeof(err))) {
+        t->ok = false;
+        snprintf(t->msg, sizeof(t->msg), "%s",
+                 err[0] ? err : "host unreachable");
+        memset(t->password, 0, sizeof(t->password));
+        __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+        return NULL;
+    }
+#endif
+    Pty *p = pty_open_ssh(
+        t->user[0] ? t->user : NULL,
+        t->host, t->port,
+        t->password[0] ? t->password : NULL,
+        t->keyfile[0] ? t->keyfile : NULL,
+        t->cols, t->rows, err, sizeof(err));
+    if (p) {
+        pty_close(p);
+        t->ok = true;
+        snprintf(t->msg, sizeof(t->msg),
+                 "Auth ok — %s@%s:%d",
+                 t->user[0] ? t->user : "(default)", t->host, t->port);
+    } else {
+        t->ok = false;
+        snprintf(t->msg, sizeof(t->msg), "%s",
+                 err[0] ? err : "auth failed");
+    }
+    memset(t->password, 0, sizeof(t->password));
+    __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void *bg_key_install_run(void *arg) {
+    BgKeyInstall *t = arg;
+    char err[256] = {0};
+    bool ok = ssh_keys_install_native(&t->prof, t->pubkey, err, sizeof(err));
+    t->ok = ok;
+    if (ok) {
+        snprintf(t->msg, sizeof(t->msg),
+                 "Installed %s on %s.", t->key_label, t->host_label);
+    } else {
+        snprintf(t->msg, sizeof(t->msg), "%s → %s: %s",
+                 t->key_label, t->host_label,
+                 err[0] ? err : "install failed");
+    }
+    memset(t->pubkey, 0, sizeof(t->pubkey));
+    __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void *bg_key_generate_run(void *arg) {
+    BgKeyGenerate *t = arg;
+    char err[256] = {0};
+    bool ok = ssh_keys_generate_native(t->type_name, t->file_stem,
+                                       t->passphrase, err, sizeof(err));
+    t->ok = ok;
+    snprintf(t->msg, sizeof(t->msg), "%s",
+             ok ? "" : (err[0] ? err : "generate failed"));
+    memset(t->passphrase, 0, sizeof(t->passphrase));
+    __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static bool bg_test_auth_kick(int cols, int rows) {
+    if (bg_test_auth_busy()) return false;
+    memset(&g_bg_test_auth, 0, sizeof(g_bg_test_auth));
+    if (g_form.user[0]) strncpy(g_bg_test_auth.user, g_form.user, sizeof(g_bg_test_auth.user) - 1);
+    strncpy(g_bg_test_auth.host, g_form.host, sizeof(g_bg_test_auth.host) - 1);
+    if (g_form.key[0])  strncpy(g_bg_test_auth.keyfile, g_form.key, sizeof(g_bg_test_auth.keyfile) - 1);
+    if (g_form.pass[0]) strncpy(g_bg_test_auth.password, g_form.pass, sizeof(g_bg_test_auth.password) - 1);
+    int port = atoi(g_form.port); if (port <= 0) port = 22;
+    g_bg_test_auth.port = port;
+    g_bg_test_auth.cols = cols;
+    g_bg_test_auth.rows = rows;
+    g_bg_test_auth.started = 1;
+    if (pthread_create(&g_bg_test_auth.th, NULL,
+                       bg_test_auth_run, &g_bg_test_auth) != 0) {
+        memset(&g_bg_test_auth, 0, sizeof(g_bg_test_auth));
+        return false;
+    }
+    return true;
+}
+
+static bool bg_key_install_kick(const SshProfile *prof,
+                                const char *pubkey,
+                                const char *key_label,
+                                const char *host_label) {
+    if (bg_key_install_busy()) return false;
+    memset(&g_bg_key_install, 0, sizeof(g_bg_key_install));
+    g_bg_key_install.prof = *prof;
+    if (pubkey)     strncpy(g_bg_key_install.pubkey, pubkey, sizeof(g_bg_key_install.pubkey) - 1);
+    if (key_label)  strncpy(g_bg_key_install.key_label, key_label, sizeof(g_bg_key_install.key_label) - 1);
+    if (host_label) strncpy(g_bg_key_install.host_label, host_label, sizeof(g_bg_key_install.host_label) - 1);
+    g_bg_key_install.started = 1;
+    if (pthread_create(&g_bg_key_install.th, NULL,
+                       bg_key_install_run, &g_bg_key_install) != 0) {
+        memset(&g_bg_key_install, 0, sizeof(g_bg_key_install));
+        return false;
+    }
+    return true;
+}
+
+static bool bg_key_generate_kick(const char *type_name,
+                                 const char *file_stem,
+                                 const char *passphrase) {
+    if (bg_key_generate_busy()) return false;
+    memset(&g_bg_key_generate, 0, sizeof(g_bg_key_generate));
+    if (type_name)  strncpy(g_bg_key_generate.type_name, type_name, sizeof(g_bg_key_generate.type_name) - 1);
+    if (file_stem)  strncpy(g_bg_key_generate.file_stem, file_stem, sizeof(g_bg_key_generate.file_stem) - 1);
+    if (passphrase) strncpy(g_bg_key_generate.passphrase, passphrase, sizeof(g_bg_key_generate.passphrase) - 1);
+    g_bg_key_generate.started = 1;
+    if (pthread_create(&g_bg_key_generate.th, NULL,
+                       bg_key_generate_run, &g_bg_key_generate) != 0) {
+        memset(&g_bg_key_generate, 0, sizeof(g_bg_key_generate));
+        return false;
+    }
+    return true;
+}
+
+static bool bg_ssh_integrate(void) {
+    bool any = false;
+    if (g_bg_test_auth.started && !g_bg_test_auth.integrated &&
+        __atomic_load_n(&g_bg_test_auth.done, __ATOMIC_ACQUIRE)) {
+        pthread_join(g_bg_test_auth.th, NULL);
+        g_bg_test_auth.integrated = 1;
+        if (g_bg_test_auth.ok) {
+            g_form.error[0] = 0;
+            strncpy(g_form_status, g_bg_test_auth.msg, sizeof(g_form_status) - 1);
+            g_form_status[sizeof(g_form_status) - 1] = 0;
+        } else {
+            g_form_status[0] = 0;
+            strncpy(g_form.error, g_bg_test_auth.msg, sizeof(g_form.error) - 1);
+            g_form.error[sizeof(g_form.error) - 1] = 0;
+        }
+        any = true;
+    }
+    if (g_bg_key_install.started && !g_bg_key_install.integrated &&
+        __atomic_load_n(&g_bg_key_install.done, __ATOMIC_ACQUIRE)) {
+        pthread_join(g_bg_key_install.th, NULL);
+        g_bg_key_install.integrated = 1;
+        strncpy(g_keys_status, g_bg_key_install.msg, sizeof(g_keys_status) - 1);
+        g_keys_status[sizeof(g_keys_status) - 1] = 0;
+        any = true;
+    }
+    if (g_bg_key_generate.started && !g_bg_key_generate.integrated &&
+        __atomic_load_n(&g_bg_key_generate.done, __ATOMIC_ACQUIRE)) {
+        pthread_join(g_bg_key_generate.th, NULL);
+        g_bg_key_generate.integrated = 1;
+        if (g_bg_key_generate.ok) {
+            snprintf(g_keys_status, sizeof(g_keys_status),
+                     "Generated %s.", g_bg_key_generate.file_stem);
+            ssh_keys_rescan();
+            memset(&g_keygen_form, 0, sizeof(g_keygen_form));
+        } else {
+            strncpy(g_keygen_form.status, g_bg_key_generate.msg,
+                    sizeof(g_keygen_form.status) - 1);
+            g_keygen_form.status[sizeof(g_keygen_form.status) - 1] = 0;
+        }
+        any = true;
+    }
+    return any;
 }
 #endif /* RBTERM_SSH */
 
@@ -14783,12 +16886,16 @@ int main(int argc, char **argv) {
         bool any = false;
         if (g_app_settings.launch_count > 0) {
             ssh_profiles_load();
-            /* Open locals up front (cheap — forkpty) and queue
-               SSH entries for after the first frame so the user
-               sees a window in <500 ms instead of waiting for
-               every libssh handshake (~1-2 s each). */
+            sessions_load();
+            /* Open locals up front (cheap — forkpty), queue SSH
+               entries for the parallel-connect drain after the
+               first frame, and instantiate session entries inline
+               (they're a mix of local + ssh and the open-from-
+               session path opens the locals fast and the ssh leaves
+               sequentially — async per-leaf parallel connect inside
+               a session is a known follow-up). */
             for (int i = 0; i < g_app_settings.launch_count; i++) {
-                if (g_app_settings.launch[i].kind == 1) {
+                if (g_app_settings.launch[i].kind == LAUNCH_KIND_SSH) {
                     if (g_launch_pending_count <
                         (int)(sizeof(g_launch_pending) / sizeof(g_launch_pending[0]))) {
                         int q = g_launch_pending_count++;
@@ -14802,6 +16909,25 @@ int main(int argc, char **argv) {
                        the tab; we don't want the fallback default
                        local pane to clutter the window. */
                     any = true;
+                } else if (g_app_settings.launch[i].kind == LAUNCH_KIND_SESSION) {
+                    int sidx = sessions_find_by_name(g_app_settings.launch[i].host);
+                    if (sidx >= 0) {
+                        Tab *t = tab_open_from_session(&g_sessions[sidx],
+                                                        init_cols, init_rows);
+                        if (t) {
+                            any = true;
+                            if (i == g_app_settings.launch_active)
+                                g_active = g_num_tabs - 1;
+                        } else {
+                            fprintf(stderr,
+                                    "rbterm: launch session '%s' failed\n",
+                                    g_app_settings.launch[i].host);
+                        }
+                    } else {
+                        fprintf(stderr,
+                                "rbterm: launch session '%s' not found\n",
+                                g_app_settings.launch[i].host);
+                    }
                 } else {
                     bool was_active = (i == g_app_settings.launch_active);
                     if (tab_open(init_cols, init_rows)) {
@@ -14855,6 +16981,10 @@ int main(int argc, char **argv) {
        move or shell write. */
     int prev_active = g_active;
     int prev_ui_mode = (int)g_ui_mode;
+    /* Active-leaf snapshot — covers the per-tab focus changes
+       (Cmd+K, Cmd+Opt+arrow, click-to-focus inside a split) that
+       prev_active alone would miss. */
+    PaneNode *prev_active_leaf = NULL;
 
     while (!WindowShouldClose() && g_num_tabs > 0) {
         bool dirty = false;
@@ -14960,11 +17090,23 @@ int main(int argc, char **argv) {
                 dirty = true;
                 continue;
             }
+            /* Placeholder may have been closed by the user before
+               the worker finished — release the just-opened Pty so
+               we don't leak the libssh session and the per-pty
+               threads it owns. */
+            if (!w->placeholder) {
+                pty_close(w->pty);
+                w->pty = NULL;
+                continue;
+            }
             const SshProfile *prof = w->prof_valid ? &w->prof : NULL;
             tab_attach_ssh_finalize(w->placeholder, w->pty, prof,
                                     w->cols, w->rows);
             dirty = true;
         }
+        /* Background SSH ops (Test Auth / Key Install / Key Generate)
+           — separate worker pool, separate visible status fields. */
+        if (bg_ssh_integrate()) dirty = true;
 #endif /* RBTERM_SSH */
 
         /* Whole-window content cell dims — still used by tab_open for
@@ -15193,7 +17335,20 @@ int main(int argc, char **argv) {
                             (int)mp.x, h.tab_idx, h.on_close, h.on_plus, h.on_ssh,
                             h.on_gear, h.on_help, h.on_split_v, h.on_split_h,
                             h.on_rec_start, h.on_rec_stop, h.on_upload, h.on_download);
-                if (h.on_plus) tab_open(content_cols, content_rows);
+                if (h.on_plus) {
+                    /* Defer the actual action: short release fires
+                       the legacy "open local tab" path; long hold
+                       surfaces the kind-picker menu instead. The
+                       press/release tracking happens further below
+                       so the rest of this if-cascade still gets a
+                       chance at other tab-bar buttons. Refresh the
+                       sessions list now so the menu shows current
+                       file contents when it pops. */
+                    sessions_load();
+                    g_plus_pressing = true;
+                    g_plus_press_at = GetTime();
+                    g_plus_menu_active = false;
+                }
                 else if (h.on_ssh) ssh_form_open();
                 else if (h.on_gear) settings_open(&r);
                 else if (h.on_help) {
@@ -15569,6 +17724,187 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* [+] long-press menu: click-to-open then click-to-pick.
+           - Hold the [+] button past PLUS_HOLD_MS → menu pops up.
+           - Release: if the menu has popped, it stays open. Quick
+             release (before threshold) opens a local tab.
+           - Hovering a primary row expands its submenu to the
+             right; releasing on a primary or hovering+clicking
+             keeps it open (so the user can pick).
+           - Click on a row (after release) fires its action and
+             dismisses. Click outside the menu dismisses without
+             firing. */
+        int menu_x = TAB_SSH_W;
+        int menu_y = TAB_BAR_H + 2;
+        int mxr = (int)mp.x, myr = (int)mp.y;
+
+        /* Threshold-based menu activation while the initial press
+           is still held. */
+        if (g_plus_pressing &&
+            !g_plus_menu_active &&
+            (GetTime() - g_plus_press_at) * 1000.0 > PLUS_HOLD_MS) {
+            g_plus_menu_active = true;
+            ssh_profiles_load();
+            sessions_load();
+            dirty = true;
+        }
+
+        /* Hover-driven submenu expansion runs every frame while the
+           menu is active (whether or not the button is held).
+
+           Sticky behavior: once a submenu is open, it stays open
+           until the user EITHER hovers a different primary that has
+           its own submenu (we swap), OR explicitly hovers the
+           Local-shell primary (no submenu — collapse is the right
+           outcome there). Mouse drifting through the 4px gap
+           between primary and submenu, or pausing on empty space
+           after triggering a submenu, no longer collapses it.
+           Outside-click still dismisses the entire menu. */
+        if (g_plus_menu_active) {
+            int hovered_primary = -1;
+            for (int k = 0; k < 3; k++) {
+                Rect ir = { menu_x, menu_y + k * PLUS_MENU_H,
+                            PLUS_MENU_W, PLUS_MENU_H };
+                if (rect_hit(ir, mxr, myr)) { hovered_primary = k; break; }
+            }
+            if (hovered_primary == PLUS_PRIMARY_SSH ||
+                hovered_primary == PLUS_PRIMARY_SESSION) {
+                if (g_plus_submenu != hovered_primary) {
+                    g_plus_submenu = hovered_primary;
+                    dirty = true;
+                }
+            } else if (hovered_primary == PLUS_PRIMARY_LOCAL) {
+                if (g_plus_submenu != -1) {
+                    g_plus_submenu = -1;
+                    dirty = true;
+                }
+            }
+            /* No "else" branch — empty space and the gap leave the
+               submenu state alone, so the user can drift between
+               panels without it disappearing. */
+        }
+
+        /* Initial-press release. Quick releases (no menu yet) fire
+           the legacy local-tab path; releases after the menu opened
+           leave it on screen so the user can navigate without
+           keeping the button held. */
+        if (g_plus_pressing && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            if (g_plus_menu_active) {
+                /* Menu stays up; nothing fires here. */
+            } else {
+                tab_open(content_cols, content_rows);
+                g_plus_menu_active = false;
+                g_plus_submenu = -1;
+            }
+            g_plus_pressing = false;
+            dirty = true;
+        }
+
+        /* After the initial press is released, subsequent clicks
+           inside the menu pick an item; clicks outside dismiss
+           without firing. We guard on !g_plus_pressing so the
+           initial press isn't double-handled (it's already
+           consumed by the release branch above). */
+        if (g_plus_menu_active && !g_plus_pressing &&
+            IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            int hit_primary = -1;
+            for (int k = 0; k < 3; k++) {
+                Rect ir = { menu_x, menu_y + k * PLUS_MENU_H,
+                            PLUS_MENU_W, PLUS_MENU_H };
+                if (rect_hit(ir, mxr, myr)) { hit_primary = k; break; }
+            }
+            int hit_sub = -1;
+            if (g_plus_submenu >= 0) {
+                int sub_count = (g_plus_submenu == PLUS_PRIMARY_SSH)
+                                   ? g_ssh_profile_count
+                                   : g_sessions_count;
+                int sub_y = menu_y + g_plus_submenu * PLUS_MENU_H;
+                for (int k = 0; k < sub_count; k++) {
+                    Rect ir = { menu_x + PLUS_MENU_W + 4,
+                                sub_y + k * PLUS_MENU_H,
+                                PLUS_SUBMENU_W, PLUS_MENU_H };
+                    if (rect_hit(ir, mxr, myr)) { hit_sub = k; break; }
+                }
+            }
+            bool fired = false;
+            if (hit_sub >= 0 && g_plus_submenu == PLUS_PRIMARY_SSH) {
+                const SshProfile *prof = &g_ssh_profiles[hit_sub];
+#ifdef RBTERM_SSH
+                /* Async kick — placeholder tab opens immediately,
+                   libssh handshakes off the main thread. An
+                   unreachable host will surface as a red banner
+                   inside the placeholder when the worker times
+                   out, instead of beachballing the UI. */
+                if (!ssh_launch_kick(prof, prof->name, NULL,
+                                     /* is_active */ true,
+                                     content_cols, content_rows)) {
+                    fprintf(stderr, "rbterm: ssh launch slots exhausted\n");
+                }
+#else
+                char err[256] = {0};
+                Tab *t = tab_open_ssh(
+                    prof->user[0]     ? prof->user     : NULL,
+                    prof->hostname[0] ? prof->hostname : prof->name,
+                    prof->port,
+                    NULL,
+                    prof->identity[0] ? prof->identity : NULL,
+                    prof->theme[0]    ? prof->theme    : NULL,
+                    prof->cursor_style,
+                    prof->font[0]     ? prof->font     : NULL,
+                    prof->font_size,
+                    prof->log_dir[0]  ? prof->log_dir  : NULL,
+                    prof->log_mode,
+                    prof->color[0]        ? prof->color        : NULL,
+                    prof->cursor_color[0] ? prof->cursor_color : NULL,
+                    prof->hud.override    ? &prof->hud         : NULL,
+                    prof->effects_override ? &prof->effects    : NULL,
+                    prof->init_cwd[0]     ? prof->init_cwd     : NULL,
+                    prof->init_cmd[0]     ? prof->init_cmd     : NULL,
+                    prof->layout[0]       ? prof->layout       : NULL,
+                    prof->layout[0]       ? prof->pane_cwds    : NULL,
+                    prof->layout[0]       ? prof->pane_cmds    : NULL,
+                    content_cols, content_rows,
+                    err, sizeof(err));
+                if (t) {
+                    strncpy(t->ssh_alias, prof->name,
+                            sizeof(t->ssh_alias) - 1);
+                    t->ssh_alias[sizeof(t->ssh_alias) - 1] = 0;
+                    if (prof->display_name[0]) {
+                        strncpy(t->tab_name, prof->display_name,
+                                sizeof(t->tab_name) - 1);
+                        t->tab_name[sizeof(t->tab_name) - 1] = 0;
+                    }
+                } else if (err[0]) {
+                    fprintf(stderr,
+                            "rbterm: ssh '%s' failed: %s\n",
+                            prof->name, err);
+                }
+#endif
+                fired = true;
+            } else if (hit_sub >= 0 &&
+                       g_plus_submenu == PLUS_PRIMARY_SESSION) {
+                tab_open_from_session(&g_sessions[hit_sub],
+                                      content_cols, content_rows);
+                fired = true;
+            } else if (hit_primary == PLUS_PRIMARY_LOCAL) {
+                tab_open(content_cols, content_rows);
+                fired = true;
+            } else if (hit_primary == PLUS_PRIMARY_SSH) {
+                ssh_form_open();
+                fired = true;
+            } else if (hit_primary == PLUS_PRIMARY_SESSION) {
+                settings_open(&r);
+                g_settings_tab = SETTINGS_TAB_SESSIONS;
+                fired = true;
+            }
+            /* Always dismiss after a click — the user picked or
+               aimed elsewhere; either way the menu's task is done. */
+            g_plus_menu_active = false;
+            g_plus_submenu = -1;
+            dirty = true;
+            (void)fired;
+        }
+
         /* Modal SSH form — swallow input until the user connects or cancels. */
         if (g_ui_mode == UI_SSH_FORM) {
             SshFormLayout L = ssh_form_layout(win_w_now, win_h_now);
@@ -15662,6 +17998,28 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Session-designer modal — visual builder for multi-host
+           split tabs. Saves to ~/.config/rbterm/sessions.ini and
+           optionally opens the new session as a Tab. */
+        if (g_ui_mode == UI_SESSION_DESIGNER) {
+            SessionDesignerLayout SL = session_designer_layout(win_w_now, win_h_now);
+            session_designer_handle_mouse(SL, content_cols, content_rows);
+            session_designer_handle_keys(content_cols, content_rows);
+            cur = active_tab();
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            if (cur) draw_tab_contents(&r, cur, win_w_now, win_h_now,
+                                       GetTime(), IsWindowFocused());
+            if (g_ui_mode == UI_SESSION_DESIGNER) {
+                /* Re-layout in case the window was resized. */
+                SL = session_designer_layout(win_w_now, win_h_now);
+                draw_session_designer(&r, win_w_now, win_h_now, SL);
+            }
+            EndDrawing();
+            continue;
+        }
+
         /* Save-recording modal. */
         if (g_ui_mode == UI_REC_SAVE) {
             RecSaveLayout RL = rec_save_layout(win_w_now, win_h_now);
@@ -15745,6 +18103,38 @@ int main(int argc, char **argv) {
                 Tab *_ct = active_tab();
                 Pane *_ap = _ct ? active_pane_of(_ct) : NULL;
                 if (_ap) search_open(_ap);
+            }
+            /* Cmd+Opt+arrows: directional pane focus. Picks the leaf
+               whose centre lies closest in the chord direction (with
+               vertical/horizontal overlap as a tiebreak). Match the
+               iTerm2 convention so muscle memory carries over. Has
+               to come before the OSC 133 Cmd+Up / Cmd+Down branch
+               so the Alt-modified version doesn't fall through to
+               prompt navigation. */
+            else if ((IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) &&
+                     (IsKeyPressed(KEY_LEFT)  || IsKeyPressed(KEY_RIGHT) ||
+                      IsKeyPressed(KEY_UP)    || IsKeyPressed(KEY_DOWN))) {
+                int dx = 0, dy = 0;
+                if      (IsKeyPressed(KEY_LEFT))  dx = -1;
+                else if (IsKeyPressed(KEY_RIGHT)) dx = +1;
+                else if (IsKeyPressed(KEY_UP))    dy = -1;
+                else if (IsKeyPressed(KEY_DOWN))  dy = +1;
+                Tab *_ct = active_tab();
+                if (_ct && _ct->root) {
+                    PaneNode *target = pane_focus_directional(
+                        _ct, win_w_now, win_h_now, dx, dy);
+                    if (target && target != _ct->active) {
+                        _ct->active = target;
+                        /* Force a redraw — the dirty-flag snapshot
+                           in the main loop watches g_active and
+                           g_ui_mode, but not the per-tab active
+                           leaf. Without this the chord lands but
+                           the screen doesn't refresh until the
+                           next mouse move or PTY byte, which feels
+                           like the chord is "very slow". */
+                        dirty = true;
+                    }
+                }
             }
             /* OSC 133 navigation. Cmd/Ctrl+Up jumps to the previous
                prompt (an A-marked row above the current view), Down
@@ -15843,6 +18233,13 @@ int main(int argc, char **argv) {
                    on a multi-pane tab; we still let the user toggle
                    when single-pane (it just won't fan out). */
                 g_broadcast_active = !g_broadcast_active;
+            }
+            else if (shift_held && IsKeyPressed(KEY_P)) {
+                /* Cmd+Shift+P — open the Session Designer. Lazily
+                   loads any saved sessions on first use so the host
+                   dropdown reflects what's on disk. */
+                if (g_sessions_count == 0) sessions_load();
+                session_designer_open_for(-1);
             }
             else if (IsKeyPressed(KEY_R)) {
                 /* Cmd+R — rename the active tab. Pre-fill the buffer
@@ -16184,6 +18581,12 @@ int main(int argc, char **argv) {
             g_broadcast_active = false;
         }
         if ((int)g_ui_mode != prev_ui_mode) dirty = true;
+        {
+            Tab *_pt = active_tab();
+            PaneNode *_pl = _pt ? _pt->active : NULL;
+            if (_pl != prev_active_leaf) dirty = true;
+            prev_active_leaf = _pl;
+        }
         prev_active = g_active;
         prev_ui_mode = (int)g_ui_mode;
         /* Cursor-blink driven dirty is intentionally NOT a trigger:
@@ -16199,6 +18602,98 @@ int main(int argc, char **argv) {
             draw_tab_bar(&r, win_w_now);
             draw_tab_contents(&r, cur, win_w_now, win_h_now, GetTime(), IsWindowFocused());
             draw_tab_bar_tooltip(&r, win_w_now);
+            /* [+] long-press menu — three primary items + an
+               optional submenu when SSH or Session is hovered. */
+            if (g_plus_menu_active) {
+                Font *_f = (Font *)r.font_data;
+                Vector2 _mp = GetMousePosition();
+                int _mx = (int)_mp.x, _my = (int)_mp.y;
+                int menu_x = TAB_SSH_W;
+                int menu_y = TAB_BAR_H + 2;
+                Color local_accent = (Color){90, 100, 120, 255};
+                Color ssh_accent   = (Color){46, 92, 150, 255};
+                Color sess_accent  = (Color){82, 50, 122, 255};
+                /* Primary backdrop. */
+                DrawRectangle(menu_x - 1, menu_y - 1,
+                              PLUS_MENU_W + 2,
+                              3 * PLUS_MENU_H + 2,
+                              (Color){8, 10, 16, 240});
+                struct { const char *label; Color accent; bool has_sub; }
+                primaries[3] = {
+                    { "Local shell", local_accent, false },
+                    { "SSH host…",   ssh_accent,   true  },
+                    { "Session…",    sess_accent,  true  },
+                };
+                for (int k = 0; k < 3; k++) {
+                    Rect ir = { menu_x, menu_y + k * PLUS_MENU_H,
+                                PLUS_MENU_W, PLUS_MENU_H };
+                    bool hover = rect_hit(ir, _mx, _my);
+                    bool sub_open = (g_plus_submenu == k);
+                    Color bg = (hover || sub_open) ? primaries[k].accent
+                                                   : (Color){32, 36, 50, 255};
+                    DrawRectangle(ir.x, ir.y, ir.w, ir.h, bg);
+                    DrawRectangleLines(ir.x, ir.y, ir.w, ir.h,
+                                       (Color){125, 207, 255, 200});
+                    DrawRectangle(ir.x + 6, ir.y + 8, 6, ir.h - 16,
+                                  primaries[k].accent);
+                    DrawTextEx(*_f, primaries[k].label,
+                               (Vector2){ir.x + 22, ir.y + 7},
+                               14, 0, (Color){230, 235, 248, 255});
+                    if (primaries[k].has_sub) {
+                        const char *chev = ">";
+                        Vector2 csz = MeasureTextEx(*_f, chev, 14, 0);
+                        DrawTextEx(*_f, chev,
+                                   (Vector2){ir.x + ir.w - csz.x - 10,
+                                             ir.y + 7},
+                                   14, 0, (Color){200, 215, 240, 220});
+                    }
+                }
+                /* Submenu — saved hosts / saved sessions. */
+                if (g_plus_submenu == PLUS_PRIMARY_SSH ||
+                    g_plus_submenu == PLUS_PRIMARY_SESSION) {
+                    bool is_ssh = (g_plus_submenu == PLUS_PRIMARY_SSH);
+                    int n = is_ssh ? g_ssh_profile_count : g_sessions_count;
+                    Color accent = is_ssh ? ssh_accent : sess_accent;
+                    int sub_x = menu_x + PLUS_MENU_W + 4;
+                    int sub_y = menu_y + g_plus_submenu * PLUS_MENU_H;
+                    int rows = (n > 0) ? n : 1;
+                    int sub_h = rows * PLUS_MENU_H;
+                    DrawRectangle(sub_x - 1, sub_y - 1,
+                                  PLUS_SUBMENU_W + 2, sub_h + 2,
+                                  (Color){8, 10, 16, 240});
+                    if (n == 0) {
+                        Rect ir = { sub_x, sub_y, PLUS_SUBMENU_W, PLUS_MENU_H };
+                        DrawRectangle(ir.x, ir.y, ir.w, ir.h,
+                                      (Color){32, 36, 50, 255});
+                        DrawRectangleLines(ir.x, ir.y, ir.w, ir.h,
+                                           (Color){125, 207, 255, 200});
+                        const char *empty = is_ssh
+                            ? "(no saved hosts in ~/.ssh/config)"
+                            : "(no saved sessions yet)";
+                        DrawTextEx(*_f, empty,
+                                   (Vector2){ir.x + 12, ir.y + 7},
+                                   13, 0, (Color){140, 145, 160, 255});
+                    }
+                    for (int k = 0; k < n; k++) {
+                        Rect ir = { sub_x, sub_y + k * PLUS_MENU_H,
+                                    PLUS_SUBMENU_W, PLUS_MENU_H };
+                        bool hover = rect_hit(ir, _mx, _my);
+                        Color bg = hover ? accent
+                                         : (Color){32, 36, 50, 255};
+                        DrawRectangle(ir.x, ir.y, ir.w, ir.h, bg);
+                        DrawRectangleLines(ir.x, ir.y, ir.w, ir.h,
+                                           (Color){125, 207, 255, 200});
+                        DrawRectangle(ir.x + 6, ir.y + 8, 6, ir.h - 16,
+                                      accent);
+                        const char *name = is_ssh
+                            ? g_ssh_profiles[k].name
+                            : g_sessions[k].name;
+                        DrawTextEx(*_f, name,
+                                   (Vector2){ir.x + 22, ir.y + 7},
+                                   14, 0, (Color){230, 235, 248, 255});
+                    }
+                }
+            }
             EndDrawing();
         } else {
             /* Idle path: pump events + sleep. PollInputEvents on
