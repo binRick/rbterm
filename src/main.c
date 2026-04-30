@@ -1314,6 +1314,16 @@ static bool   g_plus_pressing    = false;
 static double g_plus_press_at    = 0.0;
 static bool   g_plus_menu_active = false;
 static int    g_plus_submenu     = -1;   /* -1 = none, else PLUS_PRIMARY_* of the expanded row */
+/* Hover-debounce state for the submenu. When the cursor moves
+   diagonally from a primary toward its open submenu, it can cross
+   the row of a different primary on the way — without debounce
+   the submenu flips mid-move and the user clicks the wrong list.
+   We track which primary the cursor is currently over and how
+   long it's been there; the submenu only switches after the
+   cursor lingers on the new primary for PLUS_HOVER_DEBOUNCE_MS. */
+static int    g_plus_hover_primary    = -1;
+static double g_plus_hover_started_at = 0.0;
+#define PLUS_HOVER_DEBOUNCE_MS 200
 
 /* Tab-rename overlay state. Cmd+R captures the keyboard for the
    active tab's label; the user types into g_tab_rename_buf and
@@ -1669,7 +1679,20 @@ struct SessionNode {
 typedef struct {
     char         name[SESSION_NAME_MAX];
     SessionNode *root;
+    /* DFS pre-order leaf index that gets focus when this session
+       opens as a Tab. Captured from the user's selected leaf in
+       the designer canvas at save time; defaults to 0 (first leaf)
+       for legacy sessions saved before this field existed. */
+    int          default_idx;
 } Session;
+
+/* Walk the SessionNode tree in DFS pre-order and return the leaf
+   index of `target`, or -1 if target isn't a leaf in the tree. The
+   ordering matches session_collect_leaves / session_serialize_walk
+   so the index round-trips through save/load and through the live
+   PaneNode tree built by session_replay_recurse. */
+static int session_node_dfs_leaf_index(const SessionNode *root,
+                                       const SessionNode *target);
 
 #define SESSIONS_MAX 32
 static Session g_sessions[SESSIONS_MAX];
@@ -1713,6 +1736,19 @@ static SessionNode *session_next_leaf(SessionNode *leaf) {
     while (cur->parent && cur == cur->parent->child[1]) cur = cur->parent;
     if (!cur->parent) return NULL;
     return session_first_leaf(cur->parent->child[1]);
+}
+
+static int session_node_dfs_leaf_index(const SessionNode *root,
+                                       const SessionNode *target) {
+    if (!root || !target || target->split != SPLIT_NONE) return -1;
+    int idx = 0;
+    SessionNode *cur = session_first_leaf((SessionNode *)root);
+    while (cur) {
+        if (cur == target) return idx;
+        cur = session_next_leaf(cur);
+        idx++;
+    }
+    return -1;
 }
 
 /* Replace `leaf` with an internal split node whose children are the
@@ -1944,6 +1980,7 @@ static void sessions_load(void) {
        on the next [section] header (or EOF). */
     char        cur_name[SESSION_NAME_MAX] = {0};
     char        cur_layout[SESSION_LAYOUT_MAX] = {0};
+    int         cur_default = 0;
     SessionLeafKind cur_kinds[SESSION_MAX_LEAVES] = {0};
     char        cur_hosts[SESSION_MAX_LEAVES][SESSION_HOST_MAX] = {{0}};
     char        cur_cwds[SESSION_MAX_LEAVES][SESSION_CWD_MAX]   = {{0}};
@@ -1962,10 +1999,13 @@ static void sessions_load(void) {
                 Session *s = &g_sessions[g_sessions_count++];                 \
                 snprintf(s->name, sizeof(s->name), "%s", cur_name);           \
                 s->root = root;                                               \
+                s->default_idx = (cur_default >= 0 && cur_default < max)      \
+                                 ? cur_default : 0;                           \
             }                                                                 \
         }                                                                     \
         cur_name[0] = 0;                                                      \
         cur_layout[0] = 0;                                                    \
+        cur_default = 0;                                                      \
         for (int _i = 0; _i < SESSION_MAX_LEAVES; _i++) {                     \
             cur_kinds[_i] = SESSION_LEAF_LOCAL;                               \
             cur_hosts[_i][0] = 0;                                             \
@@ -2009,6 +2049,8 @@ static void sessions_load(void) {
         if (!cur_name[0]) continue;
         if (strcmp(key, "layout") == 0) {
             snprintf(cur_layout, sizeof(cur_layout), "%s", val);
+        } else if (strcmp(key, "default") == 0) {
+            cur_default = atoi(val);
         } else if (strncmp(key, "pane.", 5) == 0) {
             const char *r = key + 5;
             if (*r < '0' || *r > '0' + (SESSION_MAX_LEAVES - 1)) continue;
@@ -2073,6 +2115,7 @@ static void sessions_save(void) {
         session_collect_leaves(s->root, kinds, hosts, cwds, cmds, &idx);
         fprintf(fp, "[session.%s]\n", s->name);
         fprintf(fp, "layout = %s\n", layout);
+        if (s->default_idx > 0) fprintf(fp, "default = %d\n", s->default_idx);
         for (int k = 0; k < idx; k++) {
             if (kinds[k] == SESSION_LEAF_SSH && hosts[k][0]) {
                 fprintf(fp, "pane.%d = ssh:%s\n", k, hosts[k]);
@@ -2100,13 +2143,15 @@ static int sessions_find_by_name(const char *name) {
 /* Replace a session's tree (used by the designer when committing).
    The passed-in tree is adopted; the previous tree is freed. Caller
    must not free `new_root` after this returns. */
-static void session_replace_tree(int idx, const char *name, SessionNode *new_root) {
+static void session_replace_tree(int idx, const char *name,
+                                 SessionNode *new_root, int default_idx) {
     if (idx < 0 || idx >= SESSIONS_MAX) return;
     if (idx == g_sessions_count) g_sessions_count++;
     Session *s = &g_sessions[idx];
     if (s->root) session_node_free(s->root);
     snprintf(s->name, sizeof(s->name), "%s", name);
     s->root = new_root;
+    s->default_idx = default_idx;
 }
 
 /* Remove a session by index, shifting later entries down. */
@@ -2167,6 +2212,38 @@ static SessionNode *session_node_at(SessionNode *n, PaneRect outer,
     return session_node_at(n->child[1], rb, mx, my);
 }
 
+/* Return the internal node whose splitter strip (padded by `grab`)
+   contains (mx, my). Optionally returns its outer rect for drag math.
+   Mirrors pane_tree_splitter_at but for SessionNode trees + the
+   designer's 2-px gap. */
+static SessionNode *session_node_splitter_at(SessionNode *n, PaneRect outer,
+                                             int mx, int my, int grab,
+                                             PaneRect *outer_out) {
+    if (!n || n->split == SPLIT_NONE) return NULL;
+    PaneRect ra, rb;
+    session_node_split_children(n, outer, &ra, &rb);
+    const int gap = 2;
+    int gx, gy, gw, gh;
+    if (n->split == SPLIT_VERTICAL) {
+        gx = ra.x + ra.w - grab;
+        gy = ra.y;
+        gw = gap + 2 * grab;
+        gh = ra.h;
+    } else {
+        gx = ra.x;
+        gy = ra.y + ra.h - grab;
+        gw = ra.w;
+        gh = gap + 2 * grab;
+    }
+    if (mx >= gx && mx < gx + gw && my >= gy && my < gy + gh) {
+        if (outer_out) *outer_out = outer;
+        return n;
+    }
+    SessionNode *r = session_node_splitter_at(n->child[0], ra, mx, my, grab, outer_out);
+    if (r) return r;
+    return session_node_splitter_at(n->child[1], rb, mx, my, grab, outer_out);
+}
+
 /* ---------- Sessions: designer modal ---------- */
 
 typedef enum {
@@ -2184,6 +2261,12 @@ static bool                 g_sd_host_dropdown = false;
 static int                  g_sd_host_scroll = 0;
 static char                 g_sd_status[256];
 static bool                 g_sd_open_after_save = false;   /* Save & Open path */
+/* Splitter drag state (designer-only). One drag at a time, so a
+   single pair of globals beats per-node bookkeeping. The outer
+   rect is captured at drag-start so the math stays consistent
+   even if the canvas size changes mid-drag. */
+static SessionNode         *g_sd_drag_node = NULL;
+static PaneRect             g_sd_drag_outer;
 
 typedef struct {
     Rect modal;
@@ -2282,6 +2365,7 @@ static void session_designer_open_for(int idx) {
         /* Edit existing — deep-copy the tree. */
         snprintf(g_sd_session.name, sizeof(g_sd_session.name),
                  "%s", g_sessions[idx].name);
+        g_sd_session.default_idx = g_sessions[idx].default_idx;
         char layout[SESSION_LAYOUT_MAX];
         layout[0] = 0;
         size_t off = 0;
@@ -2305,9 +2389,19 @@ static void session_designer_open_for(int idx) {
            placeholder hint in the field invites the user to type
            one). */
         g_sd_session.name[0] = 0;
+        g_sd_session.default_idx = 0;
         g_sd_session.root = session_node_new_leaf();
     }
+    /* Pre-select the saved default leaf so the canvas highlights
+       what'll get focus on open — the user can click another pane
+       to change it. */
     g_sd_selected = session_first_leaf(g_sd_session.root);
+    {
+        int want = g_sd_session.default_idx;
+        SessionNode *cur = g_sd_selected;
+        for (int k = 0; cur && k < want; k++) cur = session_next_leaf(cur);
+        if (cur) g_sd_selected = cur;
+    }
     /* Refresh saved-host list so the dropdown is fresh. */
     ssh_profiles_load();
     g_ui_mode = UI_SESSION_DESIGNER;
@@ -2345,10 +2439,15 @@ static bool session_designer_commit(bool also_open, int cols_for_open, int rows_
                  "A session named '%s' already exists.", g_sd_session.name);
         return false;
     }
+    /* Capture the default-focused leaf from the user's current
+       selection before we hand the tree off — replace_tree adopts
+       the pointer and tracks the index by value. */
+    int sel_idx = session_node_dfs_leaf_index(g_sd_session.root, g_sd_selected);
+    if (sel_idx < 0) sel_idx = 0;
     /* Deep-copy g_sd_session.root into the slot — we adopt the tree
        directly, so clear g_sd_session.root afterwards to avoid a
        double-free when the modal closes. */
-    session_replace_tree(dst, g_sd_session.name, g_sd_session.root);
+    session_replace_tree(dst, g_sd_session.name, g_sd_session.root, sel_idx);
     g_sd_session.root = NULL;
     g_sd_selected = NULL;
     sessions_save();
@@ -2377,6 +2476,47 @@ static void session_designer_handle_mouse(SessionDesignerLayout L,
         if (wheel != 0.0f) {
             g_sd_host_scroll -= (int)(wheel * 3.0f);
             if (g_sd_host_scroll < 0) g_sd_host_scroll = 0;
+        }
+    }
+
+    /* Splitter drag — runs every frame so the ratio updates while
+       the button is held, regardless of where the cursor moves to. */
+    if (g_sd_drag_node) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            const int gap = 2;
+            float nr;
+            if (g_sd_drag_node->split == SPLIT_VERTICAL) {
+                int span = g_sd_drag_outer.w - gap;
+                nr = (span > 0)
+                     ? (float)(mx - g_sd_drag_outer.x) / (float)span
+                     : 0.5f;
+            } else {
+                int span = g_sd_drag_outer.h - gap;
+                nr = (span > 0)
+                     ? (float)(my - g_sd_drag_outer.y) / (float)span
+                     : 0.5f;
+            }
+            if (nr < 0.15f) nr = 0.15f;
+            if (nr > 0.85f) nr = 0.85f;
+            g_sd_drag_node->ratio = nr;
+            return;
+        }
+        g_sd_drag_node = NULL;  /* Button released — end drag. */
+    }
+
+    /* Splitter hit-test on a fresh press. Wider grab zone so the
+       2-px visual gap is comfortable to grab. */
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        g_sd_session.root && rect_hit(L.canvas, mx, my)) {
+        PaneRect outer = { L.canvas.x, L.canvas.y, L.canvas.w, L.canvas.h };
+        PaneRect hit_outer = {0};
+        SessionNode *hit_split =
+            session_node_splitter_at(g_sd_session.root, outer,
+                                     mx, my, SPLITTER_GRAB, &hit_outer);
+        if (hit_split) {
+            g_sd_drag_node = hit_split;
+            g_sd_drag_outer = hit_outer;
+            return;
         }
     }
 
@@ -2969,7 +3109,15 @@ static Tab *tab_open_from_session(const Session *s, int cols, int rows) {
     int next_idx = 0;
     session_replay_recurse(t, s->root, leaf, &next_idx,
                            kinds, hosts, cwds, cmds, cols, rows);
-    t->active = pane_tree_first_leaf(t->root);
+    /* Walk the live tree in DFS pre-order — same order as
+       session_collect_leaves / session_replay_recurse — and pick
+       the leaf the user marked as default in the designer. Falls
+       back to the first leaf for legacy sessions or out-of-range
+       indices. */
+    PaneNode *active = pane_tree_first_leaf(t->root);
+    int want = (s->default_idx >= 0 && s->default_idx < count) ? s->default_idx : 0;
+    for (int k = 0; active && k < want; k++) active = pane_tree_next_leaf(active);
+    t->active = active ? active : pane_tree_first_leaf(t->root);
     tab_log_open_all(t);
     return t;
 }
@@ -11394,6 +11542,7 @@ typedef struct {
     Rect launch_del   [LAUNCH_ENTRY_MAX];
     Rect launch_add_local;
     Rect launch_add_ssh;
+    Rect launch_add_session;
     /* Keys tab. Per-row [name+algo+fingerprint label] [Install]
        [Delete?] — for now we only show Install. Plus a "+
        Generate" button at the bottom. */
@@ -12159,8 +12308,13 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
         /* One row per launch entry:
              [kind pill] [host picker] [▲] [▼] [×]
            Then "+ Add local shell" / "+ Add SSH host" buttons at
-           the bottom. We render at most LAUNCH_ENTRY_MAX rows. */
-        int row_y = content_y;
+           the bottom. We render at most LAUNCH_ENTRY_MAX rows.
+
+           Reserve 22 px above the first row for the "Open these on
+           launch" caption (drawn at cap_y = launch_kind[0].y - 22).
+           Without this offset the caption lands behind the settings
+           tab bar pills above. */
+        int row_y = content_y + 22;
         int row_h = btn;
         int kind_w = 72;
         int reorder_w = 26;          /* up / down buttons */
@@ -12197,9 +12351,10 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
             }
         }
         row_y += 6;
-        int add_w = (field_w_total - gap) / 2;
-        L.launch_add_local = (Rect){ field_x,             row_y, add_w, row_h };
-        L.launch_add_ssh   = (Rect){ field_x + add_w + gap, row_y, add_w, row_h };
+        int add_w = (field_w_total - 2 * gap) / 3;
+        L.launch_add_local   = (Rect){ field_x,                            row_y, add_w, row_h };
+        L.launch_add_ssh     = (Rect){ field_x +     add_w +     gap,      row_y, add_w, row_h };
+        L.launch_add_session = (Rect){ field_x + 2 * add_w + 2 * gap,      row_y, add_w, row_h };
     } else if (g_settings_tab == SETTINGS_TAB_SESSIONS) {
         /* Row per saved session: name + [Open] [Edit] [×]; "+ New
            session" sits above the list. The designer modal handles
@@ -12937,6 +13092,23 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
                     snprintf(g_app_settings.launch[i].host,
                              sizeof(g_app_settings.launch[i].host),
                              "%s", g_ssh_profiles[0].name);
+                } else {
+                    g_app_settings.launch[i].host[0] = 0;
+                }
+            }
+            return;
+        }
+        if (rect_hit(L.launch_add_session, mx, my)) {
+            if (g_app_settings.launch_count < LAUNCH_ENTRY_MAX) {
+                /* Refresh the saved-sessions list so the picker
+                   sees anything the user just authored. */
+                sessions_load();
+                int i = g_app_settings.launch_count++;
+                g_app_settings.launch[i].kind = LAUNCH_KIND_SESSION;
+                if (g_sessions_count > 0) {
+                    snprintf(g_app_settings.launch[i].host,
+                             sizeof(g_app_settings.launch[i].host),
+                             "%s", g_sessions[0].name);
                 } else {
                     g_app_settings.launch[i].host[0] = 0;
                 }
@@ -15762,8 +15934,9 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
         /* Add buttons. Disabled (dim) when the slot list is full. */
         bool full = (g_app_settings.launch_count >= LAUNCH_ENTRY_MAX);
         struct { Rect r; const char *label; } adds[] = {
-            { L.launch_add_local, "+ Add local shell" },
-            { L.launch_add_ssh,   "+ Add SSH host"    },
+            { L.launch_add_local,   "+ Add local shell" },
+            { L.launch_add_ssh,     "+ Add SSH host"    },
+            { L.launch_add_session, "+ Add session"     },
         };
         for (size_t ai = 0; ai < sizeof(adds) / sizeof(*adds); ai++) {
             Color ab   = full ? (Color){34, 38, 52, 255} : (Color){48, 52, 70, 255};
@@ -16896,19 +17069,35 @@ int main(int argc, char **argv) {
                a session is a known follow-up). */
             for (int i = 0; i < g_app_settings.launch_count; i++) {
                 if (g_app_settings.launch[i].kind == LAUNCH_KIND_SSH) {
-                    if (g_launch_pending_count <
-                        (int)(sizeof(g_launch_pending) / sizeof(g_launch_pending[0]))) {
-                        int q = g_launch_pending_count++;
-                        snprintf(g_launch_pending[q].host,
-                                 sizeof(g_launch_pending[q].host),
-                                 "%s", g_app_settings.launch[i].host);
-                        g_launch_pending[q].is_active =
-                            (i == g_app_settings.launch_active);
+                    /* Kick the placeholder + async connect inline so
+                       the tab lands at this iteration's position in
+                       the bar. The earlier "queue + drain after
+                       first frame" path put placeholders at the
+                       end, which broke the user's chosen ordering
+                       and made the launch_active radio appear to
+                       focus the wrong tab. */
+#ifdef RBTERM_SSH
+                    const char *alias = g_app_settings.launch[i].host;
+                    const SshProfile *prof = NULL;
+                    for (int k = 0; k < g_ssh_profile_count; k++) {
+                        if (strcmp(g_ssh_profiles[k].name, alias) == 0) {
+                            prof = &g_ssh_profiles[k]; break;
+                        }
                     }
-                    /* Count as "any" — the deferred drain will open
-                       the tab; we don't want the fallback default
-                       local pane to clutter the window. */
-                    any = true;
+                    bool is_active = (i == g_app_settings.launch_active);
+                    if (ssh_launch_kick(prof, alias, NULL, is_active,
+                                        init_cols, init_rows)) {
+                        any = true;
+                    } else {
+                        fprintf(stderr,
+                                "rbterm: launch ssh '%s' failed to kick\n",
+                                alias);
+                    }
+#else
+                    fprintf(stderr,
+                            "rbterm: ssh disabled in this build, skipping '%s'\n",
+                            g_app_settings.launch[i].host);
+#endif
                 } else if (g_app_settings.launch[i].kind == LAUNCH_KIND_SESSION) {
                     int sidx = sessions_find_by_name(g_app_settings.launch[i].host);
                     if (sidx >= 0) {
@@ -16948,6 +17137,17 @@ int main(int argc, char **argv) {
                 CloseWindow();
                 return 1;
             }
+        }
+        /* Each tab_open / tab_open_from_session / placeholder helper
+           sets g_active to its own new tab, so by the time the loop
+           finishes g_active points at whichever entry was last in
+           the list — not the one the user marked as default. Now
+           that placeholders open inline (tab indices match launch
+           entry indices), the saved launch_active maps directly to
+           the right tab. Snap it back into place. */
+        if (g_app_settings.launch_active >= 0 &&
+            g_app_settings.launch_active < g_num_tabs) {
+            g_active = g_app_settings.launch_active;
         }
         (void)any;
     }
@@ -17767,13 +17967,29 @@ int main(int argc, char **argv) {
                             PLUS_MENU_W, PLUS_MENU_H };
                 if (rect_hit(ir, mxr, myr)) { hovered_primary = k; break; }
             }
-            if (hovered_primary == PLUS_PRIMARY_SSH ||
-                hovered_primary == PLUS_PRIMARY_SESSION) {
+            /* Track how long the cursor has been on the current
+               primary so a brief crossing (e.g. diagonal path from
+               SSH primary to an SSH submenu row past Session
+               primary) doesn't flip the submenu mid-move. */
+            double now_t = GetTime();
+            if (hovered_primary != g_plus_hover_primary) {
+                g_plus_hover_primary    = hovered_primary;
+                g_plus_hover_started_at = now_t;
+            }
+            bool hover_settled =
+                (hovered_primary >= 0) &&
+                ((now_t - g_plus_hover_started_at) * 1000.0 >= PLUS_HOVER_DEBOUNCE_MS);
+            /* Instant-switch on a freshly-opened menu (no submenu
+               yet) so the first hover is responsive — debounce
+               only kicks in once a submenu is already up. */
+            if (g_plus_submenu < 0) hover_settled = (hovered_primary >= 0);
+            if (hover_settled && (hovered_primary == PLUS_PRIMARY_SSH ||
+                                  hovered_primary == PLUS_PRIMARY_SESSION)) {
                 if (g_plus_submenu != hovered_primary) {
                     g_plus_submenu = hovered_primary;
                     dirty = true;
                 }
-            } else if (hovered_primary == PLUS_PRIMARY_LOCAL) {
+            } else if (hover_settled && hovered_primary == PLUS_PRIMARY_LOCAL) {
                 if (g_plus_submenu != -1) {
                     g_plus_submenu = -1;
                     dirty = true;
