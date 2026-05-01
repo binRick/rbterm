@@ -12444,12 +12444,24 @@ static void fonts_load(const char *current_path) {
    new cell metrics. */
 static void settings_apply_font(Renderer *r, const FontEntry *fe) {
     if (!fe) return;
+    if (getenv("RBTERM_DEBUG")) {
+        fprintf(stderr, "settings_apply_font: name=%s path=%s data=%p size=%d ext=%s\n",
+                fe->name, fe->path,
+                (const void *)fe->data, (int)fe->data_size,
+                fe->ext);
+        fflush(stderr);
+    }
     bool ok;
     if (fe->data && fe->data_size > 0) {
         ok = renderer_set_font_data(r, fe->data, (int)fe->data_size,
                                     fe->ext, fe->path);
     } else {
         ok = renderer_set_font_path(r, fe->path);
+    }
+    if (getenv("RBTERM_DEBUG")) {
+        fprintf(stderr, "settings_apply_font: ok=%d cell_w=%d cell_h=%d\n",
+                (int)ok, r->cell_w, r->cell_h);
+        fflush(stderr);
     }
     if (!ok) return;
     tabs_resize_all(r, GetScreenWidth(), GetScreenHeight());
@@ -18079,6 +18091,29 @@ int main(int argc, char **argv) {
     if (init_cols < 20) init_cols = 20;
     if (init_rows < 5)  init_rows = 5;
 
+    /* RBTERM_DEBUG=1: redirect stderr to a log file. Useful on
+       Windows where GUI apps have no attached console — the
+       existing fprintf(stderr) calls become visible in
+       %USERPROFILE%\rbterm-debug.log. The font-load chain has
+       extra logging gated on RBTERM_DEBUG too (see settings_apply_font
+       below + renderer_set_font_path / load_font_data_into). */
+    {
+        const char *dbg = getenv("RBTERM_DEBUG");
+        if (dbg && *dbg) {
+            char log_path[1024];
+#ifdef _WIN32
+            const char *home = getenv("USERPROFILE");
+            snprintf(log_path, sizeof(log_path),
+                     "%s\\rbterm-debug.log", home ? home : ".");
+#else
+            snprintf(log_path, sizeof(log_path), "/tmp/rbterm-debug.log");
+#endif
+            FILE *_fp = freopen(log_path, "w", stderr);
+            (void)_fp;
+            fprintf(stderr, "rbterm: debug log started\n");
+            fflush(stderr);
+        }
+    }
     app_settings_init();
     themes_load_builtins();
     /* Windows fills the embedded font table from compiled-in .rc

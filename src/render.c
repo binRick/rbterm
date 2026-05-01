@@ -547,6 +547,11 @@ static bool load_font_data_into(Renderer *r, const unsigned char *data,
 static bool load_font_into(Renderer *r, const char *path, int size) {
     size_t sz = 0;
     unsigned char *buf = slurp_file(path, &sz);
+    if (getenv("RBTERM_DEBUG")) {
+        fprintf(stderr, "load_font_into: path=%s slurped=%zu bytes\n",
+                path ? path : "(null)", sz);
+        fflush(stderr);
+    }
     if (!buf) return false;
     /* Pull the extension off the path so LoadFontFromMemory routes to
        the right parser. */
@@ -582,6 +587,15 @@ static bool load_font_data_into(Renderer *r, const unsigned char *data,
     Font f = LoadFontFromMemory(file_type, data, data_size,
                                 atlas_size, cps, cp_count);
     free(cps);
+    if (getenv("RBTERM_DEBUG")) {
+        fprintf(stderr,
+                "load_font_data_into: ext=%s size=%d data_size=%d "
+                "atlas=%d texture_id=%u glyphs=%d display=%s\n",
+                ext ? ext : "?", size, data_size, atlas_size,
+                f.texture.id, f.glyphCount,
+                display_path ? display_path : "?");
+        fflush(stderr);
+    }
     if (f.texture.id == 0) return false;
     SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
     install_font(r, f, size, display_path);
@@ -699,6 +713,12 @@ bool renderer_set_font_size(Renderer *r, int font_size) {
 /* Switch the active font to one at `path`, keeping the current
    size. Validates the path exists first. */
 bool renderer_set_font_path(Renderer *r, const char *path) {
+    if (getenv("RBTERM_DEBUG")) {
+        fprintf(stderr, "renderer_set_font_path: path=%s exists=%d\n",
+                path ? path : "(null)",
+                (path && file_exists(path)) ? 1 : 0);
+        fflush(stderr);
+    }
     if (!path || !*path) return false;
     if (!file_exists(path)) return false;
     return load_font_into(r, path, r->font_size);
