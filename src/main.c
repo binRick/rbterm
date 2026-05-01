@@ -16994,9 +16994,13 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                        14, 0, (Color){240, 200, 200, 255});
         }
         if (g_ssh_keys_count == 0) {
+            /* Place the empty-state hint a row below the header.
+               Without the +18 it landed at the same y as the
+               header (both anchor off keys_generate_btn.y - 22)
+               and the two strings drew on top of each other. */
             DrawTextEx(*f, "(no keys yet — generate one below)",
                        (Vector2){L.modal.x + 22,
-                                 L.keys_generate_btn.y - 22},
+                                 header_y + 18},
                        12, 0, (Color){140, 150, 170, 255});
         }
 
