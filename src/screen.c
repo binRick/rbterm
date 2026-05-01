@@ -128,6 +128,13 @@ struct Screen {
     int      sb_decode_row;
     int      sb_decode_scratch_cols;
 
+    /* Optional client hook fired once per scrollback push. Used
+       by main.c to write a clean .txt transcript of finalized
+       rows; declared opaque-ish so the screen doesn't depend on
+       host types. NULL = no callback. */
+    ScreenScrollbackCb sb_callback;
+    void              *sb_callback_user;
+
     // Parser
     int pstate;
     int params[MAX_PARAMS];
@@ -778,6 +785,15 @@ static void push_scrollback(Screen *s, const Cell *row, bool wrapped,
         s->sb_rows[s->sb_head] = NULL;
     }
     s->sb_rows[s->sb_head] = cr_pack(row, s->cols, wrapped, pmark, pexit);
+    /* Fire the scrollback-push callback (if any) AFTER the row is
+       committed but before any indexing fields advance — caller
+       might want to inspect the committed state. The callback only
+       fires when we're on the main screen (alt-screen sessions
+       never reach this function), so vim / less / tmux content
+       gets skipped automatically. */
+    if (s->sb_callback) {
+        s->sb_callback(s->sb_callback_user, row, s->cols, wrapped ? 1 : 0);
+    }
     /* Advance head. Wrap only when we've reached the configured
        max — during the grow phase sb_head is monotonic. */
     s->sb_head++;
@@ -2239,6 +2255,16 @@ void screen_set_cell_h_px(Screen *s, int cell_h_px) {
 void screen_set_io_user(Screen *s, void *user) {
     if (!s) return;
     s->io.user = user;
+}
+
+/* Install (or clear, with cb=NULL) the scrollback-push callback
+   that fires when a finalized row leaves the live grid. */
+void screen_set_scrollback_callback(Screen *s,
+                                    ScreenScrollbackCb cb,
+                                    void *user) {
+    if (!s) return;
+    s->sb_callback = cb;
+    s->sb_callback_user = user;
 }
 
 /* When the default fg/bg changes (OSC 10/11), convert cells that

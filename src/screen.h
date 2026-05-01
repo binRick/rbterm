@@ -72,6 +72,23 @@ void    screen_free(Screen *s);
    two-pane tab slides pane-1 into slot 0). */
 void    screen_set_io_user(Screen *s, void *user);
 
+/* Scrollback-push callback. Fires every time a row gets pushed
+   into the scrollback ring — i.e. whenever live-grid output
+   scrolls one row up because new content arrived at the bottom.
+   Useful for "clean transcript" logging that captures only
+   finalized cell content without ANSI redraw noise (vim/less/
+   tmux on the alt screen don't push to scrollback so they're
+   skipped automatically). `cells` is one row of `cols` Cells;
+   `wrapped` is non-zero when the row terminated by auto-wrap
+   (so the consumer can avoid emitting a newline). The callback
+   is invoked synchronously from screen_feed; don't do heavy
+   work or take long locks. */
+typedef void (*ScreenScrollbackCb)(void *user, const Cell *cells,
+                                   int cols, int wrapped);
+void    screen_set_scrollback_callback(Screen *s,
+                                       ScreenScrollbackCb cb,
+                                       void *user);
+
 /* Theme application lives in theme.c — exported here so screen.c
    internals stay private. */
 void    screen_set_default_fg(Screen *s, uint32_t rgb);

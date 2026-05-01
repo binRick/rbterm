@@ -570,7 +570,7 @@ static void app_settings_init(void) {
     g_app_settings.cursor_style          = CURSOR_STYLE_DEFAULT;
     g_app_settings.startup_window        = STARTUP_WINDOW_DEFAULT;
     g_app_settings.show_hud              = true;
-    g_app_settings.hud_pos               = HUD_POS_TOP_RIGHT;
+    g_app_settings.hud_pos               = HUD_POS_BOTTOM_RIGHT;
     for (int i = 0; i < HUD_FIELD_COUNT; i++) {
         g_app_settings.hud_show[i]  = true;
         g_app_settings.hud_color[i] = 0;     /* default light grey */
@@ -687,8 +687,23 @@ typedef struct {
     int last_click_col, last_click_row;
     char cwd[PATH_MAX];
     double cwd_poll_at;
-    FILE *log_fp;                /* session log file, NULL when disabled */
+    FILE *log_fp;                /* raw session log (every PTY byte) */
     char  log_path[PATH_MAX];
+    /* Hover-only "maximize / restore" rollover button — top-right
+       corner of each pane, drawn while the mouse is over that
+       pane. Cleared (w=0) every frame; the click handler reads
+       whatever the previous frame published. Stored as four ints
+       because Rect's typedef lives further down. */
+    int   maximize_btn_x, maximize_btn_y;
+    int   maximize_btn_w, maximize_btn_h;
+    /* Clean .txt transcript — written via the screen's
+       scrollback-push callback. Each row that scrolls out of the
+       live grid is emitted as UTF-8 plain text (auto-wrap flag
+       controls whether to terminate the line with \n). Alt-screen
+       output (vim/less/tmux) never pushes to scrollback so it's
+       skipped automatically — that's exactly what we want. */
+    FILE *clean_fp;
+    char  clean_path[PATH_MAX];
 
     /* HUD: top-right overlay with hostname, IP, load avg, free mem,
        free disk. For local panes the main loop fills these via cheap
@@ -779,6 +794,13 @@ struct PaneNode {
 typedef struct {
     PaneNode *root;              /* tree of leaves + splits */
     PaneNode *active;            /* current focused leaf */
+    /* When non-NULL, only this leaf renders — and it gets the
+       full content rect of the tab. Other leaves stay alive
+       (PTYs keep draining, output keeps flowing) so toggling
+       back snaps to the up-to-date state. Edge stubs around the
+       maximized rect indicate which sides have hidden siblings.
+       tab_split / tab_close_leaf clear this. */
+    PaneNode *maximized_leaf;
     bool dead;
     /* User-set tab name. When non-empty, tab_label() prefixes the
        auto-derived label (OSC 0/2 title or cwd basename) as
@@ -3358,6 +3380,11 @@ static Tab *active_tab(void) {
     return g_tabs[g_active];
 }
 
+/* Forward decl — defined alongside pane_log_close below; used
+   from pane_log_open to wire the screen's scrollback callback. */
+static void pane_clean_log_row_cb(void *user, const Cell *row,
+                                  int cols, int wrapped);
+
 /* Open a fresh per-pane log file under the current log directory. Silent
    on failure so the user's session isn't derailed by a bad path. SSH
    tabs may override the directory + on/off via ssh_log_dir +
@@ -3401,12 +3428,114 @@ static void pane_log_open(Tab *t, Pane *p, int pane_idx) {
                 p->log_path, strerror(errno));
         p->log_path[0] = 0;
     }
+    /* Parallel clean .txt transcript — same name with .txt suffix
+       instead of .log. Wired to the screen's scrollback-push
+       callback so rows finalized by scroll-up land here as plain
+       UTF-8 (no ANSI escapes). */
+    snprintf(p->clean_path, sizeof(p->clean_path), "%s", p->log_path);
+    {
+        size_t pl = strlen(p->clean_path);
+        if (pl >= 4 && strcmp(p->clean_path + pl - 4, ".log") == 0) {
+            strcpy(p->clean_path + pl - 4, ".txt");
+        }
+    }
+    p->clean_fp = fopen(p->clean_path, "ab");
+    if (!p->clean_fp) {
+        fprintf(stderr, "rbterm: can't open clean log %s: %s\n",
+                p->clean_path, strerror(errno));
+        p->clean_path[0] = 0;
+    } else if (p->scr) {
+        screen_set_scrollback_callback(p->scr, pane_clean_log_row_cb, p);
+    }
 }
 
 /* Close a pane's open log file (if any). Idempotent. */
 static void pane_log_close(Pane *p) {
     if (!p) return;
     if (p->log_fp) { fclose(p->log_fp); p->log_fp = NULL; }
+    if (p->clean_fp) {
+        /* Flush whatever is currently visible on the live grid as
+           a "tail" to the clean log, so the last screenful (which
+           never scrolled out) isn't missing from the transcript. */
+        if (p->scr) {
+            int rows = screen_rows(p->scr);
+            int cols = screen_cols(p->scr);
+            for (int y = 0; y < rows; y++) {
+                int last = -1;
+                for (int x = cols - 1; x >= 0; x--) {
+                    Cell c = screen_view_cell(p->scr, x, y);
+                    if (c.cp != 0 && c.cp != ' ' && !(c.attrs & ATTR_WIDE_CONT)) { last = x; break; }
+                }
+                if (last < 0) continue;
+                for (int x = 0; x <= last; x++) {
+                    Cell c = screen_view_cell(p->scr, x, y);
+                    if (c.attrs & ATTR_WIDE_CONT) continue;
+                    uint32_t cp = c.cp ? c.cp : ' ';
+                    if (cp < 0x80) {
+                        fputc((int)cp, p->clean_fp);
+                    } else if (cp < 0x800) {
+                        fputc(0xC0 | (cp >> 6),     p->clean_fp);
+                        fputc(0x80 | (cp & 0x3F),   p->clean_fp);
+                    } else if (cp < 0x10000) {
+                        fputc(0xE0 | (cp >> 12),         p->clean_fp);
+                        fputc(0x80 | ((cp >> 6) & 0x3F), p->clean_fp);
+                        fputc(0x80 | (cp & 0x3F),        p->clean_fp);
+                    } else {
+                        fputc(0xF0 | (cp >> 18),          p->clean_fp);
+                        fputc(0x80 | ((cp >> 12) & 0x3F), p->clean_fp);
+                        fputc(0x80 | ((cp >> 6) & 0x3F),  p->clean_fp);
+                        fputc(0x80 | (cp & 0x3F),         p->clean_fp);
+                    }
+                }
+                fputc('\n', p->clean_fp);
+            }
+        }
+        fclose(p->clean_fp);
+        p->clean_fp = NULL;
+    }
+    if (p->scr) {
+        screen_set_scrollback_callback(p->scr, NULL, NULL);
+    }
+}
+
+/* Scrollback-push callback. Each finalized row arrives here as
+   resolved Cell[cols]; we walk the cells, emit codepoints as
+   UTF-8, and either continue the line (if auto-wrapped) or
+   terminate it with \n. Skips trailing default-blank cells so
+   half-empty rows don't tail with a wall of spaces. */
+static void pane_clean_log_row_cb(void *user, const Cell *row,
+                                  int cols, int wrapped) {
+    Pane *p = (Pane *)user;
+    if (!p || !p->clean_fp) return;
+    int last = -1;
+    for (int x = cols - 1; x >= 0; x--) {
+        if (row[x].cp != 0 && row[x].cp != ' ' &&
+            !(row[x].attrs & ATTR_WIDE_CONT)) { last = x; break; }
+    }
+    for (int x = 0; x <= last; x++) {
+        if (row[x].attrs & ATTR_WIDE_CONT) continue;
+        uint32_t cp = row[x].cp ? row[x].cp : ' ';
+        if (cp < 0x80) {
+            fputc((int)cp, p->clean_fp);
+        } else if (cp < 0x800) {
+            fputc(0xC0 | (cp >> 6),     p->clean_fp);
+            fputc(0x80 | (cp & 0x3F),   p->clean_fp);
+        } else if (cp < 0x10000) {
+            fputc(0xE0 | (cp >> 12),         p->clean_fp);
+            fputc(0x80 | ((cp >> 6) & 0x3F), p->clean_fp);
+            fputc(0x80 | (cp & 0x3F),        p->clean_fp);
+        } else {
+            fputc(0xF0 | (cp >> 18),          p->clean_fp);
+            fputc(0x80 | ((cp >> 12) & 0x3F), p->clean_fp);
+            fputc(0x80 | ((cp >> 6) & 0x3F),  p->clean_fp);
+            fputc(0x80 | (cp & 0x3F),         p->clean_fp);
+        }
+    }
+    /* Auto-wrap means the row terminated by hitting cols, not by
+       a logical line break — keep the next row on the same
+       logical line by NOT writing \n. */
+    if (!wrapped) fputc('\n', p->clean_fp);
+    fflush(p->clean_fp);
 }
 
 /* Append raw PTY bytes to the pane's log file. fsync each call so a
@@ -4615,6 +4744,9 @@ static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
                       char *err, size_t errsz) {
     if (!t || !t->active) return false;
     if (mode != SPLIT_VERTICAL && mode != SPLIT_HORIZONTAL) return false;
+    /* Splitting changes the tree shape — drop maximize so the
+       new sibling becomes visible too. */
+    t->maximized_leaf = NULL;
     PaneNode *target = t->active;
     PaneNode *new_leaf = pane_node_split_leaf(t, target, mode);
     if (!new_leaf) return false;
@@ -4650,10 +4782,43 @@ static bool tab_split(Tab *t, SplitMode mode, int cols, int rows,
     return true;
 }
 
+/* Toggle maximize on a tab's active leaf. Maximizing snaps the
+   leaf to the full content area (the live grid resizes via the
+   main loop's tabs_resize_all on the next frame); unmaximizing
+   restores the recursive split layout. Stays a no-op for
+   single-pane tabs since there's nothing to maximize.
+
+   Clears every leaf's selection on toggle — selection state is
+   in cell coords, and the imminent resize either moves those
+   cells under different content (maximize) or hides them
+   entirely (restore). Without this clear, a leftover selection
+   from before the toggle paints a blue rectangle over the new
+   layout where the old cells used to live. */
+static void tab_toggle_maximize(Tab *t) {
+    if (!t || !t->root) return;
+    if (pane_tree_count(t->root) < 2) return;
+    if (t->maximized_leaf) {
+        t->maximized_leaf = NULL;
+    } else {
+        t->maximized_leaf = t->active;
+    }
+    for (PaneNode *_l = pane_tree_first_leaf(t->root); _l;
+         _l = pane_tree_next_leaf(_l)) {
+        Pane *_p = _l->pane;
+        if (!_p) continue;
+        _p->sel.active   = false;
+        _p->sel.dragging = false;
+    }
+}
+
 /* Close one leaf of a tab. If it's the only leaf, mark the tab dead
    (the caller collects via the tab_close sweep). */
 static void tab_close_leaf(Tab *t, PaneNode *leaf) {
     if (!t || !leaf || leaf->split != SPLIT_NONE) return;
+    /* Closing any leaf collapses the tree shape — clearest fix
+       is to drop maximize state so the user lands back on the
+       full layout. */
+    t->maximized_leaf = NULL;
     bool was_active = (leaf == t->active);
     /* Pick a successor leaf BEFORE we mutate the tree. */
     PaneNode *succ = NULL;
@@ -5584,11 +5749,19 @@ static const char *tab_label(const Tab *t) {
    live up at the top of the file (next to the PaneNode definition). */
 
 /* On-screen rect of a leaf within a tab's tree, given the current
-   window size. Returns false if the leaf isn't in the tab. */
+   window size. Returns false if the leaf isn't in the tab.
+   When the tab has a maximized leaf, the maximized one occupies
+   the full content area and any other leaf returns false (they're
+   not visible). */
 static bool leaf_rect(const Tab *t, const PaneNode *leaf, int win_w, int win_h,
                       PaneRect *out) {
     if (!t || !leaf) return false;
     PaneRect outer = pane_tree_terminal_outer(win_w, win_h);
+    if (t->maximized_leaf) {
+        if (leaf != t->maximized_leaf) return false;
+        if (out) *out = outer;
+        return true;
+    }
     return pane_tree_node_rect_walk(t->root, leaf, outer, out);
 }
 
@@ -6102,10 +6275,120 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
                 2.0f, bc);
         }
     }
+    /* Maximize-mode edge stubs. When a pane is maximized, walk
+       up its ancestor chain and OR together the sides on which a
+       hidden sibling lives — then paint a short colored bar on
+       each of those edges so the user knows which directions the
+       hidden panes are in. */
+    if (t->maximized_leaf && pane_tree_count(t->root) >= 2) {
+        int sides = 0;  /* bit0 top, bit1 right, bit2 bottom, bit3 left */
+        for (PaneNode *n = t->maximized_leaf; n && n->parent; n = n->parent) {
+            PaneNode *par = n->parent;
+            bool is_first = (par->child[0] == n);
+            if (par->split == SPLIT_VERTICAL) {
+                sides |= is_first ? 0x02 : 0x08;
+            } else if (par->split == SPLIT_HORIZONTAL) {
+                sides |= is_first ? 0x04 : 0x01;
+            }
+        }
+        PaneRect pr;
+        if (leaf_rect(t, t->maximized_leaf, win_w, win_h, &pr)) {
+            Color sb = (Color){125, 207, 255, 220};
+            int len_h = pr.w / 4;
+            int len_v = pr.h / 4;
+            int thick = 3;
+            if (sides & 0x01) {  /* top */
+                DrawRectangle(pr.x + (pr.w - len_h) / 2, pr.y,
+                              len_h, thick, sb);
+            }
+            if (sides & 0x02) {  /* right */
+                DrawRectangle(pr.x + pr.w - thick, pr.y + (pr.h - len_v) / 2,
+                              thick, len_v, sb);
+            }
+            if (sides & 0x04) {  /* bottom */
+                DrawRectangle(pr.x + (pr.w - len_h) / 2, pr.y + pr.h - thick,
+                              len_h, thick, sb);
+            }
+            if (sides & 0x08) {  /* left */
+                DrawRectangle(pr.x, pr.y + (pr.h - len_v) / 2,
+                              thick, len_v, sb);
+            }
+        }
+    }
+    /* Rollover maximize / restore button — top-right corner of
+       each visible pane while the mouse is over it. The arrow
+       points 45° toward the pane's centre when not maximized
+       (a "fold-into-pane" cue) and points outward in the
+       opposite direction when maximized. Click handler reads
+       p->maximize_btn_* fields the next frame. Multi-pane only;
+       a single pane has nothing to maximize. */
+    {
+        bool multi = pane_tree_count(t->root) >= 2;
+        for (PaneNode *_l = pane_tree_first_leaf(t->root); _l;
+             _l = pane_tree_next_leaf(_l)) {
+            Pane *_p = _l->pane;
+            if (!_p) continue;
+            _p->maximize_btn_x = _p->maximize_btn_y = 0;
+            _p->maximize_btn_w = _p->maximize_btn_h = 0;
+            if (!multi) continue;
+            PaneRect pr;
+            if (!leaf_rect(t, _l, win_w, win_h, &pr)) continue;
+            int btn_sz = 20;
+            int bx = pr.x + pr.w - btn_sz - 6;
+            int by = pr.y + 6;
+            int mx = (int)mpos.x, my = (int)mpos.y;
+            bool over_pane = (mx >= pr.x && mx < pr.x + pr.w &&
+                              my >= pr.y && my < pr.y + pr.h);
+            bool over_btn  = (mx >= bx && mx < bx + btn_sz &&
+                              my >= by && my < by + btn_sz);
+            if (!over_pane && !over_btn) continue;
+            _p->maximize_btn_x = bx;
+            _p->maximize_btn_y = by;
+            _p->maximize_btn_w = btn_sz;
+            _p->maximize_btn_h = btn_sz;
+            /* Soft background pill so the icon is readable
+               whatever cell colour sits underneath. */
+            Color bg   = (Color){0, 0, 0, over_btn ? 200 : 130};
+            Color line = (Color){200, 230, 255, over_btn ? 255 : 200};
+            DrawRectangle(bx, by, btn_sz, btn_sz, bg);
+            DrawRectangleLines(bx, by, btn_sz, btn_sz, line);
+            bool is_max = (t->maximized_leaf == _l);
+            int ax1, ay1, ax2, ay2;
+            if (!is_max) {
+                /* Arrow ↗ pointing OUT of the pane: "expand to
+                   fill the window". Tip at the upper-right of
+                   the button, tail at the lower-left. */
+                ax1 = bx + 4;           ay1 = by + btn_sz - 4;
+                ax2 = bx + btn_sz - 4;  ay2 = by + 4;
+            } else {
+                /* Arrow ↙ pointing INTO the pane: "contract back
+                   to its split position". Tip at lower-left, tail
+                   at upper-right. */
+                ax1 = bx + btn_sz - 4;  ay1 = by + 4;
+                ax2 = bx + 4;           ay2 = by + btn_sz - 4;
+            }
+            DrawLineEx((Vector2){(float)ax1, (float)ay1},
+                       (Vector2){(float)ax2, (float)ay2},
+                       2.0f, line);
+            /* Arrowhead — two short legs at the tip end (ax2,ay2). */
+            int dx = (ax2 > ax1) ? 1 : -1;
+            int dy = (ay2 > ay1) ? 1 : -1;
+            DrawLineEx((Vector2){(float)ax2, (float)ay2},
+                       (Vector2){(float)(ax2 - dx * 6), (float)ay2},
+                       2.0f, line);
+            DrawLineEx((Vector2){(float)ax2, (float)ay2},
+                       (Vector2){(float)ax2, (float)(ay2 - dy * 6)},
+                       2.0f, line);
+        }
+    }
 
     /* One splitter bar per internal node, walked iteratively so we
-       don't recurse and don't allocate a closure. */
-    {
+       don't recurse and don't allocate a closure. Skipped entirely
+       when a pane is maximized — without that, the splitter
+       lines paint OVER the maximized pane at the positions of
+       the original splits, which looks like leftover dividers
+       from before the maximize. */
+    if (!t->maximized_leaf) {
         PaneRect outer = pane_tree_terminal_outer(win_w, win_h);
         PaneNode *stack[64]; PaneRect rstack[64]; int sp_top = 0;
         if (t->root) { stack[sp_top] = t->root; rstack[sp_top] = outer; sp_top++; }
@@ -17428,7 +17711,11 @@ static void logs_scan(void) {
     while ((de = readdir(d)) != NULL && g_logs_count < LOGS_MAX) {
         if (de->d_name[0] == '.') continue;
         size_t nlen = strlen(de->d_name);
-        if (nlen < 5 || strcmp(de->d_name + nlen - 4, ".log") != 0) continue;
+        /* Include both raw .log and clean .txt — the user can
+           pick whichever flavour they want to read. */
+        if (nlen < 5 ||
+            (strcmp(de->d_name + nlen - 4, ".log") != 0 &&
+             strcmp(de->d_name + nlen - 4, ".txt") != 0)) continue;
         char full[PATH_MAX];
         snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
         struct stat st;
@@ -18675,8 +18962,32 @@ int main(int argc, char **argv) {
                     s_drag_node = NULL;
                 }
             } else {
+                /* Maximize / restore rollover button — checked
+                   before click-to-focus so a click on the corner
+                   button toggles maximize without ALSO mutating
+                   focus or starting a selection drag. The
+                   maximize_click_consumed flag suppresses every
+                   downstream click handler in the per-pane block. */
+                bool maximize_click_consumed = false;
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && cur && cur->root) {
+                    int mxi = (int)mp.x, myi = (int)mp.y;
+                    for (PaneNode *_l = pane_tree_first_leaf(cur->root); _l;
+                         _l = pane_tree_next_leaf(_l)) {
+                        Pane *_p = _l->pane;
+                        if (!_p || _p->maximize_btn_w == 0) continue;
+                        if (mxi >= _p->maximize_btn_x &&
+                            mxi <  _p->maximize_btn_x + _p->maximize_btn_w &&
+                            myi >= _p->maximize_btn_y &&
+                            myi <  _p->maximize_btn_y + _p->maximize_btn_h) {
+                            cur->active = _l;
+                            tab_toggle_maximize(cur);
+                            maximize_click_consumed = true;
+                            break;
+                        }
+                    }
+                }
                 /* Click-to-focus: left-press inside a pane makes it the active one. */
-                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                if (!maximize_click_consumed && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                     PaneNode *hit = pane_at(cur, win_w_now, win_h_now,
                                             (int)mp.x, (int)mp.y);
                     if (hit) cur->active = hit;
@@ -18799,7 +19110,8 @@ int main(int argc, char **argv) {
                                 goto pane_click_done;
                             }
                         }
-                        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                        if (!maximize_click_consumed &&
+                            IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                             /* Cmd/Ctrl+click on an OSC 8 hyperlink opens
                                it in the system default handler and
                                doesn't start a selection. */
@@ -19527,6 +19839,10 @@ int main(int argc, char **argv) {
                     cur->active = pane_tree_cycle_leaf(cur->root, cur->active,
                                                        shift_held ? -1 : +1);
                 }
+            }
+            /* Cmd+Shift+M — toggle maximize on the active pane. */
+            else if (shift_held && IsKeyPressed(KEY_M)) {
+                tab_toggle_maximize(cur);
             }
             else if (IsKeyPressed(KEY_LEFT_BRACKET))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
             else if (IsKeyPressed(KEY_RIGHT_BRACKET)) { g_active = (g_active + 1) % g_num_tabs; cur = active_tab(); }
