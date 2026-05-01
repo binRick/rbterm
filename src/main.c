@@ -1355,7 +1355,8 @@ static int  g_tab_rename_caret  = 0;
 typedef enum {
     UI_NORMAL = 0, UI_SSH_FORM, UI_SETTINGS, UI_HELP, UI_REC_SAVE,
     UI_SESSION_DESIGNER,
-    UI_SFTP_UPLOAD, UI_SFTP_DOWNLOAD
+    UI_SFTP_UPLOAD, UI_SFTP_DOWNLOAD,
+    UI_LOGS
 } UiMode;
 typedef enum {
     F_NAME = 0, F_HOST, F_PORT, F_USER, F_PASS, F_KEY,
@@ -2361,6 +2362,11 @@ static SessionDesignerLayout session_designer_layout(int win_w, int win_h) {
     return L;
 }
 
+/* Forward decl — logs browser is defined near the bottom of the
+   file but referenced from the Cmd+Shift+O chord and Settings →
+   Logging click handler (both above the definition). */
+static void logs_open(void);
+
 static void session_designer_open_for(int idx) {
     /* Free any previous working copy. */
     if (g_sd_session.root) session_node_free(g_sd_session.root);
@@ -3226,12 +3232,32 @@ static bool g_help_just_opened = false;
    between opens so the user lands on whichever tab they last
    looked at. */
 static int  g_help_tab = 0;
+/* Sub-tab within the Navigation top-level tab, since the chord
+   list is large enough that a single page is hard to scan. Order:
+   0 = Tabs, 1 = Panes, 2 = Scroll & font, 3 = Modals. */
+#define HELP_NAV_SUBTAB_COUNT 4
+static int  g_help_nav_subtab = 0;
+/* Edit & Search top-level tab also splits cleanly:
+   0 = Selection (clipboard + click selection)
+   1 = Search (find-bar chords). */
+#define HELP_EDIT_SUBTAB_COUNT 2
+static int  g_help_edit_subtab = 0;
+/* Shell integration top-level tab splits by shell, since the
+   one-line setup snippet is the part the user actually copies
+   and it's different per shell. The narrative + caveats render
+   identically on both panels — only the sourcing snippet
+   differs. */
+#define HELP_SHELL_SUBTAB_COUNT 2
+static int  g_help_shell_subtab = 0;
 /* Filled by draw_help_modal each frame so the main-loop click
    handler can hit-test the tab buttons AND know the actual panel
    rect (which depends on the active tab's row count, so a fixed
    fallback would over-claim "inside" for short tabs). */
 #define HELP_TAB_COUNT 3
 static Rect g_help_tab_rects[HELP_TAB_COUNT];
+static Rect g_help_nav_subtab_rects[HELP_NAV_SUBTAB_COUNT];
+static Rect g_help_edit_subtab_rects[HELP_EDIT_SUBTAB_COUNT];
+static Rect g_help_shell_subtab_rects[HELP_SHELL_SUBTAB_COUNT];
 static Rect g_help_modal_rect;
 
 /* Which scrollable list owns Up/Down keyboard nav while the modal is
@@ -11658,6 +11684,7 @@ typedef struct {
     Rect spc_dec, spc_inc;
     Rect log_toggle; /* on/off button */
     Rect log_dir;    /* editable text box with log directory */
+    Rect log_browse; /* "Browse logs" — opens the logs modal */
     Rect ligatures_toggle; /* Settings → Font: enable HarfBuzz shaping */
     Rect rec_dir;    /* editable text box with recording-save directory */
     Rect repeat_initial; /* slider track — initial repeat delay */
@@ -12339,6 +12366,12 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
 
         int log_row2_y = log_row1_y + btn + 10;
         L.log_dir = (Rect){ L.modal.x + 140, log_row2_y, w - 140 - 22, btn };
+
+        /* Browse-logs button below the directory field. Opens the
+           logs modal (same as Cmd+Shift+O) so the user can pick a
+           past session and re-open it. */
+        int log_row3_y = log_row2_y + btn + 12;
+        L.log_browse = (Rect){ L.modal.x + 140, log_row3_y, 200, btn };
     } else if (g_settings_tab == SETTINGS_TAB_WINDOW) {
         /* Two rows of size presets:
              row 1: Default | Small | Medium | Large
@@ -12784,6 +12817,10 @@ static void settings_handle_mouse(Renderer *r, SettingsLayout L) {
     if (rect_hit(L.log_toggle, mx, my)) {
         g_app_settings.log_enabled = !g_app_settings.log_enabled;
         refresh_tab_logs();
+        return;
+    }
+    if (L.log_browse.w > 0 && rect_hit(L.log_browse, mx, my)) {
+        logs_open();
         return;
     }
     /* Key-repeat sliders. Press inside the track begins a drag; the
@@ -15165,59 +15202,78 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
         } \
     } while (0)
     if (g_help_tab == 0) {
-        /* Navigation: tabs / splits / scroll / modals — all the
-           "moving around" chords, no editing or finding. */
-        ROW("",                          "Tabs");
-        ROW("Cmd+T",                     "New tab (local shell)");
-        ROW("Cmd+Shift+T",               "New tab via SSH (open the connect form)");
-        ROW("Cmd+W",                     "Close active tab (or pane if split)");
-        ROW("Cmd+1..9",                  "Jump to tab N");
-        ROW("Cmd+Left / Cmd+Right",      "Cycle to previous / next tab");
-        ROW("Cmd+[ / Cmd+]",             "Cycle to previous / next tab (alt)");
-        ROW("Cmd+Shift+Left/Right",      "Move active tab left / right");
-        ROW("Cmd+N",                     "New rbterm window (separate process — Mission Control groups them)");
-        ROW("",                          "Splits");
-        ROW("Cmd+D",                     "Split active tab vertically (side-by-side)");
-        ROW("Cmd+Shift+D",               "Split horizontally (top / bottom)");
-        ROW("Cmd+Shift+W",               "Close active pane (collapses to single)");
-        ROW("Click a pane",              "Focus that pane");
-        ROW("Drag the splitter",         "Resize panes");
-        ROW("",                          "Scroll + view");
-        ROW("Mouse wheel",               "Scroll into history (when not in app cursor mode)");
-        ROW("Ctrl+Shift+Up/Down",        "Scroll one row");
-        ROW("Shift+PageUp/PageDown",     "Scroll one screen");
-        ROW("Cmd+= / Cmd+-",             "Font size up / down");
-        ROW("Cmd+0",                     "Reset font size to 20pt");
-        ROW("",                          "Modals");
-        ROW("Cmd+,",                     "Settings");
-        ROW("Cmd+Shift+T",               "SSH connect form");
-        ROW("Esc / click outside",       "Dismiss the active modal");
-        ROW("",                          "");
-        ROW("Note",                      "Cmd shows on macOS; Ctrl is the modifier on Linux + Windows.");
+        /* Navigation chords are split into four sub-tabs so each
+           panel fits without scrolling and the user finds chords
+           grouped by what they affect. */
+        if (g_help_nav_subtab == 0) {
+            ROW("",                          "Tabs");
+            ROW("Cmd+T",                     "New tab (local shell)");
+            ROW("Cmd+Shift+T",               "New tab via SSH (open the connect form)");
+            ROW("Cmd+W",                     "Close active tab (or pane if split)");
+            ROW("Cmd+1..9",                  "Jump to tab N");
+            ROW("Cmd+Left / Cmd+Right",      "Cycle to previous / next tab");
+            ROW("Cmd+[ / Cmd+]",             "Cycle to previous / next tab (alt)");
+            ROW("Cmd+Shift+Left/Right",      "Move active tab left / right");
+            ROW("Cmd+R / dbl-click title",   "Rename active tab");
+            ROW("Cmd+N",                     "New rbterm window (separate process)");
+        } else if (g_help_nav_subtab == 1) {
+            ROW("",                          "Panes (splits)");
+            ROW("Cmd+D",                     "Split active tab vertically (side-by-side)");
+            ROW("Cmd+Shift+D",               "Split horizontally (top / bottom)");
+            ROW("Cmd+Shift+W",               "Close active pane (collapses to single)");
+            ROW("Cmd+K",                     "Cycle focus to next leaf in DFS order");
+            ROW("Cmd+Shift+K",               "Cycle focus to previous leaf");
+            ROW("Cmd+Opt+Arrows",            "Directional pane focus (iTerm2 convention)");
+            ROW("Click a pane",              "Focus that pane");
+            ROW("Drag the splitter",         "Resize panes");
+            ROW("Cmd+Shift+I",               "Toggle broadcast — type into every pane in the active tab");
+        } else if (g_help_nav_subtab == 2) {
+            ROW("",                          "Scroll + font");
+            ROW("Mouse wheel",               "Scroll into history (when not in app cursor mode)");
+            ROW("Ctrl+Shift+Up/Down",        "Scroll one row");
+            ROW("Shift+PageUp/PageDown",     "Scroll one screen");
+            ROW("Cmd+= / Cmd+-",             "Font size up / down");
+            ROW("Cmd+0",                     "Reset font size to 20pt");
+            ROW("Cmd+Up / Cmd+Down",         "Jump to previous / next prompt (needs OSC 133)");
+        } else {
+            ROW("",                          "Modals + windows");
+            ROW("Cmd+,",                     "Settings");
+            ROW("Cmd+Shift+T",               "SSH connect form");
+            ROW("Cmd+Shift+P",               "Session Designer (multi-host split sessions)");
+            ROW("Cmd+Shift+O",               "Browse session logs");
+            ROW("Cmd+Shift+S",               "Screenshot active pane");
+            ROW("Cmd+CapsLock",              "Quake-drop the window (when borderless mode is enabled)");
+            ROW("Esc / click outside",       "Dismiss the active modal");
+            ROW("",                          "");
+            ROW("Note",                      "Cmd shows on macOS; Ctrl is the modifier on Linux + Windows.");
+        }
     } else if (g_help_tab == 1) {
-        /* Edit & Search: selection, clipboard, find, plus the
-           OSC-133-powered "select last output" / prompt-jump chords
-           (cross-referenced — full setup lives on the Shell tab). */
-        ROW("",                          "Selection + clipboard");
-        ROW("Cmd+A",                     "Select all visible text in active pane");
-        ROW("Cmd+C",                     "Copy selection");
-        ROW("Cmd+V",                     "Paste");
-        ROW("Click + drag",              "Select text");
-        ROW("Double-click",              "Select word (smart trim of trailing punctuation)");
-        ROW("Triple-click",              "Select line (joins wrapped rows)");
-        ROW("",                          "Search");
-        ROW("Cmd+F",                     "Open search bar on the active pane");
-        ROW("Enter / Down / F3",         "Next match");
-        ROW("Shift+Enter / Up / Shift+F3","Previous match");
-        ROW("Cmd+A (in search)",         "Select all in search query");
-        ROW("Click / Shift+click / drag","Position caret / extend / range select in search");
-        ROW("Esc",                       "Close search, restore scroll position");
-        ROW("",                          "Shell integration (needs OSC 133 — see Shell tab)");
-        ROW("Cmd+Up / Cmd+Down",         "Jump to previous / next prompt");
-        ROW("Cmd+Shift+L",               "Select last command's output");
+        if (g_help_edit_subtab == 0) {
+            ROW("",                          "Selection + clipboard");
+            ROW("Cmd+A",                     "Select all visible text in active pane");
+            ROW("Cmd+C",                     "Copy selection");
+            ROW("Cmd+V",                     "Paste");
+            ROW("Click + drag",              "Select text");
+            ROW("Double-click",              "Select word (smart trim of trailing punctuation)");
+            ROW("Triple-click",              "Select line (joins wrapped rows)");
+            ROW("",                          "Cross-ref (needs OSC 133 — see Shell tab)");
+            ROW("Cmd+Shift+L",               "Select last command's output");
+        } else {
+            ROW("",                          "Search");
+            ROW("Cmd+F",                     "Open search bar on the active pane");
+            ROW("Enter / Down / F3",         "Next match");
+            ROW("Shift+Enter / Up / Shift+F3","Previous match");
+            ROW("Cmd+A (in search)",         "Select all in search query");
+            ROW("Click / Shift+click / drag","Position caret / extend / range select in search");
+            ROW("Esc",                       "Close search, restore scroll position");
+            ROW("",                          "Recompute is debounced 350 ms after the last keystroke,");
+            ROW("",                          "so a million-line scrollback stays responsive while typing.");
+        }
     } else {
-        /* Shell integration tab — narrative, not chords. Use chord
-           column blank + desc column carrying the prose. */
+        /* Shell integration — narrative + per-shell setup line.
+           Both panels share the same intro/caveats; only the
+           one-line `source` snippet differs (zsh vs bash). */
+        bool zsh = (g_help_shell_subtab == 0);
         ROW("", "What is shell integration?");
         ROW("", "rbterm understands OSC 133 — a small protocol where your");
         ROW("", "shell tells the terminal where each prompt and command");
@@ -15234,13 +15290,17 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
         ROW("",   "Cmd+C copies it to the clipboard.");
         ROW("",   "");
         ROW("",   "Setup (one time)");
-        ROW("",   "Source the helper from your shell rc:");
-        ROW("zsh:", "echo 'source <rbterm-repo>/tools/rbterm-shell-integration.zsh' >> ~/.zshrc");
-        ROW("bash:", "echo 'source <rbterm-repo>/tools/rbterm-shell-integration.bash' >> ~/.bashrc");
-        ROW("",     "");
-        ROW("",     "Open a new pane (Cmd+T) so the new shell picks up the");
-        ROW("",     "hook. Existing panes that didn't source the script");
-        ROW("",     "stay un-instrumented — that's deliberate.");
+        if (zsh) {
+            ROW("",     "Source the helper from your ~/.zshrc:");
+            ROW("zsh:",  "echo 'source <rbterm-repo>/tools/rbterm-shell-integration.zsh' >> ~/.zshrc");
+            ROW("",      "Then either restart zsh (`exec zsh`) or open a new");
+            ROW("",      "pane so the precmd / preexec hooks load.");
+        } else {
+            ROW("",     "Source the helper from your ~/.bashrc:");
+            ROW("bash:", "echo 'source <rbterm-repo>/tools/rbterm-shell-integration.bash' >> ~/.bashrc");
+            ROW("",      "Then `source ~/.bashrc` (or open a new pane) so the");
+            ROW("",      "DEBUG / PROMPT_COMMAND traps install.");
+        }
         ROW("",     "");
         ROW("",     "Caveats");
         ROW("•",    "Inside tmux / vim / less, rbterm is on the alt screen");
@@ -15253,12 +15313,22 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
     #undef ROW_END
 
     int row_h = 22;
-    int header_h = 50 + 32; /* title bar + tab bar */
+    /* title bar (38) + tab bar (26 + 6 gap) + sub-tab bar
+       (22 + 6 gap). All three top-level tabs now have sub-tabs
+       (Tabs/Panes/Scroll/Modals on Navigation, Selection/Search
+       on Edit, zsh/bash on Shell), so header_h is constant — the
+       modal's overall size never shifts. */
+    int header_h = 50 + 32 + 28;
     int side_pad = 28;
     int top_pad  = 18;
     int footer_h = 32;
-    int needed_h = header_h + n * row_h + top_pad + footer_h;
-    int w = 760, h = needed_h;
+    /* Fixed modal size — same dimensions regardless of which tab
+       or sub-tab is active. Picked to comfortably fit the Shell
+       integration tab (the largest content). Tabs with less
+       content just have empty space below; this keeps the modal
+       from "jumping" as the user clicks between tabs. */
+    (void)n; (void)row_h;  /* dynamic-row sizing no longer used */
+    int w = 760, h = 600;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     int mx = (win_w - w) / 2;
@@ -15277,7 +15347,10 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
                (Vector2){ mx + 20, my + 11 },
                16, 0, (Color){230, 232, 240, 255});
 
-    /* Tab bar between title and content. */
+    /* Tab bar between title and content. Active tab is visually
+       distinct three ways: brighter fill, full-strength text vs
+       dimmed inactive text, and a 3 px cyan accent strip along
+       its bottom edge. */
     {
         const char *labels[HELP_TAB_COUNT] = {
             "Navigation", "Edit & Search", "Shell integration"
@@ -15291,16 +15364,133 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
             g_help_tab_rects[i] = tr;
             bool on = (g_help_tab == i);
             DrawRectangle(tr.x, tr.y, tr.w, tr.h,
-                          on ? (Color){46, 92, 150, 255}
-                             : (Color){34, 38, 52, 255});
+                          on ? (Color){62, 120, 180, 255}
+                             : (Color){26, 30, 42, 255});
             DrawRectangleLines(tr.x, tr.y, tr.w, tr.h,
-                               (Color){125, 207, 255, on ? 255 : 120});
+                               on ? (Color){200, 230, 255, 255}
+                                  : (Color){80,  90, 110, 130});
+            if (on) {
+                /* 3-px accent strip — strong active indicator. */
+                DrawRectangle(tr.x, tr.y + tr.h - 3,
+                              tr.w, 3,
+                              (Color){125, 207, 255, 255});
+            }
             Vector2 ts = MeasureTextEx(*f, labels[i], 13, 0);
             DrawTextEx(*f, labels[i],
                        (Vector2){tr.x + (tr.w - ts.x) / 2,
                                  tr.y + (tr.h - ts.y) / 2},
-                       13, 0, (Color){230, 232, 240, 255});
+                       13, 0, on ? (Color){250, 252, 255, 255}
+                                 : (Color){140, 150, 170, 200});
         }
+    }
+    /* Sub-tab strip — only on the Navigation top-level tab.
+       Splits the chord list into Tabs / Panes / Scroll / Modals
+       so each panel fits without scrolling. Same active-state
+       cues as the top-level tabs (brighter fill + dimmed
+       inactive text + accent strip) for visual consistency. */
+    if (g_help_tab == 0) {
+        const char *sublabels[HELP_NAV_SUBTAB_COUNT] = {
+            "Tabs", "Panes", "Scroll", "Modals"
+        };
+        int sbar_y = my + 44 + 26 + 6;
+        int sbar_h = 22;
+        int sbw = (w - 2 * 14 - 3 * 6) / HELP_NAV_SUBTAB_COUNT;
+        int sbx = mx + 14;
+        for (int i = 0; i < HELP_NAV_SUBTAB_COUNT; i++) {
+            Rect tr = { sbx + i * (sbw + 6), sbar_y, sbw, sbar_h };
+            g_help_nav_subtab_rects[i] = tr;
+            bool on = (g_help_nav_subtab == i);
+            DrawRectangle(tr.x, tr.y, tr.w, tr.h,
+                          on ? (Color){80, 145, 200, 255}
+                             : (Color){22, 26, 36, 255});
+            DrawRectangleLines(tr.x, tr.y, tr.w, tr.h,
+                               on ? (Color){200, 230, 255, 220}
+                                  : (Color){70, 80, 100, 110});
+            if (on) {
+                DrawRectangle(tr.x, tr.y + tr.h - 2,
+                              tr.w, 2,
+                              (Color){170, 220, 255, 255});
+            }
+            Vector2 ts = MeasureTextEx(*f, sublabels[i], 12, 0);
+            DrawTextEx(*f, sublabels[i],
+                       (Vector2){tr.x + (tr.w - ts.x) / 2,
+                                 tr.y + (tr.h - ts.y) / 2},
+                       12, 0, on ? (Color){250, 252, 255, 255}
+                                 : (Color){135, 145, 165, 180});
+        }
+    } else {
+        for (int i = 0; i < HELP_NAV_SUBTAB_COUNT; i++)
+            g_help_nav_subtab_rects[i] = (Rect){0, 0, 0, 0};
+    }
+    /* Edit & Search sub-tab strip — Selection / Search. */
+    if (g_help_tab == 1) {
+        const char *sublabels[HELP_EDIT_SUBTAB_COUNT] = {
+            "Selection", "Search"
+        };
+        int sbar_y = my + 44 + 26 + 6;
+        int sbar_h = 22;
+        int sbw = (w - 2 * 14 - (HELP_EDIT_SUBTAB_COUNT - 1) * 6)
+                  / HELP_EDIT_SUBTAB_COUNT;
+        int sbx = mx + 14;
+        for (int i = 0; i < HELP_EDIT_SUBTAB_COUNT; i++) {
+            Rect tr = { sbx + i * (sbw + 6), sbar_y, sbw, sbar_h };
+            g_help_edit_subtab_rects[i] = tr;
+            bool on = (g_help_edit_subtab == i);
+            DrawRectangle(tr.x, tr.y, tr.w, tr.h,
+                          on ? (Color){80, 145, 200, 255}
+                             : (Color){22, 26, 36, 255});
+            DrawRectangleLines(tr.x, tr.y, tr.w, tr.h,
+                               on ? (Color){200, 230, 255, 220}
+                                  : (Color){70, 80, 100, 110});
+            if (on) {
+                DrawRectangle(tr.x, tr.y + tr.h - 2, tr.w, 2,
+                              (Color){170, 220, 255, 255});
+            }
+            Vector2 ts = MeasureTextEx(*f, sublabels[i], 12, 0);
+            DrawTextEx(*f, sublabels[i],
+                       (Vector2){tr.x + (tr.w - ts.x) / 2,
+                                 tr.y + (tr.h - ts.y) / 2},
+                       12, 0, on ? (Color){250, 252, 255, 255}
+                                 : (Color){135, 145, 165, 180});
+        }
+    } else {
+        for (int i = 0; i < HELP_EDIT_SUBTAB_COUNT; i++)
+            g_help_edit_subtab_rects[i] = (Rect){0, 0, 0, 0};
+    }
+    /* Shell integration sub-tab strip — zsh / bash. */
+    if (g_help_tab == 2) {
+        const char *sublabels[HELP_SHELL_SUBTAB_COUNT] = {
+            "zsh", "bash"
+        };
+        int sbar_y = my + 44 + 26 + 6;
+        int sbar_h = 22;
+        int sbw = (w - 2 * 14 - (HELP_SHELL_SUBTAB_COUNT - 1) * 6)
+                  / HELP_SHELL_SUBTAB_COUNT;
+        int sbx = mx + 14;
+        for (int i = 0; i < HELP_SHELL_SUBTAB_COUNT; i++) {
+            Rect tr = { sbx + i * (sbw + 6), sbar_y, sbw, sbar_h };
+            g_help_shell_subtab_rects[i] = tr;
+            bool on = (g_help_shell_subtab == i);
+            DrawRectangle(tr.x, tr.y, tr.w, tr.h,
+                          on ? (Color){80, 145, 200, 255}
+                             : (Color){22, 26, 36, 255});
+            DrawRectangleLines(tr.x, tr.y, tr.w, tr.h,
+                               on ? (Color){200, 230, 255, 220}
+                                  : (Color){70, 80, 100, 110});
+            if (on) {
+                DrawRectangle(tr.x, tr.y + tr.h - 2, tr.w, 2,
+                              (Color){170, 220, 255, 255});
+            }
+            Vector2 ts = MeasureTextEx(*f, sublabels[i], 12, 0);
+            DrawTextEx(*f, sublabels[i],
+                       (Vector2){tr.x + (tr.w - ts.x) / 2,
+                                 tr.y + (tr.h - ts.y) / 2},
+                       12, 0, on ? (Color){250, 252, 255, 255}
+                                 : (Color){135, 145, 165, 180});
+        }
+    } else {
+        for (int i = 0; i < HELP_SHELL_SUBTAB_COUNT; i++)
+            g_help_shell_subtab_rects[i] = (Rect){0, 0, 0, 0};
     }
 
     int chord_w = (g_help_tab < 2) ? 240 : 60;
@@ -15926,6 +16116,22 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
                       (Color){125, 207, 255, 255});
     }
     EndScissorMode();
+
+    /* Browse-logs button. Opens the logs modal (Cmd+Shift+O). */
+    if (L.log_browse.w > 0) {
+        DrawRectangle(L.log_browse.x, L.log_browse.y,
+                      L.log_browse.w, L.log_browse.h,
+                      (Color){48, 60, 86, 255});
+        DrawRectangleLines(L.log_browse.x, L.log_browse.y,
+                           L.log_browse.w, L.log_browse.h,
+                           (Color){125, 207, 255, 200});
+        const char *bl = "Browse logs ...";
+        Vector2 bsz = MeasureTextEx(*f, bl, 13, 0);
+        DrawTextEx(*f, bl,
+                   (Vector2){L.log_browse.x + (L.log_browse.w - bsz.x) / 2,
+                             L.log_browse.y + (L.log_browse.h - bsz.y) / 2},
+                   13, 0, (Color){210, 225, 245, 255});
+    }
 
     }  /* end Session tab */
     if (g_settings_tab == SETTINGS_TAB_WINDOW) {
@@ -17167,6 +17373,318 @@ static bool bg_ssh_integrate(void) {
     return any;
 }
 #endif /* RBTERM_SSH */
+
+/* ---------- Logs browser ----------------------------------------
+
+   Lists files in g_app_settings.log_dir (newest first), lets the
+   user open one in a new local pane via `less -R`. The modal is
+   intentionally minimal — no preview, no export, no delete in v1.
+   Opened by Cmd+Shift+L or via the Browse logs button on
+   Settings → Logging. */
+
+typedef struct {
+    char     name[256];
+    char     path[PATH_MAX];
+    long long size;
+    time_t   mtime;
+} LogEntry;
+
+#define LOGS_MAX 256
+static LogEntry g_logs[LOGS_MAX];
+static int      g_logs_count    = 0;
+static int      g_logs_selected = -1;
+static int      g_logs_scroll   = 0;
+static char     g_logs_status[256];
+
+typedef struct {
+    Rect modal;
+    Rect list;
+    Rect row[LOGS_MAX];
+    Rect open_btn;
+    Rect close_btn;
+} LogsLayout;
+
+static int log_compare_mtime_desc(const void *a, const void *b) {
+    const LogEntry *la = a, *lb = b;
+    if (la->mtime != lb->mtime) return lb->mtime > la->mtime ? 1 : -1;
+    return strcmp(la->name, lb->name);
+}
+
+static void logs_scan(void) {
+    g_logs_count = 0;
+    g_logs_selected = -1;
+    g_logs_scroll = 0;
+    g_logs_status[0] = 0;
+    char dir[PATH_MAX];
+    if (!g_app_settings.log_dir[0]) return;
+    expand_home_path(g_app_settings.log_dir, dir, sizeof(dir));
+    DIR *d = opendir(dir);
+    if (!d) {
+        snprintf(g_logs_status, sizeof(g_logs_status),
+                 "Couldn't open %s: %s", dir, strerror(errno));
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && g_logs_count < LOGS_MAX) {
+        if (de->d_name[0] == '.') continue;
+        size_t nlen = strlen(de->d_name);
+        if (nlen < 5 || strcmp(de->d_name + nlen - 4, ".log") != 0) continue;
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        if (!S_ISREG(st.st_mode)) continue;
+        LogEntry *e = &g_logs[g_logs_count++];
+        strncpy(e->name, de->d_name, sizeof(e->name) - 1);
+        e->name[sizeof(e->name) - 1] = 0;
+        strncpy(e->path, full, sizeof(e->path) - 1);
+        e->path[sizeof(e->path) - 1] = 0;
+        e->size = (long long)st.st_size;
+        e->mtime = st.st_mtime;
+    }
+    closedir(d);
+    if (g_logs_count > 1) {
+        qsort(g_logs, (size_t)g_logs_count, sizeof(LogEntry),
+              log_compare_mtime_desc);
+    }
+    if (g_logs_count > 0) g_logs_selected = 0;
+}
+
+static void logs_open(void) {
+    logs_scan();
+    g_ui_mode = UI_LOGS;
+}
+
+static LogsLayout logs_layout_compute(int win_w, int win_h) {
+    LogsLayout L = {0};
+    int w = 720, h = 540;
+    if (w > win_w - 40) w = win_w - 40;
+    if (h > win_h - 40) h = win_h - 40;
+    L.modal.x = (win_w - w) / 2;
+    L.modal.y = (win_h - h) / 2;
+    L.modal.w = w; L.modal.h = h;
+    int title_h = 38;
+    int pad = 22;
+    int btn_h = 32;
+    int row_h = 26;
+    int footer_y = L.modal.y + h - 22 - btn_h;
+    int top_y = L.modal.y + title_h + 18;
+    int list_h = footer_y - top_y - 16;
+    L.list = (Rect){ L.modal.x + pad, top_y, w - 2 * pad, list_h };
+    int visible_rows = list_h / row_h;
+    if (visible_rows < 1) visible_rows = 1;
+    if (g_logs_scroll < 0) g_logs_scroll = 0;
+    int max_scroll = g_logs_count - visible_rows;
+    if (max_scroll < 0) max_scroll = 0;
+    if (g_logs_scroll > max_scroll) g_logs_scroll = max_scroll;
+    for (int i = 0; i < LOGS_MAX; i++) L.row[i] = (Rect){0,0,0,0};
+    for (int i = 0; i < g_logs_count; i++) {
+        int rel = i - g_logs_scroll;
+        if (rel < 0 || rel >= visible_rows) continue;
+        L.row[i] = (Rect){ L.list.x, L.list.y + rel * row_h,
+                           L.list.w, row_h };
+    }
+    int open_w = 130, close_w = 90;
+    L.close_btn = (Rect){ L.modal.x + w - pad - close_w, footer_y, close_w, btn_h };
+    L.open_btn  = (Rect){ L.close_btn.x - 8 - open_w,    footer_y, open_w,  btn_h };
+    return L;
+}
+
+/* Open the selected log in the OS's default text editor. macOS
+   `open -t` honours the user's preferred .txt editor; Linux uses
+   xdg-open which honours the desktop association; Windows shells
+   out via `start ""` to associate the file with whatever the
+   user has set. The launcher returns immediately — we don't
+   block the rbterm UI on the editor's startup. */
+static void logs_open_selected_in_editor(void) {
+    if (g_logs_selected < 0 || g_logs_selected >= g_logs_count) return;
+    const char *path = g_logs[g_logs_selected].path;
+    char cmd[PATH_MAX + 32];
+#if defined(__APPLE__)
+    snprintf(cmd, sizeof(cmd), "open -t '%s'", path);
+#elif defined(_WIN32)
+    snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", path);
+#else
+    snprintf(cmd, sizeof(cmd), "xdg-open '%s' >/dev/null 2>&1 &", path);
+#endif
+    int rc = system(cmd);
+    (void)rc;
+    g_ui_mode = UI_NORMAL;
+}
+
+static void logs_handle_mouse(LogsLayout L, int cols, int rows) {
+    Vector2 mp = GetMousePosition();
+    int mx = (int)mp.x, my = (int)mp.y;
+    /* Wheel scroll inside the list. */
+    if (rect_hit(L.list, mx, my)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            g_logs_scroll -= (int)(wheel * 3.0f);
+            if (g_logs_scroll < 0) g_logs_scroll = 0;
+        }
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+    if (rect_hit(L.close_btn, mx, my)) { g_ui_mode = UI_NORMAL; return; }
+    if (rect_hit(L.open_btn,  mx, my)) { logs_open_selected_in_editor(); return; }
+    for (int i = 0; i < g_logs_count; i++) {
+        if (L.row[i].w == 0) continue;
+        if (rect_hit(L.row[i], mx, my)) {
+            /* Single click selects, double-click opens. The
+               static last-click tracker matches the path-field
+               double-click pattern in the save modal. */
+            static double last_t = -1.0;
+            static int    last_idx = -1;
+            double now = GetTime();
+            if (last_idx == i && (now - last_t) < 0.45) {
+                logs_open_selected_in_editor();
+                last_idx = -1;
+                last_t = -1.0;
+            } else {
+                g_logs_selected = i;
+                last_idx = i;
+                last_t = now;
+            }
+            return;
+        }
+    }
+}
+
+static void logs_handle_keys(int cols, int rows) {
+    if (IsKeyPressed(KEY_ESCAPE)) { g_ui_mode = UI_NORMAL; return; }
+    if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) {
+        if (g_logs_selected > 0) g_logs_selected--;
+        return;
+    }
+    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
+        if (g_logs_selected < g_logs_count - 1) g_logs_selected++;
+        return;
+    }
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        logs_open_selected_in_editor();
+        return;
+    }
+}
+
+static void draw_logs_modal(Renderer *r, int win_w, int win_h, LogsLayout L) {
+    Font *f = (Font *)r->font_data;
+    /* Backdrop dim. */
+    DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 160});
+    DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                  (Color){26, 30, 42, 250});
+    DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
+                       (Color){90, 100, 130, 220});
+    /* Title bar. */
+    DrawRectangle(L.modal.x, L.modal.y, L.modal.w, 38,
+                  (Color){34, 38, 52, 255});
+    DrawTextEx(*f, "Session logs",
+               (Vector2){L.modal.x + 22, L.modal.y + 11},
+               16, 0, (Color){230, 235, 248, 255});
+    /* Subtitle: log_dir. */
+    {
+        char dir[PATH_MAX];
+        expand_home_path(g_app_settings.log_dir, dir, sizeof(dir));
+        char sub[PATH_MAX + 16];
+        snprintf(sub, sizeof(sub), "from %s", dir);
+        DrawTextEx(*f, sub,
+                   (Vector2){L.modal.x + 22 + 130, L.modal.y + 14},
+                   12, 0, (Color){140, 150, 170, 255});
+    }
+    /* List. */
+    DrawRectangle(L.list.x, L.list.y, L.list.w, L.list.h,
+                  (Color){18, 22, 32, 255});
+    DrawRectangleLines(L.list.x, L.list.y, L.list.w, L.list.h,
+                       (Color){60, 70, 90, 180});
+    if (g_logs_count == 0) {
+        const char *msg = g_logs_status[0]
+            ? g_logs_status
+            : "No .log files in this directory yet.";
+        DrawTextEx(*f, msg,
+                   (Vector2){L.list.x + 12, L.list.y + 10},
+                   13, 0, (Color){170, 175, 195, 255});
+    }
+    BeginScissorMode(L.list.x, L.list.y, L.list.w, L.list.h);
+    for (int i = 0; i < g_logs_count; i++) {
+        if (L.row[i].w == 0) continue;
+        Rect rr = L.row[i];
+        bool sel = (g_logs_selected == i);
+        if (sel) {
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h,
+                          (Color){46, 92, 150, 255});
+        }
+        /* Format size: kB / MB. */
+        char sz[24];
+        if (g_logs[i].size < 1024)
+            snprintf(sz, sizeof(sz), "%lld B", g_logs[i].size);
+        else if (g_logs[i].size < 1024 * 1024)
+            snprintf(sz, sizeof(sz), "%lld KB", g_logs[i].size / 1024);
+        else
+            snprintf(sz, sizeof(sz), "%.1f MB",
+                     (double)g_logs[i].size / (1024.0 * 1024.0));
+        /* Format mtime as YYYY-MM-DD HH:MM. */
+        char ts[32];
+        struct tm tm;
+        localtime_r(&g_logs[i].mtime, &tm);
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M", &tm);
+        Color text_main = sel ? (Color){240, 245, 255, 255}
+                              : (Color){210, 215, 230, 255};
+        Color text_dim  = sel ? (Color){200, 215, 235, 255}
+                              : (Color){140, 150, 170, 255};
+        /* Draw timestamp + size on the right, name on the left,
+           with the name truncated if necessary. */
+        char meta[64];
+        snprintf(meta, sizeof(meta), "%s   %s", ts, sz);
+        Vector2 msz = MeasureTextEx(*f, meta, 12, 0);
+        int meta_x = rr.x + rr.w - (int)msz.x - 10;
+        DrawTextEx(*f, meta,
+                   (Vector2){meta_x, rr.y + (rr.h - msz.y) / 2 + 1},
+                   12, 0, text_dim);
+        char name_buf[256];
+        snprintf(name_buf, sizeof(name_buf), "%s", g_logs[i].name);
+        int name_max_w = meta_x - rr.x - 18;
+        Vector2 nsz = MeasureTextEx(*f, name_buf, 13, 0);
+        if ((int)nsz.x > name_max_w) {
+            /* Mid-truncate. */
+            int nlen = (int)strlen(name_buf);
+            for (int k = nlen - 4; k > 8; k--) {
+                name_buf[k] = '.'; name_buf[k - 1] = '.'; name_buf[k - 2] = '.';
+                name_buf[k - 3] = 0;
+                nsz = MeasureTextEx(*f, name_buf, 13, 0);
+                if ((int)nsz.x <= name_max_w) break;
+            }
+        }
+        DrawTextEx(*f, name_buf,
+                   (Vector2){rr.x + 10, rr.y + (rr.h - 13) / 2 + 1},
+                   13, 0, text_main);
+    }
+    EndScissorMode();
+    /* Buttons. */
+    bool has_sel = g_logs_selected >= 0 && g_logs_selected < g_logs_count;
+    Color obg = has_sel ? (Color){48, 78, 58, 255} : (Color){36, 40, 54, 255};
+    Color otext = has_sel ? (Color){220, 240, 225, 255} : (Color){130, 140, 160, 255};
+    DrawRectangle(L.open_btn.x, L.open_btn.y, L.open_btn.w, L.open_btn.h, obg);
+    DrawRectangleLines(L.open_btn.x, L.open_btn.y, L.open_btn.w, L.open_btn.h,
+                       (Color){150, 160, 180, 200});
+    {
+        const char *lbl = "Open in editor";
+        Vector2 ts = MeasureTextEx(*f, lbl, 14, 0);
+        DrawTextEx(*f, lbl,
+                   (Vector2){L.open_btn.x + (L.open_btn.w - ts.x) / 2,
+                             L.open_btn.y + (L.open_btn.h - ts.y) / 2},
+                   14, 0, otext);
+    }
+    DrawRectangle(L.close_btn.x, L.close_btn.y, L.close_btn.w, L.close_btn.h,
+                  (Color){48, 52, 66, 255});
+    DrawRectangleLines(L.close_btn.x, L.close_btn.y, L.close_btn.w, L.close_btn.h,
+                       (Color){150, 160, 180, 200});
+    {
+        const char *lbl = "Close";
+        Vector2 ts = MeasureTextEx(*f, lbl, 14, 0);
+        DrawTextEx(*f, lbl,
+                   (Vector2){L.close_btn.x + (L.close_btn.w - ts.x) / 2,
+                             L.close_btn.y + (L.close_btn.h - ts.y) / 2},
+                   14, 0, (Color){210, 215, 230, 255});
+    }
+}
 
 int main(int argc, char **argv) {
     const char *font_path = NULL;
@@ -18650,6 +19168,29 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Logs browser modal. */
+        if (g_ui_mode == UI_LOGS) {
+            LogsLayout LL = logs_layout_compute(win_w_now, win_h_now);
+            int derive_cols = (win_w_now - 2 * r.pad_x) / r.cell_w;
+            int derive_rows = (win_h_now - TAB_BAR_H - 2 * r.pad_y) / r.cell_h;
+            if (derive_cols < 20) derive_cols = 20;
+            if (derive_rows < 5)  derive_rows = 5;
+            logs_handle_mouse(LL, derive_cols, derive_rows);
+            logs_handle_keys(derive_cols, derive_rows);
+            cur = active_tab();
+            BeginDrawing();
+            ClearBackground((Color){0, 0, 0, 255});
+            draw_tab_bar(&r, win_w_now);
+            if (cur) draw_tab_contents(&r, cur, win_w_now, win_h_now,
+                                       GetTime(), IsWindowFocused());
+            if (g_ui_mode == UI_LOGS) {
+                LL = logs_layout_compute(win_w_now, win_h_now);
+                draw_logs_modal(&r, win_w_now, win_h_now, LL);
+            }
+            EndDrawing();
+            continue;
+        }
+
         /* Save-recording modal. */
         if (g_ui_mode == UI_REC_SAVE) {
             RecSaveLayout RL = rec_save_layout(win_w_now, win_h_now);
@@ -18695,15 +19236,51 @@ int main(int argc, char **argv) {
                    close it instantly. */
                 g_help_just_opened = false;
             } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && inside) {
-                /* Tab switch — uses rects populated by draw_help_modal
-                   on the previous frame. */
+                /* Tab + sub-tab switch — uses rects populated by
+                   draw_help_modal on the previous frame. Sub-tabs
+                   only render on the Navigation tab so their
+                   rects are zero outside that. */
                 int mxp = (int)mp_help.x, myp = (int)mp_help.y;
-                for (int _i = 0; _i < HELP_TAB_COUNT; _i++) {
-                    Rect tr = g_help_tab_rects[_i];
+                bool consumed = false;
+                for (int _i = 0; _i < HELP_NAV_SUBTAB_COUNT; _i++) {
+                    Rect tr = g_help_nav_subtab_rects[_i];
                     if (tr.w > 0 && mxp >= tr.x && mxp < tr.x + tr.w &&
                         myp >= tr.y && myp < tr.y + tr.h) {
-                        g_help_tab = _i;
+                        g_help_nav_subtab = _i;
+                        consumed = true;
                         break;
+                    }
+                }
+                if (!consumed) {
+                    for (int _i = 0; _i < HELP_EDIT_SUBTAB_COUNT; _i++) {
+                        Rect tr = g_help_edit_subtab_rects[_i];
+                        if (tr.w > 0 && mxp >= tr.x && mxp < tr.x + tr.w &&
+                            myp >= tr.y && myp < tr.y + tr.h) {
+                            g_help_edit_subtab = _i;
+                            consumed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!consumed) {
+                    for (int _i = 0; _i < HELP_SHELL_SUBTAB_COUNT; _i++) {
+                        Rect tr = g_help_shell_subtab_rects[_i];
+                        if (tr.w > 0 && mxp >= tr.x && mxp < tr.x + tr.w &&
+                            myp >= tr.y && myp < tr.y + tr.h) {
+                            g_help_shell_subtab = _i;
+                            consumed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!consumed) {
+                    for (int _i = 0; _i < HELP_TAB_COUNT; _i++) {
+                        Rect tr = g_help_tab_rects[_i];
+                        if (tr.w > 0 && mxp >= tr.x && mxp < tr.x + tr.w &&
+                            myp >= tr.y && myp < tr.y + tr.h) {
+                            g_help_tab = _i;
+                            break;
+                        }
                     }
                 }
             } else if (IsKeyPressed(KEY_ESCAPE) ||
@@ -18870,6 +19447,12 @@ int main(int argc, char **argv) {
                    dropdown reflects what's on disk. */
                 if (g_sessions_count == 0) sessions_load();
                 session_designer_open_for(-1);
+            }
+            else if (shift_held && IsKeyPressed(KEY_O)) {
+                /* Cmd+Shift+O — browse session logs. Lists log
+                   files from the configured log_dir, opens any of
+                   them in a new local pane via `less -R`. */
+                logs_open();
             }
             else if (IsKeyPressed(KEY_R)) {
                 /* Cmd+R — rename the active tab. Pre-fill the buffer
