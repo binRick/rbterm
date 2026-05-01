@@ -7186,7 +7186,18 @@ static void draw_tab_bar(Renderer *r, int win_w) {
             }
         }
         DrawRectangle(x, 0, tw, TAB_BAR_H, bg);
-        if (active) DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
+        if (active) {
+            /* Strong active-tab cue: thick green outline around
+               the tab header plus the cyan top stripe. The
+               outline contrasts with the cyan/amber accents the
+               rest of the UI uses, so it reads as "this is the
+               active tab" at a glance. */
+            Color act_outline = (Color){80, 220, 130, 255};
+            DrawRectangleLinesEx(
+                (Rectangle){(float)x, 0.0f, (float)tw, (float)TAB_BAR_H},
+                2.0f, act_outline);
+            DrawRectangle(x, 0, tw, 2, (Color){125, 207, 255, 255});
+        }
 
         /* Per-tab status glyph left of the label:
              - Spinner (cyan) while any pane has a command running
@@ -17943,7 +17954,11 @@ static void draw_logs_modal(Renderer *r, int win_w, int win_h, LogsLayout L) {
         /* Format mtime as YYYY-MM-DD HH:MM. */
         char ts[32];
         struct tm tm;
+#ifdef _WIN32
+        localtime_s(&tm, &g_logs[i].mtime);
+#else
         localtime_r(&g_logs[i].mtime, &tm);
+#endif
         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M", &tm);
         Color text_main = sel ? (Color){240, 245, 255, 255}
                               : (Color){210, 215, 230, 255};
