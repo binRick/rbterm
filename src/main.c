@@ -18131,6 +18131,20 @@ int main(int argc, char **argv) {
     SetConfigFlags(cfg_flags);
     SetTraceLogCallback(rl_trace_log);
     SetTraceLogLevel(LOG_WARNING);
+#ifdef _WIN32
+    /* Opt out of DPI awareness BEFORE GLFW init. raylib's bundled
+       GLFW silently marks the process per-monitor DPI-aware on
+       glfwInit; our UI is in raw pixel coords (24 px tab bar,
+       30 px buttons, 20pt font), so on a HiDPI display every
+       widget renders microscopic — see CLAUDE.md "HIGHDPI" note.
+       Going UNAWARE lets Windows transparently upscale the
+       framebuffer to physical pixels (slight bilinear softness,
+       but every UI element is the right SIZE — which is the
+       complaint that prompted this fix). The font_size DPI
+       scaling above is now redundant on UNAWARE processes
+       (GetDpiForSystem virtualises to 96) but harmless. */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+#endif
 #ifdef __EMSCRIPTEN__
     /* Match the CSS size of the canvas in web/shell.html so that mouse
        event coordinates (which come through in canvas-element space)
