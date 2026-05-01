@@ -101,18 +101,32 @@ struct Screen {
     time_t c_time;
     bool on_alt;
 
-    // Scrollback ring buffer: rows of `cols` cells
-    Cell *sb;
-    uint8_t *sb_wrap; /* parallel ring, 1 byte per row: row ended by
-                         auto-wrap into the next row. Mirrors main_wrap
-                         so selection can cross wrap boundaries back
-                         into scrollback. */
-    uint8_t *sb_pmark;
-    uint8_t *sb_pexit;
-    int sb_cap;
-    int sb_len;
-    int sb_head;     // next write slot
-    int view_off;    // rows scrolled up (>=0, <= sb_len)
+    /* Scrollback ring — array of pointers to compact-encoded rows.
+       Each CompactRow stores the row's codepoints + style runs +
+       wrap/pmark/pexit metadata (replacing the old parallel
+       sb_wrap/sb_pmark/sb_pexit arrays). Storage scales with row
+       content: an unstyled ASCII line costs ~50–100 bytes vs the
+       prior ~cols*20 bytes per row.
+
+       Allocation grows on demand (doubling) up to `sb_max`, so a
+       quiet pane stays cheap and a `find` that dumps 700 k lines
+       only commits memory it actually fills. Once sb_curcap hits
+       sb_max the buffer becomes a ring (oldest CompactRow is freed
+       before overwrite). */
+    struct CompactRow **sb_rows;
+    int sb_max;       /* configured ceiling (lines) */
+    int sb_curcap;    /* current allocation size of sb_rows[] */
+    int sb_len;       /* valid rows in [0, sb_curcap] */
+    int sb_head;      /* next write slot in [0, sb_curcap) */
+    int view_off;     /* rows scrolled up, in [0, sb_len] */
+    /* Single-row decode cache. Most accessors hit the same scrollback
+       row in succession (renderer walks columns, selection walks
+       columns). Decoding once and reusing turns O(cols) per call
+       into O(1). sb_decode_row is the absolute scrollback index
+       (0 = oldest) currently in scratch, or -1 when stale. */
+    Cell    *sb_decode_scratch;
+    int      sb_decode_row;
+    int      sb_decode_scratch_cols;
 
     // Parser
     int pstate;
@@ -196,6 +210,295 @@ struct Screen {
 
     ScreenIO io;
 };
+
+/* ---------- Compact scrollback row representation ----------
+
+   The packed row is a single heap allocation laid out as:
+
+       [ CompactRow header ][ cps[len] ][ runs[nrun] ]
+
+   Three knobs keep typical-row cost minimal:
+
+   1. **Effective-len trimming.** Trailing default-blank cells
+      aren't stored — `len` is the index of the last non-blank
+      cell + 1. cr_unpack pads anything beyond that with the
+      caller-supplied blank.
+
+   2. **Variable cp width.** If every codepoint in the row fits
+      in a byte (true for ASCII / Latin-1 — the vast majority of
+      shell output), cps is stored as `uint8_t[len]`. Mixed /
+      CJK / emoji rows fall back to `uint32_t[len]`. Selected
+      via `cp_bytes` (1 or 4) in the header.
+
+   3. **Default-style elision.** Runs only describe spans that
+      differ from the screen's current default style. A row of
+      pure default-styled output (e.g. a `find` line) ends up
+      with `nrun == 0` and zero bytes of run storage.
+
+   For an ASCII `find` line of ~50 chars: header (16 B) + cps (50 B)
+   + runs (0 B) ≈ 66 B per row, vs ~2 KB before this rewrite. */
+
+typedef struct {
+    uint16_t start;
+    uint16_t end;
+    uint32_t fg;
+    uint32_t bg;
+    uint32_t ul_color;
+    uint16_t attrs;
+    uint16_t link_id;
+} StyleRun;
+
+typedef struct CompactRow {
+    uint16_t len;        /* effective cell count (trailing blanks trimmed) */
+    uint16_t nrun;       /* style runs (non-default spans only) */
+    uint8_t  wrapped;
+    uint8_t  pmark;
+    uint8_t  pexit;
+    uint8_t  cp_bytes;   /* 1 or 4 — width of each cps[] entry */
+    /* Followed by len * cp_bytes bytes of codepoints, then
+       nrun * sizeof(StyleRun) bytes of runs. Accessed via
+       CR_CPS / CR_RUNS macros below. */
+} CompactRow;
+
+#define CR_CPS_BYTES_OFFSET    sizeof(CompactRow)
+static inline uint8_t  *cr_cps8(CompactRow *cr) { return (uint8_t *)cr + CR_CPS_BYTES_OFFSET; }
+static inline uint32_t *cr_cps32(CompactRow *cr) { return (uint32_t *)((uint8_t *)cr + CR_CPS_BYTES_OFFSET); }
+static inline StyleRun *cr_runs(CompactRow *cr) {
+    return (StyleRun *)((uint8_t *)cr + CR_CPS_BYTES_OFFSET +
+                        (size_t)cr->len * cr->cp_bytes);
+}
+
+/* Read a single codepoint, regardless of cp_bytes width. */
+static inline uint32_t cr_cp_at(const CompactRow *cr, int x) {
+    if (cr->cp_bytes == 1) {
+        return ((const uint8_t *)cr + CR_CPS_BYTES_OFFSET)[x];
+    } else {
+        return ((const uint32_t *)((const uint8_t *)cr + CR_CPS_BYTES_OFFSET))[x];
+    }
+}
+
+/* Are two cells interchangeable for run purposes (everything
+   except cp)? Used to group consecutive cells. */
+static inline bool cell_style_equal(const Cell *a, const Cell *b) {
+    return a->attrs    == b->attrs
+        && a->fg       == b->fg
+        && a->bg       == b->bg
+        && a->ul_color == b->ul_color
+        && a->link_id  == b->link_id;
+}
+
+/* Does a cell carry zero style information — i.e. matches the
+   "blank" baseline (default fg, default bg, no underline color,
+   no attrs other than the default-fg/default-bg flags, no link)?
+   Used both to detect runs we can elide and to detect trailing
+   blanks for length trimming. The cell can carry cp != 0 (e.g.
+   ' ') and still qualify as "default-styled". */
+static inline bool cell_is_default_style(const Cell *c) {
+    /* Allow only the two ATTR_DEFAULT_* bits — every other attr
+       (bold, italic, underline, reverse, wide, ...) means the
+       cell needs an explicit run. */
+    uint16_t allowed = ATTR_DEFAULT_FG | ATTR_DEFAULT_BG;
+    if (c->attrs & ~allowed) return false;
+    if (c->ul_color != 0)    return false;
+    if (c->link_id  != 0)    return false;
+    return true;
+}
+
+static inline bool cell_is_blank(const Cell *c) {
+    return cell_is_default_style(c) && (c->cp == 0 || c->cp == ' ');
+}
+
+static CompactRow *cr_pack(const Cell *row, int len, bool wrapped,
+                           uint8_t pmark, uint8_t pexit) {
+    /* Trim trailing blanks: drop cells from the end that are
+       indistinguishable from the implicit default-fill. cr_unpack
+       repaints them at read time. */
+    int eff_len = len;
+    while (eff_len > 0 && cell_is_blank(&row[eff_len - 1])) eff_len--;
+
+    /* Decide cp width — 1 byte is enough if every stored cp
+       fits in 8 bits. */
+    int cp_bytes = 1;
+    for (int i = 0; i < eff_len; i++) {
+        if (row[i].cp >= 256) { cp_bytes = 4; break; }
+    }
+
+    /* Count runs — only spans that DIFFER from default-style. A
+       row of pure default-styled output produces zero runs. */
+    int nrun = 0;
+    {
+        int i = 0;
+        while (i < eff_len) {
+            if (cell_is_default_style(&row[i])) { i++; continue; }
+            int j = i + 1;
+            while (j < eff_len &&
+                   !cell_is_default_style(&row[j]) &&
+                   cell_style_equal(&row[j], &row[i])) j++;
+            nrun++;
+            i = j;
+        }
+    }
+    if (nrun > 65535) nrun = 65535;
+
+    /* Single allocation: header + cps + runs contiguous. */
+    size_t sz = sizeof(CompactRow) +
+                (size_t)eff_len * (size_t)cp_bytes +
+                (size_t)nrun * sizeof(StyleRun);
+    CompactRow *cr = malloc(sz);
+    cr->len      = (uint16_t)(eff_len > 65535 ? 65535 : eff_len);
+    cr->nrun     = (uint16_t)nrun;
+    cr->wrapped  = wrapped ? 1 : 0;
+    cr->pmark    = pmark;
+    cr->pexit    = pexit;
+    cr->cp_bytes = (uint8_t)cp_bytes;
+
+    /* Fill cps. */
+    if (cp_bytes == 1) {
+        uint8_t *cps = cr_cps8(cr);
+        for (int i = 0; i < eff_len; i++) cps[i] = (uint8_t)row[i].cp;
+    } else {
+        uint32_t *cps = cr_cps32(cr);
+        for (int i = 0; i < eff_len; i++) cps[i] = row[i].cp;
+    }
+
+    /* Fill runs (non-default spans). */
+    if (nrun > 0) {
+        StyleRun *runs = cr_runs(cr);
+        int ri = 0, i = 0;
+        while (i < eff_len && ri < nrun) {
+            if (cell_is_default_style(&row[i])) { i++; continue; }
+            int j = i + 1;
+            while (j < eff_len &&
+                   !cell_is_default_style(&row[j]) &&
+                   cell_style_equal(&row[j], &row[i])) j++;
+            runs[ri].start    = (uint16_t)i;
+            runs[ri].end      = (uint16_t)j;
+            runs[ri].fg       = row[i].fg;
+            runs[ri].bg       = row[i].bg;
+            runs[ri].ul_color = row[i].ul_color;
+            runs[ri].attrs    = row[i].attrs;
+            runs[ri].link_id  = row[i].link_id;
+            ri++;
+            i = j;
+        }
+    }
+
+    return cr;
+}
+
+static void cr_unpack(const CompactRow *cr, Cell *out, int out_cols, Cell blank) {
+    if (out_cols <= 0) return;
+    /* Default-fill first — covers everything past `len` plus any
+       cell not painted by a non-default run. */
+    for (int x = 0; x < out_cols; x++) out[x] = blank;
+    int copy_len = (cr->len < out_cols) ? cr->len : out_cols;
+    /* Codepoints. */
+    if (cr->cp_bytes == 1) {
+        const uint8_t *cps = (const uint8_t *)cr + CR_CPS_BYTES_OFFSET;
+        for (int x = 0; x < copy_len; x++) out[x].cp = cps[x];
+    } else {
+        const uint32_t *cps = (const uint32_t *)((const uint8_t *)cr + CR_CPS_BYTES_OFFSET);
+        for (int x = 0; x < copy_len; x++) out[x].cp = cps[x];
+    }
+    /* Style runs overwrite default-fill where they apply. */
+    if (cr->nrun > 0) {
+        const StyleRun *runs = (const StyleRun *)((const uint8_t *)cr +
+            CR_CPS_BYTES_OFFSET + (size_t)cr->len * cr->cp_bytes);
+        for (int r = 0; r < cr->nrun; r++) {
+            int s_start = runs[r].start;
+            int s_end   = runs[r].end;
+            if (s_end > out_cols) s_end = out_cols;
+            for (int x = s_start; x < s_end; x++) {
+                out[x].fg       = runs[r].fg;
+                out[x].bg       = runs[r].bg;
+                out[x].ul_color = runs[r].ul_color;
+                out[x].attrs    = runs[r].attrs;
+                out[x].link_id  = runs[r].link_id;
+            }
+        }
+    }
+}
+
+static void cr_free(CompactRow *cr) { free(cr); }
+
+/* Map an absolute scrollback index (0 = oldest) → ring slot. Caller
+   guarantees idx ∈ [0, sb_len). */
+static inline int sb_ring_slot(const Screen *s, int idx) {
+    int cap = s->sb_curcap;
+    if (cap <= 0) return 0;
+    return ((s->sb_head - s->sb_len + idx) % cap + cap) % cap;
+}
+
+/* Ensure the decode scratch matches the screen's current cols. The
+   stored CompactRow can be wider or narrower than s->cols (resize
+   between push and read); cr_unpack always produces s->cols cells. */
+static void sb_ensure_decode_scratch(Screen *s) {
+    if (s->sb_decode_scratch_cols != s->cols) {
+        free(s->sb_decode_scratch);
+        s->sb_decode_scratch = calloc((size_t)s->cols, sizeof(Cell));
+        s->sb_decode_scratch_cols = s->cols;
+        s->sb_decode_row = -1;
+    }
+}
+
+/* Decode the absolute scrollback row at `abs_idx` into the cache
+   if it's not already there. Returns the cached row pointer.
+   Caller must have validated abs_idx ∈ [0, sb_len). */
+static const Cell *sb_decode_at(Screen *s, int abs_idx) {
+    sb_ensure_decode_scratch(s);
+    if (s->sb_decode_row == abs_idx) return s->sb_decode_scratch;
+    int slot = sb_ring_slot(s, abs_idx);
+    CompactRow *cr = s->sb_rows ? s->sb_rows[slot] : NULL;
+    if (!cr) {
+        for (int x = 0; x < s->cols; x++) {
+            Cell e = {0, s->default_fg, s->default_bg, 0,
+                      ATTR_DEFAULT_FG | ATTR_DEFAULT_BG, 0};
+            s->sb_decode_scratch[x] = e;
+        }
+    } else {
+        Cell blank = {0, s->default_fg, s->default_bg, 0,
+                      ATTR_DEFAULT_FG | ATTR_DEFAULT_BG, 0};
+        cr_unpack(cr, s->sb_decode_scratch, s->cols, blank);
+    }
+    s->sb_decode_row = abs_idx;
+    return s->sb_decode_scratch;
+}
+
+/* Walk one CompactRow and remap colors that match `old_rgb` per
+   the recolor / palette policy. Operates on style runs only —
+   one mutation covers every cell in that run. */
+static void cr_remap_default(CompactRow *cr, uint32_t old_rgb, bool is_bg) {
+    if (!cr) return;
+    StyleRun *runs = cr_runs(cr);
+    for (int r = 0; r < cr->nrun; r++) {
+        StyleRun *sr = &runs[r];
+        if (is_bg) {
+            if (sr->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) continue;
+            if (sr->bg != old_rgb) continue;
+            sr->attrs = (uint16_t)(sr->attrs | ATTR_DEFAULT_BG);
+        } else {
+            if (sr->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) continue;
+            if (sr->fg != old_rgb) continue;
+            sr->attrs = (uint16_t)(sr->attrs | ATTR_DEFAULT_FG);
+        }
+    }
+}
+
+static void cr_remap_palette(CompactRow *cr, uint32_t old_rgb, int idx) {
+    if (!cr) return;
+    StyleRun *runs = cr_runs(cr);
+    for (int r = 0; r < cr->nrun; r++) {
+        StyleRun *sr = &runs[r];
+        if (!(sr->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) && sr->bg == old_rgb) {
+            sr->bg = (uint32_t)idx;
+            sr->attrs = (uint16_t)(sr->attrs | ATTR_BG_INDEX);
+        }
+        if (!(sr->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) && sr->fg == old_rgb) {
+            sr->fg = (uint32_t)idx;
+            sr->attrs = (uint16_t)(sr->attrs | ATTR_FG_INDEX);
+        }
+    }
+}
 
 uint32_t screen_default_fg(const Screen *s)    { return s ? s->default_fg    : SEED_DEFAULT_FG; }
 uint32_t screen_default_bg(const Screen *s)    { return s ? s->default_bg    : SEED_DEFAULT_BG; }
@@ -455,14 +758,36 @@ static void clear_row(Screen *s, int y) {
 
 static void push_scrollback(Screen *s, const Cell *row, bool wrapped,
                             uint8_t pmark, uint8_t pexit) {
-    if (s->on_alt || s->sb_cap == 0) return;
-    memcpy(s->sb + s->sb_head * s->cols, row, sizeof(Cell) * s->cols);
-    if (s->sb_wrap)  s->sb_wrap[s->sb_head]  = wrapped ? 1 : 0;
-    if (s->sb_pmark) s->sb_pmark[s->sb_head] = pmark;
-    if (s->sb_pexit) s->sb_pexit[s->sb_head] = pexit;
-    s->sb_head = (s->sb_head + 1) % s->sb_cap;
-    if (s->sb_len < s->sb_cap) s->sb_len++;
-    // Keep view anchored if we're at bottom; otherwise drift one row.
+    if (s->on_alt || s->sb_max == 0) return;
+    /* Grow phase — the buffer doubles up to sb_max so a quiet pane
+       never commits more memory than it actually needs. Once we hit
+       sb_max the buffer becomes a ring (next branch). */
+    if (s->sb_len == s->sb_curcap && s->sb_curcap < s->sb_max) {
+        int new_cap = s->sb_curcap > 0 ? s->sb_curcap * 2 : 64;
+        if (new_cap > s->sb_max) new_cap = s->sb_max;
+        s->sb_rows = realloc(s->sb_rows,
+                             sizeof(*s->sb_rows) * (size_t)new_cap);
+        for (int k = s->sb_curcap; k < new_cap; k++) s->sb_rows[k] = NULL;
+        s->sb_curcap = new_cap;
+    }
+    /* Ring phase — overwrite the oldest entry at sb_head. The grow
+       phase leaves sb_rows[sb_head] == NULL on the first pass, so
+       cr_free(NULL) is a safe no-op. */
+    if (s->sb_len == s->sb_curcap) {
+        cr_free(s->sb_rows[s->sb_head]);
+        s->sb_rows[s->sb_head] = NULL;
+    }
+    s->sb_rows[s->sb_head] = cr_pack(row, s->cols, wrapped, pmark, pexit);
+    /* Advance head. Wrap only when we've reached the configured
+       max — during the grow phase sb_head is monotonic. */
+    s->sb_head++;
+    if (s->sb_curcap == s->sb_max && s->sb_head >= s->sb_curcap)
+        s->sb_head = 0;
+    if (s->sb_len < s->sb_curcap) s->sb_len++;
+    /* Decode cache: any abs index ≥ 0 might shift now (the meaning
+       of abs index 0 advanced by one in ring mode). Invalidate. */
+    s->sb_decode_row = -1;
+    /* Keep view anchored if we're at bottom; otherwise drift one row. */
     if (s->view_off > 0 && s->view_off < s->sb_len) s->view_off++;
     if (s->view_off > s->sb_len) s->view_off = s->sb_len;
 }
@@ -1180,21 +1505,14 @@ static void finish_osc(Screen *s) {
                             }
                         }
                     }
-                    if (s->sb && s->sb_cap > 0) {
-                        int n = s->sb_cap * s->cols;
-                        for (int i = 0; i < n; i++) {
-                            Cell *c = &s->sb[i];
-                            if (!(c->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) &&
-                                c->bg == old_rgb) {
-                                c->bg = (uint32_t)idx;
-                                c->attrs = (uint16_t)(c->attrs | ATTR_BG_INDEX);
-                            }
-                            if (!(c->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) &&
-                                c->fg == old_rgb) {
-                                c->fg = (uint32_t)idx;
-                                c->attrs = (uint16_t)(c->attrs | ATTR_FG_INDEX);
-                            }
+                    if (s->sb_rows) {
+                        /* Walk runs only — one run mutation covers
+                           every cell in its span. Massively faster
+                           than the prior cell-by-cell sweep. */
+                        for (int k = 0; k < s->sb_curcap; k++) {
+                            cr_remap_palette(s->sb_rows[k], old_rgb, idx);
                         }
+                        s->sb_decode_row = -1;
                     }
                 }
             }
@@ -1854,13 +2172,16 @@ Screen *screen_new(int cols, int rows, int scrollback, ScreenIO io) {
         for (int x = 0; x < cols; x++) s->main[y * cols + x] = b;
         for (int x = 0; x < cols; x++) s->alt[y * cols + x] = b;
     }
-    s->sb_cap = scrollback;
-    if (scrollback > 0) {
-        s->sb = calloc((size_t)scrollback * cols, sizeof(Cell));
-        s->sb_wrap  = calloc((size_t)scrollback, 1);
-        s->sb_pmark = calloc((size_t)scrollback, 1);
-        s->sb_pexit = calloc((size_t)scrollback, 1);
-    }
+    /* Scrollback: defer the actual allocation to the first push.
+       Quiet panes (e.g. tmux on the alt screen) never pay memory. */
+    s->sb_max     = scrollback;
+    s->sb_curcap  = 0;
+    s->sb_len     = 0;
+    s->sb_head    = 0;
+    s->sb_rows    = NULL;
+    s->sb_decode_scratch = NULL;
+    s->sb_decode_scratch_cols = 0;
+    s->sb_decode_row = -1;
     s->cell_h_px = 20;   /* best-effort until renderer sets the real value */
     s->io = io;
     return s;
@@ -1876,9 +2197,15 @@ void screen_free(Screen *s) {
     free(s->kpending);
     for (uint16_t i = 0; i < s->urls_count; i++) free(s->urls[i]);
     free(s->urls);
-    free(s->main); free(s->alt); free(s->sb); free(s->sb_wrap); free(s->main_wrap);
-    free(s->sb_pmark); free(s->sb_pexit);
+    free(s->main); free(s->alt); free(s->main_wrap);
     free(s->main_pmark); free(s->main_pexit);
+    /* Scrollback: free every CompactRow slot we allocated, then the
+       pointer array + decode scratch. */
+    if (s->sb_rows) {
+        for (int k = 0; k < s->sb_curcap; k++) cr_free(s->sb_rows[k]);
+        free(s->sb_rows);
+    }
+    free(s->sb_decode_scratch);
     free(s);
 }
 
@@ -1945,20 +2272,11 @@ static void remap_default_recolour(Screen *s, uint32_t old_rgb, bool is_bg) {
             }
         }
     }
-    if (s->sb && s->sb_cap > 0) {
-        int n = s->sb_cap * s->cols;
-        for (int i = 0; i < n; i++) {
-            Cell *c = &s->sb[i];
-            if (is_bg) {
-                if (c->attrs & (ATTR_DEFAULT_BG | ATTR_BG_INDEX)) continue;
-                if (c->bg != old_rgb) continue;
-                c->attrs = (uint16_t)(c->attrs | ATTR_DEFAULT_BG);
-            } else {
-                if (c->attrs & (ATTR_DEFAULT_FG | ATTR_FG_INDEX)) continue;
-                if (c->fg != old_rgb) continue;
-                c->attrs = (uint16_t)(c->attrs | ATTR_DEFAULT_FG);
-            }
+    if (s->sb_rows) {
+        for (int k = 0; k < s->sb_curcap; k++) {
+            cr_remap_default(s->sb_rows[k], old_rgb, is_bg);
         }
+        s->sb_decode_row = -1;
     }
 }
 
@@ -2090,47 +2408,13 @@ void screen_resize(Screen *s, int cols, int rows) {
     int start_row = emit - rows;
     if (start_row < 0) start_row = 0;
 
-    /* Rebuild scrollback at new width (preserve its existing content; just
-       re-bucket into the new col count). */
-    Cell *nsb = NULL;
-    uint8_t *nsbw = NULL;
-    uint8_t *nsbpm = NULL;
-    uint8_t *nsbpe = NULL;
-    if (s->sb_cap > 0) {
-        nsb = calloc((size_t)s->sb_cap * cols, sizeof(Cell));
-        nsbw  = calloc((size_t)s->sb_cap, 1);
-        nsbpm = calloc((size_t)s->sb_cap, 1);
-        nsbpe = calloc((size_t)s->sb_cap, 1);
-        for (int y = 0; y < s->sb_cap; y++)
-            for (int x = 0; x < cols; x++) nsb[y * cols + x] = blank;
-        int ccols = (cols < old_cols) ? cols : old_cols;
-        for (int i = 0; i < s->sb_len; i++) {
-            int src = ((s->sb_head - s->sb_len + i) % s->sb_cap + s->sb_cap) % s->sb_cap;
-            memcpy(nsb + (size_t)i * cols, s->sb + (size_t)src * old_cols,
-                   sizeof(Cell) * ccols);
-            nsbw[i]  = s->sb_wrap  ? s->sb_wrap[src]  : 0;
-            nsbpm[i] = s->sb_pmark ? s->sb_pmark[src] : 0;
-            nsbpe[i] = s->sb_pexit ? s->sb_pexit[src] : 0;
-        }
-        s->sb_head = s->sb_len % s->sb_cap;
-    }
-    /* Push overflow to scrollback by writing into nsb directly. We
-       temporarily point s->sb at the new buffer (and s->cols at the
-       new width) so push_scrollback writes into nsb with the right
-       stride. **Both must be restored before the teardown below
-       free()s s->sb** — otherwise we'd free the new buffer, then
-       reinstall the freed pointer, and screen_free would later
-       double-free it. */
-    if (s->sb_cap > 0 && start_row > 0) {
-        Cell *saved_sb_was = s->sb;
-        uint8_t *saved_sbw_was = s->sb_wrap;
-        uint8_t *saved_sbpm_was = s->sb_pmark;
-        uint8_t *saved_sbpe_was = s->sb_pexit;
+    /* Scrollback rows are stored as cols-agnostic CompactRows, so
+       a width change doesn't require re-bucketing the existing
+       history — the rows stay put, the decoder pads or truncates
+       at read time. We just need to push reflow overflow at the
+       NEW width so push_scrollback packs with the new cell layout. */
+    if (s->sb_max > 0 && start_row > 0) {
         int saved_cols = s->cols;
-        s->sb = nsb;
-        s->sb_wrap  = nsbw;
-        s->sb_pmark = nsbpm;
-        s->sb_pexit = nsbpe;
         s->cols = cols;
         for (int r = 0; r < start_row; r++) {
             /* Reflow loses per-row pmark/pexit on overflow rows —
@@ -2139,10 +2423,6 @@ void screen_resize(Screen *s, int cols, int rows) {
                             scratch_wrap[r] != 0, 0, 0);
         }
         s->cols = saved_cols;
-        s->sb = saved_sb_was;
-        s->sb_wrap  = saved_sbw_was;
-        s->sb_pmark = saved_sbpm_was;
-        s->sb_pexit = saved_sbpe_was;
     }
     int copy_count = emit - start_row;
     if (copy_count > rows) copy_count = rows;
@@ -2174,12 +2454,13 @@ void screen_resize(Screen *s, int cols, int rows) {
        reflow-time loss; new shell marks repopulate correctly. */
     uint8_t *npmark = calloc((size_t)rows, 1);
     uint8_t *npexit = calloc((size_t)rows, 1);
-    free(s->main); free(s->alt); free(s->sb); free(s->sb_wrap); free(s->main_wrap);
-    free(s->sb_pmark); free(s->sb_pexit);
+    free(s->main); free(s->alt); free(s->main_wrap);
     free(s->main_pmark); free(s->main_pexit);
-    s->main = nmain; s->alt = nalt; s->sb = nsb; s->sb_wrap = nsbw; s->main_wrap = nwrap;
-    s->sb_pmark = nsbpm; s->sb_pexit = nsbpe;
+    s->main = nmain; s->alt = nalt; s->main_wrap = nwrap;
     s->main_pmark = npmark; s->main_pexit = npexit;
+    /* Decode cache is sized to old cols — invalidate so the next
+       scrollback access re-allocates at the new width. */
+    s->sb_decode_row = -1;
     s->cols = cols; s->rows = rows;
     s->scroll_top = 0;
     s->scroll_bot = rows - 1;
@@ -2246,10 +2527,12 @@ Cell screen_view_cell(const Screen *s, int col, int vy) {
     // view_off rows from the bottom of scrollback replace the top rows of the live screen
     int off = s->view_off;
     if (vy < off) {
-        // From scrollback
-        int sb_index = s->sb_len - off + vy;
-        int ring = ((s->sb_head - s->sb_len + sb_index) % s->sb_cap + s->sb_cap) % s->sb_cap;
-        return s->sb[ring * s->cols + col];
+        /* From scrollback. Decode (cached) the row and read the
+           cell out. The cast is safe — sb_decode_at mutates a
+           cache field that doesn't affect logical screen state. */
+        int abs_idx = s->sb_len - off + vy;
+        const Cell *row = sb_decode_at((Screen *)s, abs_idx);
+        return row[col];
     }
     int y = vy - off;
     Cell *base = s->on_alt ? s->alt : s->main;
@@ -2270,8 +2553,8 @@ Cell screen_cell_abs(const Screen *s, int col, int abs_row) {
         return s->alt[abs_row * s->cols + col];
     }
     if (abs_row < s->sb_len) {
-        int ring = ((s->sb_head - s->sb_len + abs_row) % s->sb_cap + s->sb_cap) % s->sb_cap;
-        return s->sb[ring * s->cols + col];
+        const Cell *row = sb_decode_at((Screen *)s, abs_row);
+        return row[col];
     }
     int y = abs_row - s->sb_len;
     if (y >= s->rows) return e;
@@ -2286,10 +2569,12 @@ uint8_t screen_pmark_at_abs(const Screen *s, int abs_row, uint8_t *out_exit) {
     if (out_exit) *out_exit = 0;
     if (!s || abs_row < 0 || s->on_alt) return 0;
     if (abs_row < s->sb_len) {
-        if (!s->sb_pmark || s->sb_cap == 0) return 0;
-        int ring = ((s->sb_head - s->sb_len + abs_row) % s->sb_cap + s->sb_cap) % s->sb_cap;
-        if (out_exit && s->sb_pexit) *out_exit = s->sb_pexit[ring];
-        return s->sb_pmark[ring];
+        if (!s->sb_rows) return 0;
+        int slot = sb_ring_slot(s, abs_row);
+        CompactRow *cr = s->sb_rows[slot];
+        if (!cr) return 0;
+        if (out_exit) *out_exit = cr->pexit;
+        return cr->pmark;
     }
     int y = abs_row - s->sb_len;
     if (y < 0 || y >= s->rows || !s->main_pmark) return 0;
@@ -2302,11 +2587,13 @@ uint8_t screen_view_row_pmark(const Screen *s, int vy, uint8_t *out_exit) {
     if (!s || vy < 0 || vy >= s->rows || s->on_alt) return 0;
     int off = s->view_off;
     if (vy < off) {
-        if (!s->sb_pmark || s->sb_cap == 0) return 0;
-        int sb_index = s->sb_len - off + vy;
-        int ring = ((s->sb_head - s->sb_len + sb_index) % s->sb_cap + s->sb_cap) % s->sb_cap;
-        if (out_exit && s->sb_pexit) *out_exit = s->sb_pexit[ring];
-        return s->sb_pmark[ring];
+        if (!s->sb_rows) return 0;
+        int abs_idx = s->sb_len - off + vy;
+        int slot = sb_ring_slot(s, abs_idx);
+        CompactRow *cr = s->sb_rows[slot];
+        if (!cr) return 0;
+        if (out_exit) *out_exit = cr->pexit;
+        return cr->pmark;
     }
     int y = vy - off;
     if (!s->main_pmark) return 0;
@@ -2318,10 +2605,11 @@ bool screen_view_row_wrapped(const Screen *s, int vy) {
     if (!s || vy < 0 || vy >= s->rows || s->on_alt) return false;
     int off = s->view_off;
     if (vy < off) {
-        if (!s->sb_wrap || s->sb_cap == 0) return false;
-        int sb_index = s->sb_len - off + vy;
-        int ring = ((s->sb_head - s->sb_len + sb_index) % s->sb_cap + s->sb_cap) % s->sb_cap;
-        return s->sb_wrap[ring] != 0;
+        if (!s->sb_rows) return false;
+        int abs_idx = s->sb_len - off + vy;
+        int slot = sb_ring_slot(s, abs_idx);
+        CompactRow *cr = s->sb_rows[slot];
+        return cr && cr->wrapped;
     }
     int y = vy - off;
     if (!s->main_wrap) return false;

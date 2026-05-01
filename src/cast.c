@@ -97,10 +97,12 @@ static uint8_t *json_unescape(const char *src, size_t src_len, size_t *out_n) {
     return buf;
 }
 
-/* Parse one event line: [<num>, "o", "<string>"]. Returns true on
-   success and fills *out_t / *out_data / *out_n; caller frees data. */
+/* Parse one event line: [<num>, "o"|"i", "<string>"]. Returns true on
+   success and fills *out_t / *out_kind / *out_data / *out_n. Caller
+   frees data. Marker streams ("m" etc.) are rejected. */
 static bool parse_event(const char *line, size_t len,
-                        double *out_t, uint8_t **out_data, size_t *out_n) {
+                        double *out_t, char *out_kind,
+                        uint8_t **out_data, size_t *out_n) {
     /* Find leading '['. */
     size_t i = 0;
     while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
@@ -112,11 +114,11 @@ static bool parse_event(const char *line, size_t len,
     if (!endp || endp == line + i) return false;
     i = (size_t)(endp - line);
     while (i < len && (line[i] == ' ' || line[i] == '\t' || line[i] == ',')) i++;
-    /* Expect "o" stream. Skip "i" or anything else. */
+    /* Expect "o" or "i". Anything else (markers, future) is skipped. */
     if (i + 3 > len || line[i] != '"') return false;
     char tag = line[i + 1];
     if (line[i + 2] != '"') return false;
-    if (tag != 'o') return false;   /* skip input / marker streams */
+    if (tag != 'o' && tag != 'i') return false;
     i += 3;
     while (i < len && (line[i] == ' ' || line[i] == '\t' || line[i] == ',')) i++;
     /* Expect "<data>". */
@@ -129,6 +131,7 @@ static bool parse_event(const char *line, size_t len,
     }
     size_t data_len = i - start;
     *out_t = t;
+    *out_kind = tag;
     *out_data = json_unescape(line + start, data_len, out_n);
     return *out_data != NULL || *out_n == 0;
 }
@@ -174,9 +177,10 @@ CastFile *cast_load(const char *path, char *err, size_t errsz) {
         }
         if (n == 0) continue;   /* trailing blank line */
         double t = 0;
+        char kind = 'o';
         uint8_t *data = NULL;
         size_t dn = 0;
-        if (!parse_event(line, n, &t, &data, &dn)) continue;
+        if (!parse_event(line, n, &t, &kind, &data, &dn)) continue;
         if (cf->count == cf->cap) {
             size_t nc = cf->cap ? cf->cap * 2 : 256;
             CastEvent *ne = realloc(cf->events, nc * sizeof(*ne));
@@ -184,7 +188,7 @@ CastFile *cast_load(const char *path, char *err, size_t errsz) {
             cf->events = ne;
             cf->cap = nc;
         }
-        cf->events[cf->count++] = (CastEvent){ t, data, dn };
+        cf->events[cf->count++] = (CastEvent){ t, kind, data, dn };
         if (t > cf->duration_s) cf->duration_s = t;
     }
     free(line);

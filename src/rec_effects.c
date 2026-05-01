@@ -501,9 +501,11 @@ void rec_effects_apply_preset(RecEffects *e, EfxPreset p) {
     case EFX_PRESET_VHS_TAPE:
         /* Consumer-VHS warmth dialled to "watchable cassette" — the
            jitter / tape lines + light grain set the mood without
-           wobbling glyphs into mush. No phosphor — keeps colours
+           wobbling glyphs into mush. VHS at 10 % is enough to
+           give the wobble + chroma bleed a hint without making
+           text painful to read. No phosphor — keeps colours
            intact for the warm-cassette feel. */
-        e->vhs    = 0.40f;
+        e->vhs    = 0.10f;
         e->glitch = 0.08f;
         e->grain  = 0.18f;
         e->bloom  = 0.20f;

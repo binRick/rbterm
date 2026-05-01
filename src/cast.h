@@ -1,8 +1,10 @@
 /* Asciinema v2 (.cast) parser. Reads the JSON-line format rbterm
    writes during recording: header object on line 1 (width/height),
-   then one event array per line `[<seconds>, "o", "<bytes>"]`.
-   Only the "o" output stream is collected; "i" (input) lines are
-   skipped if they appear. */
+   then one event array per line `[<seconds>, "o"|"i", "<bytes>"]`.
+   Both "o" (PTY output → screen) and "i" (user input → PTY) streams
+   are collected; the kind field on each event tells callers which
+   to act on. Renderers feed only "o" events through screen_feed
+   and use "i" events for caption-style overlays. */
 #pragma once
 
 #include <stdbool.h>
@@ -11,6 +13,7 @@
 
 typedef struct {
     double   t;       /* seconds since start */
+    char     kind;    /* 'o' = output, 'i' = input */
     uint8_t *data;    /* heap; un-escaped bytes */
     size_t   n;
 } CastEvent;

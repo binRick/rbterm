@@ -135,6 +135,15 @@ cmake --build build
 - Missing-glyph set is built once per font load by scanning
   `font.glyphs[i].image.width`. The draw loop uses it to decide whether
   to try the emoji cache / Menlo fallback cache / `?` placeholder.
+- **`GetFontDefault()` is ASCII-only.** raylib's bundled default
+  font has no glyphs above 0x7F — any non-ASCII codepoint
+  (`↑↓←→`, `⏎`, `⌫`, `⇥`, `…`) renders as a `?` placeholder.
+  Side-overlay code that uses the default font (recording captions,
+  modal labels) MUST stick to printable ASCII or render through
+  the loaded `g_renderer->font_data` instead. This trap has bitten
+  multiple sessions — see the recording captions code as the
+  canonical example of using ASCII labels (`[Up] [Dn] [Ret]`) to
+  avoid the issue.
 - Glyph cache entries carry a `colored` flag set by the rasterizer
   (scan the RGBA: if any non-transparent pixel has unequal channels
   it's a colour bitmap). Caller tints with WHITE for colour, with the

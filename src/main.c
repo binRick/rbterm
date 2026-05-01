@@ -667,6 +667,12 @@ typedef struct {
     int  count;
     int  cap;
     int  current;     /* -1 when no matches */
+    /* Debounce: instead of recomputing matches on every keystroke
+       (slow when scrollback has hundreds of thousands of lines),
+       defer the recompute until the user has paused typing. The
+       timestamp records when the deferred work should fire; 0
+       means "no recompute pending". */
+    double pending_recompute_at;
 } Search;
 
 typedef struct {
@@ -841,6 +847,14 @@ typedef struct {
 } Tab;
 
 #define MAX_TABS 16
+/* Per-pane scrollback ceiling (lines). Stored as compact rows
+   (per-cell uint32 codepoints + run-length-encoded styles) so a
+   typical unstyled ASCII line costs ~80–150 bytes instead of the
+   prior ~2 KB. Cap of 1 000 000 lets a `find /` (~700 k entries)
+   sit fully in history without truncation. The buffer grows on
+   demand from a small seed (64 lines, doubling), so quiet panes
+   stay cheap. Once the cap is reached the ring overwrites oldest. */
+#define SCROLLBACK_LINES 1000000
 #define TAB_BAR_H 30
 #define TAB_MIN_W 100
 #define TAB_MAX_W 240
@@ -2952,7 +2966,7 @@ static void pane_ensure_screen(Pane *p, int cols, int rows) {
     if (!p) return;
     pane_init_click_state(p);
     if (!p->scr) {
-        p->scr = screen_new(cols, rows, 5000, pane_io(p));
+        p->scr = screen_new(cols, rows, SCROLLBACK_LINES, pane_io(p));
         p->effects = g_app_settings.effects;
     }
 }
@@ -3519,7 +3533,7 @@ static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
        cold-start "shell" leak. */
     p->pty = pty_open(cols, rows, cwd);
     if (!p->pty) return false;
-    p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    p->scr = screen_new(cols, rows, SCROLLBACK_LINES, pane_io(p));
     /* Seed the cursor style from the rbterm-wide default. DECSCUSR
        sequences from the shell (or programs that set their own style)
        overwrite this on the per-Screen level later. */
@@ -3549,7 +3563,7 @@ static bool pane_open_local(Pane *p, int cols, int rows, const char *cwd) {
 static void pane_attach_pty(Pane *p, Pty *pty, int cols, int rows) {
     pane_init_click_state(p);
     p->pty = pty;
-    p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    p->scr = screen_new(cols, rows, SCROLLBACK_LINES, pane_io(p));
     p->effects = g_app_settings.effects;
 }
 
@@ -3626,6 +3640,11 @@ typedef struct {
        enum near the modal layout). */
     bool       slider_drag;
     int        slider_drag_idx;
+    /* Closed-caption-style overlay of user input. When on, the
+       renderer paints a translucent strip near the bottom of each
+       frame showing the keystrokes the user typed (rendered as
+       printable chars + ⏎ for Enter, ⌫ for Backspace, etc). */
+    bool       show_captions;
 } RecSave;
 static RecSave g_rec_save;
 
@@ -3692,9 +3711,10 @@ static void rec_json_escape(FILE *fp, const uint8_t *buf, size_t n) {
 /* Walk every cell of the active screen and emit ANSI bytes that
    reconstruct what the user sees right now. Used as the first
    event of a recording so playback doesn't open on a blank screen
-   when the user starts recording mid-session. Best-effort: drops
-   attributes (bold/italic/colours) but preserves the cell text +
-   cursor position, which is what people typically want to see. */
+   when the user starts recording mid-session. Preserves cell text,
+   cursor position, and the cell's SGR styling (bold / italic /
+   underline / fg / bg), so a colourised prompt or syntax-
+   highlighted output replays in the right colours. */
 static void rec_emit_initial_snapshot(FILE *fp, Pane *p) {
     if (!p || !p->scr) return;
     Screen *s = p->scr;
@@ -3703,17 +3723,53 @@ static void rec_emit_initial_snapshot(FILE *fp, Pane *p) {
     /* Build the byte stream into a buffer, then JSON-escape it
        through the existing rec_json_escape so the syntax matches
        any other "o" event line. */
-    size_t cap = (size_t)cols * rows * 4 + 256;
+    /* Buffer needs room for the prefix + per-row CSI + worst-case
+       4-byte UTF-8 per cell + ~32 bytes of SGR per cell when
+       styling changes + the final cursor restore + safety margin.
+       Per-cell SGR upper bound (`\x1b[38;2;R;G;Bm` + bg + attrs)
+       runs ~40 B; multiplying by every cell is overkill in
+       practice (typical row has a handful of style runs) but
+       under-budgeting silently truncated the last rows in earlier
+       versions. */
+    size_t cap = (size_t)cols * rows * 48 + (size_t)rows * 24 + 1024;
     uint8_t *buf = malloc(cap);
     if (!buf) return;
     size_t n = 0;
-    /* Reset attrs, clear screen, home cursor. */
-    const char *prefix = "\x1b[0m\x1b[2J\x1b[H";
+    /* Per-row tracker of "what SGR have we already emitted?" so
+       consecutive cells with the same style don't re-emit. Reset
+       at the start of every row because we always emit a CSI H
+       which doesn't reset SGR — but we DO want the first cell to
+       paint its style explicitly. Sentinel values guarantee a
+       miss on the first compare. */
+    uint16_t last_attrs = 0xFFFF;
+    uint32_t last_fg    = 0xDEADBEEF;
+    uint32_t last_bg    = 0xDEADBEEF;
+    #define APPEND_LIT(s_lit) do { \
+        size_t _l = sizeof(s_lit) - 1; \
+        if (n + _l < cap) { memcpy(buf + n, (s_lit), _l); n += _l; } \
+    } while (0)
+    #define APPEND_FMT(...) do { \
+        int _w = snprintf((char *)buf + n, cap - n, __VA_ARGS__); \
+        if (_w > 0 && (size_t)_w < cap - n) n += (size_t)_w; \
+    } while (0)
+    /* Reset attrs, clear screen, home cursor, disable auto-wrap
+       (DECAWM off) for the duration of the snapshot. Without that,
+       writing the very last character of any row leaves wrap_next
+       set; while CSI H normally clears it, some VT impls (and any
+       intervening parser quirk) can scroll the top row to
+       scrollback if a stray byte slips through before our next
+       cursor position command. Re-enable auto-wrap before
+       restoring the cursor so live-event playback behaves as
+       expected. */
+    const char *prefix = "\x1b[0m\x1b[?7l\x1b[2J\x1b[H";
     size_t plen = strlen(prefix);
     if (n + plen < cap) { memcpy(buf + n, prefix, plen); n += plen; }
     for (int y = 0; y < rows; y++) {
-        /* Position cursor at the start of this row. */
-        int wrote = snprintf((char *)buf + n, cap - n, "\x1b[%d;1H", y + 1);
+        /* Position cursor at the start of this row. The leading \r
+           is redundant with CSI but it's a single byte of insurance
+           that any future parser oddity won't leave the cursor on
+           the wrong column. */
+        int wrote = snprintf((char *)buf + n, cap - n, "\x1b[%d;1H\r", y + 1);
         if (wrote < 0 || (size_t)wrote >= cap - n) break;
         n += (size_t)wrote;
         /* Find last non-blank column so we don't emit huge tail-runs of spaces. */
@@ -3723,9 +3779,49 @@ static void rec_emit_initial_snapshot(FILE *fp, Pane *p) {
             uint32_t cp = c.cp;
             if (cp != 0 && cp != ' ' && !(c.attrs & ATTR_WIDE_CONT)) { last = x; break; }
         }
-        for (int x = 0; x <= last && n + 4 < cap; x++) {
+        for (int x = 0; x <= last && n + 64 < cap; x++) {
             Cell c = screen_view_cell(s, x, y);
             if (c.attrs & ATTR_WIDE_CONT) continue;
+            /* Emit a fresh SGR run when this cell's style differs
+               from the most recently emitted one. Reset (`\x1b[0m`)
+               + per-attribute toggles is verbose but unambiguous;
+               playback parsers all handle it the same way and the
+               size cost is bounded by the number of style runs in
+               the snapshot. ul_color and OSC 8 link_id aren't
+               re-emitted (uncommon in shell prompts; future work
+               if anyone hits a case). */
+            if (c.attrs != last_attrs || c.fg != last_fg || c.bg != last_bg) {
+                APPEND_LIT("\x1b[0m");
+                if (c.attrs & ATTR_BOLD)      APPEND_LIT("\x1b[1m");
+                if (c.attrs & ATTR_DIM)       APPEND_LIT("\x1b[2m");
+                if (c.attrs & ATTR_ITALIC)    APPEND_LIT("\x1b[3m");
+                if (c.attrs & ATTR_UNDERLINE) APPEND_LIT("\x1b[4m");
+                if (c.attrs & ATTR_REVERSE)   APPEND_LIT("\x1b[7m");
+                if (c.attrs & ATTR_STRIKE)    APPEND_LIT("\x1b[9m");
+                if (!(c.attrs & ATTR_DEFAULT_FG)) {
+                    if (c.attrs & ATTR_FG_INDEX) {
+                        APPEND_FMT("\x1b[38;5;%dm", (int)(c.fg & 0xFF));
+                    } else {
+                        APPEND_FMT("\x1b[38;2;%d;%d;%dm",
+                                   (int)((c.fg >> 16) & 0xFF),
+                                   (int)((c.fg >> 8)  & 0xFF),
+                                   (int)( c.fg        & 0xFF));
+                    }
+                }
+                if (!(c.attrs & ATTR_DEFAULT_BG)) {
+                    if (c.attrs & ATTR_BG_INDEX) {
+                        APPEND_FMT("\x1b[48;5;%dm", (int)(c.bg & 0xFF));
+                    } else {
+                        APPEND_FMT("\x1b[48;2;%d;%d;%dm",
+                                   (int)((c.bg >> 16) & 0xFF),
+                                   (int)((c.bg >> 8)  & 0xFF),
+                                   (int)( c.bg        & 0xFF));
+                    }
+                }
+                last_attrs = c.attrs;
+                last_fg    = c.fg;
+                last_bg    = c.bg;
+            }
             uint32_t cp = c.cp ? c.cp : ' ';
             if (cp < 0x80) {
                 buf[n++] = (uint8_t)cp;
@@ -3744,10 +3840,22 @@ static void rec_emit_initial_snapshot(FILE *fp, Pane *p) {
             }
         }
     }
-    /* Move cursor back to where the shell currently has it. */
+    #undef APPEND_LIT
+    #undef APPEND_FMT
+    /* Reset SGR before re-enabling auto-wrap and restoring the
+       cursor. Without this, the LAST cell's style (e.g. a blue
+       `~` from the user's prompt) stays active on the playback
+       screen and bleeds into the first real PTY events — every
+       byte the user types would inherit the prompt's colour
+       until the shell emits its own SGR. The live session
+       doesn't have this problem because the shell typically
+       emits `\x1b[0m` after each colour run, but the snapshot
+       captures cell colours not shell state, so we must reset
+       explicitly. */
     int curx = screen_cursor_x(s) + 1;
     int cury = screen_cursor_y(s) + 1;
-    int wrote = snprintf((char *)buf + n, cap - n, "\x1b[%d;%dH", cury, curx);
+    int wrote = snprintf((char *)buf + n, cap - n,
+                         "\x1b[0m\x1b[?7h\x1b[%d;%dH", cury, curx);
     if (wrote > 0 && (size_t)wrote < cap - n) n += (size_t)wrote;
 
     /* Emit as a single t=0 event. */
@@ -3900,12 +4008,29 @@ static void rec_stop(void) {
                 sizeof(g_rec_save.src_path) - 1);
     }
     g_rec_save.duration_s = dur;
-    g_rec_save.fmt = REC_FMT_CAST;
-    rec_effects_defaults(&g_rec_save.effects);
-    /* Default destination = the first cast's path; the save action
-       strips the -pN suffix when it loops over panes. */
+    /* MP4 is the default — most users want a shareable video file,
+       and the .cast format is mostly useful for re-rendering or
+       debugging. The dst_path's extension gets rewritten below
+       (after src_path is copied in) so the file lands as .mp4. */
+    g_rec_save.fmt = REC_FMT_MP4;
+    /* Seed the save modal's effects from whatever the recorded pane
+       was rendering with — typically the user picked a preset
+       (Nostromo, VHS, etc.) before hitting Rec, so the saved file
+       should match the look they were seeing live. Falls back to
+       the global default for multi-pane recordings (where there's
+       no single source pane to copy from). */
+    if (g_rec.count == 1 && g_rec.panes[0]) {
+        g_rec_save.effects = g_rec.panes[0]->effects;
+    } else {
+        g_rec_save.effects = g_app_settings.effects;
+    }
+    /* Default destination = the first cast's path with the
+       extension rewritten to match the default format (mp4). The
+       save action strips the -pN suffix when it loops over panes. */
     strncpy(g_rec_save.dst_path, g_rec_save.src_path,
             sizeof(g_rec_save.dst_path) - 1);
+    rec_replace_ext(g_rec_save.dst_path, sizeof(g_rec_save.dst_path),
+                    rec_fmt_ext(g_rec_save.fmt));
     g_ui_mode = UI_REC_SAVE;
     g_rec.active = false;
     g_rec.count = 0;
@@ -3925,6 +4050,26 @@ static void rec_write(Pane *p, const uint8_t *buf, size_t n) {
         FILE *fp = g_rec.fps[i];
         if (!fp) return;
         fprintf(fp, "[%.6f, \"o\", \"", t);
+        rec_json_escape(fp, buf, n);
+        fputs("\"]\n", fp);
+        fflush(fp);
+        return;
+    }
+}
+
+/* Mirror user-input bytes into the cast as `[t, "i", "..."]` events
+   so the save renderer can show them as caption-style overlays.
+   Bypassed silently when no recording is active or `p` isn't one
+   of the captured panes. Same flush-on-write discipline as
+   rec_write so a forced quit doesn't lose the most recent input. */
+static void rec_input(Pane *p, const uint8_t *buf, size_t n) {
+    if (!g_rec.active || n == 0) return;
+    double t = GetTime() - g_rec.start_time;
+    for (int i = 0; i < g_rec.count; i++) {
+        if (g_rec.panes[i] != p) continue;
+        FILE *fp = g_rec.fps[i];
+        if (!fp) return;
+        fprintf(fp, "[%.6f, \"i\", \"", t);
         rec_json_escape(fp, buf, n);
         fputs("\"]\n", fp);
         fflush(fp);
@@ -4236,7 +4381,7 @@ static Tab *tab_open_ssh_placeholder(const SshProfile *prof,
     }
     Pane *p = leaf->pane;
     pane_init_click_state(p);
-    p->scr = screen_new(cols, rows, 5000, pane_io(p));
+    p->scr = screen_new(cols, rows, SCROLLBACK_LINES, pane_io(p));
     p->effects = g_app_settings.effects;
     /* Banner inside the pane area. ANSI: clear + home, bold cyan
        caption, dim line below it. The shell's first redraw blows
@@ -5055,6 +5200,7 @@ static void search_open(Pane *p) {
     p->search.caret = 0;
     p->search.sel_anchor = -1;
     p->search.mouse_down = false;
+    p->search.pending_recompute_at = 0.0;
     search_clear_matches(&p->search);
 }
 
@@ -5067,6 +5213,7 @@ static void search_close(Pane *p) {
     p->search.caret = 0;
     p->search.sel_anchor = -1;
     p->search.mouse_down = false;
+    p->search.pending_recompute_at = 0.0;
     search_clear_matches(&p->search);
     if (p->scr) screen_scroll_reset(p->scr);
 }
@@ -5283,6 +5430,18 @@ static void search_handle_input(Pane *p) {
         if (search_insert_char(S, (char)cp)) query_changed = true;
     }
     if (query_changed) {
+        /* Defer the actual scrollback walk by 350 ms of typing
+           inactivity. With a million-line history a recompute can
+           take tens of ms; running it on every keystroke makes the
+           query field feel laggy. The fire-time gets pushed
+           forward each time the query changes, so a fast typer
+           never triggers an interim recompute. */
+        S->pending_recompute_at = GetTime() + 0.350;
+    }
+    /* Fire the deferred recompute when the user has paused. */
+    if (S->pending_recompute_at > 0.0 &&
+        GetTime() >= S->pending_recompute_at) {
+        S->pending_recompute_at = 0.0;
         search_recompute(p);
         if (S->count > 0) search_scroll_to_match(p, 0);
     }
@@ -13567,6 +13726,8 @@ typedef struct {
     Rect efx_slider[EFX_SLIDER_COUNT];      /* the draggable slider track */
     Rect phos[PHOSPHOR_COUNT];              /* 4 phosphor mode buttons */
     Rect speed[EFX_SPEED_COUNT];            /* 5 playback-speed buttons */
+    Rect preset[EFX_PRESET_COUNT];          /* preset pills (Nostromo, VHS, ...) */
+    Rect captions_btn;                      /* "Show captions" toggle (overlay user input) */
     Rect save_btn, close_btn, preview_btn;
 } RecSaveLayout;
 
@@ -13575,9 +13736,10 @@ static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout
 static RecSaveLayout rec_save_layout(int win_w, int win_h) {
     RecSaveLayout L = {0};
     /* Width: keeps the format pills + status path readable at 16pt mono.
-       Height grew from 280→460 when the effects panel landed; we still
-       clamp to window-minus-margin so small displays stay usable. */
-    int w = 1080, h = 460;
+       Height grew from 280→460→640 as the effects panel + preset
+       grid landed; we still clamp to window-minus-margin so small
+       displays stay usable. */
+    int w = 1080, h = 640;
     if (w > win_w - 40) w = win_w - 40;
     if (h > win_h - 40) h = win_h - 40;
     L.modal.x = (win_w - w) / 2;
@@ -13598,9 +13760,29 @@ static RecSaveLayout rec_save_layout(int win_w, int win_h) {
     for (int i = 0; i < REC_FMT_COUNT; i++)
         L.fmt[i] = (Rect){ field_x + i * (fmt_w + fmt_gap), fmt_y, fmt_w, fmt_h };
 
+    /* Preset pill grid — same 5-column wrap as Settings → Effects so
+       muscle memory carries over. Sits above the sliders so picking
+       a look is the prominent action; the sliders below are the
+       advanced tuning. */
+    const int PRESETS_COLS = 5;
+    int preset_y = fmt_y + fmt_h + 22 + 18;          /* leaves room for "Preset" caption */
+    int preset_btn_h = 26;
+    int preset_btn_w = (field_w - (PRESETS_COLS - 1) * 6) / PRESETS_COLS;
+    int preset_rows = (EFX_PRESET_COUNT + PRESETS_COLS - 1) / PRESETS_COLS;
+    for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+        int rrow = i / PRESETS_COLS;
+        int rcol = i % PRESETS_COLS;
+        L.preset[i] = (Rect){
+            field_x + rcol * (preset_btn_w + 6),
+            preset_y + rrow * (preset_btn_h + 4),
+            preset_btn_w, preset_btn_h
+        };
+    }
+    int preset_bottom = preset_y + preset_rows * (preset_btn_h + 4);
+
     /* Effects panel: header + three slider rows in two columns + one
        picker row (phosphor / pixelate) + the speed row. */
-    int efx_top   = fmt_y + fmt_h + 22;             /* leaves room for "Effects" header */
+    int efx_top   = preset_bottom + 18;              /* gap below preset grid */
     int efx_row_h = 28;
     int efx_gap_y = 8;
     int half_w    = (field_w - 14) / 2;             /* gap between columns */
@@ -13644,6 +13826,11 @@ static RecSaveLayout rec_save_layout(int win_w, int win_h) {
     L.save_btn    = (Rect){ L.modal.x + w - 22 - save_w,        row_y2, save_w,    btn_h };
     L.close_btn   = (Rect){ L.save_btn.x - 8 - close_w,         row_y2, close_w,   btn_h };
     L.preview_btn = (Rect){ L.close_btn.x - 8 - preview_w,      row_y2, preview_w, btn_h };
+    /* Captions toggle — left-anchored on the same row as the action
+       buttons, away from them so an accidental click on Save can't
+       hit it instead. */
+    int cap_w = 150;
+    L.captions_btn = (Rect){ L.modal.x + 22, row_y2, cap_w, btn_h };
     return L;
 }
 
@@ -13940,7 +14127,7 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
 
     /* Hidden Screen — no IO callbacks needed (no PTY, no clipboard). */
     ScreenIO sio = {0};
-    Screen *scr = screen_new(cf->cols, cf->rows, 5000, sio);
+    Screen *scr = screen_new(cf->cols, cf->rows, SCROLLBACK_LINES, sio);
     if (!scr) {
         snprintf(err, errsz, "screen_new failed");
         cast_free(cf);
@@ -14071,14 +14258,76 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
         screen_free(scr); cast_free(cf);
         return false;
     }
-    /* Skip every blank frame before the first event so the gif
-       opens on actual content instead of a couple of seconds of
-       blank screen while the user was thinking. Frame 0 fires
-       events[0] immediately. The speed multiplier divides total
-       output duration: speed=2 produces half the frames over half
-       the wall-clock time, while the per-frame cast lookup
-       multiplies by speed so the same events still play out. */
+    /* Skip blank lead-in. The synthetic snapshot at t=0 fires
+       immediately, but real PTY output often takes a second or two
+       to follow — and even then the FIRST real bytes are commonly
+       title escapes / color setup / private-mode toggles that don't
+       visibly change the screen. A naive "trim until events[1]"
+       skipped only the wall-clock gap, leaving the modal frame
+       held while invisible escapes processed.
+
+       Real fix: detection-replay. Spin up a hidden Screen, feed
+       events one by one, and hash cells + cursor after each. The
+       first event whose hash diverges from the snapshot's anchors
+       t0 (with a 200 ms lead-in for context). Detection is fast —
+       a hash walk is microseconds for a typical 100x30 grid, and
+       it stops on the first divergence, so the search bounded by
+       the actual interesting events.
+
+       Speed multiplier divides total output duration: speed=2
+       produces half the frames over half the wall-clock time,
+       while the per-frame cast lookup multiplies by speed so the
+       same events still play out. */
     double t0 = cf->events[0].t;
+    {
+        ScreenIO det_sio = {0};
+        Screen *det = screen_new(cf->cols, cf->rows, 0, det_sio);
+        if (det) {
+            screen_set_cell_h_px(det, ch_);
+            screen_feed(det, cf->events[0].data, cf->events[0].n);
+            #define HASH_INIT 1469598103934665603ull
+            #define HASH_MUL  1099511628211ull
+            uint64_t snap_hash = HASH_INIT;
+            for (int yy = 0; yy < cf->rows; yy++) {
+                for (int xx = 0; xx < cf->cols; xx++) {
+                    Cell cc = screen_view_cell(det, xx, yy);
+                    snap_hash ^= cc.cp;
+                    snap_hash *= HASH_MUL;
+                }
+            }
+            snap_hash ^= (uint64_t)screen_cursor_x(det);
+            snap_hash *= HASH_MUL;
+            snap_hash ^= (uint64_t)screen_cursor_y(det);
+            snap_hash *= HASH_MUL;
+
+            double anchor_t = -1.0;
+            for (size_t k = 1; k < cf->count; k++) {
+                /* Skip user-input events — only output drives the screen. */
+                if (cf->events[k].kind != 'o') continue;
+                screen_feed(det, cf->events[k].data, cf->events[k].n);
+                uint64_t h = HASH_INIT;
+                for (int yy = 0; yy < cf->rows; yy++) {
+                    for (int xx = 0; xx < cf->cols; xx++) {
+                        Cell cc = screen_view_cell(det, xx, yy);
+                        h ^= cc.cp;
+                        h *= HASH_MUL;
+                    }
+                }
+                h ^= (uint64_t)screen_cursor_x(det);
+                h *= HASH_MUL;
+                h ^= (uint64_t)screen_cursor_y(det);
+                h *= HASH_MUL;
+                if (h != snap_hash) { anchor_t = cf->events[k].t; break; }
+            }
+            #undef HASH_INIT
+            #undef HASH_MUL
+            screen_free(det);
+            if (anchor_t > t0 + 0.3) {
+                t0 = anchor_t - 0.2;
+                if (t0 < cf->events[0].t) t0 = cf->events[0].t;
+            }
+        }
+    }
     if (t0 < 0.0) t0 = 0.0;
     double total = cf->duration_s - t0 + 0.3;
     if (total < 0.3) total = 0.3;
@@ -14101,7 +14350,11 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
                consumes `speed/fps` seconds of cast time. */
             double frame_t = t0 + ((double)f * (double)speed) / (double)fps;
             while (ev_idx < cf->count && cf->events[ev_idx].t <= frame_t) {
-                screen_feed(scr, cf->events[ev_idx].data, cf->events[ev_idx].n);
+                /* Only "o" events drive the screen — "i" events are
+                   user input, used by the caption overlay below. */
+                if (cf->events[ev_idx].kind == 'o') {
+                    screen_feed(scr, cf->events[ev_idx].data, cf->events[ev_idx].n);
+                }
                 ev_idx++;
             }
             BeginTextureMode(rt);
@@ -14118,6 +14371,109 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
                                   &g_rec_save.effects,
                                   (double)f / (double)fps);
                 src_rt = &rt_fx;
+            }
+            /* Caption overlay (closed-caption style). Walks "i"
+               events that fall inside a 2.5 s sliding window
+               anchored at frame_t, transforms each byte into a
+               printable glyph (raw ASCII for letters/digits/punc;
+               ⏎ for Enter, ⌫ for Backspace, ↑↓←→ for arrow CSI),
+               and draws the result as a translucent strip near
+               the bottom of the frame. Drawn AFTER the effects
+               pass so VHS / glitch warps the screen but leaves
+               the captions readable. */
+            if (g_rec_save.show_captions) {
+                char cap_buf[768];
+                size_t cn = 0;
+                #define CAP_APPEND_UTF8(s, n) do { \
+                    for (size_t _i = 0; _i < (size_t)(n) && cn + 1 < sizeof(cap_buf); _i++) \
+                        cap_buf[cn++] = (s)[_i]; \
+                } while (0)
+                double cap_window_start = frame_t - 2.5;
+                for (size_t k = 0; k < cf->count; k++) {
+                    if (cf->events[k].kind != 'i') continue;
+                    if (cf->events[k].t > frame_t) break;
+                    if (cf->events[k].t < cap_window_start) continue;
+                    const uint8_t *d = cf->events[k].data;
+                    size_t dn = cf->events[k].n;
+                    for (size_t b = 0; b < dn; b++) {
+                        uint8_t c = d[b];
+                        /* Detect the common arrow-key CSI form
+                           ESC '[' ('A'..'D'). Skip the 3 bytes
+                           after we render the label. ASCII labels
+                           only: raylib's GetFontDefault() is
+                           an ASCII-only pixel font, so any non-
+                           ASCII codepoint (↑↓←→⏎⌫⇥) renders as a
+                           `?` glyph. */
+                        if (c == 0x1B && b + 2 < dn && d[b + 1] == '[') {
+                            const char *arrow = NULL;
+                            switch (d[b + 2]) {
+                                case 'A': arrow = "[Up]"; break;
+                                case 'B': arrow = "[Dn]"; break;
+                                case 'C': arrow = "[Rt]"; break;
+                                case 'D': arrow = "[Lt]"; break;
+                            }
+                            if (arrow) {
+                                CAP_APPEND_UTF8(arrow, strlen(arrow));
+                                b += 2;
+                                continue;
+                            }
+                            /* Other escape sequences: skip until a
+                               final byte (letter or '~') so we
+                               don't dump raw control bytes into
+                               the caption. */
+                            size_t e = b + 1;
+                            while (e < dn) {
+                                uint8_t ec = d[e];
+                                if ((ec >= 0x40 && ec <= 0x7E) || ec == '~') break;
+                                e++;
+                            }
+                            b = e;
+                            continue;
+                        }
+                        if (c == '\r' || c == '\n')      { CAP_APPEND_UTF8("[Ret]", 5); continue; }
+                        if (c == '\t')                   { CAP_APPEND_UTF8("[Tab]", 5); continue; }
+                        if (c == 0x7F || c == 0x08)      { CAP_APPEND_UTF8("[Bks]", 5); continue; }
+                        if (c >= 0x20 && c < 0x7F)       { cap_buf[cn++] = (char)c; continue; }
+                        /* Ctrl-letter (0x01..0x1A): show as ^A..^Z. */
+                        if (c >= 0x01 && c <= 0x1A) {
+                            char buf2[3] = { '^', (char)('A' + c - 1), 0 };
+                            CAP_APPEND_UTF8(buf2, 2);
+                            continue;
+                        }
+                    }
+                }
+                #undef CAP_APPEND_UTF8
+                cap_buf[cn] = 0;
+                if (cn > 0) {
+                    /* Trim from the front so the most recent
+                       keystrokes are always visible (right-aligned
+                       feel without actually right-aligning). */
+                    const int max_chars = 80;
+                    if ((int)cn > max_chars) {
+                        memmove(cap_buf, cap_buf + (cn - max_chars),
+                                max_chars + 1);
+                        cn = max_chars;
+                    }
+                    BeginTextureMode(*src_rt);
+                        Font fnt = GetFontDefault();
+                        int fontsz = (height < 300) ? 14 : 18;
+                        Vector2 ts = MeasureTextEx(fnt, cap_buf, (float)fontsz, 1);
+                        int box_pad = 8;
+                        int box_w = (int)ts.x + 2 * box_pad;
+                        int box_h = (int)ts.y + 2 * box_pad;
+                        if (box_w > width - 16) box_w = width - 16;
+                        int box_x = (width - box_w) / 2;
+                        int box_y = height - box_h - 12;
+                        DrawRectangle(box_x, box_y, box_w, box_h,
+                                      (Color){0, 0, 0, 200});
+                        DrawRectangleLines(box_x, box_y, box_w, box_h,
+                                           (Color){240, 240, 240, 120});
+                        DrawTextEx(fnt, cap_buf,
+                                   (Vector2){box_x + box_pad, box_y + box_pad},
+                                   (float)fontsz, 1,
+                                   (Color){255, 255, 240, 255});
+                    EndTextureMode();
+                }
             }
             Image img = LoadImageFromTexture(src_rt->texture);
             ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
@@ -14301,6 +14657,16 @@ static void rec_save_handle_mouse(RecSaveLayout L) {
             return;
         }
     }
+    /* Preset pills — picking one stamps the full effect set, so a
+       click here overrides whatever sliders / phosphor / speed
+       were set. The user can still tweak afterwards. */
+    for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+        if (rect_hit(L.preset[i], mx, my)) {
+            rec_effects_apply_preset(&g_rec_save.effects, (EfxPreset)i);
+            g_rec_save.status[0] = 0;
+            return;
+        }
+    }
     /* Effects panel: sliders, phosphor pickers, pixelate factors, speed. */
     for (int i = 0; i < EFX_SLIDER_COUNT; i++) {
         if (rect_hit(L.efx_slider[i], mx, my)) {
@@ -14421,6 +14787,11 @@ static void rec_save_handle_mouse(RecSaveLayout L) {
            power-user can still rummage for it later. */
         fprintf(stderr, "rbterm: recording kept at %s\n", g_rec_save.src_path);
         g_ui_mode = UI_NORMAL;
+        return;
+    }
+    if (rect_hit(L.captions_btn, mx, my)) {
+        g_rec_save.show_captions = !g_rec_save.show_captions;
+        g_rec_save.status[0] = 0;
         return;
     }
     /* Click anywhere else inside the modal drops focus. */
@@ -14560,6 +14931,30 @@ static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout
                    13, 0, fg);
     }
 
+    /* ---- Preset pill grid — Nostromo, VHS, Tron, etc. ---- */
+    {
+        Color text_main = (Color){230, 232, 240, 255};
+        Color outline   = (Color){125, 207, 255, 150};
+        int hdr_y = L.preset[0].y - 18;
+        DrawTextEx(*f, "Preset",
+                   (Vector2){L.modal.x + 22, hdr_y},
+                   14, 0, (Color){200, 205, 220, 255});
+        DrawLine(L.modal.x + 22 + 60, hdr_y + 9,
+                 L.modal.x + L.modal.w - 22, hdr_y + 9,
+                 (Color){70, 74, 90, 255});
+        for (int i = 0; i < EFX_PRESET_COUNT; i++) {
+            Rect rr = L.preset[i];
+            DrawRectangle(rr.x, rr.y, rr.w, rr.h, (Color){34, 38, 52, 255});
+            DrawRectangleLines(rr.x, rr.y, rr.w, rr.h, outline);
+            const char *lbl = rec_effects_preset_label((EfxPreset)i);
+            Vector2 ts = MeasureTextEx(*f, lbl, 12, 0);
+            DrawTextEx(*f, lbl,
+                       (Vector2){rr.x + (rr.w - ts.x) / 2,
+                                 rr.y + (rr.h - ts.y) / 2},
+                       12, 0, text_main);
+        }
+    }
+
     /* ---- Effects panel: section header, sliders, picker rows. ---- */
     {
         /* Section header sits in the gap above the first slider row. */
@@ -14647,6 +15042,25 @@ static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout
                                  rr.y + (rr.h - ts.y) / 2},
                        13, 0, (Color){230, 232, 240, 255});
         }
+    }
+
+    /* Captions toggle (left-anchored on the action row). Reads
+       like a checkbox — pressed-in fill when on, neutral grey when
+       off, the label switches between [✓ Captions] / [Captions]. */
+    {
+        Rect cb = L.captions_btn;
+        bool on = g_rec_save.show_captions;
+        Color bg = on ? (Color){46, 92, 150, 255} : (Color){34, 38, 52, 255};
+        Color border = on ? (Color){125, 207, 255, 255} : (Color){90, 95, 110, 200};
+        Color text = on ? (Color){230, 245, 255, 255} : (Color){200, 205, 220, 255};
+        DrawRectangle(cb.x, cb.y, cb.w, cb.h, bg);
+        DrawRectangleLines(cb.x, cb.y, cb.w, cb.h, border);
+        const char *lbl = on ? "[✓] Captions" : "[ ] Captions";
+        Vector2 ts = MeasureTextEx(*f, lbl, 13, 0);
+        DrawTextEx(*f, lbl,
+                   (Vector2){cb.x + (cb.w - ts.x) / 2,
+                             cb.y + (cb.h - ts.y) / 2},
+                   13, 0, text);
     }
 
     /* Action buttons. */
@@ -18695,13 +19109,16 @@ int main(int argc, char **argv) {
                         } else {
                             pty_write(_p->pty, (const uint8_t *)t, strlen(t));
                         }
+                        rec_input(_p, (const uint8_t *)t, strlen(t));
                     }
                 } else if (screen_bracketed_paste(ap->scr)) {
                     pty_write(ap->pty, (const uint8_t *)"\x1b[200~", 6);
                     pty_write(ap->pty, (const uint8_t *)t, strlen(t));
                     pty_write(ap->pty, (const uint8_t *)"\x1b[201~", 6);
+                    rec_input(ap, (const uint8_t *)t, strlen(t));
                 } else {
                     pty_write(ap->pty, (const uint8_t *)t, strlen(t));
+                    rec_input(ap, (const uint8_t *)t, strlen(t));
                 }
             }
         }
@@ -18744,11 +19161,13 @@ int main(int argc, char **argv) {
                     if (!_p || !_p->pty) continue;
                     if (_p->scr) screen_scroll_reset(_p->scr);
                     pty_write(_p->pty, inputbuf, in_n);
+                    rec_input(_p, inputbuf, in_n);
                     if (_p->sel.active && !_p->sel.dragging) _p->sel.active = false;
                 }
             } else {
                 screen_scroll_reset(ap->scr);
                 pty_write(ap->pty, inputbuf, in_n);
+                rec_input(ap, inputbuf, in_n);
                 if (ap->sel.active && !ap->sel.dragging) ap->sel.active = false;
             }
         }
