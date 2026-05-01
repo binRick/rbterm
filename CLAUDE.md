@@ -1371,13 +1371,10 @@ dropdown open cancels the form.
 - Scrollback reflow on resize (only the main screen reflows today; the
   existing scrollback is just re-bucketed at the new width).
 - Linux `.desktop` file + icon install path.
-- Bundle a static, libwebp-enabled `ffmpeg` next to the binary in
-  the CI release archive so mp4 / webm / apng work out of the box
-  on machines without an ffmpeg install. `find_ffmpeg` already
-  prefers `Contents/Resources/ffmpeg` (macOS) / next-to-binary
-  (Linux/Windows) over PATH — the release workflow just needs to
-  drop the static build into place. gif and webp already work
-  without ffmpeg via the native encoders.
+- Bundle ffmpeg next to the macOS / Linux release binary too. Today
+  only Windows ships a bundled ffmpeg.exe (BtbN gpl-static, fetched
+  in CI). macOS/Linux still require ffmpeg on PATH for mp4 / webm /
+  apng — gif and webp work without it via the native encoders.
 - **Maximized startup window mode is broken.** Settings → Window →
   Maximized (on macOS, "Own Space") is wired up to
   `mac_enter_native_fullscreen` in `emoji_mac.m` which calls

@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>     /* intptr_t for the Windows pid_t alias below */
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -42,12 +43,11 @@
   #ifndef X_OK
     #define X_OK 0
   #endif
-  /* Windows lacks pid_t. Our subprocess helpers are no-ops on
-     Windows (the bodies are #ifndef _WIN32 guarded), but the
-     function signatures still mention pid_t. Aliasing it to int
-     lets the prototypes parse without dragging in a fork model
-     we don't use here. */
-  typedef int pid_t;
+  /* Windows lacks pid_t. The subprocess helpers below now actually
+     work on Windows by stashing the HANDLE returned by CreateProcess
+     in here, so pid_t needs to be wide enough to hold a pointer.
+     intptr_t fits both fork()'s small int pid and a HANDLE. */
+  typedef intptr_t pid_t;
 #else
   #include <strings.h>   /* strcasecmp */
   #include <dirent.h>
@@ -14221,15 +14221,144 @@ static bool find_ffmpeg(char *out, size_t cap) {
 /* Spawn ffmpeg with stdin connected to a write pipe + stderr
    redirected to `err_log_path` so we can surface the actual error
    to the user when ffmpeg dies. Caller fcloses the FILE on
-   completion and waits the child via waitpid. */
+   completion and waits the child via process_wait. */
 #ifndef _WIN32
 #include <sys/wait.h>
 #endif
+
+#ifdef _WIN32
+/* Quote one argv element for Windows command-line splitting. The
+   CreateProcess command line is a single string, parsed by
+   CommandLineToArgvW per Microsoft's documented rules: surround
+   with quotes, double any embedded backslashes that precede a quote,
+   and escape internal double quotes. We only ffmpeg here so the
+   argument set is well-behaved (no embedded quotes), but we follow
+   the rules so a future caller doesn't get burned. */
+static void win_quote_arg(char *out, size_t cap, const char *s) {
+    size_t o = 0;
+    if (o < cap) out[o++] = '"';
+    while (*s && o < cap - 2) {
+        size_t bs = 0;
+        while (*s == '\\') { bs++; s++; }
+        if (*s == '"') {
+            for (size_t k = 0; k < bs * 2 + 1 && o < cap - 2; k++) out[o++] = '\\';
+            if (o < cap - 2) out[o++] = '"';
+            s++;
+        } else if (*s == 0) {
+            for (size_t k = 0; k < bs * 2 && o < cap - 2; k++) out[o++] = '\\';
+            break;
+        } else {
+            for (size_t k = 0; k < bs && o < cap - 2; k++) out[o++] = '\\';
+            if (o < cap - 2) out[o++] = *s++;
+        }
+    }
+    if (o < cap - 1) out[o++] = '"';
+    out[o] = 0;
+}
+
+/* Glue argv into one CreateProcess command line. Returns a heap
+   buffer the caller frees. */
+static char *win_build_cmdline(const char *const argv[]) {
+    size_t cap = 1024;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    buf[0] = 0;
+    size_t len = 0;
+    for (int i = 0; argv[i]; i++) {
+        char q[1024];
+        win_quote_arg(q, sizeof(q), argv[i]);
+        size_t qlen = strlen(q);
+        size_t need = len + qlen + 2;
+        if (need >= cap) {
+            while (cap < need + 1) cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        if (i > 0) buf[len++] = ' ';
+        memcpy(buf + len, q, qlen);
+        len += qlen;
+        buf[len] = 0;
+    }
+    return buf;
+}
+#endif
+
+/* Wait for a child handed back by ffmpeg_open_pipe / run_argv,
+   returning true iff it exited with status 0. Cross-platform shim
+   over waitpid (Unix) and WaitForSingleObject + GetExitCodeProcess
+   (Windows). Closes the process handle on Windows. */
+static bool process_wait(pid_t p) {
+#ifdef _WIN32
+    HANDLE h = (HANDLE)p;
+    if (!h) return false;
+    WaitForSingleObject(h, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(h, &code);
+    CloseHandle(h);
+    return code == 0;
+#else
+    int status = 0;
+    if (waitpid(p, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
 static FILE *ffmpeg_open_pipe(const char *const argv[], pid_t *out_pid,
                               const char *err_log_path) {
 #ifdef _WIN32
-    (void)argv; (void)out_pid; (void)err_log_path;
-    return NULL;   /* TODO: CreateProcess + anonymous pipe on Windows. */
+    /* Anonymous pipe for ffmpeg's stdin. Inheritable read end →
+       child's stdin; write end stays in the parent (us) and is
+       handed back to the caller as a FILE*. */
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return NULL;
+    SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0);
+
+    /* Stderr: either redirect to err_log_path or eat it. */
+    HANDLE child_err = INVALID_HANDLE_VALUE;
+    if (err_log_path && *err_log_path) {
+        child_err = CreateFileA(err_log_path, GENERIC_WRITE, FILE_SHARE_READ,
+                                &sa, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    if (child_err == INVALID_HANDLE_VALUE) {
+        child_err = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ,
+                                &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    HANDLE child_out = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ,
+                                   &sa, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, NULL);
+
+    char *cmd = win_build_cmdline(argv);
+    if (!cmd) { CloseHandle(rd); CloseHandle(wr); return NULL; }
+
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    si.hStdInput  = rd;
+    si.hStdOutput = child_out;
+    si.hStdError  = child_err;
+    PROCESS_INFORMATION pi = {0};
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    free(cmd);
+    CloseHandle(rd);
+    if (child_err != INVALID_HANDLE_VALUE) CloseHandle(child_err);
+    if (child_out != INVALID_HANDLE_VALUE) CloseHandle(child_out);
+    if (!ok) { CloseHandle(wr); return NULL; }
+    CloseHandle(pi.hThread);
+    *out_pid = (pid_t)pi.hProcess;
+
+    /* Wrap the write end as a FILE* so the encoder's existing
+       fwrite-and-fclose pattern Just Works. _open_osfhandle hands
+       the OS handle to the CRT, and _fdopen wraps it. The CRT
+       takes ownership — fclose() will both close the FILE and the
+       underlying handle. */
+    int fd = _open_osfhandle((intptr_t)wr, 0);
+    if (fd < 0) { CloseHandle(wr); return NULL; }
+    FILE *fp = _fdopen(fd, "wb");
+    if (!fp) { _close(fd); return NULL; }
+    return fp;
 #else
     int pfd[2];
     if (pipe(pfd) != 0) return NULL;
@@ -14261,8 +14390,47 @@ static FILE *ffmpeg_open_pipe(const char *const argv[], pid_t *out_pid,
    NULL so callers can surface ffmpeg's own message. */
 static bool run_argv(const char *const argv[], const char *err_log_path) {
 #ifdef _WIN32
-    (void)argv; (void)err_log_path;
-    return false;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE child_err = INVALID_HANDLE_VALUE;
+    if (err_log_path && *err_log_path) {
+        child_err = CreateFileA(err_log_path, GENERIC_WRITE, FILE_SHARE_READ,
+                                &sa, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    if (child_err == INVALID_HANDLE_VALUE) {
+        child_err = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ,
+                                &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    HANDLE child_in  = CreateFileA("NUL", GENERIC_READ,  FILE_SHARE_READ,
+                                   &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE child_out = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ,
+                                   &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    char *cmd = win_build_cmdline(argv);
+    if (!cmd) {
+        if (child_err != INVALID_HANDLE_VALUE) CloseHandle(child_err);
+        if (child_in  != INVALID_HANDLE_VALUE) CloseHandle(child_in);
+        if (child_out != INVALID_HANDLE_VALUE) CloseHandle(child_out);
+        return false;
+    }
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    si.hStdInput  = child_in;
+    si.hStdOutput = child_out;
+    si.hStdError  = child_err;
+    PROCESS_INFORMATION pi = {0};
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    free(cmd);
+    if (child_err != INVALID_HANDLE_VALUE) CloseHandle(child_err);
+    if (child_in  != INVALID_HANDLE_VALUE) CloseHandle(child_in);
+    if (child_out != INVALID_HANDLE_VALUE) CloseHandle(child_out);
+    if (!ok) return false;
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    return code == 0;
 #else
     pid_t pid = fork();
     if (pid == 0) {
@@ -14612,7 +14780,7 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
     if (!pixels) {
         snprintf(err, errsz, "out of memory for pixel buffer");
         if (gif) gif_end(gif);
-        if (pipe_fp) { fclose(pipe_fp); waitpid(pipe_pid, NULL, 0); }
+        if (pipe_fp) { fclose(pipe_fp); process_wait(pipe_pid); }
         UnloadRenderTexture(rt); if (rt_fx.id) UnloadRenderTexture(rt_fx);
         screen_free(scr); cast_free(cf);
         return false;
@@ -14882,10 +15050,7 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
     }
     if (pipe_fp) {
         fclose(pipe_fp);
-#ifndef _WIN32
-        int status = 0;
-        waitpid(pipe_pid, &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (!process_wait(pipe_pid)) {
             char tail[256] = {0};
             read_tail(ff_log, tail, sizeof(tail));
             unlink(ff_log);
@@ -14895,7 +15060,6 @@ static bool rec_render_native(RecFmt fmt, const char *src_cast, const char *dst,
             return false;
         }
         unlink(ff_log);
-#endif
     }
     /* Second pass: gif intermediate → final apng via ffmpeg.
        libavcodec ships an APNG encoder built-in on every brew /
@@ -15056,8 +15220,21 @@ static void rec_save_handle_mouse(RecSaveLayout L) {
            registered (often a text editor); the rest get rendered
            as actual gif/mp4/webm/etc. via agg + ffmpeg. */
         char tmp[PATH_MAX];
+#ifdef _WIN32
+        /* Windows has no /tmp; use %TEMP% (or fall back to the user's
+           Downloads as a last resort if TEMP isn't set, which it
+           always is on a normal Win10/11 install). GetCurrentProcessId
+           replaces getpid for the unique-suffix part. */
+        const char *tmpdir = getenv("TEMP");
+        if (!tmpdir || !*tmpdir) tmpdir = getenv("TMP");
+        if (!tmpdir || !*tmpdir) tmpdir = ".";
+        snprintf(tmp, sizeof(tmp), "%s\\rbterm-preview-%lu.%s",
+                 tmpdir, (unsigned long)GetCurrentProcessId(),
+                 rec_fmt_ext(g_rec_save.fmt));
+#else
         snprintf(tmp, sizeof(tmp), "/tmp/rbterm-preview-%d.%s",
                  (int)getpid(), rec_fmt_ext(g_rec_save.fmt));
+#endif
         if (g_rec_save.fmt == REC_FMT_CAST) {
             /* Open the live src so previewing doesn't disturb the
                temp file the user might still want to save. */

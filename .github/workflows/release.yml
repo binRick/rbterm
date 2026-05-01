@@ -79,6 +79,27 @@ jobs:
           # RCDATA resources on Windows) so no fonts/ folder ships
           # alongside the exe.
 
+      # mp4 / webm / apng recording-save formats require ffmpeg, which
+      # Windows doesn't ship by default. Drop a static ffmpeg.exe next
+      # to rbterm.exe — find_ffmpeg() prefers next-to-binary over PATH
+      # so the bundled copy is what actually runs. BtbN's gpl-static
+      # build is a single self-contained exe (~150 MB on disk; ~70 MB
+      # compressed inside the release zip).
+      - name: Bundle ffmpeg.exe (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg" -Force
+          $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter "ffmpeg.exe" |
+                 Select-Object -First 1
+          if (-not $exe) { throw "ffmpeg.exe not found in BtbN archive" }
+          Copy-Item -Path $exe.FullName -Destination "pkg\ffmpeg.exe"
+          $size = (Get-Item "pkg\ffmpeg.exe").Length
+          Write-Host ("ffmpeg.exe staged at pkg/ffmpeg.exe ({0:N0} bytes)" -f $size)
+
       - name: Self-sign Windows binary
         if: matrix.os == 'windows-latest'
         shell: pwsh
