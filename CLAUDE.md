@@ -473,6 +473,40 @@ ssh mia 'chown rich:rich /home/rich/Downloads/rbterm-linux-x86_64.zip'
 Running rbterm on mia from an SSH session needs `ssh -Y mia ./rbterm`
 (X forwarding) or a local VNC/desktop session — it's a GUI app.
 
+When the user wants to **smoke-test the Linux release locally**
+(no remote VM available), use OrbStack — Apple-Silicon-native
+Linux VMs with Mac display passthrough. Procedure:
+
+```bash
+brew install --cask orbstack
+open -a OrbStack                        # accept first-run prompts
+orb create --arch amd64 ubuntu rbterm-test   # x86 VM matches the release binary
+orb -m rbterm-test bash -c 'sudo apt-get update -qq && \
+    sudo apt-get install -y unzip libssh-4 libharfbuzz0b libwebp7 \
+                            libwebpmux3 libfontconfig1 libxinerama1 \
+                            libxcursor1 libxi6 libgl1 libxrandr2 libxkbcommon0'
+gh release download v0.1.0 --repo binRick/rbterm \
+    --pattern 'rbterm-linux-x86_64.zip' --dir ~/Downloads --clobber
+orb -m rbterm-test bash -c \
+    'mkdir -p ~/rbterm && cp /Users/$USER/Downloads/rbterm-linux-x86_64.zip ~/rbterm/ && \
+     cd ~/rbterm && unzip -o rbterm-linux-x86_64.zip && chmod +x rbterm'
+orb -m rbterm-test bash -c 'cd ~/rbterm && timeout 4 ./rbterm 2>&1 | head'
+```
+
+Two important notes:
+
+- `--arch amd64` is **required**. The default Ubuntu image is
+  arm64 on Apple Silicon, and our linux-x86_64 release binary
+  doesn't run there (cross-arch packages are sparse on Ubuntu).
+  Always create the VM as amd64 so library deps install
+  natively.
+- For a **visible window**, install XQuartz on the host
+  (`brew install --cask xquartz`, then logout/login) so OrbStack
+  has an X11 server to forward to. Without it, the smoke test
+  still validates the dependency stack — rbterm fails at GLFW
+  init with `X11: The DISPLAY environment variable is missing`,
+  which proves every native dep loaded successfully.
+
 ## Graphics (sixel + kitty)
 
 rbterm advertises sixel support in its Primary-DA response
