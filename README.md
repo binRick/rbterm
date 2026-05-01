@@ -501,40 +501,64 @@ latency**: when a program issues an ANSI query (e.g. `CSI 6n` for
 cursor position), how fast does the terminal reply? `tools/echo_bench`
 times the round-trip end to end — kernel write, terminal parse,
 terminal reply, kernel read — across 1000 samples per terminal,
-all five fired in turn on the same M-series MacBook:
+all six fired in turn on the same M-series MacBook (2026-04-30
+refresh, with **Ghostty** added to the field):
 
 | Terminal | min | **median** | mean | p99 | max | stdev |
 |---|---:|---:|---:|---:|---:|---:|
-| **rbterm** | 0.010 | **0.014** ★ | 0.014 | 0.025 | 0.057 | 0.003 |
-| alacritty | 0.020 | 0.029 | 0.077 | 0.068 | 14.687 | 0.647 |
-| Apple Terminal | 0.037 | 0.053 | 0.065 | 0.152 | 3.969 | 0.126 |
-| kitty | 3.081 | 3.485 | 3.484 | 3.766 | 16.452 | 0.458 |
-| iTerm2 ¹ | 5.719 | 20.346 | 21.663 | 32.497 | 45.346 | 6.043 |
+| **rbterm** | 0.012 | **0.016** ★ | 0.018 | 0.038 | 0.114 | — |
+| ghostty | 0.017 | 0.024 | 0.025 | 0.044 | 0.092 | — |
+| alacritty | 0.020 | 0.031 | 0.094 | 0.130 | 16.341 | — |
+| Apple Terminal | 0.038 | 0.049 | 0.059 | 0.118 | 3.162 | — |
+| kitty | 3.060 | 3.486 | 3.502 | 3.627 | 22.654 | — |
+| iTerm2 ¹ | 1.935 | 21.610 | 21.967 | 37.872 | 45.784 | — |
 
 (values: ms per round trip, lower is better. ¹ iTerm2 hit
-echo_bench's 5-second total deadline at n=231 — its parser is
-slow enough that 1000 samples takes longer than 5 seconds.)
+echo_bench's per-sample deadline at n=228 — its parser is slow
+enough that ~75 % of samples don't return inside the cutoff.)
 
 Median ratios vs rbterm:
 
-- **2.1× faster** than alacritty
-- **3.8× faster** than Apple Terminal
-- **249× faster** than kitty
-- **1453× faster** than iTerm2
-- **stdev of 0.003 ms** — essentially deterministic, no jitter
+- **1.5× faster** than Ghostty
+- **1.9× faster** than alacritty
+- **3.1× faster** than Apple Terminal
+- **218× faster** than kitty
+- **1351× faster** than iTerm2
 
-Why so fast? `pty_unix.c`'s reader thread peeks at incoming bytes
-for the 4-byte `\e[6n` pattern and emits the reply directly using a
-cursor snapshot the main thread refreshes after every parser drain
-(two relaxed atomic stores, ~free). No parser. No frame budget. No
-GUI thread hop. The reply path is deterministic memcmp + write.
+### How the benchmark works
 
-The previous personal best on this benchmark was 0.009 ms median
-(`bench/echo-rbterm-fast.txt`, April 25), still tracked in the
-results dir. Today's 0.014 ms is the post-recursive-split-tree
-build — a small regression from rerouting the reader thread's
-cursor snapshot through the new pane node abstraction. Closing
-that delta is a known follow-up.
+The benchmark is a tight C program (`tools/echo_bench.c`) that
+exercises only the round-trip path — no rendering, no scrolling,
+no PTY drain. For each sample it:
+
+1. Records a high-resolution timestamp (`clock_gettime(CLOCK_MONOTONIC)`).
+2. Writes the 4-byte query `\x1b[6n` (Device Status Report) to
+   the controlling tty.
+3. Reads bytes back until it sees the reply `\x1b[<row>;<col>R`.
+4. Records the second timestamp and stores the delta.
+
+After 1000 samples it reports min / median / mean / p99 / max /
+stdev. The query is the cheapest possible interaction: the
+terminal must wake up, parse the CSI sequence, look up its
+cursor position, format the reply, and write it back. Anything
+the terminal does on its hot path — input parsing, event
+dispatch, lock contention, GUI work — shows up as latency here.
+
+`bench-here.sh` auto-detects the host terminal via `$TERM_PROGRAM`
+(or fallback env vars like `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR`),
+builds `echo_bench` if needed, runs the sample loop, and writes
+`bench/echo-<slug>-<stamp>.txt`. `bench-summary.sh` reads the
+newest result per slug and prints the side-by-side table —
+running the same script in multiple terminals + the summary
+gives you the comparison above.
+
+Why is rbterm at the front of the field? `pty_unix.c`'s reader
+thread peeks at incoming bytes for the 4-byte `\e[6n` pattern
+and emits the reply directly using a cursor snapshot the main
+thread refreshes after every parser drain (two relaxed atomic
+stores, ~free). No parser. No frame budget. No GUI thread hop.
+The reply path is deterministic memcmp + write — sub-millisecond
+median, sub-100-microsecond best case.
 
 Reproduce, with the bench scripts checked into `tools/`:
 
@@ -545,11 +569,6 @@ cd ~/Desktop/repos/rbterm && ./tools/bench-here.sh
 # Then, once you've covered the field:
 ./tools/bench-summary.sh
 ```
-
-`bench-here.sh` auto-detects the host terminal via `$TERM_PROGRAM`,
-runs 1000-sample echo_bench, and writes
-`bench/echo-<slug>-<stamp>.txt`. `bench-summary.sh` reads the
-newest result per terminal and prints the side-by-side table.
 
 ### Idle resource use — smallest memory, low idle CPU
 
