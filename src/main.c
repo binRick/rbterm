@@ -19889,14 +19889,20 @@ int main(int argc, char **argv) {
                 }
             }
             /* Cmd+Shift+M — toggle maximize on the active pane.
-               Cmd+Z does the same (matches tmux's "<prefix> z"
-               zoom; rbterm has no undo to conflict with). */
+               Cmd+Z does the same on macOS (matches tmux's
+               "<prefix> z" zoom). Linux / Windows don't get the
+               Cmd+Z binding because their UI modifier is Ctrl
+               and the input layer also emits 0x1A (SIGTSTP) for
+               Ctrl+Z, which would suspend the foreground shell
+               every time the user wanted to zoom a pane. */
             else if (shift_held && IsKeyPressed(KEY_M)) {
                 tab_toggle_maximize(cur);
             }
+#ifdef __APPLE__
             else if (!shift_held && IsKeyPressed(KEY_Z)) {
                 tab_toggle_maximize(cur);
             }
+#endif
             else if (IsKeyPressed(KEY_LEFT_BRACKET))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
             else if (IsKeyPressed(KEY_RIGHT_BRACKET)) { g_active = (g_active + 1) % g_num_tabs; cur = active_tab(); }
             /* Cmd+Shift+Left/Right reorders the active tab, sliding it
