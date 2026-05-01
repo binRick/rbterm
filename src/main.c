@@ -12753,7 +12753,10 @@ static SettingsLayout settings_layout(int win_w, int win_h) {
                 L.keys_delete[i]  = (Rect){0,0,0,0};
             }
         }
-        row_y += 8;
+        /* Reserve a row of space when there are zero keys so the
+           "(no keys yet — generate one below)" hint has somewhere
+           to sit between the header and the Generate button. */
+        row_y += (g_ssh_keys_count == 0) ? 32 : 8;
         L.keys_generate_btn = (Rect){ field_x, row_y, 200, row_h };
         /* Delete-confirmation modal — same size + position as keygen. */
         {
