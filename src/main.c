@@ -18141,12 +18141,16 @@ int main(int argc, char **argv) {
            path didn't, the auto-generated init's module-handle
            assumption is broken on this build. */
         {
+            /* MAKEINTRESOURCEA lives in winuser.h, which NOUSER strips
+               from the windows.h pull at the top of this file. Inline
+               the macro: (LPSTR)((ULONG_PTR)(WORD)id). */
             wchar_t exe_path[MAX_PATH];
             GetModuleFileNameW(NULL, exe_path, MAX_PATH);
             HMODULE m1 = GetModuleHandleW(NULL);
             HMODULE m2 = LoadLibraryExW(exe_path, NULL, LOAD_LIBRARY_AS_DATAFILE);
-            HRSRC h1 = m1 ? FindResourceA(m1, MAKEINTRESOURCEA(1000), "RBTERMFONT") : NULL;
-            HRSRC h2 = m2 ? FindResourceA(m2, MAKEINTRESOURCEA(1000), "RBTERMFONT") : NULL;
+            char *res_id = (char *)((ULONG_PTR)(WORD)1000);
+            HRSRC h1 = m1 ? FindResourceA(m1, res_id, "RBTERMFONT") : NULL;
+            HRSRC h2 = m2 ? FindResourceA(m2, res_id, "RBTERMFONT") : NULL;
             fprintf(stderr,
                     "win-resource diagnostic:\n"
                     "  GetModuleHandle(NULL)=%p FindResource=%p err=%lu\n"
