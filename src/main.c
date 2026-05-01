@@ -18024,6 +18024,7 @@ static void draw_logs_modal(Renderer *r, int win_w, int win_h, LogsLayout L) {
 int main(int argc, char **argv) {
     const char *font_path = NULL;
     int font_size = 20;
+    bool font_size_explicit = false;     /* CLI override beats DPI scaling */
     int init_cols = 100, init_rows = 30;
     int init_padding = 6;
     float init_opacity = 1.0f;
@@ -18032,7 +18033,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
         else if (!strcmp(argv[i], "--font") && i + 1 < argc) font_path = argv[++i];
-        else if (!strcmp(argv[i], "--size") && i + 1 < argc) font_size = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
+            font_size = atoi(argv[++i]);
+            font_size_explicit = true;
+        }
         else if (!strcmp(argv[i], "--cols") && i + 1 < argc) init_cols = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rows") && i + 1 < argc) init_rows = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--padding") && i + 1 < argc) init_padding = atoi(argv[++i]);
@@ -18040,6 +18044,27 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--undecorated")) init_undecorated = true;
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(); return 2; }
     }
+    /* font_size_explicit is only consumed in the Windows DPI
+       block below; mark it used on the other platforms so the
+       compiler doesn't warn. */
+    (void)font_size_explicit;
+#ifdef _WIN32
+    /* Windows runs without FLAG_WINDOW_HIGHDPI (the layout bug
+       in CLAUDE.md), so the framebuffer is in physical pixels.
+       On a HiDPI display — Retina Macs running Parallels, 4K
+       monitors at 150 % scale, etc. — a 20pt font renders at 20
+       actual pixels and looks microscopic. Read the system DPI
+       (96 = 100 %, 144 = 150 %, 192 = 200 %) and scale the
+       default font size to match. CLI --size and the persisted
+       config value still win — only the bare default scales. */
+    if (!font_size_explicit) {
+        UINT sys_dpi = GetDpiForSystem();
+        if (sys_dpi >= 120) {
+            font_size = (int)(((double)font_size * (double)sys_dpi) / 96.0 + 0.5);
+            if (font_size > 96) font_size = 96;
+        }
+    }
+#endif
     if (init_padding < 0) init_padding = 0;
     if (init_padding > 64) init_padding = 64;
     if (init_opacity < 0.2f) init_opacity = 0.2f;
