@@ -14193,11 +14193,23 @@ static RecSaveLayout rec_save_layout(int win_w, int win_h) {
     return L;
 }
 
-/* Look up bundled ffmpeg first (next to the rbterm executable on
-   Linux/Windows, or in Contents/Resources/ on macOS .app bundles),
-   then fall back to whatever is on PATH. Returns the resolved
-   path in `out` (caller's buffer) or false if nothing's available. */
+#ifdef _WIN32
+#include "ffmpeg_embedded.h"
+#endif
+
+/* Look up ffmpeg in this priority order:
+     1. Embedded RCDATA blob extracted to %TEMP% (Windows only —
+        rbterm.exe ships ffmpeg.exe baked into its .rsrc section).
+     2. Next to the rbterm executable (Linux/Windows) or in
+        Contents/Resources/ on macOS .app bundles.
+     3. PATH fallback.
+   Returns the resolved path in `out` (caller's buffer). Always
+   returns true since (3) is unconditional — the caller can still
+   get a "couldn't run ffmpeg" if PATH doesn't have it either. */
 static bool find_ffmpeg(char *out, size_t cap) {
+#ifdef _WIN32
+    if (ffmpeg_embedded_extract(out, cap)) return true;
+#endif
 #ifndef __EMSCRIPTEN__
     const char *exe_dir = GetApplicationDirectory();
     if (exe_dir && *exe_dir) {

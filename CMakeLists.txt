@@ -108,6 +108,20 @@ else()
     list(APPEND RBTERM_SOURCES src/fonts_embedded.S)
 endif()
 
+# Embedded ffmpeg (Windows only). When assets/ffmpeg/ffmpeg.exe is
+# present (CI fetches it from the BtbN release before configure;
+# dev builds without it just skip embedding), bake it into rbterm.exe
+# as RCDATA so users get one self-contained binary. ffmpeg_embedded.c
+# is always compiled — its FindResource path returns false on builds
+# that didn't bundle, and find_ffmpeg falls back to PATH.
+list(APPEND RBTERM_SOURCES src/ffmpeg_embedded.c)
+if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/assets/ffmpeg/ffmpeg.exe")
+    list(APPEND RBTERM_SOURCES src/ffmpeg_embedded.rc)
+    message(STATUS "Embedding assets/ffmpeg/ffmpeg.exe into rbterm.exe")
+elseif(WIN32)
+    message(STATUS "assets/ffmpeg/ffmpeg.exe not found — building without embedded ffmpeg")
+endif()
+
 # Regenerate src/themes_embedded.h whenever any kfc/dark palette file
 # (or the generator script) changes. Theme.c #includes the header, so
 # this fires before it compiles.

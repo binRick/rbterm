@@ -1,0 +1,12 @@
+/* Bake ffmpeg.exe into rbterm.exe as RCDATA so users get one
+   self-contained binary instead of an exe + ~200 MB sidecar.
+   ffmpeg_embedded_extract() at runtime materialises this blob
+   to %TEMP% on first use; find_ffmpeg() prefers the extracted
+   path over PATH so the bundled copy is what actually runs.
+
+   Path is relative to this .rc file's directory (src/), with
+   ffmpeg.exe staged into ../assets/ffmpeg/ by CI before the build.
+   The same relative-path convention as fonts_embedded.rc keeps
+   absolute dev-box paths from leaking into the bundled exe and
+   plays nicely with Git Bash on Windows runners. */
+2000 RBTERMFFMPEG "../assets/ffmpeg/ffmpeg.exe"

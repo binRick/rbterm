@@ -1,6 +1,7 @@
 build/
 build-web/
 site/
+.claude/
 rbterm
 rbterm.app/
 src/*.o
@@ -26,3 +27,8 @@ src/fonts_embedded_win.c
 # src/themes_embedded.h IS committed: it's small (~250 KB of C
 # strings), depends only on the submodule, and lets Windows build
 # without bash for the gen script.
+# CI fetches a ~200 MB ffmpeg.exe into assets/ffmpeg/ before
+# configure so RC.exe can bake it into rbterm.exe as RCDATA. Dev
+# builds without the file just skip embedding and fall back to
+# PATH for ffmpeg.
+assets/ffmpeg/
