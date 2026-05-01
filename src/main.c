@@ -18120,6 +18120,21 @@ int main(int argc, char **argv) {
        resources at this point; Mac/Linux is a no-op (the table is
        already populated at link time). */
     embedded_fonts_init();
+    if (getenv("RBTERM_DEBUG")) {
+        /* Dump every embedded-font slot's data ptr + size so we can
+           tell whether init populated anything on Windows. On
+           Mac/Linux these are filled at link time via .incbin and
+           should always be non-zero; on Windows they come from
+           FindResource/LoadResource at startup. */
+        fprintf(stderr, "embedded_fonts_init done — slots:\n");
+        for (int _i = 0; _i < k_embedded_font_count; _i++) {
+            fprintf(stderr, "  [%d] %s: data=%p size=%u\n",
+                    _i, k_embedded_fonts[_i].name,
+                    (const void *)k_embedded_fonts[_i].data,
+                    (unsigned)k_embedded_fonts[_i].data_size);
+        }
+        fflush(stderr);
+    }
     /* Hand the renderer a broad-coverage backup font so glyphs the
        primary font lacks (box-drawing, arrows, less common Unicode)
        fall through to it instead of rendering as "?". DejaVu Sans
