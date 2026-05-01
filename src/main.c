@@ -18122,10 +18122,9 @@ int main(int argc, char **argv) {
     embedded_fonts_init();
     if (getenv("RBTERM_DEBUG")) {
         /* Dump every embedded-font slot's data ptr + size so we can
-           tell whether init populated anything on Windows. On
-           Mac/Linux these are filled at link time via .incbin and
-           should always be non-zero; on Windows they come from
-           FindResource/LoadResource at startup. */
+           tell whether init populated anything. On Mac/Linux these
+           are filled at link time via .incbin; on Windows they come
+           from FindResource/LoadResource in embedded_fonts_init. */
         fprintf(stderr, "embedded_fonts_init done — slots:\n");
         for (int _i = 0; _i < k_embedded_font_count; _i++) {
             fprintf(stderr, "  [%d] %s: data=%p size=%u\n",
@@ -18134,33 +18133,6 @@ int main(int argc, char **argv) {
                     (unsigned)k_embedded_fonts[_i].data_size);
         }
         fflush(stderr);
-#ifdef _WIN32
-        /* Diagnostic: is GetModuleHandle(NULL) the cause? Same call,
-           same arguments, but using LoadLibraryEx-as-datafile instead.
-           If THAT works while embedded_fonts_init's GetModuleHandle
-           path didn't, the auto-generated init's module-handle
-           assumption is broken on this build. */
-        {
-            /* MAKEINTRESOURCEA lives in winuser.h, which NOUSER strips
-               from the windows.h pull at the top of this file. Inline
-               the macro: (LPSTR)((ULONG_PTR)(WORD)id). */
-            wchar_t exe_path[MAX_PATH];
-            GetModuleFileNameW(NULL, exe_path, MAX_PATH);
-            HMODULE m1 = GetModuleHandleW(NULL);
-            HMODULE m2 = LoadLibraryExW(exe_path, NULL, LOAD_LIBRARY_AS_DATAFILE);
-            char *res_id = (char *)((ULONG_PTR)(WORD)1000);
-            HRSRC h1 = m1 ? FindResourceA(m1, res_id, "RBTERMFONT") : NULL;
-            HRSRC h2 = m2 ? FindResourceA(m2, res_id, "RBTERMFONT") : NULL;
-            fprintf(stderr,
-                    "win-resource diagnostic:\n"
-                    "  GetModuleHandle(NULL)=%p FindResource=%p err=%lu\n"
-                    "  LoadLibraryEx(exe, DATAFILE)=%p FindResource=%p err=%lu\n",
-                    (void *)m1, (void *)h1, (unsigned long)GetLastError(),
-                    (void *)m2, (void *)h2, (unsigned long)GetLastError());
-            if (m2) FreeLibrary(m2);
-            fflush(stderr);
-        }
-#endif
     }
     /* Hand the renderer a broad-coverage backup font so glyphs the
        primary font lacks (box-drawing, arrows, less common Unicode)

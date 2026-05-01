@@ -198,6 +198,20 @@ checks ensure clicking directly on punctuation still selects it.
   shifts remaining slots down. Each `Screen`'s `io.user` is the stable
   heap-allocated `Tab *`, so the shift doesn't invalidate callbacks.
 
+### Embedded fonts on Windows — `static` arrays in headers
+- `src/fonts_embedded.h` declares the `k_embedded_fonts[]` table. On
+  Mac/Linux it's `static const` with link-time `.incbin` data
+  pointers — every TU gets its own copy but they all see the same
+  data because the pointers come from extern symbols. On **Windows**
+  the data pointers have to be filled at runtime by
+  `embedded_fonts_init()` (FindResource / LoadResource), so the
+  array MUST NOT be `static` in the header — `extern` decl in the
+  header + non-static definition in `fonts_embedded_win.c` so all
+  TUs share the one instance. If you ever see "embedded fonts work
+  on Mac/Linux but every Windows slot has data=NULL after init",
+  check `gen_fonts.sh` hasn't regressed back to a `static` header
+  array.
+
 ## Recursive split tree
 
 Each `Tab` owns a `PaneNode *root` plus `PaneNode *active` (the
