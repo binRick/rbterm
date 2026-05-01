@@ -17,7 +17,7 @@ how the OS, the shell, and a graphics library all meet.
 
 ## Pure C99 — fast, lean, no runtime
 
-The whole thing is ~27,000 lines of straight C99 — no C++, no
+The whole thing is ~33,000 lines of straight C99 — no C++, no
 garbage collector, no Electron, no JavaScript engine, no embedded
 scripting language. Every keystroke goes from raylib's input → a
 fixed-state-machine parser → a flat cell-grid → a single glyph atlas
@@ -44,7 +44,11 @@ at link time**:
   at the top under a "Programming / ligatures" header so you can
   spot them at a glance. `make app` on macOS produces a single
   self-contained `.app` you can drag and drop; the Linux/Windows
-  release zips are likewise standalone.
+  release zips are likewise standalone (see
+  [Downloads](#downloads--single-file-builds-pick-your-windows-zip)
+  for the two Windows variants — the full build also embeds
+  ffmpeg.exe as RCDATA so mp4 / webm / apng recording works with
+  zero install).
 
 The result is a 13 MB single-file terminal that opens instantly,
 runs with one process per window, has zero non-system dependencies
@@ -173,7 +177,7 @@ stays plain green VT100 and `playground` looks like a Game Boy. The
 session recording's save modal has the same effects panel, so you
 can bake any look into the rendered .gif / .mp4 / .webp.
 
-## Session recording — seven formats, two of them ffmpeg-free
+## Session recording — seven formats, all of them dependency-free on Windows
 
 Hit **● Rec** in the tab bar and rbterm captures the active pane.
 Stop opens a save modal with seven format pills:
@@ -184,14 +188,18 @@ Stop opens a save modal with seven format pills:
 | `txt`  | ANSI-stripped, CR/BS-aware overprint | none |
 | `gif`  | hand-written LZW + 6×6×6 RGB cube + 40-step gray ramp (`gif_encoder.c`) | **none** |
 | `webp` | `libwebp` + `libwebpmux` animated WebP (`webp_encoder.c`) | bundled into the binary |
-| `mp4`  | rawvideo piped to `ffmpeg -c:v libx264 -pix_fmt yuv420p -movflags +faststart` | ffmpeg on PATH |
-| `webm` | rawvideo piped to `ffmpeg -c:v libvpx -b:v 1M -pix_fmt yuv420p` | ffmpeg on PATH |
-| `apng` | render via the gif encoder, then `ffmpeg -i tmp.gif -plays 1` | ffmpeg on PATH |
+| `mp4`  | rawvideo piped to `ffmpeg -c:v libx264 -pix_fmt yuv420p -movflags +faststart` | ffmpeg (Windows full release: **embedded as RCDATA**; macOS/Linux: PATH) |
+| `webm` | rawvideo piped to `ffmpeg -c:v libvpx -b:v 1M -pix_fmt yuv420p` | ffmpeg (same as above) |
+| `apng` | render via the gif encoder, then `ffmpeg -i tmp.gif -plays 1` | ffmpeg (same as above) |
 
-`cast`, `txt`, `gif`, and `webp` work out of the box on a fresh
-machine. The video formats need ffmpeg only because the static
-build with libx264/libvpx isn't worth bundling alongside the binary
-yet.
+`cast`, `txt`, `gif`, and `webp` work out of the box everywhere.
+On the **Windows full release** (`rbterm-windows-x86_64.zip`), a
+static BtbN ffmpeg.exe is baked into rbterm.exe's `.rsrc` section
+and extracted to `%TEMP%\rbterm-ffmpeg-<size>.exe` on first use, so
+mp4/webm/apng also work with no extra install. macOS / Linux still
+look up ffmpeg on PATH for those three. (See the
+[Downloads](#downloads--single-file-builds-pick-your-windows-zip)
+section for why we ship a slim Windows zip too.)
 
 How it actually works:
 
@@ -845,6 +853,43 @@ To reproduce on your own machine, see [docs/BENCHMARKING.md](docs/BENCHMARKING.m
 | Cmd+F | Search in scrollback (Enter / F3 = next, Esc = close) |
 | ● Rec / ▣ Stop in tab bar | Start / stop recording the active pane |
 | `?` button | Tabbed cheat sheet (Navigation / Edit & Search / Shell integration) |
+
+## Downloads — single-file builds, pick your Windows zip
+
+Pre-built binaries for every release live on the
+[GitHub Releases](https://github.com/binRick/rbterm/releases) page.
+Each platform ships as a single self-contained `.zip`; unzip,
+double-click (or `chmod +x` and run on Linux), and you're done.
+No installer, no DLLs to scatter, no `fonts/` folder to keep next
+to the binary — fonts and themes live inside the executable.
+
+Windows ships in **two flavours**, same source, different bundle:
+
+| Asset | Size (zipped) | What's inside | Use it when |
+|---|---|---|---|
+| `rbterm-windows-x86_64.zip`       | ~82 MB | rbterm.exe **with ffmpeg.exe baked into `.rsrc`** (~227 MB extracted) | You want one self-contained binary that records mp4 / webm / apng without installing anything else. |
+| `rbterm-windows-x86_64-slim.zip`  | ~13 MB | Just rbterm.exe (~24 MB extracted)              | You don't care about mp4/webm/apng recording, or you already have ffmpeg on `PATH`. gif, webp, cast, and txt recording still work natively in this build. |
+
+The full build's runtime behaviour is `find_ffmpeg` →
+`ffmpeg_embedded_extract()` → write the embedded blob to
+`%TEMP%\rbterm-ffmpeg-<size>.exe` on first use, then reuse the
+cached extract on every subsequent recording-save in the same
+session. The slim build's `find_ffmpeg` skips the extract and
+falls through to the standard "next to the exe → PATH" probes —
+identical behaviour to the macOS / Linux releases.
+
+macOS and Linux ship one zip each (~13 MB):
+
+- `rbterm-macos-arm64.zip` — Apple Silicon. `unzip` it, then
+  run `./rbterm`. Or `make app` from source for an `.app` bundle
+  with a Dock icon.
+- `rbterm-linux-x86_64.zip` — generic glibc x86_64 Linux. The
+  release archive depends on a few system libs (`libgl1`,
+  `libfontconfig1`, `libxkbcommon0`, `libwebp7`, `libssh-4`,
+  `libharfbuzz0b`); `apt install` them if your distro doesn't
+  carry them by default. See the OrbStack section in `CLAUDE.md`
+  for the exact one-line install line that gets a vanilla Ubuntu
+  amd64 image to "rbterm runs" in under a minute.
 
 ## Build
 
