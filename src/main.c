@@ -17701,6 +17701,38 @@ static void logs_scan(void) {
     char dir[PATH_MAX];
     if (!g_app_settings.log_dir[0]) return;
     expand_home_path(g_app_settings.log_dir, dir, sizeof(dir));
+#ifdef _WIN32
+    char pattern[PATH_MAX + 4];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        snprintf(g_logs_status, sizeof(g_logs_status),
+                 "Couldn't open %s", dir);
+        return;
+    }
+    do {
+        if (g_logs_count >= LOGS_MAX) break;
+        if (fd.cFileName[0] == '.') continue;
+        size_t nlen = strlen(fd.cFileName);
+        if (nlen < 5 ||
+            (strcmp(fd.cFileName + nlen - 4, ".log") != 0 &&
+             strcmp(fd.cFileName + nlen - 4, ".txt") != 0)) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        LogEntry *e = &g_logs[g_logs_count++];
+        strncpy(e->name, fd.cFileName, sizeof(e->name) - 1);
+        e->name[sizeof(e->name) - 1] = 0;
+        snprintf(e->path, sizeof(e->path), "%s\\%s", dir, fd.cFileName);
+        e->size = ((long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        /* FILETIME → time_t: 100 ns ticks since 1601-01-01,
+           subtract the 1601→1970 offset, divide by 10^7. */
+        ULARGE_INTEGER ft;
+        ft.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+        ft.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        e->mtime = (time_t)((ft.QuadPart - 116444736000000000ULL) / 10000000ULL);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
     DIR *d = opendir(dir);
     if (!d) {
         snprintf(g_logs_status, sizeof(g_logs_status),
@@ -17730,6 +17762,7 @@ static void logs_scan(void) {
         e->mtime = st.st_mtime;
     }
     closedir(d);
+#endif
     if (g_logs_count > 1) {
         qsort(g_logs, (size_t)g_logs_count, sizeof(LogEntry),
               log_compare_mtime_desc);
@@ -19840,8 +19873,13 @@ int main(int argc, char **argv) {
                                                        shift_held ? -1 : +1);
                 }
             }
-            /* Cmd+Shift+M — toggle maximize on the active pane. */
+            /* Cmd+Shift+M — toggle maximize on the active pane.
+               Cmd+Z does the same (matches tmux's "<prefix> z"
+               zoom; rbterm has no undo to conflict with). */
             else if (shift_held && IsKeyPressed(KEY_M)) {
+                tab_toggle_maximize(cur);
+            }
+            else if (!shift_held && IsKeyPressed(KEY_Z)) {
                 tab_toggle_maximize(cur);
             }
             else if (IsKeyPressed(KEY_LEFT_BRACKET))  { g_active = (g_active - 1 + g_num_tabs) % g_num_tabs; cur = active_tab(); }
