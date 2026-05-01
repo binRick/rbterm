@@ -91,17 +91,14 @@ fi
     echo "#ifdef _WIN32"
     echo "/* On Windows the data pointers are filled at runtime by"
     echo "   embedded_fonts_init() (defined in fonts_embedded_win.c)"
-    echo "   from RCDATA resources baked in via fonts_embedded.rc. */"
-    echo "static EmbeddedFont k_embedded_fonts[] = {"
-    for f in $files; do
-        name="$(display_name "$f")"
-        ext_raw="${f##*.}"
-        ext_lower="$(echo "$ext_raw" | tr '[:upper:]' '[:lower:]')"
-        printf '    {"%s", "%s", NULL, 0u},\n' "$name" "$ext_lower"
-    done
-    echo "};"
-    echo "static const int k_embedded_font_count ="
-    echo "    (int)(sizeof(k_embedded_fonts) / sizeof(k_embedded_fonts[0]));"
+    echo "   from RCDATA resources baked in via fonts_embedded.rc."
+    echo "   The array is declared extern here and DEFINED in"
+    echo "   fonts_embedded_win.c — if it were 'static' in the"
+    echo "   header, every translation unit would get its own"
+    echo "   private copy, init would write to one, and main.c"
+    echo "   would read from another (always-NULL) one. */"
+    echo "extern EmbeddedFont k_embedded_fonts[];"
+    echo "extern const int k_embedded_font_count;"
     echo "void embedded_fonts_init(void);"
     echo "#else"
     for f in $files; do
@@ -181,6 +178,21 @@ fi
     echo "#define NOGDI"
     echo "#include <windows.h>"
     echo "#include \"fonts_embedded.h\""
+    echo
+    echo "/* Definition lives here (not the header) so every TU that"
+    echo "   includes fonts_embedded.h shares the SAME array — otherwise"
+    echo "   each TU gets its own static copy and embedded_fonts_init's"
+    echo "   writes never reach main.c's reads. */"
+    echo "EmbeddedFont k_embedded_fonts[] = {"
+    for f in $files; do
+        name="$(display_name "$f")"
+        ext_raw="${f##*.}"
+        ext_lower="$(echo "$ext_raw" | tr '[:upper:]' '[:lower:]')"
+        printf '    {"%s", "%s", NULL, 0u},\n' "$name" "$ext_lower"
+    done
+    echo "};"
+    echo "const int k_embedded_font_count ="
+    echo "    (int)(sizeof(k_embedded_fonts) / sizeof(k_embedded_fonts[0]));"
     echo
     echo "void embedded_fonts_init(void) {"
     echo "    HMODULE mod = GetModuleHandleW(NULL);"
