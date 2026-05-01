@@ -10687,8 +10687,16 @@ static void ssh_form_handle_keys(int cols, int rows, SshFormLayout L) {
             strncpy(g_form.font, g_fonts[next].path, sizeof(g_form.font) - 1);
             g_form.font[sizeof(g_form.font) - 1] = 0;
         }
-        list_scroll_to(&g_form_font_scroll, g_form_font_idx + 1,
-                       total + 1, 22, L.font_list.h);
+        /* The +1 accounts for the synthetic "Default" row at the top
+           of the SSH form's font list. For real fonts (idx >= 0),
+           also offset by section-header rows so the selection lands
+           fully in view. */
+        int sel_row = (g_form_font_idx < 0)
+            ? 0
+            : 1 + font_idx_to_display(g_form_font_idx);
+        int total_rows = 1 + font_display_row_count();
+        list_scroll_to(&g_form_font_scroll, sel_row,
+                       total_rows, 22, L.font_list.h);
         return;
     }
 
@@ -14013,8 +14021,13 @@ static void settings_handle_keys(Renderer *r, SettingsLayout L) {
             g_font_list_selected = next;
             settings_apply_font(r, &g_fonts[next]);
         }
-        list_scroll_to(&g_font_list_scroll, g_font_list_selected,
-                       g_font_count, 22, L.font_list.h);
+        /* The render path uses display rows (font rows + section
+           headers). Convert the flat font index to its display row
+           so scroll-into-view doesn't get fooled into stopping one
+           or two header rows short of the selection. */
+        list_scroll_to(&g_font_list_scroll,
+                       font_idx_to_display(g_font_list_selected),
+                       font_display_row_count(), 22, L.font_list.h);
         return;
     }
     if (g_settings_focused_list == SETTINGS_FOCUS_THEME && (up || down)) {
