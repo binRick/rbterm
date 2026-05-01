@@ -29,12 +29,26 @@ jobs:
             build_subdir: build
             binary_name: rbterm
             cmake_extra: ""
+          # Two Windows variants — same source, only difference is
+          # whether ffmpeg.exe (~200 MB) is baked into the .rsrc
+          # section. The "full" build is one self-contained ~227 MB
+          # exe; the "slim" build is ~24 MB and falls through to
+          # PATH for mp4/webm/apng (gif/webp/cast/txt still work
+          # natively in either build).
           - os: windows-latest
             platform: windows-x86_64
             asset_name: rbterm-windows-x86_64.zip
             build_subdir: build/Release
             binary_name: rbterm.exe
             cmake_extra: "-DRBTERM_SSH=OFF"
+            embed_ffmpeg: true
+          - os: windows-latest
+            platform: windows-x86_64-slim
+            asset_name: rbterm-windows-x86_64-slim.zip
+            build_subdir: build/Release
+            binary_name: rbterm.exe
+            cmake_extra: "-DRBTERM_SSH=OFF"
+            embed_ffmpeg: false
 
     steps:
       - uses: actions/checkout@v4
@@ -73,8 +87,8 @@ jobs:
       # exe + 200 MB sidecar. BtbN's gpl-static build is a single
       # self-contained ffmpeg.exe with everything we need (libx264,
       # libvpx, apng).
-      - name: Stage ffmpeg.exe for embedding (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Stage ffmpeg.exe for embedding (Windows full build)
+        if: matrix.os == 'windows-latest' && matrix.embed_ffmpeg
         shell: pwsh
         run: |
           $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
