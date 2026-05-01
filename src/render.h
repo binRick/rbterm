@@ -35,6 +35,14 @@ typedef struct {
        whenever the font / size changes. */
     bool  ligatures;
     void *shape_font;     /* ShapeFont *, owned by the renderer */
+
+    /* UI/chrome font — independent of the terminal font so the user
+       can pick any monospace for the grid without changing how the
+       tabs, modals, settings panels look. Loaded once at startup
+       (typically CaskaydiaCoveNerdFont) at a single atlas size;
+       DrawTextEx scales it to whatever pt the chrome needs. NULL
+       until renderer_set_ui_font_data is called. */
+    void *ui_font_data;   /* Font *, owned by the renderer */
 } Renderer;
 
 typedef struct {
@@ -88,6 +96,20 @@ void renderer_draw(Renderer *r, Screen *s, double time_sec, bool focused,
 
 // Find a default system monospace font. Returns static buffer.
 const char *renderer_find_default_font(void);
+
+// Load the UI/chrome font from a memory buffer. Independent of the
+// terminal font — call this once at startup with the embedded
+// CaskaydiaCoveNerdFont blob. `ext` is "ttf" / "otf". Returns true on
+// success; on failure, ui_font_data stays NULL and renderer_ui_font
+// falls back to the terminal font. Atlas size is fixed (the chrome
+// scales via DrawTextEx — one Font handle works for every pt).
+bool renderer_set_ui_font_data(Renderer *r, const unsigned char *data,
+                               int data_size, const char *ext);
+// Returns the Font * to use for chrome (tabs, modals, settings).
+// Always non-NULL when the renderer has any font loaded — falls
+// back to the terminal font if the UI font wasn't registered.
+// Cast to (Font *) at the call site, the same way r->font_data is cast.
+void *renderer_ui_font(Renderer *r);
 
 // Toggle OpenType ligature shaping. When `on` is true and HarfBuzz
 // was linked at build time, the next renderer_draw will shape each

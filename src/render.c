@@ -489,6 +489,47 @@ void renderer_set_backup_font_data(const unsigned char *data, int data_size,
     backup_font_unload();   /* lazy reload at next size change */
 }
 
+/* UI/chrome font. Loaded once at startup with a fixed atlas size; the
+   chrome scales it to whatever pt it draws at via DrawTextEx. The
+   atlas size has to be tall enough that downscaling stays crisp at
+   the chrome's biggest pt (settings modal headings ~16-18pt). 32 hits
+   the sweet spot — bigger atlas than that just burns texture memory. */
+#define UI_FONT_ATLAS_SIZE 32
+bool renderer_set_ui_font_data(Renderer *r, const unsigned char *data,
+                                int data_size, const char *ext) {
+    if (!r || !data || data_size <= 0) return false;
+    if (r->ui_font_data) {
+        UnloadFont(*(Font *)r->ui_font_data);
+        free(r->ui_font_data);
+        r->ui_font_data = NULL;
+    }
+    int cp_count;
+    int *cps = build_codepoints(&cp_count);
+    char ft[8] = ".";
+    strncat(ft, (ext && *ext) ? ext : "ttf", sizeof(ft) - 2);
+    Font f = LoadFontFromMemory(ft, data, data_size,
+                                UI_FONT_ATLAS_SIZE, cps, cp_count);
+    free(cps);
+    if (f.texture.id == 0) return false;
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+    r->ui_font_data = malloc(sizeof(Font));
+    if (!r->ui_font_data) {
+        UnloadFont(f);
+        return false;
+    }
+    *(Font *)r->ui_font_data = f;
+    return true;
+}
+
+/* Returns the Font * to use when drawing chrome. Falls back to the
+   terminal font if the UI font wasn't registered, so chrome still
+   draws something on builds where CaskaydiaCove isn't bundled. */
+void *renderer_ui_font(Renderer *r) {
+    if (!r) return NULL;
+    if (r->ui_font_data) return r->ui_font_data;
+    return r->font_data;
+}
+
 /* True iff the backup font has a non-empty rasterised glyph for
    `cp` — used by the missing-glyph fallback to decide whether to
    draw via the backup atlas before giving up to "?". */
@@ -665,7 +706,13 @@ void renderer_shutdown(Renderer *r) {
     free(g_fallback.items); g_fallback.items = NULL; g_fallback.cap = 0;
     present_set_clear();
     backup_font_unload();
-    if (!r || !r->font_data) return;
+    if (!r) return;
+    if (r->ui_font_data) {
+        UnloadFont(*(Font *)r->ui_font_data);
+        free(r->ui_font_data);
+        r->ui_font_data = NULL;
+    }
+    if (!r->font_data) return;
     if (r->shape_font) {
         shape_font_free((ShapeFont *)r->shape_font);
         r->shape_font = NULL;

@@ -2748,7 +2748,7 @@ static void session_canvas_paint(Renderer *r, const SessionNode *n,
             (Rectangle){(float)outer.x, (float)outer.y,
                         (float)outer.w, (float)outer.h},
             (n == selected) ? 3.0f : 1.0f, border);
-        if (outer.h >= 24 && outer.w >= 60 && r->font_data) {
+        if (outer.h >= 24 && outer.w >= 60 && renderer_ui_font(r)) {
             const char *label;
             char buf[160];
             if (n->kind == SESSION_LEAF_SSH) {
@@ -2758,7 +2758,7 @@ static void session_canvas_paint(Renderer *r, const SessionNode *n,
             } else {
                 label = "local shell";
             }
-            Font *f = (Font *)r->font_data;
+            Font *f = (Font *)renderer_ui_font(r);
             DrawTextEx(*f, label,
                        (Vector2){outer.x + 8, outer.y + 6},
                        13, 0, (Color){220, 230, 245, 255});
@@ -2783,7 +2783,7 @@ static void session_canvas_paint(Renderer *r, const SessionNode *n,
 
 static void draw_session_designer(Renderer *r, int win_w, int win_h,
                                   SessionDesignerLayout L) {
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     /* Backdrop. */
     DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 160});
     DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
@@ -6193,7 +6193,7 @@ static void draw_tab_contents(Renderer *r, Tab *t, int win_w, int win_h,
             DrawRectangleLines(bx, by, bw, bh,
                                pane_focused ? (Color){125, 207, 255, 220}
                                             : (Color){90, 100, 120, 180});
-            Font *ff = (Font *)r->font_data;
+            Font *ff = (Font *)renderer_ui_font(r);
             DrawTextEx(*ff, "Find:",
                        (Vector2){bx + 10, by + (bh - 13) / 2},
                        13, 0, (Color){180, 190, 210, 255});
@@ -6889,7 +6889,7 @@ static void draw_tab_bar(Renderer *r, int win_w) {
     DrawRectangle(0, 0, win_w, TAB_BAR_H, bar_bg);
     DrawRectangle(0, TAB_BAR_H - 1, win_w, 1, (Color){60, 60, 75, 255});
 
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     float fs = 13.0f;
 
     /* "ssh" button anchored top-left. */
@@ -7369,7 +7369,7 @@ static void draw_tab_bar_tooltip(Renderer *r, int win_w) {
         label = buf; btn_x = gear_x; btn_w = TAB_GEAR_W;
     }
     if (!label || btn_x < 0) return;
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     int tt_pad_x = 8, tt_pad_y = 5;
     int tt_fs = 12;
     Vector2 tsz = MeasureTextEx(*f, label, tt_fs, 0);
@@ -8425,7 +8425,7 @@ static void draw_upload_form(Renderer *r, int win_w, int win_h, UploadFormLayout
                   (Color){30, 34, 46, 255});
     DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
                        (Color){125, 207, 255, 220});
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
                   (Color){38, 42, 58, 255});
     DrawTextEx(*f, "SFTP — Upload",
@@ -8970,7 +8970,7 @@ static void draw_download_form(Renderer *r, int win_w, int win_h, DownloadFormLa
                   (Color){30, 34, 46, 255});
     DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
                        (Color){125, 207, 255, 220});
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
                   (Color){38, 42, 58, 255});
     DrawTextEx(*f, "SFTP — Download",
@@ -10895,7 +10895,7 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
     DrawRectangleLines(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
                        (Color){125, 207, 255, 220});
 
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     /* Title bar. */
     DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
                   (Color){38, 42, 58, 255});
@@ -15222,7 +15222,7 @@ static void draw_rec_save_modal(Renderer *r, int win_w, int win_h, RecSaveLayout
                        (Color){125, 207, 255, 220});
     DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
                   (Color){38, 42, 58, 255});
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     char title[80];
     snprintf(title, sizeof(title), "Save recording (%.1fs)", g_rec_save.duration_s);
     DrawTextEx(*f, title,
@@ -15649,7 +15649,7 @@ static void draw_help_modal(Renderer *r, int win_w, int win_h) {
     DrawRectangle(mx + 1, my + 1, w - 2, 38, (Color){38, 42, 58, 255});
     g_help_modal_rect = (Rect){mx, my, w, h};
 
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     char title[80];
     snprintf(title, sizeof(title), "Help (modifier = %s)", MOD);
     DrawTextEx(*f, title,
@@ -15848,7 +15848,7 @@ static void draw_settings(Renderer *r, int win_w, int win_h, SettingsLayout L) {
     DrawRectangle(L.modal.x + 1, L.modal.y + 1, L.modal.w - 2, 38,
                   (Color){38, 42, 58, 255});
 
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     DrawTextEx(*f, "Settings",
                (Vector2){L.modal.x + 20, L.modal.y + 11},
                16, 0, (Color){230, 232, 240, 255});
@@ -17916,7 +17916,7 @@ static void logs_handle_keys(int cols, int rows) {
 }
 
 static void draw_logs_modal(Renderer *r, int win_w, int win_h, LogsLayout L) {
-    Font *f = (Font *)r->font_data;
+    Font *f = (Font *)renderer_ui_font(r);
     /* Backdrop dim. */
     DrawRectangle(0, 0, win_w, win_h, (Color){0, 0, 0, 160});
     DrawRectangle(L.modal.x, L.modal.y, L.modal.w, L.modal.h,
@@ -18336,6 +18336,16 @@ int main(int argc, char **argv) {
     r.pad_x = init_padding;
     r.pad_y = init_padding;
     r.bg_alpha = init_opacity;
+    /* Pin the chrome (tabs, modals, settings) to CaskaydiaCoveNerdFont
+       regardless of which font the user picks for the grid. Falls back
+       to the terminal font silently if the embed lookup misses (e.g.
+       a stripped-down build). */
+    {
+        const EmbeddedFont *ui = embedded_font_lookup("CaskaydiaCoveNerdFont");
+        if (ui) {
+            renderer_set_ui_font_data(&r, ui->data, (int)ui->data_size, ui->ext);
+        }
+    }
     if (g_persisted.has_spacing) renderer_set_cell_spacing(&r, g_persisted.spacing);
     /* Apply persisted ligature toggle. shape_available() is the
        compile-time HarfBuzz check — when shaping isn't built in,
@@ -19225,7 +19235,7 @@ int main(int argc, char **argv) {
                             int mx = (int)mp.x, my = (int)mp.y;
                             bool inside_bar = (mx >= bx && mx < bx + bw &&
                                                my >= by && my < by + bh);
-                            Font *ff = (Font *)r.font_data;
+                            Font *ff = (Font *)renderer_ui_font(&r);
                             int text_left = bx + SEARCH_TEXT_OFF;
                             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && inside_bar) {
                                 bool sh = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
@@ -20293,7 +20303,7 @@ int main(int argc, char **argv) {
             /* [+] long-press menu — three primary items + an
                optional submenu when SSH or Session is hovered. */
             if (g_plus_menu_active) {
-                Font *_f = (Font *)r.font_data;
+                Font *_f = (Font *)renderer_ui_font(&r);
                 Vector2 _mp = GetMousePosition();
                 int _mx = (int)_mp.x, _my = (int)_mp.y;
                 int menu_x = TAB_SSH_W;
