@@ -453,6 +453,38 @@ the exclusion first before re-copying:
 ssh win 'powershell -NoProfile -Command "Add-MpPreference -ExclusionPath \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\""'
 ```
 
+**Always kill any running rbterm and delete the existing exe on
+the VM BEFORE pushing a new one.** Without this, an already-open
+process holds the file lock and the SCP overwrite silently fails
+(or the user double-clicks the stale binary because Explorer
+caches the icon). The full sequence:
+
+```bash
+# 1. Kill running rbterm + remove the stale exe in one ssh call.
+ssh win 'powershell -NoProfile -Command "
+    Get-Process rbterm-windows-x86_64 -ErrorAction SilentlyContinue | Stop-Process -Force;
+    Remove-Item \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\" -Force -ErrorAction SilentlyContinue
+"'
+
+# 2. Wipe local stale copies + fetch the fresh release zip.
+cd ~/Downloads && rm -f rbterm.exe rbterm-windows-x86_64.exe rbterm-windows-x86_64.zip
+gh release download v0.1.0 --repo binRick/rbterm \
+    --pattern 'rbterm-windows-x86_64.zip' --clobber
+unzip -o rbterm-windows-x86_64.zip
+cp rbterm.exe rbterm-windows-x86_64.exe
+
+# 3. SCP into the VM + add Defender exclusion + verify mtime.
+scp rbterm-windows-x86_64.exe win:Downloads/
+ssh win 'powershell -NoProfile -Command "
+    Add-MpPreference -ExclusionPath \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\";
+    ls \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\" | Select-Object Name,LastWriteTime
+"'
+```
+
+The mtime in step 3's output is the trust signal — if it doesn't
+match the time you ran the script, something kept the lock and
+the user is still on the old binary.
+
 When the user says **"push to my mia vm"** (or similar for the `mia`
 host): `mia` is a Linux x86_64 **VM** reached over SSH (`Host mia`
 in `~/.ssh/config`, currently 172.238.205.61, RHEL-family / el10).
