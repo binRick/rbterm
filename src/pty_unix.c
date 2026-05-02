@@ -198,9 +198,14 @@ void *local_open_impl(int cols, int rows, const char *cwd) {
     return p;
 }
 
-/* SIGHUP the shell, wait for it, close the master fd (which unblocks
-   the reader thread's pending read()), join the thread, free state.
-   NULL-safe. */
+/* SIGHUP the shell, poll for exit with a short timeout, escalate to
+   SIGKILL if it ignores us, give up after a second total so the main
+   thread never freezes. Then close the master fd (unblocks the reader
+   thread's pending read()), join the thread, free state. NULL-safe.
+
+   Why poll-with-escalation instead of waitpid(..., 0): a child that
+   traps or ignores SIGHUP — or one wedged in `?Es` by the kernel —
+   would otherwise block the UI forever. Seen in the wild. */
 void local_close_impl(void *impl) {
     LocalPty *p = impl;
     if (!p) return;
@@ -208,7 +213,24 @@ void local_close_impl(void *impl) {
     if (p->pid > 0) {
         kill(p->pid, SIGHUP);
         int status;
-        waitpid(p->pid, &status, 0);
+        /* Up to ~250 ms for the SIGHUP, then SIGKILL, then up to
+           another ~750 ms before giving up. Total <= ~1 s. */
+        bool reaped = false;
+        for (int i = 0; i < 25; i++) {
+            pid_t r = waitpid(p->pid, &status, WNOHANG);
+            if (r == p->pid || (r == -1 && errno == ECHILD)) { reaped = true; break; }
+            usleep(10 * 1000);
+        }
+        if (!reaped) {
+            kill(p->pid, SIGKILL);
+            for (int i = 0; i < 75; i++) {
+                pid_t r = waitpid(p->pid, &status, WNOHANG);
+                if (r == p->pid || (r == -1 && errno == ECHILD)) break;
+                usleep(10 * 1000);
+            }
+            /* If it's still not reaped, it's kernel-wedged. Leak the
+               zombie rather than block — kernel will reap on our exit. */
+        }
     }
     if (p->fd >= 0) {
         close(p->fd);           /* unblocks any pending read() in the thread */
