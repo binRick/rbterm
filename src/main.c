@@ -11093,15 +11093,20 @@ static void draw_ssh_form(Renderer *r, int win_w, int win_h, SshFormLayout L) {
                              sl.y + (sl.h - tsz.y) / 2},
                    13, 0, armed ? (Color){230, 232, 240, 255}
                                 : (Color){140, 145, 160, 255});
-        /* Status line right of the button. */
+        /* Status line below the button. Lives on its own row so the
+           full modal width is available — earlier render-to-the-right
+           overflowed for any message longer than ~30 chars. */
         const char *msg = g_form.layout_status[0]
                             ? g_form.layout_status
                             : (g_form.layout[0]
                                   ? g_form.layout
                                   : "(no saved layout for this host)");
+        int right = L.field[0].x + L.field[0].w;
+        BeginScissorMode(sl.x, sl.y + sl.h + 4, right - sl.x, 18);
         DrawTextEx(*f, msg,
-                   (Vector2){sl.x + sl.w + 12, sl.y + 7},
+                   (Vector2){sl.x, sl.y + sl.h + 6},
                    13, 0, (Color){170, 180, 200, 255});
+        EndScissorMode();
     }
 
     if (g_ssh_form_tab == SSH_FORM_TAB_APPEARANCE) {
