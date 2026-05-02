@@ -1,260 +1,164 @@
 # rbterm — notes for Claude
 
-Terminal emulator in C, rendered with raylib. Unix + Windows. The design
-leans on a thin abstraction (`pty.h`) so the rest of the code is
-platform-agnostic.
+Terminal emulator in C, rendered with raylib. Unix + Windows. Thin
+abstraction (`pty.h`) keeps the rest of the code platform-agnostic.
 
-## Keep the README in sync as code grows
+## Keep the README in sync
 
-The README (`## Pure C99 — fast, lean, no runtime`) cites a rough total
-line count for `src/`. After any change that materially adds or removes
-code, re-run `wc -l src/*.c src/*.h src/*.m` and update the figure if
-the existing number is off by more than ~1k lines. Round to the nearest
-thousand. Same goes for any other figures in the README that describe
-code size, file counts, or feature lists — if a session ships a new
-subsystem (recording formats, graphics protocols, etc.), update the
-relevant README section in the same commit.
+The README cites a rough total line count for `src/`. After material
+add/remove, re-run `wc -l src/*.c src/*.h src/*.m` and update if off
+by more than ~1k lines (round to nearest thousand). Same for any
+README figures describing code size, file counts, or feature lists —
+new subsystems get a README update in the same commit.
 
 ## Architecture
 
 ```
-        +-------------+        +--------------+        +-----------+
-  user  | raylib      |        | input_poll() |        | pty_write |
- input  | events ---> | -----> | (input.c)    | -----> | (pty.h)   | -----> shell
-        +-------------+        +--------------+        +-----------+
-                                                              |
-                                                        stdout of shell
-                                                              v
-        +-------------+        +--------------+        +-----------+
-  glyph | renderer_   | <----- | screen_feed()| <----- | pty_read  | <-----  |
- output | draw()      |        | VT parser    |        | (pty.h)   |
-        +-------------+        +--------------+        +-----------+
+   user input ─► raylib events ─► input_poll() ─► pty_write ─► shell
+                                                                │
+   glyph output ◄─ renderer_draw ◄─ screen_feed (VT) ◄─ pty_read ◄─┘
 ```
 
-Each tab owns a `PaneNode *root` — a recursive split tree whose
-leaves each carry a `Pane` (PTY + Screen + Selection + title +
-cwd). Internal nodes carry a SplitMode (V/H), a ratio, and two
-children. `tab_split` replaces the active leaf with a fresh
-internal node; `tab_close_leaf` collapses the parent into the
-sibling. The main loop drains every leaf's PTY each frame so
-background panes stay up to date.
+Each tab owns a `PaneNode *root` — recursive split tree. Leaves carry
+a `Pane` (PTY + Screen + Selection + title + cwd). Internal nodes
+carry SplitMode (V/H), ratio, two children. `tab_split` replaces the
+active leaf with an internal node; `tab_close_leaf` collapses parent
+into sibling. Main loop drains every leaf's PTY each frame.
 
 ## Files
 
 | file | contents |
 |------|----------|
 | `src/main.c` | Event loop, tab bar UI, SSH prompt modal, clipboard, mouse/keyboard routing |
-| `src/pty.h` | Platform-agnostic PTY interface (public) |
-| `src/pty_internal.h` | Shared `struct Pty` + backend function prototypes |
-| `src/pty_dispatch.c` | Dispatches `pty_*` calls to the right backend |
-| `src/pty_unix.c` | Local PTY via `forkpty` + non-blocking read (macOS/Linux) |
+| `src/pty.h` / `pty_internal.h` / `pty_dispatch.c` | PTY interface + backend dispatch |
+| `src/pty_unix.c` | Local PTY via `forkpty` (macOS/Linux) |
 | `src/pty_win.c` | Local PTY via ConPTY + reader thread + ring buffer (Windows) |
 | `src/pty_ssh.c` | SSH backend via libssh — key auth, trust-on-first-use |
 | `src/screen.{c,h}` | ANSI/VT parser, grid buffer, scrollback, reflow |
 | `src/render.{c,h}` | raylib rendering, glyph atlas, emoji cache, cursor |
-| `src/input.{c,h}` | raylib event → PTY bytes (C0 chords, arrow keys, UTF-8) |
-| `src/emoji.h` | Glyph rasterization interface (CoreText or stub) |
-| `src/emoji_mac.m` | CoreText + CoreGraphics rasterizer (macOS only) |
-| `src/emoji_stub.c` | No-op stub for Linux/Windows |
-| `src/cast.{c,h}` | Asciinema v2 (.cast) parser — used to replay a recording during render |
-| `src/gif_encoder.{c,h}` | Native GIF89a encoder (LZW, no deps) used by the recording save path |
-| `src/webp_encoder.{c,h}` | Native animated WebP encoder via libwebp + libwebpmux |
-| `src/hud.{c,h}` | System-info overlay (hostname, IP, load, memory, disk) — local probe + format helper |
+| `src/input.{c,h}` | raylib event → PTY bytes (C0 chords, arrows, UTF-8) |
+| `src/emoji_mac.m` / `emoji_stub.c` | CoreText rasterizer (mac) / no-op stub |
+| `src/cast.{c,h}` | Asciinema v2 (.cast) parser for recording replay |
+| `src/gif_encoder.{c,h}` / `webp_encoder.{c,h}` | Native encoders (no ffmpeg) |
+| `src/hud.{c,h}` | System-info overlay |
 | `tools/gen_icon.c` | Procedural app-icon generator (macOS .icns) |
 
 ## Platform notes
 
 ### macOS (primary target)
-- Default font fallback: Consolas → SFNSMono.ttf → Monaco.ttf → Menlo.ttc.
-  SF Mono is a .ttf so stb_truetype is happy; Menlo is a TTC and
-  raylib's stb_truetype bundled copy can't index into collections.
-- Colour emoji via Core Text (`emoji_mac.m`). Font substitution via
-  `CTFontCreateForString` so a missing glyph still draws (e.g. `➜`
-  falls through to Menlo when SF Mono doesn't have it).
+- Font fallback: Consolas → SFNSMono.ttf → Monaco.ttf → Menlo.ttc.
+  Menlo is a TTC and raylib's stb_truetype can't index collections.
+- Colour emoji via Core Text. `CTFontCreateForString` does font
+  substitution itself (so `➜` falls through to Menlo).
 - Cmd is the UI modifier; Ctrl is for C0 chords (SIGINT etc.).
-- `.app` bundle generated by `make app` with a procedurally-drawn icon.
-- `run.sh`: kills any running rbterm, `make app`, launches via `open -n`.
+- `make app` → `.app` bundle. `run.sh`: kill, build, `open -n`.
 
 ### Linux
-- PTY backend is the same as macOS (`pty_unix.c`).
-- Emoji path is the stub — users who want colour emoji would need a
-  HarfBuzz/FreeType port.
-- Default font fallback: DejaVu Sans Mono → Liberation Mono → Noto.
-- UI modifier is Ctrl (same as Windows).
+- Same `pty_unix.c` backend. Emoji = stub (HarfBuzz/FreeType TODO).
+- Font fallback: DejaVu Sans Mono → Liberation Mono → Noto.
+- UI modifier is Ctrl.
 
 ### Windows
-- PTY backend is ConPTY (`pty_win.c`). Requires Windows 10 1809+ for
-  `CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`.
-- Anonymous pipes don't support overlapped I/O, so there's a reader
-  thread per PTY feeding a 256KB ring buffer under a `CRITICAL_SECTION`.
-  `pty_read()` drains the ring non-blockingly.
-- `pty_cwd()` returns false on Windows. Tab labels fall back to the
-  OSC 0/2 title. PEB-reading via `NtQueryInformationProcess` would work
-  but it's undocumented and permissions-gated — left to the user if
-  they need it.
-- Emoji uses the stub; a DirectWrite port is a future project.
-- Shell preference: `$SHELL` env → `powershell.exe` → `cmd.exe`.
+- ConPTY (`pty_win.c`). Requires Win10 1809+. Anonymous pipes don't
+  support overlapped I/O — reader thread per PTY feeds a 256KB ring
+  buffer under `CRITICAL_SECTION`.
+- `pty_cwd()` returns false; tab labels fall back to OSC 0/2 title.
+- Emoji = stub. Shell: `$SHELL` → powershell.exe → cmd.exe.
 
 ## Build
 
 ```bash
-# macOS (Makefile, quick path; uses brew-installed raylib):
-make           # -> ./rbterm
-make app       # -> ./rbterm.app (with icon + Info.plist)
-
-# macOS / Linux / Windows (CMake, self-contained via FetchContent):
-cmake -S . -B build
-cmake --build build
+make           # macOS Makefile (uses brew raylib) → ./rbterm
+make app       # → ./rbterm.app
+cmake -S . -B build && cmake --build build   # cross-platform
 ```
 
 ## Tricky bits / gotchas
 
 ### VT parser (`screen.c`)
-- The `put_cp` path for wide chars sets `ATTR_WIDE` on the head cell and
-  `ATTR_WIDE_CONT` on the following cell. The draw loop skips
-  `ATTR_WIDE_CONT` and draws the head over two cell widths. Selection
-  copy also skips the cont cell.
-- Auto-wrap detection: when `wrap_next && autowrap` triggers a line
-  break, the leaving row's index is marked in `main_wrap[]`. Scroll
-  regions shift the flag array in parallel with the cell array.
-- OSC 4 (palette) / OSC 104 (reset) are parsed; `pal(i)` reads from
-  the mutable global palette. SGR 30-47 / 90-107 / 38;5 / 48;5 all go
-  through it so `pal` CLI works.
+- Wide chars: `ATTR_WIDE` on head cell, `ATTR_WIDE_CONT` on next.
+  Draw loop and selection copy skip `ATTR_WIDE_CONT`.
+- Auto-wrap: `wrap_next && autowrap` triggers a line break and marks
+  the leaving row in `main_wrap[]`. Scroll regions shift the flag
+  array in parallel with cells.
+- OSC 4 (palette) / OSC 104 (reset) are parsed; SGR 30-47 / 90-107 /
+  38;5 / 48;5 all read through `pal(i)`, so `pal` CLI works.
 
 ### Reflow (`screen_resize`)
-- Collects logical lines from `main_wrap[]` + `main[]`, rewraps at the
-  new `cols`, then copies the *last* `rows` rows into the new main
-  buffer. Overflow goes into scrollback via `push_scrollback` with a
-  temporary `s->cols` swap so width accounting lines up.
-- Cursor is repositioned to the end of the last row with real content
-  so bash's SIGWINCH redraw lands in place. Scrollback is re-bucketed
-  (not reflowed) since it was never in a logical-line form.
+- Collects logical lines from `main_wrap[]` + `main[]`, rewraps at
+  new `cols`, copies last `rows` rows into new main. Overflow into
+  scrollback via `push_scrollback` (with temporary `s->cols` swap).
+- Cursor lands at end of last row with content (so bash's SIGWINCH
+  redraw lands in place). Scrollback is re-bucketed, not reflowed.
 - Alt screen is *not* reflowed — full-screen apps redraw on SIGWINCH.
 
 ### Rendering (`render.c`)
-- Missing-glyph set is built once per font load by scanning
-  `font.glyphs[i].image.width`. The draw loop uses it to decide whether
-  to try the emoji cache / Menlo fallback cache / `?` placeholder.
-- **`GetFontDefault()` is ASCII-only.** raylib's bundled default
-  font has no glyphs above 0x7F — any non-ASCII codepoint
-  (`↑↓←→`, `⏎`, `⌫`, `⇥`, `…`) renders as a `?` placeholder.
-  Side-overlay code that uses the default font (recording captions,
-  modal labels) MUST stick to printable ASCII or render through
-  the loaded `g_renderer->font_data` instead. This trap has bitten
-  multiple sessions — see the recording captions code as the
-  canonical example of using ASCII labels (`[Up] [Dn] [Ret]`) to
-  avoid the issue.
-- Glyph cache entries carry a `colored` flag set by the rasterizer
-  (scan the RGBA: if any non-transparent pixel has unequal channels
-  it's a colour bitmap). Caller tints with WHITE for colour, with the
-  cell's `fg` for monochrome vector glyphs.
-- `BeginMode2D` with a y-offset camera is used so terminal content
-  translates cleanly below the tab bar without touching every draw
-  call site.
+- Missing-glyph set built once per font load. Draw loop uses it to
+  decide emoji cache / Menlo fallback / `?` placeholder.
+- **`GetFontDefault()` is ASCII-only.** Any non-ASCII codepoint
+  (`↑↓←→ ⏎ ⌫ ⇥ …`) renders as `?`. Side-overlay code using the
+  default font (recording captions, modal labels) MUST stick to
+  printable ASCII or render via `g_renderer->font_data`. Has bitten
+  multiple sessions — recording captions use `[Up] [Dn] [Ret]`.
+- Glyph cache `colored` flag set by rasterizer (RGBA scan: any
+  unequal channels = colour bitmap). Tint with WHITE for colour,
+  cell `fg` for monochrome.
+- `BeginMode2D` with y-offset camera puts terminal content below
+  tab bar without touching every draw site.
 
 ### Input (`input.c`)
-- On macOS, `GetCharPressed()` doesn't fire for `Ctrl+letter`. We pick
-  up the C0 chord explicitly via `IsKeyPressed(KEY_A..KEY_Z)` and emit
-  `k - KEY_A + 1`. Also covers `Ctrl+[`, `Ctrl+\`, `Ctrl+]`, `Ctrl+Space`.
+- macOS `GetCharPressed()` doesn't fire for `Ctrl+letter`. Pick up
+  the C0 chord via `IsKeyPressed(KEY_A..KEY_Z)` and emit
+  `k - KEY_A + 1`. Also `Ctrl+[ \ ]` and `Ctrl+Space`.
 - Cmd vs Ctrl are *separate* — `ctrl_down()` is real Ctrl only.
-  Otherwise Cmd+C eats Ctrl+C and you can't send SIGINT.
+  Otherwise Cmd+C eats Ctrl+C (no SIGINT).
 
-### Intelligent double-click (selection)
+### Intelligent double-click (`select_word` in main.c)
+Naive "run of non-whitespace" then post-trim:
+- Trailing sentence punctuation (`, ; : . ! ?`) stripped right
+  unless clicked directly on it.
+- Unmatched `) ] } > "` stripped right; unmatched `( [ { < "`
+  stripped left.
+- Interior `- _ / @ = . + #` and leading hyphens (`--flag`) kept.
 
-Double-click uses a naive "run of non-whitespace" as the starting word
-span, then post-processes it to shave off boundary chars that almost
-never belong to what the user meant to copy. Lives in `select_word`
-in `src/main.c`.
-
-Current rules (in order of application):
-
-| Input (click on `^`)    | Naive span       | Trimmed      |
-|-------------------------|------------------|--------------|
-| `--bold,`<br>`   ^`     | `--bold,`        | `--bold`     |
-| `foo.` `foo,` `foo!`    | `foo.` etc.      | `foo`        |
-| `foo)`                  | `foo)`           | `foo`        |
-| `(x)`                   | `(x)`            | `(x)`        |
-| `(foo`                  | `(foo`           | `foo`        |
-| `"hello"`               | `"hello"`        | `"hello"`    |
-| `hello"`                | `hello"`         | `hello`      |
-
-Trim classes:
-- **Trailing sentence punctuation**: `, ; : . ! ?` stripped from the
-  right unless the user clicked directly on it.
-- **Unmatched closing delimiter**: `) ] } > "` stripped from the right
-  if the matching opener isn't inside the span.
-- **Unmatched opening delimiter**: `( [ { < "` stripped from the left
-  if the matching closer isn't inside the span.
-
-Kept as-is (treated as part of the word): `- _ / @ = . + #` interior,
-hyphens at the start (for `--flag`), digits, letters, most UTF-8.
-
-When adding a new case, extend the predicate helpers or add another
-post-trim pass in `select_word`. The guarded `c2 != col` / `c1 != col`
-checks ensure clicking directly on punctuation still selects it.
+When adding cases, extend the helpers or add another post-trim pass.
+The `c2 != col` / `c1 != col` checks ensure clicking directly on
+punctuation still selects it.
 
 ### Tab ordering
-- Tabs live in a `Tab *g_tabs[MAX_TABS]` pointer array. `tab_close`
-  shifts remaining slots down. Each `Screen`'s `io.user` is the stable
-  heap-allocated `Tab *`, so the shift doesn't invalidate callbacks.
+`Tab *g_tabs[MAX_TABS]`. `tab_close` shifts slots down. `Screen->io.user`
+is the stable heap-allocated `Tab *`, so the shift doesn't invalidate
+callbacks.
 
 ### Embedded fonts on Windows — `static` arrays in headers
-- `src/fonts_embedded.h` declares the `k_embedded_fonts[]` table. On
-  Mac/Linux it's `static const` with link-time `.incbin` data
-  pointers — every TU gets its own copy but they all see the same
-  data because the pointers come from extern symbols. On **Windows**
-  the data pointers have to be filled at runtime by
-  `embedded_fonts_init()` (FindResource / LoadResource), so the
-  array MUST NOT be `static` in the header — `extern` decl in the
-  header + non-static definition in `fonts_embedded_win.c` so all
-  TUs share the one instance. If you ever see "embedded fonts work
-  on Mac/Linux but every Windows slot has data=NULL after init",
-  check `gen_fonts.sh` hasn't regressed back to a `static` header
-  array.
+`fonts_embedded.h` declares `k_embedded_fonts[]`. Mac/Linux: `static
+const` with `.incbin` symbol pointers — every TU has its own copy
+but all see the same data via extern symbols. **Windows: data
+pointers must be filled at runtime** by `embedded_fonts_init()`
+(FindResource/LoadResource). Array MUST NOT be `static` in the
+header — `extern` decl in header + non-static defn in
+`fonts_embedded_win.c`. If Windows slots show `data=NULL` after init,
+check `gen_fonts.sh` hasn't regressed back to `static`.
 
 ## Recursive split tree
 
-Each `Tab` owns a `PaneNode *root` plus `PaneNode *active` (the
-current focused leaf). A node is either:
+`Tab` owns `PaneNode *root` + `PaneNode *active`. Leaf:
+`split == SPLIT_NONE`, `pane != NULL` (heap-allocated for stable
+`io.user`). Internal: `split == SPLIT_VERTICAL/HORIZONTAL`,
+`child[0/1]`, `ratio` (0.15..0.85), `splitter_drag` bool.
 
-- **Leaf**: `split == SPLIT_NONE`, `pane != NULL`. Owns a heap-
-  allocated `Pane` (so the address handed to Screen as `io.user`
-  stays stable across collapses — no `screen_set_io_user`
-  re-pointing needed).
-- **Internal**: `split == SPLIT_VERTICAL/HORIZONTAL`, `child[0/1]`
-  populated, owns a `ratio` (0.15..0.85) and a `splitter_drag`
-  bool. Carries no `Pane`.
+Helpers in `main.c`: `pane_node_new_leaf` / `_free_recursive` /
+`pane_tree_count` / `_first_leaf` / `_next_leaf` / `_prev_leaf` /
+`_cycle_leaf` / `_split_children` / `_node_rect_walk` / `leaf_rect`
+/ `pane_tree_at` / `_splitter_at` / `pane_node_split_leaf` /
+`_close_leaf` / `tab_split` / `tab_close_leaf` / `pane_close_active`.
 
-Helpers in `src/main.c`:
+Splitter dragging: each internal node has its own `splitter_drag`.
+Mouse handler walks the tree to find dragging node, stashes outer
+rect of press in a function-local static so drag math stays
+consistent across frames as the tree mutates.
 
-- `pane_node_new_leaf` / `pane_node_free_recursive`
-- `pane_tree_count` / `pane_tree_first_leaf` / `pane_tree_next_leaf`
-  / `pane_tree_prev_leaf` — flat iteration in tree order
-- `pane_tree_cycle_leaf` — wraps; used by Cmd+K
-- `pane_tree_split_children` — given an internal node + outer
-  rect, computes the child rects (and stash space for splitter)
-- `pane_tree_node_rect_walk` — outer rect of any node in the tree
-- `leaf_rect` (Tab convenience wrapper) — leaf's rect within the
-  current window
-- `pane_tree_at` — leaf hit-test for click-to-focus
-- `pane_tree_splitter_at` — internal node whose splitter strip
-  (padded by `SPLITTER_GRAB`) contains a point; also returns its
-  outer rect for drag math
-- `pane_node_split_leaf` — replaces a leaf with a new internal
-  node whose children are (the original leaf, a fresh leaf)
-- `pane_node_close_leaf` — frees a leaf, promotes its sibling
-  into the parent's slot. Returns true if the tab should die.
-- `tab_split` / `tab_close_leaf` / `pane_close_active` —
-  Tab-level wrappers that update `t->active` and re-open per-pane
-  log files.
-
-Splitter dragging: each internal node has its own `splitter_drag`
-bool. The main loop's mouse handler walks the tree to find the
-dragging node, and stashes the outer rect of the press in a
-function-local static so the drag math stays consistent across
-frames even as the tree mutates.
-
-When adding code that iterates panes, the canonical pattern is:
+Canonical pane iteration:
 
 ```c
 for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
@@ -265,173 +169,89 @@ for (PaneNode *leaf = pane_tree_first_leaf(t->root); leaf;
 }
 ```
 
-Avoid hardcoding "pane 0" / "pane 1" or `t->active_pane` — those
-field names no longer exist.
+Avoid hardcoding "pane 0/1" or `t->active_pane` — those don't exist.
 
-## User preferences (learned this session)
+## User preferences
 
 - Terse, direct responses. No trailing summaries of what changed.
-- When user says "commit to github", they mean: make the commit AND
-  push. Default visibility is private; flip with
-  `gh repo edit binRick/rbterm --visibility public` if they ask.
-- GitHub handle: `binRick` (SSH auth, keyring token).
-- Prefers real fixes over workarounds — e.g. when `➜` didn't show, the
-  first fix was to add Menlo fallback, the second was to recognise
-  Core Text does font substitution itself via `CTFontCreateForString`.
-- When the user says **"pal"** they mean the companion CLI at
-  `third_party/pal/` (git submodule, `git@github.com:binRick/pal.git`).
-  It's a palette-theme applier that emits OSC 4 / 10 / 11 codes into
-  the current TTY — used to test rbterm's palette handling. Run it
-  inside a tab to apply a theme to *that* pane only (rbterm keeps
-  palette + default fg/bg/cursor per-Screen, so one pane's theme
-  doesn't bleed into the others).
+- "commit to github" = commit + push. Default visibility private;
+  flip with `gh repo edit binRick/rbterm --visibility public`.
+- GitHub: `binRick` (SSH auth, keyring token).
+- Prefers real fixes over workarounds.
+- "pal" = companion CLI at `third_party/pal/` (separate
+  `binRick/pal` repo — see memory note, NOT a submodule). Palette
+  applier emitting OSC 4/10/11. Run inside a tab to apply per-pane;
+  rbterm keeps palette+fg/bg/cursor per-Screen.
 
-## Settings modal
+## Settings modal (`Cmd+,`, `UI_SETTINGS`)
 
-`Cmd+,` opens the settings modal (`UI_SETTINGS`). This is *the* place
-preferences live — new user-facing options get an entry here rather
-than a one-off shortcut or CLI flag. Current controls:
+*The* place preferences live — new options go here, not as one-off
+shortcuts. Layout computed once per frame in `settings_layout` so
+draw + hit-test share rects. Modifier chords (`Cmd/Ctrl+A`) are
+consumed so GetCharPressed doesn't leak the `a` into the field.
+`g_settings_dir_focus` gates whether the directory field has input.
 
-- **Font size** — live adjust via `+` / `-` buttons, or Up/Down / `=`/`-`
-  keys. Applies immediately through `renderer_set_font_size` and
-  resizes every tab's screen + PTY to fit.
-- **Logging** — toggle (button or Space key) to enable session logging.
-  When on, each tab opens an append file at
-  `<log_dir>/rbterm-<YYYYMMDD-HHMMSS>-tab<N>.log` and the main loop
-  calls `tab_log_write` with every byte read from the PTY. Log
-  directory is an editable text field with `$HOME` / `%USERPROFILE%`
-  tilde expansion; `mkdir_p` creates the tree on first write.
-  Details worth knowing:
-    - Writes are **raw PTY bytes** — ANSI escapes, cursor moves and
-      colour SGRs included. Good for replay (`cat` into a real
-      terminal) and exact debugging; if you want plain text, run
-      the file through `sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'` or `ansi2txt`.
-    - `fflush` after every write so a crash or forced-quit still
-      leaves the log intact up to the last byte we saw.
-    - Toggling the checkbox or editing the path calls
-      `refresh_tab_logs`, which immediately opens/closes log handles
-      on **every** currently-open tab — you don't have to restart
-      tabs to start or stop capturing them.
-    - The `tab<N>` slot number in the filename is the tab's current
-      index at open time, so multiple tabs opened in the same second
-      don't collide. Closing a tab lower in the index doesn't rename
-      remaining files.
-    - Settings (logging on/off + path) live in `AppSettings`. They
-      persist when the user clicks **Save as Default** in the
-      settings modal — `config_save` writes
-      `~/.config/rbterm/config.ini` and `config_load_into_defaults`
-      reads it back at startup. Without that click, edits are
-      process-local and restarting loses them.
+Persistence: `config_save` / `config_load_into_defaults` use
+`~/.config/rbterm/config.ini`; **Save as Default** button triggers
+save. Without that click, edits are process-local.
 
-The layout is computed once per frame in `settings_layout` so draw +
-hit-test share rects. Modifier chords (`Cmd+A` / `Ctrl+A` for select
-all in the directory field) are consumed so GetCharPressed doesn't
-leak the `a` into the field. `g_settings_dir_focus` gates whether the
-directory field owns keyboard input.
+Logging tab: enabled toggle + log dir. Writes are **raw PTY bytes**
+(ANSI, SGR included — `sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'` for plain).
+`fflush` after every write. Toggle/path edit calls `refresh_tab_logs`
+which immediately opens/closes handles on every open tab. Filename
+slot is the tab's open-time index (closing earlier tab doesn't
+rename remaining files).
 
 ### Adding a new setting
-
-1. Add the field to `AppSettings` in `main.c` (and `app_settings_init`
-   if it has a non-zero default).
-2. Add a `Rect` for it in `SettingsLayout`, place it in
-   `settings_layout`.
-3. Handle click + keyboard in `settings_handle_mouse` /
-   `settings_handle_keys`.
-4. Draw it in `draw_settings`.
-5. Wire any runtime side-effects (e.g. `refresh_tab_logs` for logging).
-
-Persistence is wired up via `config_save` / `config_load_into_defaults`
-(`~/.config/rbterm/config.ini`); the **Save as Default** button in the
-settings modal triggers it. New settings should be added to both the
-load and save paths if they're meant to survive restarts.
+1. Field in `AppSettings` (+ `app_settings_init` if non-zero default).
+2. `Rect` in `SettingsLayout`, place in `settings_layout`.
+3. Click + key in `settings_handle_mouse` / `_keys`.
+4. Draw in `draw_settings`.
+5. Wire side-effects (e.g. `refresh_tab_logs`).
+6. Add to both `config_save` and `config_load_into_defaults` if it
+   should survive restart.
 
 ## SSH
 
-- `src/pty_ssh.c` uses libssh. Cross-platform via the same dispatch
-  layer: a `PTY_SSH` Pty holds an `SshPty *impl` with an `ssh_session`
-  + `ssh_channel`. The session is flipped to non-blocking after
-  auth/channel setup, so `pty_read` drains via
-  `ssh_channel_read_nonblocking` the same way local PTYs drain via
-  `read() + EAGAIN`.
-- Connect/auth/channel setup happens on the main thread. The UI
-  stalls for 1-2 seconds during connect — future work is to punt
-  this to a thread and show a spinner.
-- Auth is key-only: `ssh_userauth_publickey_auto` (agent first, then
-  `~/.ssh/id_*`). No interactive password prompt yet; user needs
-  ssh-agent or a non-encrypted key. The interactive prompt would
-  route through the Screen (write to display, capture input) — not
-  trivial.
-- Host-key policy is trust-on-first-use: unknown keys go into
-  `~/.ssh/known_hosts`; `SSH_KNOWN_HOSTS_CHANGED` aborts with a
-  message in the prompt modal.
-- The UI modal lives in `main.c`. Toggled by `Cmd+Shift+T`, takes over
-  input until Enter or Esc. `ssh_prompt_handle_keys` calls
-  `tab_open_ssh`, which writes any libssh error back into a fixed
-  buffer the modal renders in red.
+`pty_ssh.c` uses libssh. `PTY_SSH` Pty holds `SshPty *impl` with
+`ssh_session` + `ssh_channel`. Session goes non-blocking after auth/
+channel setup, so `pty_read` drains via `ssh_channel_read_nonblocking`.
 
-## Benchmark harness — driving the field
+- Connect/auth on main thread. UI stalls 1-2s during connect (TODO:
+  threaded connect with spinner).
+- Auth: `ssh_userauth_publickey_auto` (agent first, then `~/.ssh/id_*`).
+  No interactive password yet (TODO: prompt through Screen).
+- Host-key: trust-on-first-use into `~/.ssh/known_hosts`;
+  `SSH_KNOWN_HOSTS_CHANGED` aborts.
+- UI modal in `main.c`, `Cmd+Shift+T`. `ssh_prompt_handle_keys` calls
+  `tab_open_ssh`; libssh errors render in red in the modal.
 
-Two scripts cover the round-trip-latency comparison against
-competitor terminals.
-
-**Manual / interactive flow (preferred — works for every
-terminal, no scripting glue needed):**
+## Benchmark harness
 
 ```bash
-# Open kitty / alacritty / iTerm2 / Terminal / rbterm. In each:
+# Manual (preferred — works for every terminal):
 cd ~/Desktop/repos/rbterm
-./tools/bench-here.sh             # 1000 samples; N=200 for a quick run
+./tools/bench-here.sh             # 1000 samples; N=200 quick
+./tools/bench-summary.sh          # side-by-side from any term
 
-# Once you've covered the field, from any terminal:
-./tools/bench-summary.sh
-```
-
-`bench-here.sh` auto-detects the host via `$TERM_PROGRAM` (rbterm
-sets `TERM_PROGRAM=rbterm` itself; iTerm2/Terminal/alacritty/kitty/
-WezTerm/ghostty are all known) and writes
-`bench/echo-<slug>-<stamp>.txt` with the standard
-`term=… n=… min=… med=… mean=… p99=… max=… sd=… ms` summary line.
-`bench-summary.sh` reads the newest file per slug and prints a
-side-by-side table.
-
-**Automated flow (less reliable — GUI focus + window-open timing
-get flaky):**
-
-```bash
+# Automated (flaky on focus/window timing):
 N=1000 TIMEOUT_S=120 ./tools/run-benchmark.sh
 ```
 
-This drives every terminal from a single command using:
-
-- **rbterm**: `SHELL=<shim>` so its shell auto-runs the bench
-  wrapper and exits.
-- **alacritty / kitty**: their built-in `-e <cmd>` / `<cmd>` form.
-- **iTerm2 / Apple Terminal**: AppleScript via `osascript` (open
-  new tab, write the command, exit).
-
-In practice the manual flow is faster end-to-end because the
-automated one waits on each terminal's open animation + window
-focus settling. Keep `run-benchmark.sh` for CI-style automated
-sweeps; use `bench-here.sh` for interactive runs.
-
-`echo_bench` (built from `tools/echo_bench.c`) measures the round
-trip on `CSI 6n` device-status-report queries: time to write the
-query, the terminal parses + replies with `CSI <row>;<col>R`, and
-we read the answer. Captures parser + I/O path latency without
-needing pixel-level event injection.
+`bench-here.sh` auto-detects host via `$TERM_PROGRAM` (rbterm sets
+its own) and writes `bench/echo-<slug>-<stamp>.txt`. `echo_bench`
+(`tools/echo_bench.c`) measures round-trip on `CSI 6n` DSR queries
+— write query, parse + reply with `CSI <r>;<c>R`, read answer.
 
 ## Commit + release flow
 
-When the user says **"commit"** or **"commit to github"**: `git add -A`,
-make a clear commit, and `git push`. That's it — nothing fancy.
+**"commit"** / **"commit to github"**: `git add -A`, clear commit,
+`git push`. That's it.
 
-When the user says **"commit and release"** or **"publish a release"**
-(or a variant like "update the release"): do everything above, plus
-**re-tag `v0.1.0`** so CI rebuilds and re-publishes the release. The
-flow is:
+**"commit and release"** / **"publish a release"** / **"update the
+release"**: above plus re-tag `v0.1.0`:
 
 ```bash
-# after the commit + push is done…
 git tag -d v0.1.0
 git push origin :refs/tags/v0.1.0
 gh release delete v0.1.0 --repo binRick/rbterm --yes --cleanup-tag || true
@@ -439,55 +259,32 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-The tag push triggers `.github/workflows/release.yml`, which builds
-`rbterm-linux-x86_64` and `rbterm-windows-x86_64.exe` and attaches
-them to the release. Takes ~2 min. Use `gh run watch <run_id>` to
-block until it's done.
+Triggers `.github/workflows/release.yml` (~2 min) → builds
+`rbterm-linux-x86_64` + `rbterm-windows-x86_64.exe`. `gh run watch
+<run_id>` to block.
 
-When the user says **"copy the exe to my windows vm"** (or similar):
-the host alias is `win` in their `~/.ssh/config`. The Windows
-Downloads folder is redirected to `\\Mac\Home\Downloads` (Parallels/
-Fusion shared folder), so the reliable drop is
-`~/Downloads/rbterm-windows-x86_64.exe` on the **Mac side** — that's
-what Windows Explorer's Downloads sidebar shows. `scp`-ing into
-`win:Downloads/` lands in `C:\Users\richardblundell\Downloads\`,
-which is a separate, physical Windows folder the user usually isn't
-browsing. Always land the file on the Mac side:
+### "copy the exe to my windows vm"
+Windows VM SSH alias: `win`. Windows Downloads is redirected to
+`\\Mac\Home\Downloads` (Parallels/Fusion shared folder), so always
+land the file on the **Mac side** — `scp`-ing into `win:Downloads/`
+goes to a separate physical Windows folder the user doesn't browse.
 
-```bash
-gh release download v0.1.0 --repo binRick/rbterm \
-    --pattern 'rbterm-windows-x86_64.exe' \
-    --dir ~/Downloads --clobber
-```
-
-Defender will quarantine unsigned exes on sight. If that happens, add
-the exclusion first before re-copying:
+**Always kill any running rbterm + delete the existing exe BEFORE
+pushing a new one.** Otherwise the file lock blocks SCP silently or
+the user double-clicks a stale binary (Explorer caches the icon).
 
 ```bash
-ssh win 'powershell -NoProfile -Command "Add-MpPreference -ExclusionPath \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\""'
-```
-
-**Always kill any running rbterm and delete the existing exe on
-the VM BEFORE pushing a new one.** Without this, an already-open
-process holds the file lock and the SCP overwrite silently fails
-(or the user double-clicks the stale binary because Explorer
-caches the icon). The full sequence:
-
-```bash
-# 1. Kill running rbterm + remove the stale exe in one ssh call.
+# 1. Kill + remove stale exe.
 ssh win 'powershell -NoProfile -Command "
     Get-Process rbterm-windows-x86_64 -ErrorAction SilentlyContinue | Stop-Process -Force;
     Remove-Item \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\" -Force -ErrorAction SilentlyContinue
 "'
-
-# 2. Wipe local stale copies + fetch the fresh release zip.
+# 2. Wipe local + fetch.
 cd ~/Downloads && rm -f rbterm.exe rbterm-windows-x86_64.exe rbterm-windows-x86_64.zip
-gh release download v0.1.0 --repo binRick/rbterm \
-    --pattern 'rbterm-windows-x86_64.zip' --clobber
+gh release download v0.1.0 --repo binRick/rbterm --pattern 'rbterm-windows-x86_64.zip' --clobber
 unzip -o rbterm-windows-x86_64.zip
 cp rbterm.exe rbterm-windows-x86_64.exe
-
-# 3. SCP into the VM + add Defender exclusion + verify mtime.
+# 3. SCP + Defender exclusion + verify mtime (the trust signal).
 scp rbterm-windows-x86_64.exe win:Downloads/
 ssh win 'powershell -NoProfile -Command "
     Add-MpPreference -ExclusionPath \"$env:USERPROFILE\Downloads\rbterm-windows-x86_64.exe\";
@@ -495,38 +292,23 @@ ssh win 'powershell -NoProfile -Command "
 "'
 ```
 
-The mtime in step 3's output is the trust signal — if it doesn't
-match the time you ran the script, something kept the lock and
-the user is still on the old binary.
-
-When the user says **"push to my mia vm"** (or similar for the `mia`
-host): `mia` is a Linux x86_64 **VM** reached over SSH (`Host mia`
-in `~/.ssh/config`, currently 172.238.205.61, RHEL-family / el10).
-It's the user's "test this build before publishing" box — pre-release
-binaries land there first.
-
-Gotcha: the SSH alias defaults to `User root`, but the user
-interactively logs in / operates as **`rich`**. `scp
-mia:Downloads/…` goes to `/root/Downloads/`, which `rich`'s session
-never looks at. Always drop into `rich`'s home and hand over
-ownership:
+### "push to my mia vm"
+`mia` = Linux x86_64 VM (RHEL-family/el10, currently 172.238.205.61).
+Pre-release smoke-test box. SSH alias defaults `User root` but user
+operates as **`rich`** — drop into `rich`'s home and chown:
 
 ```bash
 scp rbterm-linux-x86_64.zip mia:/home/rich/Downloads/
 ssh mia 'chown rich:rich /home/rich/Downloads/rbterm-linux-x86_64.zip'
 ```
 
-Running rbterm on mia from an SSH session needs `ssh -Y mia ./rbterm`
-(X forwarding) or a local VNC/desktop session — it's a GUI app.
+GUI app needs `ssh -Y mia ./rbterm` or local desktop session.
 
-When the user wants to **smoke-test the Linux release locally**
-(no remote VM available), use OrbStack — Apple-Silicon-native
-Linux VMs with Mac display passthrough. Procedure:
+### Smoke-test Linux release locally (OrbStack)
 
 ```bash
-brew install --cask orbstack
-open -a OrbStack                        # accept first-run prompts
-orb create --arch amd64 ubuntu rbterm-test   # x86 VM matches the release binary
+brew install --cask orbstack && open -a OrbStack
+orb create --arch amd64 ubuntu rbterm-test   # x86 REQUIRED
 orb -m rbterm-test bash -c 'sudo apt-get update -qq && \
     sudo apt-get install -y unzip libssh-4 libharfbuzz0b libwebp7 \
                             libwebpmux3 libfontconfig1 libxinerama1 \
@@ -539,375 +321,189 @@ orb -m rbterm-test bash -c \
 orb -m rbterm-test bash -c 'cd ~/rbterm && timeout 4 ./rbterm 2>&1 | head'
 ```
 
-Two important notes:
-
-- `--arch amd64` is **required**. The default Ubuntu image is
-  arm64 on Apple Silicon, and our linux-x86_64 release binary
-  doesn't run there (cross-arch packages are sparse on Ubuntu).
-  Always create the VM as amd64 so library deps install
-  natively.
-- For a **visible window**, install XQuartz on the host
-  (`brew install --cask xquartz`, then logout/login) so OrbStack
-  has an X11 server to forward to. Without it, the smoke test
-  still validates the dependency stack — rbterm fails at GLFW
-  init with `X11: The DISPLAY environment variable is missing`,
-  which proves every native dep loaded successfully.
+`--arch amd64` required (default Ubuntu image is arm64; cross-arch
+deps sparse). For visible window: `brew install --cask xquartz`
+(logout/login). Without XQuartz, GLFW init fails with "DISPLAY
+missing" — still validates dep stack loaded.
 
 ## Graphics (sixel + kitty)
 
-rbterm advertises sixel support in its Primary-DA response
-(`CSI ? 65 ; 1 ; 4 ; 9 c`) so tools like `img2sixel`, `chafa -f sixel`,
-`ranger` and `gnuplot` auto-select sixel output.
+Primary-DA advertises sixel (`CSI ? 65;1;4;9 c`) so `img2sixel`,
+`chafa -f sixel`, `ranger`, `gnuplot` auto-select.
 
 Pipeline:
-
-1. **Parser** (`screen.c`): DCS (`ESC P ... ESC \`) and APC
-   (`ESC _ ... ESC \`) payloads are collected into a growable buffer.
-   On terminator the first byte of payload picks the decoder — DCS
-   beginning with `<digits>;<...>q` → sixel; APC beginning with `G` →
-   kitty.
-2. **Decoders** (`sixel.c`, `kitty.c`): return a heap RGBA8 bitmap.
-   Sixel does two passes (scan extents, then rasterise). Kitty v1
-   only supports `f=100` (PNG) single-message payloads, decoded via
-   raylib's `LoadImageFromMemory`.
-3. **Storage** (`screen.c`): images attach to the `Screen` with an
-   anchor row+col (viewport coords). When the terminal scrolls up,
-   every image's anchor row decrements; images that pass row 0 are
-   dropped (no scrollback persistence in v1). Cap of 32 concurrent
-   images per screen; oldest evicted on overflow.
+1. **Parse** (`screen.c`): DCS / APC payloads buffered. Terminator
+   dispatches by first byte — DCS digits + `q` = sixel, APC `G` = kitty.
+2. **Decode** (`sixel.c`, `kitty.c`): heap RGBA8. Sixel two-pass
+   (extents, raster). Kitty v1: `f=100` PNG single-message, decoded
+   via raylib's `LoadImageFromMemory`.
+3. **Store** (`screen.c`): images attach with anchor row+col. Scrolls
+   decrement anchor; row<0 drops. Cap 32 per screen, oldest evicted.
 4. **Blit** (`render.c`): per-frame cache keyed by
-   `(ScreenImage*, generation)`. New images upload to a `Texture2D`
-   once; stale entries (image no longer in the screen's list) are
-   evicted. Images draw over text — the cursor advances past the
-   image when it's ingested so normal output doesn't overlap.
+   `(ScreenImage*, generation)`. Stale entries evicted. Cursor
+   advances past the image so text doesn't overlap.
 
-v1 limitations / intentional gaps:
-- Sixel: no background-fill mode (P1=0), no stretched aspect (P3),
-  no custom color-register widths.
-- Kitty: raw RGBA (f=24/32), chunked (m=1), animation (a=a), delete
-  commands (a=d) and the response protocol (q=) are all ignored.
-- No selection or copy over images.
-- No reflow for images on resize — they keep their original pixel size.
-
-Test: inside an rbterm pane, `img2sixel some.png` (libsixel).
+v1 gaps: sixel no P1=0 / P3 / custom registers; kitty no f=24/32, m=1,
+animation, deletes, response protocol; no selection over images; no
+reflow on resize.
 
 ## Recording
 
-Each pane can be captured to a file via the **● Rec** button in
-the tab bar. The capture path:
+Rec button per pane → `g_rec.fp` mirrors PTY bytes as asciinema v2:
+`[<sec>, "o", "<json-bytes>"]`. Starts with synthetic snapshot at
+t=0 (clear + per-row cursor + cell codepoints + cursor restore) so
+playback opens with what the user already saw.
 
-1. **Tap (`tab_pty_read` in `main.c`)** — every byte the PTY hands
-   back is mirrored into `g_rec.fp` as an asciinema v2 event line:
-   `[<seconds>, "o", "<json-escaped bytes>"]`. The recording starts
-   with a **synthetic snapshot event** at t=0 that emits ANSI to
-   reproduce the screen state at the moment Rec was pressed (clear
-   + per-row cursor positioning + cell codepoints + cursor restore)
-   so playback opens with what the user already saw, not a blank
-   screen waiting for the next byte.
-2. **Stop** moves the live `Rec` into `RecSave`, opens
-   `UI_REC_SAVE`. The modal layout is one row of seven format pills
-   (`cast`, `txt`, `gif`, `mp4`, `webm`, `apng`, `webp`) above a
-   path field, with `[Preview] [Close] [Save]` in the footer.
-3. **Save** dispatches into `rec_render_native(fmt, src_cast, dst)`:
+Stop → `RecSave` → `UI_REC_SAVE` modal with seven format pills and
+path field. Save dispatches into `rec_render_native(fmt, src, dst)`:
 
-| fmt    | Path |
-|--------|------|
-| cast   | `rename(src, dst)` — no rendering. |
-| txt    | One pass through `strip_feed` — drops CSI/OSC/DCS/APC/PM/SOS escapes, handles CR (cursor=0), BS (cursor--), LF (flush line). No render. |
-| gif    | Native `gif_encoder.c`. Replay events into a hidden `Screen`, render each frame off-screen, encode. |
-| webp   | Native `webp_encoder.c` via libwebp + libwebpmux. Same render loop; `WebPAnimEncoderAdd` per frame, then `WebPAnimEncoderAssemble`. Lossy q=75. |
-| mp4    | Render loop, pipe rawvideo rgba into `ffmpeg -pix_fmt yuv420p -movflags +faststart`. |
-| webm   | Same as mp4 but `-c:v libvpx -b:v 1M -pix_fmt yuv420p`. |
-| apng   | Two-pass: render to a temp gif (native encoder), then `ffmpeg -i tmp.gif -plays 1 dst.apng`. libavcodec's apng encoder is built-in to every brew/distro ffmpeg, so this works with the stock build. |
+| fmt | path |
+|--|--|
+| cast | `rename` |
+| txt | `strip_feed` — drops escapes; CR/BS/LF cursor model |
+| gif | Native `gif_encoder.c` (LZW, 6×6×6 cube + 40-step gray) |
+| webp | Native `webp_encoder.c` (libwebp + libwebpmux, q=75) |
+| mp4 | Pipe rawvideo into `ffmpeg -pix_fmt yuv420p -movflags +faststart` |
+| webm | Same but `-c:v libvpx -b:v 1M -pix_fmt yuv420p` |
+| apng | Two-pass: temp gif → `ffmpeg -i tmp.gif -plays 1 dst.apng` |
 
-The render loop is **chunked** (`CHUNK_SZ=6` frames) and presents a
-fresh modal frame between chunks, so the user sees the spinner +
-percentage update live instead of an unresponsive UI. Without this
-the OS overlays its "not responding" beachball during a long save.
+Render loop is **chunked** (`CHUNK_SZ=6` frames) with a fresh modal
+frame between chunks — without this the OS shows beachball during
+long saves.
 
-Render stack:
-- `cast_load` parses the JSON-line file into `CastEvent[]` (timestamp + un-escaped bytes).
-- A **hidden `Screen`** (no IO callbacks) replays the bytes via `screen_feed`.
-- Frames go to an off-screen `RenderTexture2D` of `cols*cell_w + 2*pad` × `rows*cell_h + 2*pad`.
-- `LoadImageFromTexture` reads back rgba; we Y-flip into `pixels[]` and hand to the encoder.
-- Frame timestamps tick at a fixed `fps=15` (`delay_cs=6` for gif, `delay_ms=66` for webp).
-- Skip every blank frame *before* the first cast event (`t0 = events[0].t`) so the gif opens on real content.
+Render: `cast_load` → un-escaped `CastEvent[]`, hidden `Screen` with
+no IO callbacks, `RenderTexture2D` of `cols*cell_w + 2*pad` ×
+`rows*cell_h + 2*pad`, `LoadImageFromTexture` + Y-flip → encoder.
+Fixed `fps=15`. Skip blank frames before first cast event.
 
-Native encoders avoid the "ffmpeg-not-found" / "encoder-missing"
-class of failures: `gif_encoder.c` is a hand-written LZW with a
-6×6×6 RGB cube + 40-step gray ramp palette; `webp_encoder.c` wraps
-WebPAnimEncoder + WebPMux for play-once loop count. The brew
-`webp` formula ships both libs — the `libwebp` ffmpeg bottle does
-not, which is why we don't go through ffmpeg for WebP.
+Native encoders avoid ffmpeg-not-found failures for gif/webp.
+mp4/webm/apng still need ffmpeg on PATH (release archive bundles
+static build on Windows; macOS/Linux still need it externally — TODO).
 
-Limitations / intentional gaps:
-- mp4 / webm / apng still need `ffmpeg` on PATH (the release archive
-  bundles a static build but a from-source brew install needs it
-  separately). gif and webp work without any external binary.
-- The recording snapshot at t=0 preserves cell codepoints + cursor
-  position only — colour / bold / italic attributes from the
-  pre-existing screen are not replayed (they would require emitting
-  full SGR runs per row).
-- One recording at a time globally (`g_rec.active`); switching tabs
-  during recording works but only the originally-selected pane is
-  captured.
-- Text mode's CR/BS line cursor doesn't model wide chars or wrap;
-  for typical shell output this is fine, but a curses app's TUI
-  state will not round-trip cleanly.
+Snapshot at t=0 preserves codepoints + cursor only (no SGR).
+One recording globally (`g_rec.active`); switching tabs works but
+only originally-selected pane is captured.
 
 ## HUD (system-info overlay)
 
-A small slab of system stats — hostname, IP, 1-min load, free
-memory, free disk — overlays one corner of every pane. Per-pane:
-each `Pane` holds its own `hud_*` snapshot (host string, IP
-string, load, mem MB, disk %, last-update timestamp, next-poll
-timestamp), and the data source depends on whether the pane's
-PTY is local or SSH.
+Per-pane `hud_*` snapshot (host, IP, load, mem MB, disk %, CPU
+ticks/history). Drawn from `draw_tab_contents` after panes — paints
+on top. Translucent black (alpha 175) + thin border. Uses
+`DrawText`/`MeasureText` (bundled font, 12pt/~14px), per-line width
+so the slab hugs longest line.
 
 ### Data flow
+- **Local**: 1 Hz via `hud_local_poll` — `gethostname` (strip
+  `.local`), `getifaddrs` first non-loopback IPv4, `getloadavg`,
+  `host_statistics64(HOST_VM_INFO64)` (mac) or `/proc/meminfo
+  MemAvailable` (linux), `statfs("/")` or `statvfs("/")`.
+- **SSH**: `SshPty` probe thread. Every 2s opens fresh exec channel
+  on same session, runs portable POSIX shell echoing `KEY=VALUE`
+  lines (HOST, IP, LOAD, MEM_MB, DISK_PCT, CPU_BUSY, CPU_TOTAL,
+  END=1). Probe uses `pthread_mutex_trylock` against shared session
+  lock so a busy shell doesn't stall the probe — skip cycle, show
+  previous snap. Probe shell is mac+linux portable (tries `hostname
+  -I`, then `-i`, then ifconfig en0/en1; `/proc/stat` else
+  `sysctl -n kern.cp_time`; `free -m` else `vm_stat`+pagesize).
 
-- **Local panes (`pty_is_local(p->pty)`)** — main loop polls every
-  second via `hud_local_poll`, which calls cheap syscalls:
-  - `gethostname()` (and strips trailing `.local` from Bonjour
-    names so it doesn't leak into every overlay).
-  - `getifaddrs()` for the first non-loopback IPv4. Falls back to
-    empty if no interface is up.
-  - `getloadavg()` for the 1-minute load average.
-  - macOS: `host_statistics64(HOST_VM_INFO64, ...)` for free + inactive +
-    speculative pages × pagesize → "available" memory in MB.
-    Linux: `/proc/meminfo` `MemAvailable` / 1024.
-  - `statfs("/")` (macOS) or `statvfs("/")` (Linux) → root disk
-    `bavail / blocks` × 100 = % free.
-  All sub-millisecond on a modern host; no measurable CPU at 1 Hz.
-
-- **SSH panes** — `SshPty` runs a dedicated probe thread next to
-  the existing reader. Every 2 sec it opens a fresh exec channel
-  on the SAME libssh session, runs a small POSIX shell snippet
-  that echoes `KEY=VALUE` lines (`HOST=`, `IP=`, `LOAD=`,
-  `MEM_MB=`, `DISK_PCT=`, `CPU_BUSY=`, `CPU_TOTAL=`, `END=1`),
-  parses them, and stores the result in `hud_snap` under
-  `hud_lock`. The probe uses `pthread_mutex_trylock` against the
-  shared session lock so a busy shell (cat / find / git log)
-  never gets stalled by a probe — it just skips that cycle and
-  shows the previous snapshot for one more second.
-
-  Probe shell is intentionally Linux+macOS portable: tries
-  `hostname -I` then `hostname -i` then ifconfig en0/en1; reads
-  `/proc/stat` if available else falls back to `sysctl -n
-  kern.cp_time`; reads `free -m` then falls back to `vm_stat`
-  + `sysctl -n hw.pagesize`. Failure modes are quiet — anything
-  the probe can't compute stays at the last-known value, never
-  flickers to `?`.
-
-  main.c's HUD poll loop dispatches: local pane → `hud_local_poll`
-  + `hud_read_cpu_ticks` (cheap syscalls); SSH pane →
-  `pty_hud_snapshot` (copy under hud_lock). Both paths feed the
-  same `Pane->hud_*` fields and the same delta-CPU + ring-buffer
-  logic — there's only one render path.
-
-### Customisation (Settings → HUD tab)
-
-- **Show HUD** — master enable/disable. `g_app_settings.show_hud`.
-- **Position** — TL / TR / BL / BR via `HudPosition` enum and
-  `g_app_settings.hud_pos`. Slab placement in `draw_tab_contents`
-  picks the corner from this.
-- **Per-field grid** — five rows (Host / IP / Load / Memory / Disk),
-  each with:
-  - **Visible** toggle → `g_app_settings.hud_show[HUD_FIELD_*]`.
-    Suppressed fields are skipped during render so the slab shrinks
-    to fit the remaining lines.
-  - **Colour swatch** → `hud_color[]` is an index into the 8-entry
-    `HUD_PALETTE` (light grey / white / cyan / green / yellow /
-    orange / pink / lavender). Click cycles to the next preset.
-    Indices are stable across releases so saved configs roundtrip.
-  - **Size −/+** → `hud_size[]` in points, clamped 10..18. The
-    slab measures each line at its own size; rows can be different
-    heights.
-- **CPU graph** — toggle (`hud_show_cpu`) for a 60-sample sparkline
-  rendered below the text slab. See "CPU sparkline" below.
+### Customisation (Settings → HUD)
+- Master toggle (`show_hud`), position (TL/TR/BL/BR via `hud_pos`).
+- Per-field grid (Host/IP/Load/Memory/Disk): visible toggle,
+  colour swatch (8-entry `HUD_PALETTE`, indices stable across
+  releases), size −/+ (10..18 pt).
+- CPU graph toggle (`hud_show_cpu`).
 
 ### CPU sparkline
+60-slot ring (`hud_cpu_pct`, head, init flag) + `hud_cpu_prev_busy/_total`.
+1 Hz: `hud_read_cpu_ticks` returns cumulative busy + total; pct =
+`(busy_delta * 100) / total_delta`, clamped 0..100. First call
+primes; history seeded with `-1`, render skips negatives. Bars
+oldest→newest, height = `gh * pct / 100`. Colour: green→yellow at
+0..50, yellow→red at 50..100. Recent value as text tag.
+- macOS: `host_statistics(HOST_CPU_LOAD_INFO)` USER+SYSTEM+NICE busy.
+- Linux: `/proc/stat` cpu line, busy = user+nice+system+irq+softirq+steal.
+- Windows/web: not implemented.
 
-`Pane` carries a 60-slot ring buffer of percentages
-(`hud_cpu_pct[HUD_CPU_HISTORY]`, head index, init flag) plus the
-previous tick counters needed to compute deltas
-(`hud_cpu_prev_busy`, `hud_cpu_prev_total`). Every 1 sec poll on
-local panes, `hud_read_cpu_ticks` returns cumulative busy + total
-ticks; the percentage is `(busy_delta * 100) / total_delta`,
-clamped to 0..100, pushed at `hud_cpu_head`. First call just
-primes `hud_cpu_prev_*` and seeds the history with `-1` ("no
-sample yet"); render skips negative slots so the sparkline ramps
-up over the first minute.
+### Adding a field
+1. Compute in `hud_local_poll` (+ SSH probe).
+2. Storage on `Pane`.
+3. Through `hud_format` + `hud_show_<field>` in `AppSettings`.
+4. Toggle button in `SettingsLayout.hud_field_*`.
+5. Default in `app_settings_init`.
 
-Render walks the ring oldest→newest and draws one filled bar per
-sample. Bar height = `gh * pct / 100`. Colour ramp interpolates
-green→yellow at 0..50% and yellow→red at 50..100% so high CPU is
-immediately readable. The most-recent value also renders as a
-text tag (`cpu N%`) in the sparkline corner.
+## Multi-window (unfinished)
 
-Tick sources:
-- macOS: `host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, ...)`
-  → `cpu_ticks[USER + SYSTEM + NICE]` is busy, `+ IDLE` is total.
-- Linux: `/proc/stat`'s `cpu` line; busy =
-  user+nice+system+irq+softirq+steal, idle includes iowait.
-- Windows / web: not yet implemented (sparkline stays empty).
+One raylib window per process today. Cmd+N `fork+exec`s — separate
+Dock icons, Cmd+\` doesn't cross. Goal: same-process multi-window.
 
-### Render details
-
-- Drawn from `draw_tab_contents` after panes + splitter, so the
-  slab paints on top of terminal content. Translucent black
-  background (`alpha 175`) plus a thin border so legibility holds
-  on both dark and light themes.
-- Uses raylib's bundled `DrawText`/`MeasureText` rather than the
-  app's custom font atlas — the HUD is meant to be informational
-  and the bundled font keeps the layout code simple.
-- 12pt, ~14px line height. Width is measured per-line so the slab
-  hugs the longest line.
-
-### Adding a new field
-
-1. Pull / compute the value in `hud_local_poll` (and eventually
-   the SSH probe).
-2. Add storage to `Pane` (`hud_<field>`).
-3. Pass it into `hud_format`; add a corresponding `show_*` arg
-   and `bool hud_show_<field>` in `AppSettings`.
-4. Plumb a per-field toggle button into the HUD settings tab
-   (`SettingsLayout` has a `Rect hud_field_*` block; mirror the
-   existing five).
-5. Init default in `app_settings_init`.
-
-## Multi-window (unfinished — future session)
-
-rbterm runs as one raylib window per OS process today. Cmd+N
-`fork+exec`s a fresh rbterm, which means each window gets its own
-macOS Dock icon and Cmd+` only cycles within a single process (i.e.
-never crosses rbterm windows). Goal: **same-process multi-window**
-with a single Dock entry and working Cmd+` / Windows taskbar group.
-
-### Validated approach (standalone POC only)
-
-- raylib built with `USE_EXTERNAL_GLFW=ON` + brew's `libglfw` = one
-  GLFW runtime instead of two. Without this, raylib's embedded GLFW
-  and brew's GLFW both register `GLFWApplicationDelegate` /
-  `GLFWContentView` / etc. as Objective-C classes → Cocoa warns
-  "may cause spurious casting failures and mysterious crashes".
+### Validated POC
+- raylib `USE_EXTERNAL_GLFW=ON` + brew `libglfw` = one GLFW runtime.
+  Without this, two GLFW runtimes register the same Objective-C
+  classes (`GLFWApplicationDelegate`, etc.) and Cocoa warns about
+  spurious casts / mysterious crashes.
 - After `InitWindow`, `glfwGetCurrentContext()` returns raylib's
-  `GLFWwindow *`. `glfwCreateWindow(..., share=<that>)` then makes
-  additional windows that share the GL context.
-- Per-frame: draw to raylib's window via the usual
-  `BeginDrawing/EndDrawing`. For each extra window:
-  `rlDrawRenderBatchActive()` → `glfwMakeContextCurrent(extra)` →
-  `rlViewport/rlMatrixMode/rlLoadIdentity/rlOrtho` →
-  `rlClearColor/rlClearScreenBuffers` → raylib draw primitives →
-  `rlDrawRenderBatchActive` → `glfwSwapBuffers(extra)` →
-  `glfwMakeContextCurrent(primary)`.
-- POC binary at `/tmp/multiwin_poc3` (source `/tmp/multiwin_poc2.c`)
-  opens two windows that render raylib primitives independently.
-  Confirmed: no class collisions when raylib is built with
-  `USE_EXTERNAL_GLFW=ON`; brew raylib bottle doesn't do this, so
-  CMake fetched raylib has to be used.
+  `GLFWwindow*`. `glfwCreateWindow(..., share=<that>)` = additional
+  windows sharing GL context.
+- Per-frame extra window: `rlDrawRenderBatchActive` →
+  `glfwMakeContextCurrent(extra)` → rlViewport/Mode/Identity/Ortho
+  → rlClearColor/Buffers → draw → `rlDrawRenderBatchActive` →
+  `glfwSwapBuffers(extra)` → make primary current.
+- POC at `/tmp/multiwin_poc3` (`/tmp/multiwin_poc2.c`) confirmed
+  (only with CMake-fetched raylib; brew bottle doesn't set the flag).
 
-### First integration attempt (reverted)
+### Integration attempt was reverted
+Naïve "add an extra GLFWwindow at startup" looked fine compiling
+but was visually chaotic — context switching + raylib's rlgl state
++ mid-frame context swaps interacting badly. ~8-12h dedicated session
+needed:
 
-Tried a minimal landing in `main.c`: switch CMakeLists to
-`USE_EXTERNAL_GLFW`, point `run.sh` at the CMake build, then create
-one extra `GLFWwindow` at startup and hand-render into it each
-frame. Looked fine compiling, but the first run was visually
-chaotic — some combination of context switching, raylib's internal
-rlgl state assuming its own window, and the main app's `BeginDrawing`
-interacting badly with mid-frame context swaps. Reverted all three
-files to the prior committed state; no code survived.
+1. CMakeLists `USE_EXTERNAL_GLFW ON` + `find_package(glfw3)`. Makefile
+   can't use brew raylib anymore (embedded GLFW).
+2. Per-window state: extract globals into a `Window` struct.
+3. Bootstrap: `glfwInit + glfwCreateWindow + rlglInit + rlLoadExtensions`
+   per window, share context after first.
+4. Input wrapper: per-window callbacks → `WindowInput`, retarget
+   `IsKeyPressed`-style API to "focused window's" state. Don't
+   rewrite call sites.
+5. Main loop: iterate windows, current context, input+draw+swap.
+6. Cmd+N → new Window. macOS Cmd+\` works once single-process. Win:
+   `SetCurrentProcessExplicitAppUserModelID` for taskbar grouping.
 
-### What the proper implementation actually needs
+Don't waste time on: separate processes + shared Dock icon (Cmd+\`
+stays per-process, no hook for cross-process cycling); brew
+GLFW alongside brew raylib (class name collisions).
 
-This is ~8-12 focused hours and worth a dedicated session:
+## Search-in-scrollback
 
-1. **Build**: CMakeLists sets `USE_EXTERNAL_GLFW ON` + `find_package(glfw3)`.
-   Makefile can't use brew raylib anymore (it ships with embedded
-   GLFW); either rip out the Makefile shortcut or have it drive CMake
-   for the raylib sub-build.
-2. **Per-window state**: extract globals in `main.c` (tabs + active
-   + drag state + ui mode + SSH form + settings modal + pickers +
-   slider drag + hover) into a `Window` struct. Phase-1a sketch lived
-   briefly as a no-op macro layer (`#define g_tabs g_win->tabs`,
-   etc.); reverted with the rest.
-3. **Bootstrap**: replace `InitWindow` with explicit
-   `glfwInit + glfwCreateWindow + rlglInit(w, h) + rlLoadExtensions`
-   per window. First window creates; subsequent windows share
-   context.
-4. **Input wrapper**: raylib's `IsKeyPressed/IsKeyDown/IsMouseButton*/
-   GetMousePosition/GetCharPressed` all read from raylib's window.
-   Multi-window means per-window input state — simplest is to set
-   GLFW per-window callbacks that populate a `WindowInput` struct,
-   then keep a `IsKeyPressed`-style API that reads from "the focused
-   window's" input state. Hundreds of call sites; don't rewrite them,
-   just retarget the API.
-5. **Main loop**: iterate windows, make each context current,
-   dispatch input + draw + swap. Tear down on window close; process
-   exits when the last window dies.
-6. **Chords**: Cmd+N creates a new Window (clones settings); Cmd+`
-   is handled by macOS automatically once the app is single-process.
-   Windows counterpart: `SetCurrentProcessExplicitAppUserModelID`
-   + Alt+Tab / taskbar groups the windows.
+`Cmd/Ctrl+F` opens per-pane search bar. Substring, ASCII-fold
+case-insensitive. Enter/Down/F3 next, Shift+ prev. Esc closes,
+restores `view_offset`. Cmd/Ctrl+V pastes into query.
 
-### What won't work (don't waste time on)
+- `Search` on `Pane` (query, matches, current). Freed in `pane_free`.
+- `screen_total_rows` + `screen_cell_abs` give absolute-row history
+  for `search_recompute`. Wide-char cont skipped.
+- Matches: `(abs_row, col_start, col_end)`. `search_next` wraps;
+  `search_scroll_to_match` centres.
+- `draw_tab_contents` paints translucent yellow (current brighter).
+- `p->search.active` → main loop skips `input_poll`, calls
+  `search_handle_input` so keys stay out of the shell.
 
-- **Separate processes + shared Dock icon**: bundle-ID consolidation
-  merges the icon visually but Cmd+` stays per-process. macOS has no
-  hook for cross-process window cycling inside one app.
-- **Linking brew GLFW alongside brew raylib**: same Objective-C
-  class names defined in two libraries. Cocoa picks one at runtime,
-  the other's windows behave erratically. Has to be exactly one
-  GLFW runtime.
+v1 limits: ASCII fold only; match within single row (auto-wrapped
+words missed — could use `screen_view_row_wrapped`); inside
+tmux/vim/less = alt screen, no scrollback (use `<prefix>[`); no
+regex / search-within-selection / case toggle.
 
-## Search-in-scrollback (v1 shipped)
+## Dirty-flag gotcha
 
-`Cmd+F` (or `Ctrl+F`) opens a per-pane search bar docked at the top
-of the active pane. Live substring match, case-insensitive (ASCII
-only for now). Enter / Down / F3 = next match, Shift+Enter / Up /
-Shift+F3 = prev. Esc closes and restores `view_offset`. Cmd/Ctrl+V
-pastes the clipboard into the query.
+Main loop skips `BeginDrawing`/`EndDrawing` when `dirty == false`.
+**Any path mutating UI state without producing PTY output must set
+`dirty = true` itself**, or the screen freezes on old state until
+something else triggers a redraw.
 
-- State lives in `Search` on each `Pane` (query, match arrays,
-  current index). Freed in `pane_free`.
-- `screen_total_rows` + `screen_cell_abs` (screen.h) expose the full
-  history in absolute-row coordinates so `search_recompute` can walk
-  scrollback + live grid uniformly. Wide-char continuation cells
-  skipped.
-- Matches stored as `(abs_row, col_start, col_end)`. `search_next`
-  wraps around; `search_scroll_to_match` centres the hit.
-- `draw_tab_contents` paints translucent yellow rectangles over the
-  grid (current match brighter) then draws the search bar.
-- While `p->search.active`, the main loop skips `input_poll` and
-  calls `search_handle_input` so keystrokes stay out of the shell.
+Symptom: "Cmd+1 is sluggish" when the tab actually switched — the
+loop just isn't repainting.
 
-Deliberate v1 limits:
-- ASCII case-folding only (proper Unicode folding → future).
-- Match must fit within a single row — words that auto-wrapped
-  across a wrap boundary are currently missed. Could use the
-  existing `screen_view_row_wrapped` to join logical lines.
-- Inside tmux / vim / less rbterm is on the alt screen with no
-  scrollback, so search only covers the current screenful. For
-  search over tmux's own buffer the user has to use tmux's
-  `<prefix>[` copy-mode.
-- No regex, no search-within-selection, no case-sensitivity toggle.
-
-## Dirty-flag gotcha — state changes need an explicit trigger
-
-The main loop skips `BeginDrawing` / `EndDrawing` whenever
-`dirty == false`. That means **any code path that mutates UI
-state without producing PTY output has to set `dirty = true`
-itself, or the screen freezes on the old state until something
-else (mouse move, shell write) triggers a redraw**.
-
-The trap is that the screen is sometimes wrong but the action
-fired correctly — symptom looks like "Cmd+1 is extremely
-sluggish" when really the tab switched instantly and the loop
-just isn't repainting.
-
-The unified catch in `main.c` is a snapshot of cross-frame UI
-state: `prev_active` (= `g_active`) and `prev_ui_mode`
-(= `g_ui_mode`). At the end of each iteration:
+Unified catch in `main.c`:
 
 ```c
 if (g_active != prev_active) dirty = true;
@@ -916,193 +512,100 @@ prev_active = g_active;
 prev_ui_mode = (int)g_ui_mode;
 ```
 
-This catches every tab-switch chord (`Cmd+1..9`, `Cmd+[/]`,
-`Cmd+arrows`, `Cmd+Shift+arrows` reorder) and every modal
-toggle (settings / help / SSH form / pickers) without each
-one having to remember to mark dirty.
-
-When you add new cross-frame UI state (a new global, a new
-modal, a per-pane bool that affects rendering), either:
-
-- Extend the snapshot/compare block above, or
-- Set `dirty = true;` at the site that mutates it.
-
-Don't rely on the next mouse twitch to bail you out — the user
-notices.
+Catches every tab-switch chord and modal toggle. New cross-frame UI
+state: extend the snapshot/compare or set `dirty = true` at mutation
+site. Don't rely on the next mouse twitch.
 
 ## Idle CPU floor (macOS)
 
-**The number to know: ~3.2% idle CPU is the floor with brew raylib
-on macOS. alacritty / kitty sit at 0%.**
+**~3.2% idle CPU is the floor with brew raylib on macOS.**
+alacritty/kitty sit at 0%.
 
-How we got here, and what blocks going lower (so future sessions
-don't burn time re-discovering this):
+How we got here:
+1. Pre-opt: 60 fps full-grid → ~18%.
+2. Dirty-flag gating in `main.c`. Triggers: PTY drain, input byte,
+   focus, mouse move (focused only), button/wheel, resize, title.
+   **Cursor blink is intentionally NOT a trigger** — biggest win.
+3. Wake cadence: 250 Hz focused (cap=0.004), 20 Hz unfocused (cap=0.05).
+   Counter-intuitive: high poll rate → empty NSApp queue, near-instant
+   `PollInputEvents`; lower rate → queue accumulates, ~50 ms per call.
+   4 ms cap also keeps chord shortcuts feeling instant. Don't try
+   adaptive sleep.
 
-1. **Pre-optimisation**: 60 fps full-grid redraw → ~18% idle CPU
-   (much higher when typing).
-2. **Dirty-flag gating** in `main.c`: each iteration computes a
-   `dirty` flag. If nothing changed, skip `BeginDrawing` /
-   `EndDrawing` entirely and just call `PollInputEvents()` +
-   `WaitTime()`. Triggers: any PTY drain, any `input_poll` byte,
-   focus changes, mouse movement (only when focused), button /
-   wheel events, window resize, title changes. **Cursor blink is
-   intentionally NOT a trigger** — terminating that 2 Hz redraw
-   cycle was the single biggest contributor to the drop.
-3. **Wake cadence**: 250 Hz when focused (cap=0.004), 20 Hz when
-   unfocused (cap=0.05). Counter-intuitive but verified: at
-   higher poll rates the `NSApp` event queue is consistently
-   empty and each `PollInputEvents` returns near-instantly, so
-   net CPU is *lower* than at 1 Hz where the queue accumulates
-   and each call costs ~50 ms. The 4 ms cap also keeps typing
-   and chord shortcuts (Cmd+T, Cmd+1) feeling instant — slower
-   caps showed up as user-visible "very slow" chord lag. Don't
-   try an "adaptive" sleep that stretches when idle; it just
-   raises CPU and adds first-keystroke latency without saving
-   anything.
+**Remaining ~5% is `glfwPollEvents` itself.** macOS dispatches the
+NSApp queue per call (~50 ms), so 1 Hz = 50/1000 = 5%. Verified with
+minimal repro (no rbterm logic, no draw): 4.6-6.0% CPU.
 
-**The remaining 5% is `glfwPollEvents` itself.** Verified with a
-minimal repro:
+**Only way past floor: `glfwWaitEventsTimeout`** (kernel-blocked).
+Failed attempts:
+- Link `-lglfw` alongside brew raylib: builds but two GLFW runtimes
+  register same classes; wait fn resolves to brew GLFW which has no
+  window → returns instantly, 3M empty iterations/sec.
+- `extern void glfwWaitEventsTimeout` from brew raylib: symbols
+  hidden, link fails.
 
-```c
-InitWindow(640, 400, "idle test");
-while (!WindowShouldClose()) {
-    PollInputEvents();
-    WaitTime(1.0);
-}
-```
+**Real fix**: rebuild raylib with `USE_EXTERNAL_GLFW=ON` (CMake
+FetchContent) — same architectural unblocker as multi-window arc,
+deferred for the same reason (multi-hour change touching build/init/
+per-window state).
 
-That program — no rbterm logic, no draw calls — sits at 4.6-6.0%
-CPU on macOS. macOS dispatches the entire `NSApp` event queue per
-call (~50 ms each, even when there's nothing to dispatch). At 1 Hz
-that's 50 ms / 1000 ms = 5%. There's no cheap version of this
-function.
-
-**The only way past the floor is `glfwWaitEventsTimeout`** (kernel-
-blocked wait — sleeps until an event arrives or timeout fires).
-Two failed attempts:
-
-- **Link `-lglfw` alongside brew raylib**: builds, but two GLFW
-  runtimes register the same Objective-C classes
-  (`GLFWApplicationDelegate`, `GLFWContentView`, etc.) and Cocoa
-  emits warnings. Worse, the wait function call resolves to brew's
-  GLFW — which has no window of its own — and returns instantly.
-  3 million empty iterations / sec. Same class-collision blocker
-  as the multi-window arc.
-- **`extern void glfwWaitEventsTimeout(double)` resolved out of
-  brew raylib**: brew raylib hides those symbols, so the link
-  fails outright.
-
-**The actual fix** is rebuilding raylib with `USE_EXTERNAL_GLFW=ON`
-(via CMake `FetchContent`), so a single brew GLFW handles both
-raylib's window and our `glfwWaitEventsTimeout` calls. That's the
-same architectural unblocker the multi-window arc needs and is
-deferred for the same reason — it's a multi-hour change touching
-build, init, and per-window state. See "Multi-window (unfinished)"
-above.
-
-**Diagnostics that aren't worth re-trying**: per-iteration timing,
-per-thread sampling (`sample $PID 15`), HUD bypass — confirmed the
-main loop body costs only ~0.16 ms at 1 Hz (0.016% main thread).
-The CPU is being charged to the process for `PollInputEvents`
-work that runs synchronously inside the call but doesn't show up
-on any individual thread sample.
+Don't re-try: per-iteration timing, thread sampling, HUD bypass —
+main loop body is ~0.16 ms at 1 Hz (0.016% main thread). CPU is
+charged for `PollInputEvents` work synchronous inside the call.
 
 ## SFTP upload + download
 
-Each SSH tab grows two tab-bar buttons in the right cluster:
-**↑** upload, **↓** download. Both ride the existing libssh
-session — no second auth, no scp/rsync wrapper.
+SSH tabs have **↑** / **↓** buttons. Both ride existing libssh
+session — no second auth, no scp/rsync.
 
-### Upload (`pty_upload_*` in `pty_ssh.c`)
-- `pty_upload_start` spawns a worker thread; the worker takes
-  `session_lock` cooperatively (alongside reader / writer / HUD
-  probe) and runs `sftp_new` → `sftp_init` → `sftp_open(O_WRONLY|
-  O_CREAT|O_TRUNC, 0644)` → 32 KB chunked `sftp_write`.
-- Handles `~/foo` by stripping the `~/` (SFTP cwd is already the
-  user's home; SFTP doesn't know about tildes — that's a shell
-  thing).
-- If the remote path is a directory (trailing `/` or `sftp_stat`
-  says so), the local basename is appended.
+**Upload** (`pty_upload_*` in `pty_ssh.c`): worker thread takes
+`session_lock` cooperatively, `sftp_new` → `sftp_init` →
+`sftp_open(O_WRONLY|O_CREAT|O_TRUNC, 0644)` → 32 KB chunked write.
+`~/foo` strips `~/` (SFTP cwd is home, no tilde expansion). If
+remote is dir, append local basename.
 
-### Download (`pty_download_*` in `pty_ssh.c`)
-- Same pattern in the opposite direction.
-- The worker `sftp_stat`s the target first and branches: regular
-  file → `sftp_open(O_RDONLY)` + chunked read; directory →
-  `sftp_download_dir_recursive` walks the tree, snapshots each
-  directory's listing before recursing (libssh's SFTP isn't
-  reentrant on the same dir handle), `mkdir(0755)`s locally,
-  accumulates `bytes_total` on the way down so the toast %
-  reflects the whole tree.
+**Download** (`pty_download_*`): mirror. `sftp_stat` first; regular
+file → chunked read; directory → `sftp_download_dir_recursive`
+(snapshot listing per dir before recursing — libssh SFTP isn't
+reentrant on same dir handle), local mkdir 0755, accumulate
+`bytes_total` for toast %.
 
-### UI
-- Modal types: `UI_SFTP_UPLOAD`, `UI_SFTP_DOWNLOAD`. The
-  download modal does `pty_listdir` (sorted dirs-first, alpha)
-  on open; refreshes on path change. Double-click a folder to
-  navigate; single-click + Download to download (a folder ⇒
-  picks a local **parent** dir via `mac_pick_open_directory`).
-- Per-pane state: `Pane.upload`, `Pane.download` (both `Pty*Upload`/`Pty*Download`).
-  Toasts render at bottom-left of the pane, stacked when both
-  active. `pane_free` cancels + joins workers before tearing
-  down the PTY.
-- Native pickers in `emoji_mac.m`: `mac_pick_open_file`
-  (NSOpenPanel files), `mac_pick_save_file` (NSSavePanel),
-  `mac_pick_open_directory` (NSOpenPanel directories).
+UI: `UI_SFTP_UPLOAD` / `UI_SFTP_DOWNLOAD`. Download modal does
+`pty_listdir` (dirs-first alpha) on open + path change. Double-click
+folder = navigate, single + Download = download (folder ⇒ pick local
+**parent** via `mac_pick_open_directory`). Per-pane `Pane.upload` /
+`.download`. Toasts bottom-left, stacked. `pane_free` cancels +
+joins workers before tearing down PTY. Mac native pickers in
+`emoji_mac.m`.
 
-### Debug logging
-`run.sh` exports `RBTERM_DEBUG=1`. When set, every transfer step
-appends to `~/rbterm-upload.log` with libssh + sftp error codes
-on failure. Released `open -a rbterm` users see no log file.
+`run.sh` exports `RBTERM_DEBUG=1` → transfer steps log to
+`~/rbterm-upload.log` with libssh + sftp error codes.
 
 ## Broadcast input
 
-`Cmd+Shift+I` (or the radio-tower button on the tab bar) toggles
-`g_broadcast_active`. While on, every keystroke and every paste in
-the active tab is fanned out to **every leaf** of the tab's pane
-tree instead of just the focused leaf. Output stays per-pane.
+`Cmd+Shift+I` (or radio-tower tab-bar button) toggles
+`g_broadcast_active`. Every keystroke / paste in active tab fans
+out to **every leaf**. Output stays per-pane.
 
-Visual cues (deliberately redundant — fanned-out typing is
-destructive enough that you should always be able to tell):
+Visual cues (deliberately redundant): button glows red, `BROADCAST`
+pill in right cluster, 3px red border on every leaf.
 
-- The toolbar button glows red when active.
-- A `BROADCAST` pill appears in the right cluster (left of the
-  REC pill if both are on).
-- A 3px red border outlines every leaf in the active tab.
+Safety: button hidden when `pane_tree_count < 2`. Auto-disarms on
+tab switch (same `prev_active` snapshot block as dirty-flag).
+**Mouse clicks / selection drags are NOT broadcast.** Only keystrokes
+and pastes.
 
-Safety belts:
+Implementation: input section replaces per-pane `pty_write` with
+tree-walk when active. Each leaf checks own `screen_bracketed_paste`.
+Per-leaf `screen_scroll_reset` + selection clear inside fan-out.
 
-- The button is hidden when `pane_tree_count(t->root) < 2` — single-
-  pane broadcast would just be typing.
-- Broadcast auto-disarms whenever `g_active` changes (tab switch).
-  The detection happens in the same `prev_active` snapshot block
-  that drives the dirty-flag dance, so this can't drift.
-- Mouse clicks / selection drags are **not** broadcast. Only
-  keystrokes (`input_poll` output) and paste payloads.
-
-Implementation:
-
-- The fan-out lives in the input section of the main loop. When
-  `g_broadcast_active && pane_tree_count(cur->root) >= 2`, the
-  per-pane `pty_write` is replaced with a tree-walk that writes
-  to every leaf. Same for the paste branch (each leaf checks its
-  own `screen_bracketed_paste(_p->scr)` so leaves with different
-  bracketed-paste modes round-trip cleanly).
-- Per-leaf `screen_scroll_reset` and selection-clear run inside
-  the fan-out so a stale highlight doesn't linger anywhere.
-
-Future: a per-pane "broadcast member" toggle (`Cmd+Shift+B` on a
-focused leaf) so the user can curate which subset of leaves gets
-fanned-to. Today everything in the active tab is the group.
+Future: per-leaf "broadcast member" toggle for curated subsets.
 
 ## Per-host SSH layout
 
-Saved hosts can predefine a recursive split layout that's replayed
-on connect: pane tree shape, ratios, and per-leaf cwd. Authored via
-the **Save Layout from Active Tab** button on the SSH form's
-Connection tab — splits the active SSH tab's tree into a string
-descriptor and writes it back into `~/.ssh/config` as new
-`# rbterm-*` comment lines.
-
-Format in ssh_config:
+Saved hosts can predefine recursive split layouts replayed on
+connect. Authored via **Save Layout from Active Tab** on SSH form's
+Connection tab — writes `# rbterm-*` lines into `~/.ssh/config`:
 
 ```
 Host mia
@@ -1110,389 +613,218 @@ Host mia
     User rich
     # rbterm-layout: V0.50(H0.50(0,1),2)
     # rbterm-pane-0-cwd: /var/log
-    # rbterm-pane-1-cwd: /etc
-    # rbterm-pane-2-cwd: /home/rich
     # rbterm-pane-2-cmd: htop
 ```
 
 Grammar: `expr := DIGIT | ('V'|'H') ratio '(' expr ',' expr ')'`,
-where ratio is `0.NN` (clamped to 0.15..0.85), and integers are leaf
-indices into pane_cwds[] / pane_cmds[]. Indices are assigned in DFS
-pre-order so the serializer and parser agree without a separate
-numbering pass. `SSH_LAYOUT_MAX_PANES = 8` is the leaf cap.
+ratio `0.NN` (0.15..0.85), integers index pane_cwds[]/pane_cmds[].
+DFS pre-order so serializer + parser agree without separate numbering.
+Cap `SSH_LAYOUT_MAX_PANES = 8`.
 
-Implementation:
-
-- `layout_serialize` walks `t->root`, emits the descriptor string,
-  and snapshots each leaf's cwd. Doesn't capture cmd — we don't
-  reliably know what's running. Users can hand-edit the
-  `# rbterm-pane-N-cmd:` lines or set them via the form (TODO).
-- `layout_parse` is a recursive-descent parser that returns a
-  `LayoutNode` tree (leaves carry indices, internals carry split
-  + ratio). Malformed input → NULL → caller falls back to single-
-  pane.
-- `layout_replay_walk` does the splits in DFS pre-order. Starts
-  from the first PaneNode (the one created by the SSH connect),
-  sets `t->active = current_leaf` before each `tab_split` so the
-  split lands in the right place, then sends `cd "<cwd>"; <cmd>\r`
-  to each leaf via `ssh_send_init_line`.
-- `tab_open_ssh` takes `layout`, `pane_cwds`, `pane_cmds` as new
-  params. If layout is non-empty AND parses, it owns the per-leaf
-  init; otherwise the legacy `init_cwd`/`init_cmd` fires for the
-  single first pane.
-- Single-pane saves are a no-op: the Save Layout handler clears
-  the layout string when leaf count == 1, so users can't
-  accidentally clobber their `init_cwd`/`init_cmd` by hitting Save
-  on a not-yet-split tab.
-- Per-pane cmd is preserved across saves (we re-snapshot cwd but
-  leave the cmd array alone) so hand-edited commands stick.
+- `layout_serialize` walks `t->root`, snapshots cwds (not cmds —
+  unreliable to know what's running).
+- `layout_parse` is recursive descent → `LayoutNode` tree. Malformed
+  → NULL → fallback to single pane.
+- `layout_replay_walk` does splits in DFS pre-order, sets
+  `t->active = current_leaf` before each `tab_split`, sends
+  `cd "<cwd>"; <cmd>\r` via `ssh_send_init_line`.
+- `tab_open_ssh(layout, pane_cwds, pane_cmds)`. Non-empty parsing
+  layout owns per-leaf init; otherwise legacy `init_cwd`/`init_cmd`
+  for first pane.
+- Single-pane Save = no-op (clears layout string) so users don't
+  clobber `init_cwd`/`init_cmd` accidentally.
+- Per-pane cmd preserved across saves (re-snapshot cwd, leave cmd
+  array) so hand-edited cmds stick.
 
 ## Per-host SSH startup commands
 
-`SshProfile` / `Tab` / `SshForm` carry `init_cwd` and `init_cmd`
-strings. After `pane_open_ssh` succeeds, `tab_open_ssh` writes
-`cd "<cwd>"; <cmd>\r` to the channel as the very first input —
-the remote shell processes it as if the user typed it. Either
-field can be empty; the missing one is omitted from the
-composed line. The `cwd` is quoted to survive spaces; `cmd` is
-sent verbatim so users can pipe / chain.
-
-Persisted in `~/.ssh/config` as `# rbterm-init-cwd:` /
-`# rbterm-init-cmd:` so the saved-host list and Settings →
-Launch see the same values.
+`SshProfile` / `Tab` / `SshForm` carry `init_cwd` + `init_cmd`. After
+`pane_open_ssh`, `tab_open_ssh` writes `cd "<cwd>"; <cmd>\r` as first
+input. Either field can be empty. cwd quoted (spaces); cmd verbatim
+(pipe/chain). Persisted as `# rbterm-init-cwd:` / `# rbterm-init-cmd:`
+in ssh_config.
 
 ## Settings → Launch
 
-`AppSettings.launch[]` (max 16 entries) drives which tabs open
-on startup. Each entry has `kind` (0 = local shell, 1 = SSH) and
-`host` (the `~/.ssh/config` alias for SSH entries; empty for
-local). Persisted as `launch.<i>=local` or `launch.<i>=ssh:<alias>`
-lines in `~/.config/rbterm/config.ini`.
+`AppSettings.launch[]` (max 16) drives startup tabs. Entry: `kind`
+(0=local, 1=ssh) + `host` (ssh_config alias for ssh; empty for
+local). Persisted as `launch.<i>=local` / `launch.<i>=ssh:<alias>`.
 
-UI: a Settings tab with one row per entry — `[kind pill]
-[host picker] [▲] [▼] [×]`. The host picker is a click-to-open
-dropdown of saved profiles (refreshed on each open via
-`ssh_profiles_load`). ▲/▼ swap with the neighbouring row;
-they're zero-width at the ends of the list. ▲/▼ also follow
-the open dropdown anchor across swaps so the picker doesn't
-snap to a different row when you reorder underneath it.
-
-At startup `main()` walks the entries and opens each. SSH
-connect failures log to stderr and skip the entry — a single
-typo can't lock a user out of rbterm. SSH entries pick up the
-matching `SshProfile`'s overrides (theme/font/cursor/colour/log/
-HUD/init-cwd/init-cmd).
+UI: row per entry — `[kind pill] [host picker] [▲][▼][×]`. Host
+picker dropdown of saved profiles, refreshed on open via
+`ssh_profiles_load`. ▲/▼ swap with neighbour, zero-width at ends,
+follow open dropdown anchor across swaps. SSH connect failures
+log to stderr + skip — single typo can't lock user out. SSH entries
+pick up matching `SshProfile` overrides.
 
 ## Settings → Window startup modes
 
-`AppSettings.startup_window` is a `StartupWindowMode` enum with 8
-values (back-compat: index 1 is the legacy FULLSCREEN that's now
-remapped to BORDERLESS at load time). The dispatch happens once
-in `main()` between `InitWindow` and the renderer-init block:
+`AppSettings.startup_window` enum, 8 values (back-compat: legacy
+FULLSCREEN remapped to BORDERLESS at load).
 
-| mode | what it does |
-|---|---|
-| DEFAULT | leave whatever raylib's `InitWindow` chose |
-| SMALL / MEDIUM / LARGE | `SetWindowSize` + centre on current monitor |
-| FILL | `MaximizeWindow()` — green-button zoom (work area) |
-| BORDERLESS | `SetWindowState(FLAG_WINDOW_UNDECORATED)` + `MaximizeWindow()` — fills the screen, no title bar, NOT macOS native fullscreen so Cmd+Tab still cycles |
-| MAXIMIZED (Own Space on macOS) | `mac_enter_native_fullscreen()` — `[NSWindow toggleFullScreen:]`, separate Space |
+| mode | what |
+|--|--|
+| DEFAULT | leave raylib's choice |
+| SMALL/MEDIUM/LARGE | `SetWindowSize` + centre on monitor |
+| FILL | `MaximizeWindow()` (work area) |
+| BORDERLESS | `FLAG_WINDOW_UNDECORATED` + maximize. NOT native fullscreen so Cmd+Tab cycles |
+| MAXIMIZED (Own Space) | `mac_enter_native_fullscreen` — `[NSWindow toggleFullScreen:]` |
 
-**Critical gate**: the renderer-init block below the dispatch
-unconditionally calls `SetWindowSize(win_w, win_h)` to fit the
-default 100×30 grid. Without `window_is_explicitly_sized`, that
-clobbers all the size presets — Medium / Large rendered identical
-to Default until we gated the auto-fit. If you add a new mode
-that wants the OS / explicit size to stick, add it to the
-`window_is_explicitly_sized` test.
+**Critical gate**: renderer-init unconditionally calls
+`SetWindowSize(win_w, win_h)` to fit default 100×30 grid. Without
+`window_is_explicitly_sized`, that clobbers all size presets — Med/
+Large rendered identical to Default until gated. New OS-/explicit-
+sized modes must add to that test.
 
 ## Quake hotkey (Cmd+CapsLock)
 
-When `STARTUP_WINDOW_BORDERLESS` is the chosen window mode,
-`mac_install_quake_hotkey` registers a system-wide toggle that
-summons / dismisses rbterm from any app. The implementation
-fights several layers of macOS scheduling that all conspired to
-make naïve approaches feel laggy or unresponsive:
+`STARTUP_WINDOW_BORDERLESS` → `mac_install_quake_hotkey` registers a
+system-wide summon/dismiss. Fights several macOS scheduling layers:
 
-1. **Chord delivery — Carbon `RegisterEventHotKey`** (not just
-   NSEvent). NSEvent's global monitor needs Input Monitoring
-   permission and silently fails to fire if the user hasn't
-   granted it. Carbon's hotkey API is older but doesn't require
-   IM permission. We register both — Carbon as the reliable
-   fallback, NSEvent as a swallow-the-chord-when-rbterm-has-focus
-   path.
-2. **App Nap throttling**. Once rbterm loses foreground status,
-   macOS happily buffers Cocoa events for 1-2 s at a time. Two
-   defenses, both required: `NSProcessInfo.beginActivityWithOptions:
-   NSActivityUserInitiated | NSActivityLatencyCritical` and an
-   `IOPMAssertion` of type `kIOPMAssertionTypePreventUserIdleSystemSleep`.
-   Either alone wasn't enough.
-3. **Hide via `[NSApp hide:]` deep-suspends the process**. Even
-   with the activity tokens above, calling `hide:` puts us into
-   a state where Cocoa events never dispatch. Replaced with
-   `orderOut:` per window + explicit `activateWithOptions:` of
-   the previously-frontmost app (tracked via
-   `NSWorkspaceDidActivateApplicationNotification`). Keeps our
-   run loop hot.
-4. **Toggle source-of-truth is `[NSApp isActive]`**, not our own
-   `g_quake_was_hidden` flag — the user might have Cmd+Tab'd
-   away (we lost focus without anyone calling our hide path) and
-   the chord still needs to summon us.
-5. **Caps Lock state reset**. Caps Lock is a stateful toggle;
-   each press flips the LED. After detecting the chord we call
-   `IOHIDSetModifierLockState(kIOHIDCapsLockState, false)` so
-   the user's keyboard doesn't drift into ALL CAPS.
+1. **Carbon `RegisterEventHotKey`** (not just NSEvent). NSEvent
+   needs Input Monitoring permission and silently fails without it;
+   Carbon doesn't. Both registered — Carbon as reliable fallback.
+2. **App Nap throttling**. Lost focus → Cocoa events buffer 1-2s.
+   Both required: `NSProcessInfo.beginActivityWithOptions:
+   UserInitiated|LatencyCritical` + `IOPMAssertion` of type
+   `kIOPMAssertionTypePreventUserIdleSystemSleep`. Either alone fails.
+3. **`[NSApp hide:]` deep-suspends.** Even with activity tokens,
+   events stop dispatching. Use `orderOut:` per window + explicit
+   `activateWithOptions:` of previous frontmost (tracked via
+   `NSWorkspaceDidActivateApplicationNotification`) → run loop hot.
+4. **Toggle source = `[NSApp isActive]`**, not our `g_quake_was_hidden`
+   — user might Cmd+Tab away (hide path didn't run) and chord still
+   needs to summon.
+5. **Caps Lock state reset** via `IOHIDSetModifierLockState(...,
+   kIOHIDCapsLockState, false)` so keyboard doesn't drift to ALL CAPS.
 
-The toggle runs inline from the NSEvent / Carbon block, not via
-a polled flag — raylib's main loop pauses while hidden and a
-flag-based handoff was the original "queues up for 1-2 s" bug.
+Toggle runs inline from NSEvent/Carbon block, not via a polled flag
+— raylib's main loop pauses while hidden and a flag handoff was the
+original 1-2s queueing bug.
 
-Need `-framework Carbon` linked. Both Makefile and CMakeLists
-have it.
+Need `-framework Carbon` (Makefile + CMakeLists have it).
 
 ## Cursor colour (Settings → Cursor + per-host)
 
-`AppSettings.cursor_color[16]` holds an `#rrggbb` hex string;
-empty means "use the cell's natural fg colour". Persisted as
-`cursor_color=` in `~/.config/rbterm/config.ini`. Applied at
-`pane_open_local` time via `screen_set_cursor_color`; live updates
-from the Settings click handler walk every open pane.
+`AppSettings.cursor_color[16]` `#rrggbb`; empty = cell's natural fg.
+Persisted as `cursor_color=`. Applied at `pane_open_local` via
+`screen_set_cursor_color`; live updates walk every open pane.
+`SshProfile.cursor_color[16]` mirror, persisted as
+`# rbterm-cursor-color:`, applied in `pane_apply_tab_appearance`,
+takes precedence over app-wide.
 
-`SshProfile.cursor_color[16]` mirrors the field for per-host
-overrides, persisted as `# rbterm-cursor-color:`. Applied in
-`pane_apply_tab_appearance`; takes precedence over the app-wide
-setting when set.
-
-The picker uses `SSH_COLOR_PRESETS` (the same 8-tile palette as
-the SSH tab-accent picker) plus a 9th "default" tile that clears
-the override.
+Picker: 8-tile `SSH_COLOR_PRESETS` + 9th "default" tile that clears.
 
 ## SSH key manager (Settings → Keys)
 
-A Settings tab that owns `~/.ssh` for the user — list, generate,
-install, delete. Pure libssh + POSIX, no `ssh-keygen` /
-`ssh-copy-id` subprocess dependency anywhere.
+Settings tab owning `~/.ssh` — list, generate, install, delete.
+Pure libssh + POSIX, no `ssh-keygen`/`ssh-copy-id` subprocess.
 
-### Discovery — `ssh_keys_rescan` in `main.c`
-- `opendir(~/.ssh)` + scan for `*.pub`. Each match is a
-  `SshKeyEntry { name, algo, fingerprint, pubpath, privpath,
-  has_private, mtime }`. Capped at `SSH_KEYS_MAX = 32`.
-- `algo` is the first whitespace-delimited token of the pub
-  file's first line (`ssh-ed25519` → `ed25519`).
-- `fingerprint` is the SHA256 line from `ssh-keygen -lf` (popen,
-  trimmed). Optional — silently empty when ssh-keygen isn't on
-  PATH; everything else still works.
-- `mtime` from `stat()` on the .pub file; sort key is descending
-  mtime with case-insensitive name as tie-break, so a
-  freshly-generated key lands at the top of both this list and
-  the SSH form's Key file dropdown.
+### Discovery — `ssh_keys_rescan`
+- `opendir(~/.ssh)` + scan `*.pub`. Each → `SshKeyEntry { name, algo,
+  fingerprint, pubpath, privpath, has_private, mtime }`. Cap `SSH_KEYS_MAX = 32`.
+- `algo` = first whitespace-token of pub line 1.
+- `fingerprint` = SHA256 from `ssh-keygen -lf` (popen, optional —
+  silently empty if not on PATH).
+- Sort: descending mtime, case-insensitive name tiebreak — fresh
+  key tops both this list and SSH form's Key file dropdown.
 
 ### Generation — `ssh_keys_generate_native`
-- `ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &k)` for ed25519,
-  `SSH_KEYTYPE_RSA` + `4096` for rsa-4096. Both are deprecated in
-  recent libssh but still functional and the only single-call
-  generators that don't require pulling in OpenSSL directly.
-- `ssh_pki_export_privkey_file(k, passphrase, NULL, NULL, path)` +
-  `ssh_pki_export_pubkey_file(k, path)`. Then `chmod 0600` on the
-  private file and `0644` on the pub file.
-- Sub-modal UI lives in `SettingsLayout.keygen_*` rects with
-  `g_keygen_form` as state (type pill, name field, passphrase
-  field, status). Cancel / Esc / click-outside dismiss without
-  side effects.
+- ed25519 → `ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &k)`; rsa-4096
+  → `SSH_KEYTYPE_RSA, 4096`. Both deprecated but the only single-
+  call generators that don't need OpenSSL directly.
+- `ssh_pki_export_privkey_file` + `_pubkey_file`. Then `chmod 0600`
+  / `0644`.
+- Sub-modal at `SettingsLayout.keygen_*` with `g_keygen_form`.
 
 ### Install — `ssh_keys_install_native`
-- Opens a fresh `ssh_session` to the chosen `SshProfile`, applies
-  the same options the SSH form does (HostName / User / Port /
-  IdentityFile), `ssh_connect`, `ssh_session_is_known_server`
-  for trust-on-first-use, then `ssh_userauth_publickey_auto(s,
-  NULL, "")` (the empty-string passphrase is load-bearing — see
-  "tty-prompt fix" below).
-- Auth done, opens an exec channel and runs:
+- Fresh `ssh_session` to chosen `SshProfile` with same options as
+  SSH form (HostName/User/Port/IdentityFile), `ssh_connect`,
+  `ssh_session_is_known_server` for TOFU, then
+  `ssh_userauth_publickey_auto(s, NULL, "")` (empty-string
+  passphrase load-bearing — see tty-prompt fix below).
+- Exec channel runs:
   ```sh
   umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys
   if ! grep -qF "$KEY" ~/.ssh/authorized_keys 2>/dev/null; then
       printf '%s\n' "$KEY" >> ~/.ssh/authorized_keys
   fi
   ```
-  Pubkey is fed via `ssh_channel_write` as stdin, exit status
-  collected via `ssh_channel_get_exit_status` (also deprecated
-  but still works). Duplicate insertions are no-ops.
-- Failures land in `g_keys_status` ("auth: …", "exec: …", "host
-  key changed"). Successes too ("Installed id_rbterm on mia.").
+  Pubkey via `ssh_channel_write` as stdin, exit via
+  `ssh_channel_get_exit_status`. Dups are no-ops.
+- Status in `g_keys_status` ("auth: …", "exec: …", "host key
+  changed", "Installed id_rbterm on mia.").
 
-### Delete — confirmation + unlink
-- Per-row × button. Click sets `g_keys_delete_idx`; the modal at
-  `L.keysdel_*` shows both **absolute** paths (private + .pub)
-  plus Cancel / Delete pair. Delete runs `unlink()` on each then
-  rescans. `errno` flows into the status line on failure.
-- Both `g_keys_delete_idx` and `g_keys_install_dropdown` are
-  reset in `settings_open` so a half-finished interaction
-  doesn't reappear next time the modal opens.
+### Delete
+Per-row × → `g_keys_delete_idx`, modal at `L.keysdel_*` shows both
+absolute paths + Cancel/Delete. `unlink()` each then rescan. errno
+→ status. Both `g_keys_delete_idx` + `g_keys_install_dropdown`
+reset in `settings_open`.
 
 ### tty-prompt fix (`pty_ssh.c` + `main.c`)
+Bug to remember: `ssh_pki_import_privkey_file(path, NULL, NULL,
+NULL, &k)` lets libssh/OpenSSL fall back to OpenSSL's `Enter PEM
+pass phrase:` prompt on the controlling tty (the launching shell)
+— modal hangs while invisible prompt sits on launching terminal.
 
-The bug to remember: `ssh_pki_import_privkey_file(path, NULL,
-NULL, NULL, &k)` lets libssh / OpenSSL fall back to OpenSSL's
-default `Enter PEM pass phrase:` prompter on the controlling
-tty — which is whatever shell launched rbterm. The user sees
-the modal hang while the prompt sits invisibly on the launching
-terminal.
+Fix: `rbterm_passphrase_cb` in `pty_ssh.c` wired into every
+`ssh_pki_import_privkey_file`. Non-empty userdata → return passphrase;
+otherwise return -1 → libssh fails the load cleanly. Either way
+short-circuits the OpenSSL tty fallback. Side effect: encrypted
+private keys work in-app — SSH form's Password field passes through.
 
-Fix is `rbterm_passphrase_cb` in `pty_ssh.c` — wired into every
-`ssh_pki_import_privkey_file` call. If `userdata` carries a
-non-empty passphrase, hand it back; otherwise return -1 so
-libssh fails the load cleanly. Either way the OpenSSL tty
-fallback is short-circuited. Side effect: encrypted private
-keys now work in-app — typing the passphrase into the SSH
-form's Password field gets passed straight through.
-
-For `ssh_userauth_publickey_auto` (used by the install path in
-`main.c`) the equivalent fix is passing `""` as the passphrase
-arg instead of `NULL`. Same root cause, same outcome:
-encrypted ~/.ssh/id_* keys are skipped silently.
+For `ssh_userauth_publickey_auto` (install path): pass `""` not
+`NULL` as passphrase arg. Same root cause, same outcome.
 
 ### SSH form integration
-
-The SSH form's Key file field has a small `▼` button to its
-right that opens a dropdown sourced from the same
-`ssh_keys_rescan` data. Picking a row sets `g_form.key` to the
-key's absolute private path. Esc collapses the dropdown
-without dismissing the SSH modal — only an Esc with no
-dropdown open cancels the form.
+Key file field has `▼` button → dropdown sourced from same
+`ssh_keys_rescan`. Pick → `g_form.key` = absolute private path.
+Esc collapses dropdown without dismissing modal — only Esc with
+no dropdown open cancels the form.
 
 ## Things left for later
 
-- SSH interactive password / keyboard-interactive auth (draw a prompt
-  through the Screen buffer and capture typed chars).
-- Async SSH connect so the UI doesn't freeze during the handshake.
-- Saved SSH profiles / a connect history.
+- SSH interactive password / kbd-interactive auth (prompt through
+  Screen, capture chars).
+- Async SSH connect (don't freeze UI on handshake).
+- Saved SSH profiles / connect history.
 - DirectWrite emoji for Windows.
-- Ligatures (needs shaping — HarfBuzz).
-- Scrollback reflow on resize (only the main screen reflows today; the
-  existing scrollback is just re-bucketed at the new width).
-- Linux `.desktop` file + icon install path.
-- Bundle ffmpeg next to the macOS / Linux release binary too. Today
-  only Windows ships a bundled ffmpeg.exe (BtbN gpl-static, fetched
-  in CI). macOS/Linux still require ffmpeg on PATH for mp4 / webm /
-  apng — gif and webp work without it via the native encoders.
-- **Maximized startup window mode is broken.** Settings → Window →
-  Maximized (on macOS, "Own Space") is wired up to
-  `mac_enter_native_fullscreen` in `emoji_mac.m` which calls
-  `[w toggleFullScreen:nil]`, but the result isn't right — symptom
-  to investigate next session. Fullscreen was already disabled for
-  the same class of reason (raylib's `ToggleFullscreen` on the macOS
-  GLFW build misbehaved); likely both need the same fix, probably
-  around timing the mode change relative to raylib's first frame or
-  making sure the screens resize to the new window size. For now
-  the picker only offers Default + Maximized in the UI; config-file
-  back-compat silently demotes `fullscreen` to default.
+- Ligatures (HarfBuzz shaping).
+- Scrollback reflow on resize (currently re-bucketed only).
+- Linux `.desktop` file + icon install.
+- Bundle ffmpeg next to mac/Linux release (Windows already does).
+- **Maximized startup mode is broken.** Wired to
+  `mac_enter_native_fullscreen` / `[w toggleFullScreen:nil]` but
+  result isn't right. Likely same class of fix as raylib's broken
+  `ToggleFullscreen` — timing the mode change vs first frame /
+  ensuring screens resize. Picker only offers Default + Maximized;
+  config back-compat demotes `fullscreen` → default.
 
 ## Missing features (vs iTerm2 / Alacritty / kitty)
 
-A running list of things competing terminals do that rbterm doesn't.
-Not a roadmap — a shopping list to prioritise from.
+Shopping list, not roadmap.
 
-### Window / layout
-- **Broadcast input** to all panes / tabs (iTerm2: Cmd+Shift+I) — useful
-  for fleet-of-ssh sessions.
-- (was: recursive N-way splits — shipped; see "Recursive split tree" below.)
-- **Per-tab / per-pane title override** that survives shell rewrites.
-- **Tab bar styles** (top/bottom/left, powerline separators) — kitty.
-- **Hotkey window** — system-wide drop-down terminal (iTerm2).
-- (was: Quake-style fullscreen toggle — shipped; see "Quake hotkey" below.)
-- **Session restore** on relaunch (iTerm2: restore tabs + scrollback).
-
-### Scrollback / search
-- **Find in scrollback** (Cmd+F, regex, highlight all matches) — all
-  three. rbterm has no search.
-- **Vi mode for scrollback** navigation (Alacritty, kitty) — keyboard
-  scrolling + visual selection without mouse.
-- **Jump to prompt / previous command** (iTerm2 + shell integration,
-  kitty marks) — needs OSC 133.
-- **Clickable URL detection** (Cmd/Ctrl+click to open) — all three.
-  rbterm currently has none.
-- **Hints / hyperlinks-by-keyboard** (kitty `hints` kitten) — label
-  every URL with a keystroke and open with one keypress.
-- **OSC 8 hyperlinks** (`\e]8;;url\e\\text\e]8;;\e\\`) — kitty,
-  iTerm2, recent Alacritty.
-- **Smart selection** (regex-defined word boundaries) — iTerm2.
-- **Triple-click selects line; quad-click selects paragraph** —
-  iTerm2.
-- **Rectangular / column selection** (Alt+drag) — all three.
-
-### Shell integration
-- **OSC 133 prompt marks** — *parser + gutter shipped.* Each row
-  carries a `pmark` (A/B/C/D) and `pexit` byte parallel to
-  `main_wrap` / `sb_wrap`; `screen_view_row_pmark` exposes them to
-  the renderer. `render.c` paints a 3px gutter badge in the pad area
-  just left of the grid (green for exit 0, red otherwise) on every
-  'D' mark. Helper scripts in `tools/rbterm-shell-integration.{zsh,
-  bash}` install precmd / preexec / DEBUG-trap hooks that emit
-  OSC 133 A/C/D. Future passes: jump-to-prev/next-prompt chord,
-  select-last-command-output, long-command notification (all use
-  the same already-stored marks).
-- **Per-tab cwd inheritance on new tab** (open new tab in same dir
-  as current) — OSC 7 is parsed but not used for this.
-- **Command status badges** (success/fail glyph next to each prompt) —
-  iTerm2 with shell integration.
-- **Notify on long-running command finish** (iTerm2, kitty
-  `notify-on-cmd-finish`).
-- **Paste guards** for multi-line / sudo / newline-containing pastes
-  (iTerm2, kitty `paste_actions confirm`).
-
-### Graphics / fonts
-- **iTerm2 inline-image protocol** (`OSC 1337 ; File=…`) — rbterm
-  supports sixel + kitty but not this one yet.
-- **Ligatures** (already on TODO).
-- **Per-local-tab font size** — rbterm has per-SSH-host font size
-  but not per-local-tab override.
-- **Background image / blur / transparency** — iTerm2, kitty.
-- **Cursor trail / smooth cursor animation** — kitty.
-- **Minimum-contrast adjustment** — iTerm2 (auto-bumps fg lightness so
-  text never disappears against close-coloured bg).
-- **Dim inactive panes** — iTerm2.
-- **True-color background gradients** per pane.
-
-### Configuration
-- (was: persisted settings — shipped via `~/.config/rbterm/config.ini`
-  and the "Save as Default" button in the settings modal.)
-- **Config file** (TOML / conf / Lua) — Alacritty, kitty, iTerm2 all
-  have one. rbterm has only the modal.
-- **Live config reload** on file change — Alacritty, kitty.
-- **Per-local-tab profiles** — rbterm has per-SSH-host profile
-  overrides (theme/font/cursor/log), but not per-local-tab profiles.
-- **Per-cwd profile auto-switching** — iTerm2 dynamic profiles.
-
-### Input / keys
-- **User-definable keybindings** in config — all three.
-- **Chord / leader-key bindings** — kitty.
-- **macOS native key remap** (Option-as-Meta, Left-Option vs
-  Right-Option distinct) — iTerm2.
-- **Unicode input kitten / compose key** — kitty.
-- **Password manager autofill** — iTerm2.
-
-### Extensibility / scripting
-- **Remote control protocol** (`kitty @ ls`, `kitty @ send-text`) —
-  kitten ecosystem, scriptable from outside the terminal.
-- **Triggers** — regex on output runs an action (iTerm2: ring bell,
-  highlight, run script, capture into variable).
-- **Watchers / event hooks** (kitty: Python scripts invoked on
-  window/tab events).
-- **Status bar** with custom segments (iTerm2, kitty `tab_bar_style`
-  with active indicators).
-- **ssh kitten**-equivalent — auto-ship terminfo and dotfiles to the
-  remote host on connect (kitty). rbterm's SSH backend currently
-  inherits whatever terminfo the remote has for `xterm-256color`.
-
-### Bell / notifications
-- **Visual bell** (flash window/tab) — all three. rbterm ignores BEL.
-- **Audible bell** toggle.
-- **OSC 9 / OSC 777 desktop notifications** — kitty, iTerm2.
-- **Per-tab unread / activity / silence indicators** — iTerm2, kitty.
-
-### Performance / rendering
-- **Damage-tracked redraw** (only redraw changed cells) — Alacritty,
-  kitty. rbterm currently redraws the full grid each frame.
-- **Vsync / frame-rate cap when idle** to drop GPU/CPU use.
-- **Headless / daemon mode** for one-process-many-windows (Alacritty
-  `--daemon`, kitty single-instance).
+**Window/layout**: per-tab/pane title override surviving shell
+rewrites, tab bar styles (top/bottom/left, powerline), session
+restore. **Scrollback**: regex search, vi mode, jump to prev
+prompt (OSC 133 needed), URL detection + click, hints kitten,
+OSC 8 hyperlinks, smart selection, triple/quad-click,
+rectangular Alt+drag. **Shell integration**: OSC 133 prompt
+marks shipped (parser + 3px gutter badge in pad — green exit 0,
+red otherwise; helper scripts at `tools/rbterm-shell-integration.{zsh,
+bash}`. Future: jump-prev/next-prompt, select-last-output,
+long-cmd notification — all use already-stored marks). New-tab
+cwd inheritance (OSC 7 parsed, not used), command status badges,
+notify-on-cmd-finish, paste guards. **Graphics**: iTerm2
+`OSC 1337 ; File=…` inline images, ligatures, per-local-tab font
+size, bg image/blur/transparency, cursor trail, min-contrast,
+dim inactive panes, gradients. **Config**: TOML/conf/Lua file +
+live reload, per-local-tab profiles, per-cwd auto-switching.
+**Input**: user keybindings, leader chords, Option-as-Meta
+left/right distinct, compose key, password autofill.
+**Extensibility**: remote control protocol (`kitty @`), regex
+triggers, watchers/event hooks, status bar segments, ssh
+kitten-equivalent (ship terminfo + dotfiles). **Bell/notify**:
+visual bell, audible toggle, OSC 9 / OSC 777, per-tab
+unread/activity/silence. **Performance**: damage-tracked
+redraw, vsync/fps cap idle, headless daemon mode.
